@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+.venv/
+
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Databases and local data
+*.db
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+
+# Logs and coverage
+*.log
+coverage/
