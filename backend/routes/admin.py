@@ -11,6 +11,13 @@ from db_admin import wipe_database
 from player_db import add_or_update_player
 from team_db import add_or_update_team
 from team_strength import PARAMS_PATH
+from swiss_stage.fantasy_scoring import (
+    compute_rating_points,
+    compute_role_points,
+    compute_win_points,
+    compute_booster_points,
+)
+from swiss_stage.swiss_models import PlayerState
 
 router = APIRouter()
 
@@ -162,6 +169,8 @@ def import_trigger_rates(payload: Dict[str, Any]):
         raise HTTPException(status_code=400, detail="playerTriggerRates missing or empty")
 
     updated = 0
+    updated_players_info: List[Dict[str, Any]] = []
+    seen_player_ids = set()
     for entry in ptr_list:
         pid = entry.get("playerId", {}).get("playerId")
         if pid is None:
@@ -236,8 +245,17 @@ def import_trigger_rates(payload: Dict[str, Any]):
             roles_json=roles_json,
         )
         updated += 1
+        if int(pid) not in seen_player_ids:
+            updated_players_info.append({"player_id": int(pid), "name": name})
+            seen_player_ids.add(int(pid))
 
-    return {"status": "ok", "updated_players": updated}
+    updated_player_names = [p["name"] for p in updated_players_info]
+    return {
+        "status": "ok",
+        "updated_players": updated,
+        "updated_players_info": updated_players_info,
+        "updated_player_names": updated_player_names,
+    }
 
 
 @router.post("/import-top-ratings")
@@ -404,3 +422,101 @@ def fit_winrate(payload: Dict[str, Any]):
         json.dump(payload_out, f)
 
     return payload_out
+
+
+@router.post("/booster-calc")
+def booster_calc(payload: Dict[str, Any]):
+    """
+    Utility calculator for per-match and expected fantasy components.
+    Payload:
+      {
+        "rating": float,
+        "major_pct": float,
+        "minor_pct": float,
+        "win_prob": float,           # expected per-match win probability [0,1]
+        "booster_rates": [float...], # trigger rates per match (typically 5)
+        "matches": int,              # optional, default 5
+        "expected_games": float      # optional, e.g. 4.2
+      }
+    """
+    try:
+        rating = float(payload.get("rating", 1.0))
+        major_pct = float(payload.get("major_pct", 0.0))
+        minor_pct = float(payload.get("minor_pct", 0.0))
+        win_prob = float(payload.get("win_prob", 0.5))
+    except Exception:
+        raise HTTPException(status_code=400, detail="rating, major_pct, minor_pct, win_prob must be numeric")
+
+    if not (0.0 <= win_prob <= 1.0):
+        raise HTTPException(status_code=400, detail="win_prob must be between 0 and 1")
+
+    raw_rates = payload.get("booster_rates", []) or []
+    booster_rates: List[float] = []
+    for r in raw_rates:
+        try:
+            booster_rates.append(float(r))
+        except Exception:
+            continue
+
+    matches = int(payload.get("matches", 5))
+    if matches < 1:
+        matches = 1
+    if matches > 10:
+        matches = 10
+
+    player = PlayerState(
+        player_id=0,
+        rating=rating,
+        major_pct=major_pct,
+        minor_pct=minor_pct,
+        boosters=booster_rates,
+    )
+
+    rating_points = compute_rating_points(player)
+    role_points = compute_role_points(player)
+    win_points = compute_win_points(win_prob, did_win=True)
+
+    per_match = []
+    for match_no in range(1, matches + 1):
+        booster_points = compute_booster_points(player, match_no)
+        total_points = rating_points + role_points + win_points + booster_points
+        per_match.append(
+            {
+                "match_number": match_no,
+                "rating_points": rating_points,
+                "role_points": role_points,
+                "win_points": win_points,
+                "booster_points": booster_points,
+                "total_points": total_points,
+            }
+        )
+
+    out: Dict[str, Any] = {
+        "rating_points": rating_points,
+        "role_points": role_points,
+        "win_points": win_points,
+        "per_match": per_match,
+    }
+
+    if payload.get("expected_games") is not None:
+        try:
+            expected_games = float(payload.get("expected_games"))
+        except Exception:
+            raise HTTPException(status_code=400, detail="expected_games must be numeric")
+
+        expected_games = max(0.0, min(float(matches), expected_games))
+        whole = int(math.floor(expected_games))
+        frac = expected_games - whole
+
+        expected_booster = sum(p["booster_points"] for p in per_match[:whole])
+        if whole < matches and frac > 0:
+            expected_booster += frac * per_match[whole]["booster_points"]
+
+        base_no_booster = (rating_points + role_points + win_points) * expected_games
+        expected_total = base_no_booster + expected_booster
+
+        out["expected_games"] = expected_games
+        out["expected_booster_points"] = expected_booster
+        out["expected_total_points"] = expected_total
+
+    return out

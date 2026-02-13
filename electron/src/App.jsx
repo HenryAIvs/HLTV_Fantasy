@@ -1,11 +1,10 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
 const tabs = [
   { key: "view", label: "Database" },
-  { key: "sim", label: "Run Simulation" },
-  { key: "bracket", label: "Bracket" },
+  { key: "sim", label: "Swiss Group Stage" },
   { key: "playoff", label: "Playoff Bracket" },
-  { key: "admin", label: "Admin" },
+  { key: "admin", label: "Data Management" },
 ];
 
 const api = window.api || {
@@ -27,8 +26,6 @@ const TabButton = ({ active, onClick, children }) => (
     {children}
   </button>
 );
-
-const Pill = ({ children }) => <span className="pill">{children}</span>;
 
 const Section = ({ title, children }) => (
   <section className="card">
@@ -60,18 +57,54 @@ const Select = ({ label, value, onChange, options }) => (
 );
 
 const Badge = ({ children }) => <span className="badge">{children}</span>;
+const ROLE_NAME_MAP = {
+  0: "Main AWP",
+  1: "Support",
+  2: "Attacker",
+  3: "Leader",
+  4: "Stathunter",
+  5: "Entry Fragger",
+  6: "Camper",
+  7: "Defender",
+  8: "HS Machine",
+  9: "Noob",
+  10: "Multi Fragger",
+  11: "Eco Friendly",
+};
 
-function SimulationTab({ teams, teamLookup }) {
-  const [selected, setSelected] = useState([]);
-  const [bo, setBo] = useState("elim_qual");
-  const [sims, setSims] = useState("200");
-  const [results, setResults] = useState(null);
+const roleLabel = (roleName) => {
+  const n = Number(roleName);
+  if (Number.isFinite(n) && ROLE_NAME_MAP[n]) return ROLE_NAME_MAP[n];
+  return roleName || "-";
+};
+
+function GroupStageTab({
+  teams,
+  teamLookup,
+  selected,
+  setSelected,
+  bo,
+  setBo,
+  sims,
+  setSims,
+  results,
+  setResults,
+  simUpdatedAt,
+  onResetSimulation,
+}) {
   const [busy, setBusy] = useState(false);
-  const [topTeams, setTopTeams] = useState(null);
-  const [exclude, setExclude] = useState(new Set());
+  const [processedSims, setProcessedSims] = useState(0);
+  const [totalSims, setTotalSims] = useState(0);
+  const [etaSeconds, setEtaSeconds] = useState(null);
+  const [runMessage, setRunMessage] = useState("");
   const [playerLookup, setPlayerLookup] = useState({});
+  const simPollingRef = useRef(false);
+  const SIM_JOB_ID_KEY = "swiss_sim_job_id";
+  const SIM_JOB_STARTED_AT_KEY = "swiss_sim_job_started_at";
   const toggle = (tid) =>
     setSelected((prev) => (prev.includes(tid) ? prev.filter((x) => x !== tid) : [...prev, tid]));
+  const selectAllTeams = () => setSelected(teams.map((t) => t.team_id));
+  const clearTeams = () => setSelected([]);
 
   const loadPlayers = async () => {
     const data = await api.get("/players/");
@@ -86,9 +119,24 @@ function SimulationTab({ teams, teamLookup }) {
     loadPlayers();
   }, []);
 
+  const formatEta = (seconds) => {
+    if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return "-";
+    const s = Math.max(0, Math.round(seconds));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const r = s % 60;
+    if (h > 0) return `${h}h ${m}m ${r}s`;
+    if (m > 0) return `${m}m ${r}s`;
+    return `${r}s`;
+  };
+
   const run = async () => {
     if (selected.length < 2) return;
     setBusy(true);
+    setRunMessage("");
+    setProcessedSims(0);
+    setTotalSims(Number(sims || 0));
+    setEtaSeconds(null);
     const vrs = {};
     teams.forEach((t) => {
       if (selected.includes(t.team_id)) vrs[t.team_id] = t.vrs_rank ?? 999;
@@ -99,43 +147,133 @@ function SimulationTab({ teams, teamLookup }) {
       bo3_mode: bo,
       n_sims: Number(sims || 0),
     };
-    const data = await api.post("/simulate/", body);
-    setResults(data);
-    setTopTeams(null);
-    setBusy(false);
-  };
+    const pollSimulationJob = async (jobId, startedAtMs) => {
+      if (!jobId) return;
+      if (simPollingRef.current) return;
+      simPollingRef.current = true;
+      try {
+        let done = false;
+        while (!done) {
+          const status = await api.get(`/simulate/job/${jobId}`);
+          if (status?.detail) {
+            setRunMessage(String(status.detail));
+            localStorage.removeItem(SIM_JOB_ID_KEY);
+            localStorage.removeItem(SIM_JOB_STARTED_AT_KEY);
+            return;
+          }
+          const processed = Number(status.processed_sims || 0);
+          const total = Number(status.total_sims || 0);
+          setProcessedSims(processed);
+          setTotalSims(total);
+          if (processed > 0 && total > processed) {
+            const elapsedSec = Math.max(0.001, (Date.now() - startedAtMs) / 1000);
+            const rate = processed / elapsedSec;
+            if (rate > 0) setEtaSeconds((total - processed) / rate);
+          } else if (total > 0 && processed >= total) {
+            setEtaSeconds(0);
+          }
 
-  const toggleExclude = (pid) => {
-    setExclude((prev) => {
-      const next = new Set(Array.from(prev));
-      if (next.has(pid)) next.delete(pid);
-      else next.add(pid);
-      return next;
-    });
-  };
-
-  const findTopTeams = async () => {
-    if (!results || selected.length < 2) return;
-    setBusy(true);
-    const vrs = {};
-    teams.forEach((t) => {
-      if (selected.includes(t.team_id)) vrs[t.team_id] = t.vrs_rank ?? 999;
-    });
-    const payload = {
-      team_ids: selected,
-      vrs_ranks: vrs,
-      bo3_mode: bo,
-      n_sims: Number(sims || 0),
-      exclude_player_ids: Array.from(exclude),
+          if (status.status === "failed") {
+            setRunMessage(status.error || "Simulation failed.");
+            localStorage.removeItem(SIM_JOB_ID_KEY);
+            localStorage.removeItem(SIM_JOB_STARTED_AT_KEY);
+            return;
+          }
+          if (status.status === "completed") {
+            setResults(status.result || null);
+            localStorage.removeItem(SIM_JOB_ID_KEY);
+            localStorage.removeItem(SIM_JOB_STARTED_AT_KEY);
+            done = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+      } finally {
+        simPollingRef.current = false;
+      }
     };
-    const data = await api.post("/best-team/", payload);
-    setTopTeams(data.top_teams || []);
-    setBusy(false);
+    try {
+      const start = await api.post("/simulate/start", body);
+      if (start?.detail) {
+        setRunMessage(String(start.detail));
+        return;
+      }
+      const jobId = start?.job_id;
+      if (!jobId) {
+        setRunMessage("Failed to start simulation job.");
+        return;
+      }
+      const startedAt = Date.now();
+      localStorage.setItem(SIM_JOB_ID_KEY, String(jobId));
+      localStorage.setItem(SIM_JOB_STARTED_AT_KEY, String(startedAt));
+      await pollSimulationJob(jobId, startedAt);
+    } finally {
+      setBusy(false);
+    }
   };
+
+  useEffect(() => {
+    const resumeSimulationJob = async () => {
+      const jobId = localStorage.getItem(SIM_JOB_ID_KEY);
+      if (!jobId || simPollingRef.current) return;
+      const startedAt = Number(localStorage.getItem(SIM_JOB_STARTED_AT_KEY) || Date.now());
+      simPollingRef.current = true;
+      setBusy(true);
+      try {
+        let done = false;
+        while (!done) {
+          const status = await api.get(`/simulate/job/${jobId}`);
+          if (status?.detail) {
+            setRunMessage(String(status.detail));
+            localStorage.removeItem(SIM_JOB_ID_KEY);
+            localStorage.removeItem(SIM_JOB_STARTED_AT_KEY);
+            return;
+          }
+          const processed = Number(status.processed_sims || 0);
+          const total = Number(status.total_sims || 0);
+          setProcessedSims(processed);
+          setTotalSims(total);
+          if (processed > 0 && total > processed) {
+            const elapsedSec = Math.max(0.001, (Date.now() - startedAt) / 1000);
+            const rate = processed / elapsedSec;
+            if (rate > 0) setEtaSeconds((total - processed) / rate);
+          } else if (total > 0 && processed >= total) {
+            setEtaSeconds(0);
+          }
+          if (status.status === "failed") {
+            setRunMessage(status.error || "Simulation failed.");
+            localStorage.removeItem(SIM_JOB_ID_KEY);
+            localStorage.removeItem(SIM_JOB_STARTED_AT_KEY);
+            return;
+          }
+          if (status.status === "completed") {
+            setResults(status.result || null);
+            localStorage.removeItem(SIM_JOB_ID_KEY);
+            localStorage.removeItem(SIM_JOB_STARTED_AT_KEY);
+            done = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+      } finally {
+        simPollingRef.current = false;
+        setBusy(false);
+      }
+    };
+    resumeSimulationJob();
+  }, []);
 
   return (
-    <Section title="Swiss Simulation">
+    <Section title="Swiss Group Stage">
       <div className="stack">
+        <div className="actions" style={{ marginTop: 0 }}>
+          <button className="secondary" onClick={selectAllTeams}>
+            Select All
+          </button>
+          <button className="secondary" onClick={clearTeams} disabled={selected.length === 0}>
+            Clear
+          </button>
+        </div>
         <div className="chips">
           {teams.map((t) => (
             <button
@@ -153,19 +291,44 @@ function SimulationTab({ teams, teamLookup }) {
             value={bo}
             onChange={setBo}
             options={[
-              { value: "elim_qual", label: "elim_qual" },
-              { value: "all", label: "all" },
-              { value: "none", label: "none" },
+              { value: "elim_qual", label: "BO3 on Elimination/Qualification Matches" },
+              { value: "all", label: "BO3 on All Matches" },
+              { value: "none", label: "No BO3 (All BO1)" },
             ]}
           />
           <Input label="# Sims" value={sims} onChange={setSims} />
           <div className="field">
             <span>Run</span>
             <button className="primary" onClick={run} disabled={busy || selected.length < 2}>
-              {busy ? "Running..." : "Run Simulation"}
+              {busy ? "Running..." : "Run Swiss Group Stage"}
             </button>
           </div>
         </div>
+        <div className="actions" style={{ marginTop: 8 }}>
+          <button className="danger" onClick={onResetSimulation} disabled={busy || !results}>
+            Reset Stored Simulation
+          </button>
+          {simUpdatedAt && <p className="muted">Stored: {new Date(simUpdatedAt).toLocaleString()}</p>}
+        </div>
+        {busy && (
+          <div className="card sub">
+            <p className="muted">
+              Running Swiss simulations: {processedSims.toLocaleString()} / {totalSims.toLocaleString()}
+            </p>
+            <p className="muted">ETA: {formatEta(etaSeconds)}</p>
+            <div className="progress">
+              <div
+                className="progress-bar determinate"
+                style={{ width: `${totalSims > 0 ? Math.min(100, (processedSims / totalSims) * 100) : 0}%` }}
+              />
+            </div>
+          </div>
+        )}
+        {runMessage && (
+          <div className="card sub">
+            <p className="muted">{runMessage}</p>
+          </div>
+        )}
         {results && (
           <div className="grid two">
             {Object.entries(results).map(([tid, data]) => (
@@ -178,7 +341,7 @@ function SimulationTab({ teams, teamLookup }) {
                     </span>
                   ))}
                 </div>
-                <table>
+                <table className="swiss-player-table">
                   <thead>
                     <tr>
                       <th>Player</th>
@@ -187,26 +350,19 @@ function SimulationTab({ teams, teamLookup }) {
                       <th>Win</th>
                       <th>Role</th>
                       <th>Booster</th>
-                      <th>Exclude</th>
                     </tr>
                   </thead>
                   <tbody>
                     {Object.entries(data.players || {}).map(([pid, comps]) => (
                       <tr key={pid}>
-                        <td>{playerLookup[Number(pid)] || pid}</td>
+                        <td className="player-col" title={String(playerLookup[Number(pid)] || pid)}>
+                          {playerLookup[Number(pid)] || pid}
+                        </td>
                         <td>{comps.total.toFixed(2)}</td>
                         <td>{comps.rating.toFixed(2)}</td>
                         <td>{comps.win.toFixed(2)}</td>
                         <td>{comps.role.toFixed(2)}</td>
                         <td>{comps.booster.toFixed(2)}</td>
-                        <td>
-                          <button
-                            className={exclude.has(Number(pid)) ? "chip active" : "chip"}
-                            onClick={() => toggleExclude(Number(pid))}
-                          >
-                            {exclude.has(Number(pid)) ? "Excluded" : "Exclude"}
-                          </button>
-                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -215,16 +371,508 @@ function SimulationTab({ teams, teamLookup }) {
             ))}
           </div>
         )}
+      </div>
+    </Section>
+  );
+}
+
+function TopTeamsTab({ teamLookup, selected, bo, sims, results }) {
+  const [busy, setBusy] = useState(false);
+  const [generationBusy, setGenerationBusy] = useState(false);
+  const [cacheId, setCacheId] = useState("");
+  const [totalTeams, setTotalTeams] = useState(0);
+  const [filteredCount, setFilteredCount] = useState(0);
+  const [topTeams, setTopTeams] = useState([]);
+  const [pageTeams, setPageTeams] = useState([]);
+  const [page, setPage] = useState(0);
+  const [comboSearch, setComboSearch] = useState("");
+  const [sortKey, setSortKey] = useState("ev_desc");
+  const [message, setMessage] = useState("");
+  const [include, setInclude] = useState(new Set());
+  const [exclude, setExclude] = useState(new Set());
+  const [appliedInclude, setAppliedInclude] = useState(new Set());
+  const [appliedExclude, setAppliedExclude] = useState(new Set());
+  const [includeInput, setIncludeInput] = useState("");
+  const [excludeInput, setExcludeInput] = useState("");
+  const [processedCombos, setProcessedCombos] = useState(0);
+  const [totalCombos, setTotalCombos] = useState(0);
+  const [etaSeconds, setEtaSeconds] = useState(null);
+  const [jobPhase, setJobPhase] = useState("queued");
+  const [finalizeProgress, setFinalizeProgress] = useState(0);
+  const [finalizeStep, setFinalizeStep] = useState("");
+  const [filterModalOpen, setFilterModalOpen] = useState(false);
+  const [filterSearch, setFilterSearch] = useState("");
+  const [allPlayers, setAllPlayers] = useState([]);
+  const topTeamsPollingRef = useRef(false);
+  const TOP5_JOB_ID_KEY = "swiss_top5_job_id";
+  const TOP5_JOB_STARTED_AT_KEY = "swiss_top5_job_started_at";
+
+  const clearStoredData = () => {
+    setCacheId("");
+    setTotalTeams(0);
+    setFilteredCount(0);
+    setTopTeams([]);
+    setPageTeams([]);
+    setPage(0);
+    setComboSearch("");
+    setInclude(new Set());
+    setExclude(new Set());
+    setAppliedInclude(new Set());
+    setAppliedExclude(new Set());
+    setIncludeInput("");
+    setExcludeInput("");
+    setProcessedCombos(0);
+    setTotalCombos(0);
+    setEtaSeconds(null);
+    setJobPhase("queued");
+    setFinalizeProgress(0);
+    setFinalizeStep("");
+    setMessage("");
+  };
+
+  const formatEta = (seconds) => {
+    if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return "-";
+    const s = Math.max(0, Math.round(seconds));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const r = s % 60;
+    if (h > 0) return `${h}h ${m}m ${r}s`;
+    if (m > 0) return `${m}m ${r}s`;
+    return `${r}s`;
+  };
+
+  const parsePlayerIdSet = (text) => {
+    const ids = (text || "")
+      .split(",")
+      .map((x) => Number(x.trim()))
+      .filter((x) => Number.isFinite(x) && x > 0);
+    return new Set(ids);
+  };
+
+  const parseIdsToSet = (text) =>
+    new Set(
+      (text || "")
+        .split(",")
+        .map((x) => Number(x.trim()))
+        .filter((x) => Number.isFinite(x) && x > 0)
+    );
+
+  const setFromSetToCsv = (idsSet) => Array.from(idsSet).sort((a, b) => a - b).join(", ");
+
+  const toggleIncludeId = (pid) => {
+    const includeSet = parseIdsToSet(includeInput);
+    const excludeSet = parseIdsToSet(excludeInput);
+    if (includeSet.has(pid)) {
+      includeSet.delete(pid);
+    } else {
+      includeSet.add(pid);
+      excludeSet.delete(pid);
+    }
+    setIncludeInput(setFromSetToCsv(includeSet));
+    setExcludeInput(setFromSetToCsv(excludeSet));
+  };
+
+  const toggleExcludeId = (pid) => {
+    const includeSet = parseIdsToSet(includeInput);
+    const excludeSet = parseIdsToSet(excludeInput);
+    if (excludeSet.has(pid)) {
+      excludeSet.delete(pid);
+    } else {
+      excludeSet.add(pid);
+      includeSet.delete(pid);
+    }
+    setIncludeInput(setFromSetToCsv(includeSet));
+    setExcludeInput(setFromSetToCsv(excludeSet));
+  };
+
+  useEffect(() => {
+    setInclude(parsePlayerIdSet(includeInput));
+  }, [includeInput]);
+
+  useEffect(() => {
+    setExclude(parsePlayerIdSet(excludeInput));
+  }, [excludeInput]);
+
+  useEffect(() => {
+    if (allPlayers.length > 0 || !results) return;
+    const loadPlayers = async () => {
+      const data = await api.get("/players/");
+      setAllPlayers(Array.isArray(data) ? data : []);
+    };
+    loadPlayers();
+  }, [results, allPlayers.length]);
+
+  useEffect(() => {
+    clearStoredData();
+  }, [results, selected, bo, sims]);
+
+  const queryStoredTeams = async (targetPage = page, activeCacheId = cacheId) => {
+    if (!activeCacheId) return;
+    setBusy(true);
+    try {
+      const res = await api.post("/best-team/query", {
+        cache_id: activeCacheId,
+        include_player_ids: Array.from(appliedInclude),
+        exclude_player_ids: Array.from(appliedExclude),
+        search: comboSearch,
+        sort_key: sortKey,
+        page: targetPage,
+        page_size: 200,
+      });
+      if (res?.detail) {
+        setMessage(String(res.detail));
+        return;
+      }
+      setTotalTeams(res.total_teams || 0);
+      setFilteredCount(res.filtered_count || 0);
+      setTopTeams(res.top_teams || []);
+      setPageTeams(res.page_teams || []);
+      setPage(targetPage);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const findTopTeams = async () => {
+    if (!results) return;
+    setBusy(true);
+    setGenerationBusy(true);
+    setProcessedCombos(0);
+    setTotalCombos(0);
+    setEtaSeconds(null);
+    setJobPhase("queued");
+    setFinalizeProgress(0);
+    setFinalizeStep("");
+    setMessage("");
+    const pollTopTeamsJob = async (jobId, startedAtMs) => {
+      if (!jobId) return;
+      if (topTeamsPollingRef.current) return;
+      topTeamsPollingRef.current = true;
+      try {
+        let done = false;
+        let finalResult = null;
+        while (!done) {
+          const status = await api.get(`/best-team/job/${jobId}`);
+          if (status?.detail) {
+            setMessage(String(status.detail));
+            localStorage.removeItem(TOP5_JOB_ID_KEY);
+            localStorage.removeItem(TOP5_JOB_STARTED_AT_KEY);
+            return;
+          }
+          const processed = Number(status.processed_combinations || 0);
+          const total = Number(status.total_combinations || 0);
+          setJobPhase(String(status.phase || status.status || "queued"));
+          setFinalizeProgress(Number(status.finalize_progress || 0));
+          setFinalizeStep(String(status.finalize_step || ""));
+          setProcessedCombos(processed);
+          setTotalCombos(total);
+          if (processed > 0 && total > processed) {
+            const elapsedSec = Math.max(0.001, (Date.now() - startedAtMs) / 1000);
+            const rate = processed / elapsedSec;
+            if (rate > 0) {
+              setEtaSeconds((total - processed) / rate);
+            }
+          } else if (total > 0 && processed >= total) {
+            setEtaSeconds(0);
+          }
+
+          if (status.status === "failed") {
+            setMessage(status.error || "Top 5 generation failed.");
+            localStorage.removeItem(TOP5_JOB_ID_KEY);
+            localStorage.removeItem(TOP5_JOB_STARTED_AT_KEY);
+            return;
+          }
+          if (status.status === "completed") {
+            finalResult = status.result;
+            localStorage.removeItem(TOP5_JOB_ID_KEY);
+            localStorage.removeItem(TOP5_JOB_STARTED_AT_KEY);
+            done = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+
+        const data = finalResult || {};
+        if (data.error) {
+          setMessage(data.error);
+          setCacheId("");
+          setTotalTeams(0);
+          setFilteredCount(0);
+          setTopTeams([]);
+          setPageTeams([]);
+          return;
+        }
+        setCacheId(data.cache_id || "");
+        setTotalTeams(data.total_teams || 0);
+        setTopTeams(data.top_teams || []);
+        setFilteredCount(data.total_teams || 0);
+        setPage(0);
+        setMessage(`Stored ${data.total_teams || 0} team combinations.`);
+        await queryStoredTeams(0);
+      } finally {
+        topTeamsPollingRef.current = false;
+      }
+    };
+    try {
+      const start = await api.post("/best-team/from-latest/start", {});
+      if (start?.detail) {
+        setMessage(String(start.detail));
+        return;
+      }
+      const jobId = start.job_id;
+      if (!jobId) {
+        setMessage("Failed to start Top 5 generation job.");
+        return;
+      }
+      const startedAt = Date.now();
+      localStorage.setItem(TOP5_JOB_ID_KEY, String(jobId));
+      localStorage.setItem(TOP5_JOB_STARTED_AT_KEY, String(startedAt));
+      await pollTopTeamsJob(jobId, startedAt);
+    } finally {
+      setGenerationBusy(false);
+      setBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!cacheId) return;
+    queryStoredTeams(0);
+  }, [appliedInclude, appliedExclude, comboSearch, sortKey]);
+
+  useEffect(() => {
+    const loadLatestCache = async () => {
+      if (!results) return;
+      const latest = await api.get("/best-team/latest");
+      if (!latest?.exists || !latest?.cache_id) return;
+      setCacheId(latest.cache_id);
+      setTotalTeams(latest.total_teams || 0);
+      setFilteredCount(latest.total_teams || 0);
+      setMessage(`Loaded persisted team combinations (${latest.total_teams || 0}).`);
+      await queryStoredTeams(0, latest.cache_id);
+    };
+    loadLatestCache();
+  }, [results]);
+
+  const modalMatches = useMemo(() => {
+    const q = filterSearch.trim().toLowerCase();
+    if (!q) return [];
+    return allPlayers
+      .filter((p) => String(p.name || "").toLowerCase().includes(q))
+      .slice(0, 25);
+  }, [allPlayers, filterSearch]);
+
+  const playerNameById = useMemo(() => {
+    const m = {};
+    allPlayers.forEach((p) => {
+      m[Number(p.player_id)] = String(p.name || p.player_id);
+    });
+    return m;
+  }, [allPlayers]);
+
+  const includedIds = useMemo(() => Array.from(parseIdsToSet(includeInput)).sort((a, b) => a - b), [includeInput]);
+  const excludedIds = useMemo(() => Array.from(parseIdsToSet(excludeInput)).sort((a, b) => a - b), [excludeInput]);
+
+  useEffect(() => {
+    const resumeTop5Job = async () => {
+      if (!results) return;
+      const jobId = localStorage.getItem(TOP5_JOB_ID_KEY);
+      if (!jobId || topTeamsPollingRef.current) return;
+      const startedAt = Number(localStorage.getItem(TOP5_JOB_STARTED_AT_KEY) || Date.now());
+      topTeamsPollingRef.current = true;
+      setBusy(true);
+      setGenerationBusy(true);
+      try {
+        let done = false;
+        let finalResult = null;
+        while (!done) {
+          const status = await api.get(`/best-team/job/${jobId}`);
+          if (status?.detail) {
+            setMessage(String(status.detail));
+            localStorage.removeItem(TOP5_JOB_ID_KEY);
+            localStorage.removeItem(TOP5_JOB_STARTED_AT_KEY);
+            return;
+          }
+          const processed = Number(status.processed_combinations || 0);
+          const total = Number(status.total_combinations || 0);
+          setJobPhase(String(status.phase || status.status || "queued"));
+          setFinalizeProgress(Number(status.finalize_progress || 0));
+          setFinalizeStep(String(status.finalize_step || ""));
+          setProcessedCombos(processed);
+          setTotalCombos(total);
+          if (processed > 0 && total > processed) {
+            const elapsedSec = Math.max(0.001, (Date.now() - startedAt) / 1000);
+            const rate = processed / elapsedSec;
+            if (rate > 0) {
+              setEtaSeconds((total - processed) / rate);
+            }
+          } else if (total > 0 && processed >= total) {
+            setEtaSeconds(0);
+          }
+
+          if (status.status === "failed") {
+            setMessage(status.error || "Top 5 generation failed.");
+            localStorage.removeItem(TOP5_JOB_ID_KEY);
+            localStorage.removeItem(TOP5_JOB_STARTED_AT_KEY);
+            return;
+          }
+          if (status.status === "completed") {
+            finalResult = status.result;
+            localStorage.removeItem(TOP5_JOB_ID_KEY);
+            localStorage.removeItem(TOP5_JOB_STARTED_AT_KEY);
+            done = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+        const data = finalResult || {};
+        if (data.error) {
+          setMessage(data.error);
+          return;
+        }
+        setCacheId(data.cache_id || "");
+        setTotalTeams(data.total_teams || 0);
+        setTopTeams(data.top_teams || []);
+        setFilteredCount(data.total_teams || 0);
+        setPage(0);
+        setMessage(`Stored ${data.total_teams || 0} team combinations.`);
+        await queryStoredTeams(0);
+      } finally {
+        topTeamsPollingRef.current = false;
+        setGenerationBusy(false);
+        setBusy(false);
+      }
+    };
+    resumeTop5Job();
+  }, [results]);
+
+  return (
+    <Section title="Top 5 Teams">
+      <div className="stack">
+        {!results && (
+          <div className="card sub">
+            <p className="muted">Run Swiss Group Stage in the Group Stage tab first.</p>
+          </div>
+        )}
+        {results && (
+          <div className="card sub">
+            <p className="muted">
+              Using Group Stage setup: {selected.length} teams, {sims} simulations, mode{" "}
+              {bo === "elim_qual" ? "BO3 on Elimination/Qualification Matches" : bo === "all" ? "BO3 on All Matches" : "No BO3 (All BO1)"}.
+            </p>
+          </div>
+        )}
         {results && (
           <div className="actions">
             <button className="primary" onClick={findTopTeams} disabled={busy}>
-              {busy ? "Working..." : "Find Best 5 Team"}
+              {busy ? "Working..." : "Generate & Store Team Combos"}
+            </button>
+            <button
+              className="danger"
+              onClick={async () => {
+                if (cacheId) await api.delete(`/best-team/cache/${cacheId}`);
+                clearStoredData();
+              }}
+              disabled={!cacheId}
+            >
+              Delete Stored Data
             </button>
           </div>
         )}
-        {topTeams && topTeams.length > 0 && (
+        {generationBusy && (
           <div className="card sub">
-            <h3>Top Teams</h3>
+            <p className="muted">
+              Processing combinations: {processedCombos.toLocaleString()} / {totalCombos.toLocaleString()}
+            </p>
+            <p className="muted">ETA: {formatEta(etaSeconds)}</p>
+            <div className="progress">
+              <div
+                className="progress-bar determinate"
+                style={{ width: `${totalCombos > 0 ? Math.min(100, (processedCombos / totalCombos) * 100) : 0}%` }}
+              />
+            </div>
+            <p className="muted" style={{ marginTop: 8 }}>
+              Finalizing/Persisting: {Math.round(finalizeProgress * 100)}%{finalizeStep ? ` (${finalizeStep})` : ""}
+            </p>
+            <div className="progress">
+              <div className="progress-bar determinate" style={{ width: `${Math.min(100, Math.max(0, finalizeProgress * 100))}%` }} />
+            </div>
+            <p className="muted">Phase: {jobPhase}</p>
+          </div>
+        )}
+        {message && (
+          <div className="card sub">
+            <p className="muted">{message}</p>
+          </div>
+        )}
+        {cacheId && topTeams && topTeams.length > 0 && (
+          <div className="card sub">
+            <h3>Top Teams (Filtered)</h3>
+            <div className="top5-filters">
+              <div className="grid two">
+                <div className="field">
+                  <span>Included Players</span>
+                  <div className="chips">
+                    {includedIds.length === 0 && <span className="muted">None</span>}
+                    {includedIds.map((pid) => (
+                      <span key={`inc-${pid}`} className="chip active">
+                        {playerNameById[pid] || `Player ${pid}`}
+                        <button className="close" style={{ marginLeft: 8, padding: "2px 6px" }} onClick={() => toggleIncludeId(pid)}>
+                          x
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                <div className="field">
+                  <span>Excluded Players</span>
+                  <div className="chips">
+                    {excludedIds.length === 0 && <span className="muted">None</span>}
+                    {excludedIds.map((pid) => (
+                      <span key={`exc-${pid}`} className="chip active">
+                        {playerNameById[pid] || `Player ${pid}`}
+                        <button className="close" style={{ marginLeft: 8, padding: "2px 6px" }} onClick={() => toggleExcludeId(pid)}>
+                          x
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <div className="actions top5-filter-actions">
+                <button className="secondary" onClick={() => setFilterModalOpen(true)}>
+                  Include/Exclude by Name
+                </button>
+                <button
+                  className="primary"
+                  onClick={() => {
+                    setAppliedInclude(new Set(Array.from(include)));
+                    setAppliedExclude(new Set(Array.from(exclude)));
+                  }}
+                  disabled={!cacheId}
+                >
+                  Apply Filters
+                </button>
+              </div>
+              <div className="grid three top5-controls">
+                <Input label="Search Combos" value={comboSearch} onChange={setComboSearch} placeholder="Player/team name or id" />
+                <Select
+                  label="Sort by"
+                  value={sortKey}
+                  onChange={setSortKey}
+                  options={[
+                    { value: "ev_desc", label: "EV desc" },
+                    { value: "ev_asc", label: "EV asc" },
+                    { value: "cost_asc", label: "Cost asc" },
+                    { value: "cost_desc", label: "Cost desc" },
+                    { value: "cpp_desc", label: "Value (EV/Cost) desc" },
+                  ]}
+                />
+                <div className="field top5-counter">
+                  <span>Filtered / Stored</span>
+                  <p className="muted">{filteredCount} / {totalTeams}</p>
+                </div>
+              </div>
+            </div>
             {topTeams.map((team, idx) => (
               <div key={idx} className="card sub">
                 <h4>
@@ -235,6 +883,7 @@ function SimulationTab({ teams, teamLookup }) {
                     <tr>
                       <th>Player</th>
                       <th>Team</th>
+                      <th>Assigned Role</th>
                       <th>Cost</th>
                       <th>Total EV</th>
                       <th>Rating</th>
@@ -248,6 +897,7 @@ function SimulationTab({ teams, teamLookup }) {
                       <tr key={p.player_id}>
                         <td>{p.name}</td>
                         <td>{teamLookup[p.team_id] || p.team_id}</td>
+                        <td>{roleLabel(p.role_name)}</td>
                         <td>{p.price}</td>
                         <td>{p.total_ev.toFixed(2)}</td>
                         <td>{p.rating_ev.toFixed(2)}</td>
@@ -262,6 +912,124 @@ function SimulationTab({ teams, teamLookup }) {
             ))}
           </div>
         )}
+        {cacheId && filteredCount > 0 && (
+          <div className="card sub">
+            <h3>All Filtered Teams ({filteredCount})</h3>
+            <div className="actions">
+              <button
+                className="secondary"
+                onClick={() => {
+                  const prev = Math.max(0, page - 1);
+                  if (prev !== page) queryStoredTeams(prev);
+                }}
+                disabled={page === 0}
+              >
+                Prev 200
+              </button>
+              <button
+                className="secondary"
+                onClick={() => {
+                  const next = (page + 1) * 200 < filteredCount ? page + 1 : page;
+                  if (next !== page) queryStoredTeams(next);
+                }}
+                disabled={(page + 1) * 200 >= filteredCount}
+              >
+                Next 200
+              </button>
+              <p className="muted">
+                Page {page + 1} showing {Math.min(200, Math.max(0, filteredCount - page * 200))} of {filteredCount}
+              </p>
+            </div>
+            <table>
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>EV</th>
+                  <th>Cost</th>
+                  <th>Players</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pageTeams.map((team, idx) => (
+                  <tr key={idx + page * 200}>
+                    <td>{idx + 1 + page * 200}</td>
+                    <td>{team.total_ev.toFixed(2)}</td>
+                    <td>{team.cost}</td>
+                    <td>{team.players.map((p) => `${p.name} (${teamLookup[p.team_id] || p.team_id}, ${roleLabel(p.role_name)})`).join(", ")}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {cacheId && filteredCount === 0 && (
+          <div className="card sub">
+            <p className="muted">No team combinations match current include/exclude/search filters.</p>
+          </div>
+        )}
+        {filterModalOpen && (
+          <div className="modal-backdrop" onClick={() => setFilterModalOpen(false)}>
+            <div className="modal" onClick={(e) => e.stopPropagation()}>
+              <div className="modal-header">
+                <h3>Include/Exclude Players</h3>
+                <button className="close" onClick={() => setFilterModalOpen(false)}>
+                  Close
+                </button>
+              </div>
+              <div className="modal-body">
+                <Input
+                  label="Search player name"
+                  value={filterSearch}
+                  onChange={setFilterSearch}
+                  placeholder="Type e.g. zy to find ZywOo"
+                />
+                {filterSearch.trim().length === 0 && <p className="muted">Start typing a player name.</p>}
+                {filterSearch.trim().length > 0 && modalMatches.length === 0 && <p className="muted">No matching players.</p>}
+                {modalMatches.length > 0 && (
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Player</th>
+                        <th>ID</th>
+                        <th>Include</th>
+                        <th>Exclude</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {modalMatches.map((p) => {
+                        const pid = Number(p.player_id);
+                        const isIncluded = include.has(pid);
+                        const isExcluded = exclude.has(pid);
+                        return (
+                          <tr key={pid}>
+                            <td>{p.name}</td>
+                            <td>{pid}</td>
+                            <td>
+                              <button
+                                className={isIncluded ? "chip active" : "chip"}
+                                onClick={() => toggleIncludeId(pid)}
+                              >
+                                {isIncluded ? "Included" : "Include"}
+                              </button>
+                            </td>
+                            <td>
+                              <button
+                                className={isExcluded ? "chip active" : "chip"}
+                                onClick={() => toggleExcludeId(pid)}
+                              >
+                                {isExcluded ? "Excluded" : "Exclude"}
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </Section>
   );
@@ -269,96 +1037,163 @@ function SimulationTab({ teams, teamLookup }) {
 
 function BracketTab({ teams, teamLookup }) {
   const [selected, setSelected] = useState([]);
-  const [bo, setBo] = useState("elim_qual");
-  const [results, setResults] = useState(null);
+  const [simState, setSimState] = useState(null);
+  const [winnerPicks, setWinnerPicks] = useState({});
   const [busy, setBusy] = useState(false);
 
   const toggle = (tid) =>
     setSelected((prev) => (prev.includes(tid) ? prev.filter((x) => x !== tid) : [...prev, tid]));
+  const selectAllTeams = () => setSelected(teams.map((t) => t.team_id));
+  const clearTeams = () => setSelected([]);
+  const resetSimulator = () => {
+    setSimState(null);
+    setWinnerPicks({});
+  };
 
-  const run = async () => {
+  const startSimulator = async () => {
     if (selected.length < 2) return;
+    if (selected.length % 2 !== 0) return;
     setBusy(true);
     const vrs = {};
     teams.forEach((t) => {
       if (selected.includes(t.team_id)) vrs[t.team_id] = t.vrs_rank ?? 999;
     });
-    const data = await api.post("/bracket/swiss-run", {
+    const data = await api.post("/bracket/swiss-manual/init", {
       team_ids: selected,
       vrs_ranks: vrs,
-      bo3_mode: bo,
     });
-    setResults(data);
+    setSimState(data);
+    setWinnerPicks({});
+    setBusy(false);
+  };
+
+  const allCurrentMatches = (simState?.pools || []).flatMap((p) => p.matches || []);
+
+  const applyRound = async () => {
+    if (!simState || simState.done) return;
+    if (allCurrentMatches.length === 0) return;
+
+    const missing = allCurrentMatches.some((m) => !winnerPicks[m.match_id]);
+    if (missing) return;
+
+    setBusy(true);
+    const results = allCurrentMatches.map((m) => ({
+      team_a_id: m.team_a_id,
+      team_b_id: m.team_b_id,
+      winner_id: winnerPicks[m.match_id],
+    }));
+    const next = await api.post("/bracket/swiss-manual/apply-round", {
+      team_states: simState.team_states,
+      results,
+    });
+    setSimState(next);
+    setWinnerPicks({});
     setBusy(false);
   };
 
   return (
-    <Section title="Swiss Bracket (single run)">
+    <Section title="Swiss Bracket Simulator">
       <div className="stack">
-        <div className="chips">
-          {teams.map((t) => (
-            <button
-              key={t.team_id}
-              className={selected.includes(t.team_id) ? "chip active" : "chip"}
-              onClick={() => toggle(t.team_id)}
-            >
-              {t.name} <Badge>id {t.team_id}</Badge>
-            </button>
-          ))}
-        </div>
-        <div className="grid two">
-          <Select
-            label="BO Mode"
-            value={bo}
-            onChange={setBo}
-            options={[
-              { value: "elim_qual", label: "elim_qual" },
-              { value: "all", label: "all" },
-              { value: "none", label: "none" },
-            ]}
-          />
-          <div className="field">
-            <span>Run</span>
-            <button className="primary" onClick={run} disabled={busy || selected.length < 2}>
-              {busy ? "Running..." : "Run Bracket"}
-            </button>
-          </div>
-        </div>
-        {results && (
-          <div className="grid two">
-            {Object.entries(results).map(([tid, data]) => (
-              <div key={tid} className="card sub">
-                <h3>{teamLookup[Number(tid)] || `Team ${tid}`}</h3>
-                <p className="muted">
-                  Record: {data.wins}-{data.losses} {data.qualified ? "(qualified)" : data.eliminated ? "(eliminated)" : ""}
-                </p>
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Player</th>
-                      <th>Total</th>
-                      <th>Rating</th>
-                      <th>Win</th>
-                      <th>Role</th>
-                      <th>Booster</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {Object.entries(data.players || {}).map(([pid, comps]) => (
-                      <tr key={pid}>
-                        <td>{pid}</td>
-                        <td>{comps.total_points?.toFixed(2) ?? comps.total?.toFixed?.(2)}</td>
-                        <td>{comps.rating_points_total?.toFixed(2) ?? comps.rating?.toFixed?.(2)}</td>
-                        <td>{comps.win_points_total?.toFixed(2) ?? comps.win?.toFixed?.(2)}</td>
-                        <td>{comps.role_points_total?.toFixed(2) ?? comps.role?.toFixed?.(2)}</td>
-                        <td>{comps.booster_points_total?.toFixed(2) ?? comps.booster?.toFixed?.(2)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+        {!simState && (
+          <>
+            <div className="actions" style={{ marginTop: 0 }}>
+              <button className="secondary" onClick={selectAllTeams}>
+                Select All
+              </button>
+              <button className="secondary" onClick={clearTeams} disabled={selected.length === 0}>
+                Clear
+              </button>
+            </div>
+            <div className="chips">
+              {teams.map((t) => (
+                <button
+                  key={t.team_id}
+                  className={selected.includes(t.team_id) ? "chip active" : "chip"}
+                  onClick={() => toggle(t.team_id)}
+                >
+                  {t.name} <Badge>id {t.team_id}</Badge>
+                </button>
+              ))}
+            </div>
+            <div className="actions">
+              <button className="primary" onClick={startSimulator} disabled={busy || selected.length < 2 || selected.length % 2 !== 0}>
+                {busy ? "Starting..." : "Start Bracket Simulator"}
+              </button>
+            </div>
+            {selected.length % 2 !== 0 && selected.length > 0 && (
+              <p className="muted">Select an even number of teams to start.</p>
+            )}
+          </>
+        )}
+
+        {simState && (
+          <>
+            <div className="actions" style={{ marginTop: 0 }}>
+              <button className="secondary" onClick={resetSimulator}>
+                New Bracket
+              </button>
+            </div>
+
+            {!simState.done && (
+              <div className="card sub">
+                <h3>Round {simState.round}</h3>
+                {(simState.pools || []).map((pool) => (
+                  <div key={pool.record} className="card sub">
+                    <h4>Pool {pool.record}</h4>
+                    {(pool.matches || []).map((m) => {
+                      const a = teamLookup[m.team_a_id] || `Team ${m.team_a_id}`;
+                      const b = teamLookup[m.team_b_id] || `Team ${m.team_b_id}`;
+                      const picked = winnerPicks[m.match_id];
+                      return (
+                        <div key={m.match_id} className="actions" style={{ marginTop: 8 }}>
+                          <span className="muted" style={{ minWidth: 220 }}>{a} vs {b}</span>
+                          <button
+                            className={picked === m.team_a_id ? "chip active" : "chip"}
+                            onClick={() => setWinnerPicks((prev) => ({ ...prev, [m.match_id]: m.team_a_id }))}
+                          >
+                            {a}
+                          </button>
+                          <button
+                            className={picked === m.team_b_id ? "chip active" : "chip"}
+                            onClick={() => setWinnerPicks((prev) => ({ ...prev, [m.match_id]: m.team_b_id }))}
+                          >
+                            {b}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ))}
+                <div className="actions">
+                  <button className="primary" onClick={applyRound} disabled={busy}>
+                    {busy ? "Applying..." : "Apply Round"}
+                  </button>
+                </div>
               </div>
-            ))}
-          </div>
+            )}
+
+            <div className="card sub">
+              <h3>{simState.done ? "Final Standings" : "Current Standings"}</h3>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Team</th>
+                    <th>Record</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(simState.standings || []).map((s) => (
+                    <tr key={s.team_id}>
+                      <td>{teamLookup[s.team_id] || `Team ${s.team_id}`}</td>
+                      <td>{s.wins}-{s.losses}</td>
+                      <td>{s.qualified ? "Qualified" : s.eliminated ? "Eliminated" : "Alive"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
         )}
       </div>
     </Section>
@@ -739,6 +1574,11 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters }) {
 }
 
 function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
+  const [dbTab, setDbTab] = useState("players");
+  const [playerSearch, setPlayerSearch] = useState("");
+  const [playerSort, setPlayerSort] = useState("name_asc");
+  const [teamSearch, setTeamSearch] = useState("");
+  const [teamSort, setTeamSort] = useState("name_asc");
   const [selectedPlayer, setSelectedPlayer] = useState(null);
   const [showPlayerModal, setShowPlayerModal] = useState(false);
   const [playerTab, setPlayerTab] = useState("info");
@@ -783,6 +1623,17 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
     players.forEach((p) => (m[p.player_id] = p.name));
     return m;
   }, [players]);
+  const playerTeamLookup = useMemo(() => {
+    const m = {};
+    teams.forEach((t) => {
+      const ids = [t.player1_id, t.player2_id, t.player3_id, t.player4_id, t.player5_id].filter(Boolean);
+      ids.forEach((pid) => {
+        if (!m[pid]) m[pid] = [];
+        m[pid].push(t.name || `Team ${t.team_id}`);
+      });
+    });
+    return m;
+  }, [teams]);
 
   const boosterNames = {
     0: "Best Pistol Round",
@@ -1044,9 +1895,127 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
     setShowTeamModal(true);
   };
 
+  const hasJsonEntries = (raw) => {
+    if (!raw) return false;
+    try {
+      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (Array.isArray(parsed)) return parsed.length > 0;
+      if (parsed && typeof parsed === "object") return Object.keys(parsed).length > 0;
+      return false;
+    } catch {
+      return false;
+    }
+  };
+
+  const hasTopXRatings = (player) => {
+    const tiers = [5, 10, 20, 30, 50];
+    return tiers.some((tier) => {
+      const rating = player[`rating_top${tier}`];
+      const maps = player[`maps_top${tier}`];
+      return rating !== null && rating !== undefined && rating !== "" && maps !== null && maps !== undefined && maps !== "";
+    });
+  };
+
+  const hasBoostersAndRoles = (player) => hasJsonEntries(player.boosters_json) && hasJsonEntries(player.roles_json);
+  const toNum = (v, fallback = 0) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  };
+  const filteredSortedPlayers = useMemo(() => {
+    const q = playerSearch.trim().toLowerCase();
+    const list = players.filter((p) => {
+      if (!q) return true;
+      const teamsText = (playerTeamLookup[p.player_id] || []).join(", ").toLowerCase();
+      return (
+        String(p.player_id).includes(q) ||
+        String(p.name || "").toLowerCase().includes(q) ||
+        teamsText.includes(q)
+      );
+    });
+
+    list.sort((a, b) => {
+      switch (playerSort) {
+        case "name_desc":
+          return String(b.name || "").localeCompare(String(a.name || ""));
+        case "id_asc":
+          return toNum(a.player_id) - toNum(b.player_id);
+        case "id_desc":
+          return toNum(b.player_id) - toNum(a.player_id);
+        case "rating_desc":
+          return toNum(b.rating) - toNum(a.rating);
+        case "rating_asc":
+          return toNum(a.rating) - toNum(b.rating);
+        case "price_desc":
+          return toNum(b.price) - toNum(a.price);
+        case "price_asc":
+          return toNum(a.price) - toNum(b.price);
+        case "team_asc":
+          return ((playerTeamLookup[a.player_id] || [])[0] || "").localeCompare(((playerTeamLookup[b.player_id] || [])[0] || ""));
+        case "topx_desc":
+          return Number(hasTopXRatings(b)) - Number(hasTopXRatings(a));
+        case "boost_desc":
+          return Number(hasBoostersAndRoles(b)) - Number(hasBoostersAndRoles(a));
+        case "name_asc":
+        default:
+          return String(a.name || "").localeCompare(String(b.name || ""));
+      }
+    });
+
+    return list;
+  }, [players, playerSearch, playerSort, playerTeamLookup]);
+  const filteredSortedTeams = useMemo(() => {
+    const q = teamSearch.trim().toLowerCase();
+    const list = teams.filter((t) => {
+      if (!q) return true;
+      const rosterText = [t.player1_id, t.player2_id, t.player3_id, t.player4_id, t.player5_id]
+        .filter(Boolean)
+        .map((pid) => playerLookup[pid] || pid)
+        .join(", ")
+        .toLowerCase();
+      return (
+        String(t.team_id).includes(q) ||
+        String(t.name || "").toLowerCase().includes(q) ||
+        rosterText.includes(q)
+      );
+    });
+
+    list.sort((a, b) => {
+      switch (teamSort) {
+        case "name_desc":
+          return String(b.name || "").localeCompare(String(a.name || ""));
+        case "id_asc":
+          return toNum(a.team_id) - toNum(b.team_id);
+        case "id_desc":
+          return toNum(b.team_id) - toNum(a.team_id);
+        case "hltv_asc":
+          return toNum(a.hltv_rank, 9999) - toNum(b.hltv_rank, 9999);
+        case "hltv_desc":
+          return toNum(b.hltv_rank, 9999) - toNum(a.hltv_rank, 9999);
+        case "vrs_asc":
+          return toNum(a.vrs_rank, 9999) - toNum(b.vrs_rank, 9999);
+        case "vrs_desc":
+          return toNum(b.vrs_rank, 9999) - toNum(a.vrs_rank, 9999);
+        case "name_asc":
+        default:
+          return String(a.name || "").localeCompare(String(b.name || ""));
+      }
+    });
+
+    return list;
+  }, [teams, teamSearch, teamSort, playerLookup]);
+
   return (
-    <div className="grid two">
-      <Section title="Players">
+    <div className="stack">
+      <div className="tab-bar small">
+        <button className={dbTab === "players" ? "tab active" : "tab"} onClick={() => setDbTab("players")}>
+          Players
+        </button>
+        <button className={dbTab === "teams" ? "tab active" : "tab"} onClick={() => setDbTab("teams")}>
+          Teams
+        </button>
+      </div>
+
+      {dbTab === "players" && <Section title="Players">
         {loading ? (
           <p>Loading...</p>
         ) : error ? (
@@ -1054,17 +2023,58 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
         ) : (
           <>
             <p className="muted">Click a player row to view/edit details.</p>
+            <div className="grid two">
+              <Input label="Search Players" value={playerSearch} onChange={setPlayerSearch} placeholder="Name, ID, or team" />
+              <Select
+                label="Sort Players"
+                value={playerSort}
+                onChange={setPlayerSort}
+                options={[
+                  { value: "name_asc", label: "Name A-Z" },
+                  { value: "name_desc", label: "Name Z-A" },
+                  { value: "id_asc", label: "ID low-high" },
+                  { value: "id_desc", label: "ID high-low" },
+                  { value: "rating_desc", label: "Rating high-low" },
+                  { value: "rating_asc", label: "Rating low-high" },
+                  { value: "price_desc", label: "Price high-low" },
+                  { value: "price_asc", label: "Price low-high" },
+                  { value: "team_asc", label: "Team A-Z" },
+                  { value: "topx_desc", label: "Top X imported first" },
+                  { value: "boost_desc", label: "Boost/Role imported first" },
+                ]}
+              />
+            </div>
+            <p className="muted status-legend">
+              <span>
+                <span className="status-dot ok" /> imported
+              </span>
+              <span>
+                <span className="status-dot missing" /> missing
+              </span>
+            </p>
             <table>
+              <colgroup>
+                <col style={{ width: "12%" }} />
+                <col style={{ width: "20%" }} />
+                <col style={{ width: "18%" }} />
+                <col style={{ width: "14%" }} />
+                <col style={{ width: "14%" }} />
+                <col style={{ width: "10%" }} />
+                <col style={{ width: "12%" }} />
+              </colgroup>
               <thead>
                 <tr>
-                  <th>ID</th>
                   <th>Name</th>
+                  <th>ID</th>
+                  <th>Team</th>
                   <th>Rating</th>
                   <th>Price</th>
+                  <th>Top X</th>
+                  <th title="Boosters and Roles imported">Boost/Role</th>
                 </tr>
               </thead>
               <tbody>
-                {players.map((p) => (
+                {filteredSortedPlayers.map((p) => (
                   <tr
                     key={p.player_id}
                     className={selectedPlayer === p.player_id ? "row-active" : ""}
@@ -1073,10 +2083,23 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
                       setShowPlayerModal(true);
                     }}
                   >
-                    <td>{p.player_id}</td>
                     <td>{p.name}</td>
+                    <td>{p.player_id}</td>
+                    <td>{(playerTeamLookup[p.player_id] || []).join(", ") || "-"}</td>
                     <td>{Number(p.rating || 0).toFixed(2)}</td>
                     <td>{p.price}</td>
+                    <td className="status-cell">
+                      <span
+                        className={hasTopXRatings(p) ? "status-dot ok" : "status-dot missing"}
+                        title={hasTopXRatings(p) ? "Top X ratings imported" : "Top X ratings missing"}
+                      />
+                    </td>
+                    <td className="status-cell">
+                      <span
+                        className={hasBoostersAndRoles(p) ? "status-dot ok" : "status-dot missing"}
+                        title={hasBoostersAndRoles(p) ? "Boosters and roles imported" : "Boosters and roles missing"}
+                      />
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -1137,7 +2160,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
             </button>
           </div>
         </div>
-      </Section>
+      </Section>}
 
       {showPlayerModal && (
         <div className="modal-backdrop" onClick={() => setShowPlayerModal(false)}>
@@ -1276,46 +2299,66 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
         </div>
       )}
 
-      <Section title="Teams">
+      {dbTab === "teams" && <Section title="Teams">
         {loading ? (
           <p>Loading...</p>
         ) : error ? (
           <p className="error">{error}</p>
         ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Name</th>
-                <th>HLTV Rank</th>
-                <th>VRS Rank</th>
-                <th>Players</th>
-              </tr>
-            </thead>
-            <tbody>
-                {teams.map((t) => (
-                  <tr
-                    key={t.team_id}
-                    className={selectedTeam === t.team_id ? "row-active" : ""}
-                    onClick={() => {
-                      setSelectedTeam(t.team_id);
-                      setShowTeamModal(true);
-                    }}
-                  >
-                  <td>{t.team_id}</td>
-                  <td>{t.name}</td>
-                  <td>{t.hltv_rank}</td>
-                  <td>{t.vrs_rank}</td>
-                  <td>
-                    {[t.player1_id, t.player2_id, t.player3_id, t.player4_id, t.player5_id]
-                      .filter(Boolean)
-                      .map((pid) => playerLookup[pid] || pid)
-                      .join(", ")}
-                  </td>
+          <>
+            <div className="grid two">
+              <Input label="Search Teams" value={teamSearch} onChange={setTeamSearch} placeholder="Name, ID, or player" />
+              <Select
+                label="Sort Teams"
+                value={teamSort}
+                onChange={setTeamSort}
+                options={[
+                  { value: "name_asc", label: "Name A-Z" },
+                  { value: "name_desc", label: "Name Z-A" },
+                  { value: "id_asc", label: "ID low-high" },
+                  { value: "id_desc", label: "ID high-low" },
+                  { value: "hltv_asc", label: "HLTV rank low-high" },
+                  { value: "hltv_desc", label: "HLTV rank high-low" },
+                  { value: "vrs_asc", label: "VRS rank low-high" },
+                  { value: "vrs_desc", label: "VRS rank high-low" },
+                ]}
+              />
+            </div>
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>ID</th>
+                  <th>HLTV Rank</th>
+                  <th>VRS Rank</th>
+                  <th>Players</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                  {filteredSortedTeams.map((t) => (
+                    <tr
+                      key={t.team_id}
+                      className={selectedTeam === t.team_id ? "row-active" : ""}
+                      onClick={() => {
+                        setSelectedTeam(t.team_id);
+                        setShowTeamModal(true);
+                      }}
+                    >
+                    <td>{t.name}</td>
+                    <td>{t.team_id}</td>
+                    <td>{t.hltv_rank}</td>
+                    <td>{t.vrs_rank}</td>
+                    <td>
+                      {[t.player1_id, t.player2_id, t.player3_id, t.player4_id, t.player5_id]
+                        .filter(Boolean)
+                        .map((pid) => playerLookup[pid] || pid)
+                        .join(", ")}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </>
         )}
         <div className="card sub" style={{ display: "none" }}>
           <div className="actions">
@@ -1343,24 +2386,47 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
             </button>
           </div>
         </div>
-      </Section>
+      </Section>}
 
     </div>
   );
 }
 
-function AdminTab({ refresh, notify }) {
+function AdminTab({ refresh, notify, teams, players }) {
+  const [dataTab, setDataTab] = useState("trigger");
   const [triggerJson, setTriggerJson] = useState("");
+  const [triggerUpdatedPlayers, setTriggerUpdatedPlayers] = useState([]);
   const [eventId, setEventId] = useState("");
   const [importResult, setImportResult] = useState("");
   const [importBusy, setImportBusy] = useState(false);
   const [eventBusy, setEventBusy] = useState(false);
   const [wipeBusy, setWipeBusy] = useState(false);
-  const [topPlayerId, setTopPlayerId] = useState("");
-  const [topText, setTopText] = useState("");
+  const [selectedTopTeamIds, setSelectedTopTeamIds] = useState([]);
+  const [topTeamIndex, setTopTeamIndex] = useState(0);
+  const [topRatingsByPlayer, setTopRatingsByPlayer] = useState({});
   const [topBusy, setTopBusy] = useState(false);
   const [fitBusy, setFitBusy] = useState(false);
   const [fitRows, setFitRows] = useState([{ rankA: "", oddsA: "", rankB: "", oddsB: "" }]);
+  const playerNameLookup = useMemo(() => {
+    const map = {};
+    players.forEach((p) => (map[p.player_id] = p.name));
+    return map;
+  }, [players]);
+  const selectedTopTeams = useMemo(() => {
+    const selected = teams.filter((t) => selectedTopTeamIds.includes(t.team_id));
+    return selected.sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+  }, [teams, selectedTopTeamIds]);
+  const currentTopTeam = selectedTopTeams[topTeamIndex] || null;
+  const currentTopRoster = currentTopTeam
+    ? [currentTopTeam.player1_id, currentTopTeam.player2_id, currentTopTeam.player3_id, currentTopTeam.player4_id, currentTopTeam.player5_id]
+        .filter(Boolean)
+    : [];
+
+  useEffect(() => {
+    if (topTeamIndex >= selectedTopTeams.length) {
+      setTopTeamIndex(Math.max(0, selectedTopTeams.length - 1));
+    }
+  }, [topTeamIndex, selectedTopTeams.length]);
 
   const importTriggers = async () => {
     if (!triggerJson.trim()) {
@@ -1369,10 +2435,13 @@ function AdminTab({ refresh, notify }) {
     }
     setImportBusy(true);
     setImportResult("");
+    setTriggerUpdatedPlayers([]);
     try {
       const res = await api.post("/admin/import-trigger-rates", { trigger_json: triggerJson });
       const msg = `Updated players: ${res.updated_players ?? 0}`;
       setImportResult(msg);
+      setTriggerUpdatedPlayers(res.updated_players_info || []);
+      setTriggerJson("");
       notify("Trigger rates imported");
       refresh();
     } finally {
@@ -1406,19 +2475,55 @@ function AdminTab({ refresh, notify }) {
     refresh();
   };
 
-  const importTopRatings = async () => {
-    if (!topPlayerId.trim() || !topText.trim()) {
-      setImportResult("Enter player id and paste the top-X text.");
+  const toggleTopTeam = (teamId) => {
+    setSelectedTopTeamIds((prev) =>
+      prev.includes(teamId) ? prev.filter((x) => x !== teamId) : [...prev, teamId]
+    );
+  };
+
+  const selectAllTopTeams = () => {
+    setSelectedTopTeamIds(teams.map((t) => t.team_id));
+    setTopTeamIndex(0);
+  };
+
+  const clearTopTeams = () => {
+    setSelectedTopTeamIds([]);
+    setTopTeamIndex(0);
+  };
+
+  const importTopRatingsForCurrentTeam = async () => {
+    if (!currentTopTeam) {
+      setImportResult("Select teams first.");
       return;
     }
     setTopBusy(true);
     setImportResult("");
+    let updatedPlayers = 0;
+    const errors = [];
     try {
-      const res = await api.post("/admin/import-top-ratings", { player_id: topPlayerId.trim(), text: topText });
-      const msg = `Updated: ${res.updated_fields?.join(", ") || "none"}`;
-      setImportResult(msg);
-      notify("Top ratings imported");
+      for (const pid of currentTopRoster) {
+        const text = (topRatingsByPlayer[pid] || "").trim();
+        if (!text) continue;
+        const res = await api.post("/admin/import-top-ratings", { player_id: pid, text });
+        if (res?.updated_fields?.length) updatedPlayers += 1;
+      }
+
+      if (updatedPlayers === 0) {
+        setImportResult(`No player fields were filled for ${currentTopTeam.name}.`);
+      } else {
+        setImportResult(`Imported top ratings for ${updatedPlayers} player(s) on ${currentTopTeam.name}.`);
+      }
+
+      const nextIndex = topTeamIndex + 1;
+      if (nextIndex < selectedTopTeams.length) {
+        setTopTeamIndex(nextIndex);
+      } else {
+        notify("Top ratings import workflow complete");
+      }
       refresh();
+    } catch (e) {
+      errors.push("One or more player imports failed.");
+      setImportResult(errors.join(" "));
     } finally {
       setTopBusy(false);
     }
@@ -1458,42 +2563,147 @@ function AdminTab({ refresh, notify }) {
 
   return (
     <div className="stack">
-      <Section title="Admin Tools">
-        <div className="grid two">
-          <label className="field">
-            <span>Trigger Rates JSON (playerTriggerRates)</span>
-            <textarea
-              rows={12}
-              value={triggerJson}
-              onChange={(e) => setTriggerJson(e.target.value)}
-              placeholder="Paste the triggerRates JSON here"
-            />
-          </label>
+      <Section title="Data Management Tools">
+        <div className="tab-bar small">
+          <button className={dataTab === "trigger" ? "tab active" : "tab"} onClick={() => setDataTab("trigger")}>
+            Trigger Rates
+          </button>
+          <button className={dataTab === "event" ? "tab active" : "tab"} onClick={() => setDataTab("event")}>
+            HLTV Event
+          </button>
+          <button className={dataTab === "top" ? "tab active" : "tab"} onClick={() => setDataTab("top")}>
+            Top Ratings
+          </button>
+          <button className={dataTab === "fit" ? "tab active" : "tab"} onClick={() => setDataTab("fit")}>
+            Winrate Fit
+          </button>
+          <button className={dataTab === "maintenance" ? "tab active" : "tab"} onClick={() => setDataTab("maintenance")}>
+            Maintenance
+          </button>
+        </div>
+
+        {dataTab === "trigger" && (
           <div className="stack">
-            <p className="muted">Paste the triggerRates JSON to update boosters and roles for all players.</p>
-            <button className="primary" onClick={importTriggers} disabled={importBusy}>
-              {importBusy ? "Importing..." : "Import Trigger Rates"}
-            </button>
-            <hr />
-            <Input label="HLTV Event ID" value={eventId} onChange={setEventId} placeholder="e.g. 12345" />
-            <button className="primary" onClick={importByEvent} disabled={eventBusy}>
-              {eventBusy ? "Importing..." : "Import by Event ID"}
-            </button>
-            <hr />
-            <Input label="Player ID for Top Ratings" value={topPlayerId} onChange={setTopPlayerId} placeholder="player id" />
             <label className="field">
-              <span>Top opponents text (e.g. '0.88 vs top 5 opponents (37 maps)')</span>
+              <span>Trigger Rates JSON (playerTriggerRates)</span>
               <textarea
-                rows={8}
-                value={topText}
-                onChange={(e) => setTopText(e.target.value)}
-                placeholder="Paste the top 5/10/20/30/50 block here"
+                rows={14}
+                value={triggerJson}
+                onChange={(e) => setTriggerJson(e.target.value)}
+                placeholder="Paste the triggerRates JSON here"
               />
             </label>
-            <button className="primary" onClick={importTopRatings} disabled={topBusy}>
-              {topBusy ? "Importing..." : "Import Top Ratings"}
-            </button>
-            <hr />
+            <p className="muted">Paste the triggerRates JSON to update boosters and roles for all players.</p>
+            <div className="actions">
+              <button className="primary" onClick={importTriggers} disabled={importBusy}>
+                {importBusy ? "Importing..." : "Import Trigger Rates"}
+              </button>
+            </div>
+            {triggerUpdatedPlayers.length > 0 && (
+              <div className="card sub">
+                <h4>Updated Players ({triggerUpdatedPlayers.length})</h4>
+                <ul>
+                  {triggerUpdatedPlayers.map((p) => (
+                    <li key={p.player_id}>
+                      {p.name} (ID {p.player_id})
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
+
+        {dataTab === "event" && (
+          <div className="stack">
+            <Input label="HLTV Event ID" value={eventId} onChange={setEventId} placeholder="e.g. 12345" />
+            <div className="actions">
+              <button className="primary" onClick={importByEvent} disabled={eventBusy}>
+                {eventBusy ? "Importing..." : "Import by Event ID"}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {dataTab === "top" && (
+          <div className="stack">
+            <p className="muted">Select teams, then import top-X ratings team-by-team using five player fields.</p>
+            <div className="actions" style={{ marginTop: 0 }}>
+              <button className="secondary" onClick={selectAllTopTeams}>
+                Select All Teams
+              </button>
+              <button className="secondary" onClick={clearTopTeams} disabled={selectedTopTeamIds.length === 0}>
+                Clear Teams
+              </button>
+            </div>
+            <div className="chips">
+              {teams.map((t) => (
+                <button
+                  key={t.team_id}
+                  className={selectedTopTeamIds.includes(t.team_id) ? "chip active" : "chip"}
+                  onClick={() => toggleTopTeam(t.team_id)}
+                >
+                  {t.name} <Badge>id {t.team_id}</Badge>
+                </button>
+              ))}
+            </div>
+
+            {selectedTopTeams.length > 0 && currentTopTeam && (
+              <div className="card sub">
+                <h4>
+                  Team {topTeamIndex + 1} / {selectedTopTeams.length}: {currentTopTeam.name}
+                </h4>
+                {currentTopRoster.map((pid, idx) => (
+                  <label key={pid} className="field">
+                    <span>
+                      Player {idx + 1}: {playerNameLookup[pid] || `Player ${pid}`} (ID {pid})
+                    </span>
+                    <textarea
+                      rows={6}
+                      value={topRatingsByPlayer[pid] || ""}
+                      onChange={(e) =>
+                        setTopRatingsByPlayer((prev) => ({
+                          ...prev,
+                          [pid]: e.target.value,
+                        }))
+                      }
+                      placeholder="Paste the top 5/10/20/30/50 block here"
+                    />
+                  </label>
+                ))}
+                <div className="actions">
+                  <button
+                    className="secondary"
+                    onClick={() => setTopTeamIndex((i) => Math.max(0, i - 1))}
+                    disabled={topTeamIndex === 0 || topBusy}
+                  >
+                    Previous Team
+                  </button>
+                  <button className="primary" onClick={importTopRatingsForCurrentTeam} disabled={topBusy}>
+                    {topBusy ? "Importing..." : topTeamIndex + 1 < selectedTopTeams.length ? "Save & Next Team" : "Save Final Team"}
+                  </button>
+                  <button
+                    className="secondary"
+                    onClick={() => setTopTeamIndex((i) => Math.min(selectedTopTeams.length - 1, i + 1))}
+                    disabled={topTeamIndex >= selectedTopTeams.length - 1 || topBusy}
+                  >
+                    Next Team
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {selectedTopTeams.length === 0 && (
+              <p className="muted">No teams selected.</p>
+            )}
+            <div className="actions">
+              <p className="muted">Tip: You can leave a player field blank to skip that player.</p>
+            </div>
+          </div>
+        )}
+
+        {dataTab === "fit" && (
+          <div className="stack">
             <div className="card sub">
               <h4>Winrate Fit Samples</h4>
               <p className="muted">Enter rank and odds per row. oddsA is used to imply P(A)=1/oddsA.</p>
@@ -1562,18 +2772,217 @@ function AdminTab({ refresh, notify }) {
                 </button>
               </div>
             </div>
-            <button className="primary" onClick={fitWinrate} disabled={fitBusy}>
-              {fitBusy ? "Fitting..." : "Fit Winrate Params"}
-            </button>
-            {importResult && <p className="muted">{importResult}</p>}
-            <hr />
+            <div className="actions">
+              <button className="primary" onClick={fitWinrate} disabled={fitBusy}>
+                {fitBusy ? "Fitting..." : "Fit Winrate Params"}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {dataTab === "maintenance" && (
+          <div className="stack">
             <button className="danger" onClick={wipeDb} disabled={wipeBusy}>
               {wipeBusy ? "Wiping..." : "Wipe Database"}
             </button>
             <p className="muted">Deletes all players and teams (schema is kept).</p>
           </div>
-        </div>
+        )}
+
+        {importResult && <p className="muted">{importResult}</p>}
       </Section>
+    </div>
+  );
+}
+
+function BoosterCalculatorTab() {
+  const [rating, setRating] = useState("1.05");
+  const [majorPct, setMajorPct] = useState("0.30");
+  const [minorPct, setMinorPct] = useState("0.20");
+  const [winProb, setWinProb] = useState("0.50");
+  const [boosterRates, setBoosterRates] = useState("0.12,0.10,0.09,0.08,0.07");
+  const [matches, setMatches] = useState("5");
+  const [expectedGames, setExpectedGames] = useState("4.2");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [result, setResult] = useState(null);
+
+  const run = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const rates = boosterRates
+        .split(",")
+        .map((x) => x.trim())
+        .filter((x) => x.length > 0)
+        .map((x) => Number(x))
+        .filter((x) => Number.isFinite(x));
+
+      const payload = {
+        rating: Number(rating),
+        major_pct: Number(majorPct),
+        minor_pct: Number(minorPct),
+        win_prob: Number(winProb),
+        booster_rates: rates,
+        matches: Number(matches),
+        expected_games: expectedGames === "" ? undefined : Number(expectedGames),
+      };
+
+      const res = await api.post("/admin/booster-calc", payload);
+      if (res?.detail) {
+        setError(String(res.detail));
+        setResult(null);
+      } else {
+        setResult(res);
+      }
+    } catch (e) {
+      setError("Failed to run booster calculation.");
+      setResult(null);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Section title="Booster Calculator">
+      <div className="stack">
+        <div className="grid three">
+          <Input label="Rating" value={rating} onChange={setRating} />
+          <Input label="Role Major %" value={majorPct} onChange={setMajorPct} />
+          <Input label="Role Minor %" value={minorPct} onChange={setMinorPct} />
+          <Input label="Win Probability (0-1)" value={winProb} onChange={setWinProb} />
+          <Input label="# Matches" value={matches} onChange={setMatches} />
+          <Input label="Expected Games (optional)" value={expectedGames} onChange={setExpectedGames} />
+        </div>
+        <label className="field">
+          <span>Booster rates per match (comma-separated)</span>
+          <input
+            value={boosterRates}
+            onChange={(e) => setBoosterRates(e.target.value)}
+            placeholder="e.g. 0.12,0.10,0.09,0.08,0.07"
+          />
+        </label>
+        <div className="actions">
+          <button className="primary" onClick={run} disabled={busy}>
+            {busy ? "Calculating..." : "Calculate"}
+          </button>
+        </div>
+        {error && <p className="error">{error}</p>}
+        {result && (
+          <div className="card sub">
+            <p className="muted">
+              Base per match: Rating {result.rating_points?.toFixed?.(2)} | Role {result.role_points?.toFixed?.(2)} | Win{" "}
+              {result.win_points?.toFixed?.(2)}
+            </p>
+            {result.expected_games !== undefined && (
+              <p className="muted">
+                Expected total ({result.expected_games?.toFixed?.(2)} games): {result.expected_total_points?.toFixed?.(2)} (booster{" "}
+                {result.expected_booster_points?.toFixed?.(2)})
+              </p>
+            )}
+            <table>
+              <thead>
+                <tr>
+                  <th>Match</th>
+                  <th>Rating</th>
+                  <th>Role</th>
+                  <th>Win</th>
+                  <th>Booster</th>
+                  <th>Total</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(result.per_match || []).map((m) => (
+                  <tr key={m.match_number}>
+                    <td>{m.match_number}</td>
+                    <td>{m.rating_points?.toFixed?.(2)}</td>
+                    <td>{m.role_points?.toFixed?.(2)}</td>
+                    <td>{m.win_points?.toFixed?.(2)}</td>
+                    <td>{m.booster_points?.toFixed?.(2)}</td>
+                    <td>{m.total_points?.toFixed?.(2)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </Section>
+  );
+}
+
+function SwissTab({ teams, teamLookup }) {
+  const [swissTab, setSwissTab] = useState("group");
+  const [selectedTeamIds, setSelectedTeamIds] = useState([]);
+  const [boMode, setBoMode] = useState("elim_qual");
+  const [simCount, setSimCount] = useState("200");
+  const [simResults, setSimResults] = useState(null);
+  const [simUpdatedAt, setSimUpdatedAt] = useState("");
+
+  const loadStoredSimulation = async () => {
+    const data = await api.get("/simulate/latest");
+    if (!data?.exists) return;
+    const payload = data.payload || {};
+    setSelectedTeamIds(Array.isArray(payload.team_ids) ? payload.team_ids.map((x) => Number(x)) : []);
+    setBoMode(payload.bo3_mode || "elim_qual");
+    setSimCount(String(payload.n_sims || 200));
+    setSimResults(data.results || null);
+    setSimUpdatedAt(data.updated_at || "");
+  };
+
+  useEffect(() => {
+    loadStoredSimulation();
+  }, []);
+
+  const resetStoredSimulation = async () => {
+    await api.delete("/simulate/latest");
+    setSelectedTeamIds([]);
+    setBoMode("elim_qual");
+    setSimCount("200");
+    setSimResults(null);
+    setSimUpdatedAt("");
+  };
+
+  return (
+    <div className="stack">
+      <div className="tab-bar small">
+        <button className={swissTab === "group" ? "tab active" : "tab"} onClick={() => setSwissTab("group")}>
+          Group Stage
+        </button>
+        <button className={swissTab === "top5" ? "tab active" : "tab"} onClick={() => setSwissTab("top5")}>
+          Top 5 Teams
+        </button>
+        <button className={swissTab === "single" ? "tab active" : "tab"} onClick={() => setSwissTab("single")}>
+          Bracket Simulator
+        </button>
+        <button className={swissTab === "booster" ? "tab active" : "tab"} onClick={() => setSwissTab("booster")}>
+          Booster Calculator
+        </button>
+      </div>
+      {swissTab === "group" && (
+        <GroupStageTab
+          teams={teams}
+          teamLookup={teamLookup}
+          selected={selectedTeamIds}
+          setSelected={setSelectedTeamIds}
+          bo={boMode}
+          setBo={setBoMode}
+          sims={simCount}
+          setSims={setSimCount}
+          results={simResults}
+          setResults={(data) => {
+            setSimResults(data);
+            setSimUpdatedAt(new Date().toISOString());
+          }}
+          simUpdatedAt={simUpdatedAt}
+          onResetSimulation={resetStoredSimulation}
+        />
+      )}
+      {swissTab === "top5" && (
+        <TopTeamsTab teamLookup={teamLookup} selected={selectedTeamIds} bo={boMode} sims={simCount} results={simResults} />
+      )}
+      {swissTab === "single" && <BracketTab teams={teams} teamLookup={teamLookup} />}
+      {swissTab === "booster" && <BoosterCalculatorTab />}
     </div>
   );
 }
@@ -1663,27 +3072,13 @@ export default function App() {
 
   const contentMap = {
     view: <DatabaseTab players={players} teams={teams} loading={loading} error={error} refresh={load} notify={notify} />,
-    sim: <SimulationTab teams={teams} teamLookup={teamLookup} />,
-    bracket: <BracketTab teams={teams} teamLookup={teamLookup} />,
+    sim: <SwissTab teams={teams} teamLookup={teamLookup} />,
     playoff: <PlayoffTab teams={teams} teamLookup={teamLookup} players={players} sortTeams={sortTeams} applyFilters={applyFilters} />,
-    admin: <AdminTab refresh={load} notify={notify} />,
+    admin: <AdminTab refresh={load} notify={notify} teams={teams} players={players} />,
   };
 
   return (
     <div className="layout">
-      <header className="hero">
-        <div>
-          <p className="eyebrow">CS Fantasy Toolkit</p>
-          <h1>Electron + FastAPI</h1>
-          <p className="muted">Modern UI for the existing Swiss simulation and bracket tools.</p>
-        </div>
-        <div className="pills">
-          <Pill>FastAPI</Pill>
-          <Pill>Electron</Pill>
-          <Pill>React</Pill>
-        </div>
-      </header>
-
       <nav className="tab-bar">
         {tabs.map((t) => (
           <TabButton key={t.key} active={t.key === active} onClick={() => setActive(t.key)}>

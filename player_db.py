@@ -1,9 +1,10 @@
 # player_db.py
 import sqlite3
 import json
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-DB_PATH = "fantasy_players.db"
+DB_PATH = str(Path(__file__).resolve().with_name("fantasy_players.db"))
 
 
 def connect() -> sqlite3.Connection:

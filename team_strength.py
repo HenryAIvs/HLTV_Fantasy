@@ -4,10 +4,12 @@ import math
 import sqlite3
 import json
 import os
+from pathlib import Path
 from typing import Dict, Tuple
 
-DB_PATH = "fantasy_players.db"
-PARAMS_PATH = "winrate_params.json"
+ROOT_DIR = Path(__file__).resolve().parent
+DB_PATH = str(ROOT_DIR / "fantasy_players.db")
+PARAMS_PATH = str(ROOT_DIR / "winrate_params.json")
 
 
 def _connect() -> sqlite3.Connection:

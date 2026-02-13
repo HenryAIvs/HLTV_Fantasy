@@ -1,7 +1,8 @@
 import sqlite3
+from pathlib import Path
 from typing import List, Dict, Optional
 
-DB_PATH = "fantasy_players.db"
+DB_PATH = str(Path(__file__).resolve().with_name("fantasy_players.db"))
 
 
 def connect() -> sqlite3.Connection:

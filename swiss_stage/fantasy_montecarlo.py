@@ -3,6 +3,7 @@
 from typing import Dict, List, Tuple
 import os
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import as_completed
 
 from swiss_stage.swiss_bracket import simulate_single_swiss_run
 
@@ -79,6 +80,7 @@ def simulate_swiss_fantasy(
     bo3_mode: str,
     n_sims: int,
     n_workers: int = None,
+    progress_callback=None,
 ) -> Dict[int, Dict]:
     """
     Parallel Swiss Monte Carlo + fantasy scoring.
@@ -109,15 +111,20 @@ def simulate_swiss_fantasy(
         raise ValueError("n_sims must be positive")
 
     if n_workers is None:
-        # use up to #cores, but not more than n_sims
-        n_workers = min(os.cpu_count() or 1, n_sims)
+        # use up to #cores, but not more than n_sims; Windows ProcessPool limit is 61.
+        n_workers = min(os.cpu_count() or 1, n_sims, 61)
     if n_workers < 1:
         n_workers = 1
 
-    # Split n_sims into chunks per worker
-    base = n_sims // n_workers
-    rem = n_sims % n_workers
-    chunks = [base + (1 if i < rem else 0) for i in range(n_workers)]
+    # Split n_sims into chunks for workers; use smaller chunks for smoother progress reporting.
+    target_tasks = max(n_workers, min(n_sims, n_workers * 20))
+    chunk_size = max(1, n_sims // target_tasks)
+    chunks = []
+    remaining = n_sims
+    while remaining > 0:
+        step = min(chunk_size, remaining)
+        chunks.append(step)
+        remaining -= step
     chunks = [c for c in chunks if c > 0]
 
     args_list = [(team_ids, vrs_ranks, bo3_mode, c) for c in chunks]
@@ -130,18 +137,32 @@ def simulate_swiss_fantasy(
     total_player_sums: Dict[int, Dict[int, Dict[str, float]]] = {
         tid: {} for tid in team_ids
     }
+    processed_sims = 0
+    if progress_callback:
+        progress_callback(processed_sims, n_sims)
 
     # Run chunks in parallel
     if len(args_list) == 1:
         # single-worker fallback
         rc, ps = _run_chunk(args_list[0])
-        results = [(rc, ps)]
+        results = [(rc, ps, args_list[0][3])]
+        processed_sims += args_list[0][3]
+        if progress_callback:
+            progress_callback(processed_sims, n_sims)
     else:
-        with ProcessPoolExecutor(max_workers=len(args_list)) as ex:
-            results = list(ex.map(_run_chunk, args_list))
+        with ProcessPoolExecutor(max_workers=min(n_workers, 61)) as ex:
+            futures = {ex.submit(_run_chunk, args): args[3] for args in args_list}
+            results = []
+            for fut in as_completed(futures):
+                sims_chunk = futures[fut]
+                rc, ps = fut.result()
+                results.append((rc, ps, sims_chunk))
+                processed_sims += sims_chunk
+                if progress_callback:
+                    progress_callback(processed_sims, n_sims)
 
     # Merge partial results
-    for record_counts_chunk, player_sums_chunk in results:
+    for record_counts_chunk, player_sums_chunk, _ in results:
         # records
         for tid, rec_map in record_counts_chunk.items():
             for rec, cnt in rec_map.items():
