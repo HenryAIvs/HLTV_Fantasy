@@ -4,6 +4,7 @@ import math
 import sqlite3
 import json
 import os
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -18,6 +19,7 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+@lru_cache(maxsize=2048)
 def _get_hltv_rank(team_id: int) -> int:
     """
     Fetch hltv_rank for a given team_id from the teams table.

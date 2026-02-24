@@ -2,14 +2,15 @@ import json
 import re
 import math
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 from fastapi import APIRouter, HTTPException
 
 from db_admin import wipe_database
+from event_db import set_active_event, upsert_event_snapshot
 from player_db import add_or_update_player
-from team_db import add_or_update_team
+from team_db import add_or_update_team, get_team_by_name
 from team_strength import PARAMS_PATH
 from swiss_stage.fantasy_scoring import (
     compute_rating_points,
@@ -38,10 +39,11 @@ TIER_FIELD_MAP = {
 }
 
 
-def _import_money_draft_data(money: Dict[str, Any]) -> Dict[str, int]:
+def _import_money_draft_data(money: Dict[str, Any], event_id: Optional[int] = None) -> Dict[str, int]:
     teams = money.get("teams") or []
     imported_players = 0
     imported_teams = 0
+    event_teams_snapshot: List[Dict[str, Any]] = []
 
     for team_block in teams:
         team_name = team_block.get("teamData", {}).get("name", "").strip()
@@ -50,6 +52,7 @@ def _import_money_draft_data(money: Dict[str, Any]) -> Dict[str, int]:
 
         player_entries = team_block.get("players", []) or []
         player_ids = []
+        prices_by_player: Dict[int, int] = {}
 
         for entry in player_entries:
             p_data = entry.get("playerData", {}) or {}
@@ -64,6 +67,7 @@ def _import_money_draft_data(money: Dict[str, Any]) -> Dict[str, int]:
 
             pid = int(pid)
             player_ids.append(pid)
+            prices_by_player[pid] = int(cost)
 
             add_or_update_player(
                 player_id=pid,
@@ -79,14 +83,29 @@ def _import_money_draft_data(money: Dict[str, Any]) -> Dict[str, int]:
             imported_players += 1
 
         ids = player_ids[:5] if len(player_ids) >= 5 else player_ids + [0] * (5 - len(player_ids))
+        existing_team = get_team_by_name(team_name)
+        hltv_rank = int((existing_team or {}).get("hltv_rank") or 999)
+        vrs_rank = int((existing_team or {}).get("vrs_rank") or 999)
+        win_rate = float((existing_team or {}).get("win_rate") or 0.5)
         add_or_update_team(
             name=team_name,
-            hltv_rank=999,
-            vrs_rank=999,
-            win_rate=0.5,
+            hltv_rank=hltv_rank,
+            vrs_rank=vrs_rank,
+            win_rate=win_rate,
             player_ids=ids,
         )
         imported_teams += 1
+        event_teams_snapshot.append(
+            {
+                "team_name": team_name,
+                "player_ids": ids,
+                "prices_by_player": prices_by_player,
+            }
+        )
+
+    if event_id is not None:
+        upsert_event_snapshot(int(event_id), event_teams_snapshot)
+        set_active_event(int(event_id))
 
     return {"imported_players": imported_players, "imported_teams": imported_teams}
 
@@ -145,7 +164,7 @@ def import_hltv_event(payload: Dict[str, Any]):
     if not money:
         raise HTTPException(status_code=400, detail="moneyDraftData missing in response")
 
-    counts = _import_money_draft_data(money)
+    counts = _import_money_draft_data(money, event_id=int(event_id))
     return {"status": "ok", **counts, "event_id": event_id}
 
 

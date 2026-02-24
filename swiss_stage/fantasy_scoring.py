@@ -28,10 +28,13 @@ def compute_role_points(player: PlayerState) -> float:
 
 def compute_win_points(win_prob: float, did_win: bool) -> float:
     """
-    Win component:
-      win_prob * 6 - 3 * (1 - win_prob)
+    Win component (deterministic by match outcome):
+      - win  -> +6
+      - loss -> -3
+
+    win_prob is retained in the signature for compatibility with existing callers.
     """
-    return win_prob * 6.0 - 3.0 * (1.0 - win_prob)
+    return 6.0 if did_win else -3.0
 
 
 def compute_booster_points(player: PlayerState, match_number: int) -> float:

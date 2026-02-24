@@ -6,6 +6,7 @@
 # and apply fantasy-scoring side effects for each match.
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Callable
 import random
 
@@ -32,6 +33,11 @@ class MatchResult:
 
 WinProbabilityFn = Callable[[int, int, str], float]
 RandomFn = Callable[[], float]
+
+
+@lru_cache(maxsize=10000)
+def _get_player_cached(player_id: int):
+    return get_player(player_id)
 
 
 def calculate_win_probability(
@@ -76,6 +82,8 @@ def apply_fantasy_points_for_team(
     did_win: bool,
     match_number: int,
     match_type: str,
+    player_rows_by_id: dict[int, dict] | None = None,
+    team_rank_by_id: dict[int, int] | None = None,
 ) -> None:
     """
     Apply fantasy point side effects for every player on a single team,
@@ -87,10 +95,16 @@ def apply_fantasy_points_for_team(
     passing p for team A and (1 - p) for team B.
     """
     is_bo1 = match_type.lower() == "bo1"
-    opponent_rank = _get_hltv_rank(opponent_team_id)
+    if team_rank_by_id is not None and opponent_team_id in team_rank_by_id:
+        opponent_rank = int(team_rank_by_id[opponent_team_id])
+    else:
+        opponent_rank = _get_hltv_rank(opponent_team_id)
 
     for player in team.players.values():
-        row = get_player(player.player_id)
+        if player_rows_by_id is not None:
+            row = player_rows_by_id.get(player.player_id)
+        else:
+            row = _get_player_cached(player.player_id)
         if row is not None:
             match_rating = pick_match_rating(row, opponent_rank)
         else:
@@ -104,8 +118,7 @@ def apply_fantasy_points_for_team(
             rating_pts *= 0.5  # BO1 halves the rating contribution
 
         role_pts = compute_role_points(player)
-        effective_prob = win_probability if did_win else (1.0 - win_probability)
-        win_pts = compute_win_points(effective_prob, did_win)
+        win_pts = compute_win_points(win_probability, did_win)
         booster_pts = compute_booster_points(player, match_number)
 
         total = rating_pts + role_pts + win_pts + booster_pts

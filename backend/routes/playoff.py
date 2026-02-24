@@ -1,16 +1,91 @@
 import itertools
+import json
+import math
 import random
+import sqlite3
+import threading
+import time
+import uuid
 from typing import List, Dict
 
 from fastapi import APIRouter, HTTPException
 
+from player_db import DB_PATH
 from player_db import get_player
 from role_assignment import best_role_assignment_for_team, extract_role_scores_for_player
 from swiss_stage.team_initialization import initialize_teams
-from swiss_stage.swiss_models import TeamState
-from match_engine import simulate_match_outcome, apply_fantasy_points_for_team
+from swiss_stage.swiss_models import TeamState, PlayerState
+from match_engine import simulate_match_outcome, apply_fantasy_points_for_team, calculate_win_probability
 
 router = APIRouter()
+PLAYOFF_JOBS = {}
+PLAYOFF_JOBS_LOCK = threading.Lock()
+PLAYOFF_BEST_TEAM_JOBS = {}
+PLAYOFF_BEST_TEAM_JOBS_LOCK = threading.Lock()
+
+
+def _connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def ensure_playoff_schema() -> None:
+    conn = _connect()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS playoff_simulation_state (
+                singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+                payload_json TEXT NOT NULL,
+                results_json TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_latest_playoff(payload: dict, results: dict) -> None:
+    conn = _connect()
+    try:
+        conn.execute(
+            """
+            INSERT INTO playoff_simulation_state (singleton_id, payload_json, results_json, updated_at)
+            VALUES (1, ?, ?, ?)
+            ON CONFLICT(singleton_id) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                results_json = excluded.results_json,
+                updated_at = excluded.updated_at
+            """,
+            (json.dumps(payload), json.dumps(results), float(time.time())),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_latest_playoff() -> dict | None:
+    conn = _connect()
+    try:
+        row = conn.execute(
+            """
+            SELECT payload_json, results_json, updated_at
+            FROM playoff_simulation_state
+            WHERE singleton_id = 1
+            """
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "payload": json.loads(row["payload_json"]),
+            "results": json.loads(row["results_json"]),
+            "updated_at": float(row["updated_at"]),
+        }
+    finally:
+        conn.close()
 
 
 def _apply_elimination_penalty(team: TeamState, remaining_rounds: int) -> None:
@@ -43,8 +118,48 @@ def _serialize_team(ts: TeamState) -> dict:
     }
 
 
+def _build_playoff_lookup_context(team_slots: List[int]) -> tuple[Dict[int, dict], Dict[int, int]]:
+    conn = _connect()
+    try:
+        team_rows = conn.execute(
+            """
+            SELECT team_id, hltv_rank, player1_id, player2_id, player3_id, player4_id, player5_id
+            FROM teams
+            WHERE team_id IN ({})
+            """.format(",".join("?" for _ in team_slots)),
+            tuple(int(t) for t in team_slots),
+        ).fetchall()
+
+        team_rank_by_id: Dict[int, int] = {}
+        player_ids = set()
+        for r in team_rows:
+            tid = int(r["team_id"])
+            rank = r["hltv_rank"]
+            team_rank_by_id[tid] = int(rank) if rank is not None else 100
+            for col in ("player1_id", "player2_id", "player3_id", "player4_id", "player5_id"):
+                pid = r[col]
+                if pid:
+                    player_ids.add(int(pid))
+
+        player_rows_by_id: Dict[int, dict] = {}
+        if player_ids:
+            p_rows = conn.execute(
+                """
+                SELECT * FROM players
+                WHERE player_id IN ({})
+                """.format(",".join("?" for _ in player_ids)),
+                tuple(player_ids),
+            ).fetchall()
+            player_rows_by_id = {int(r["player_id"]): dict(r) for r in p_rows}
+
+        return player_rows_by_id, team_rank_by_id
+    finally:
+        conn.close()
+
+
 def _simulate_bracket(team_slots: List[int], vrs_ranks: Dict[int, int], rng=None):
     team_states: Dict[int, TeamState] = initialize_teams(team_slots, vrs_ranks)
+    player_rows_by_id, team_rank_by_id = _build_playoff_lookup_context(team_slots)
     match_results = {"quarters": [], "semis": [], "final": []}
 
     def ts(tid: int) -> TeamState:
@@ -68,8 +183,14 @@ def _simulate_bracket(team_slots: List[int], vrs_ranks: Dict[int, int], rng=None
         winner.record_win(loser.team_id)
         loser.record_loss(winner.team_id)
 
-        apply_fantasy_points_for_team(A, B.team_id, result.win_probability, did_win_a, match_num_a, "bo3")
-        apply_fantasy_points_for_team(B, A.team_id, 1.0 - result.win_probability, did_win_b, match_num_b, "bo3")
+        apply_fantasy_points_for_team(
+            A, B.team_id, result.win_probability, did_win_a, match_num_a, "bo3",
+            player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id
+        )
+        apply_fantasy_points_for_team(
+            B, A.team_id, 1.0 - result.win_probability, did_win_b, match_num_b, "bo3",
+            player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id
+        )
 
         _apply_elimination_penalty(loser, remaining_rounds_after)
         return winner.team_id, loser.team_id, result.win_probability
@@ -100,12 +221,280 @@ def _simulate_bracket(team_slots: List[int], vrs_ranks: Dict[int, int], rng=None
     return team_states, match_results
 
 
-def _average_player_totals(team_slots: List[int], vrs_ranks: Dict[int, int], n_sims: int) -> Dict[int, Dict]:
+def _clone_team_states(team_states: Dict[int, TeamState]) -> Dict[int, TeamState]:
+    cloned: Dict[int, TeamState] = {}
+    for tid, ts in team_states.items():
+        cloned_players: Dict[int, PlayerState] = {}
+        for pid, p in ts.players.items():
+            cloned_players[pid] = PlayerState(
+                player_id=p.player_id,
+                rating=p.rating,
+                major_pct=p.major_pct,
+                minor_pct=p.minor_pct,
+                boosters=list(p.boosters),
+                total_points=p.total_points,
+                rating_points_total=p.rating_points_total,
+                win_points_total=p.win_points_total,
+                role_points_total=p.role_points_total,
+                booster_points_total=p.booster_points_total,
+            )
+        cloned[tid] = TeamState(
+            team_id=ts.team_id,
+            vrs_rank=ts.vrs_rank,
+            players=cloned_players,
+            wins=ts.wins,
+            losses=ts.losses,
+            opponents_played=set(ts.opponents_played),
+        )
+    return cloned
+
+
+def _play_match_deterministic(
+    team_states: Dict[int, TeamState],
+    a_id: int,
+    b_id: int,
+    winner_id: int,
+    remaining_rounds_after: int,
+    prob_cache: Dict[tuple[int, int], float] | None = None,
+    player_rows_by_id: Dict[int, dict] | None = None,
+    team_rank_by_id: Dict[int, int] | None = None,
+) -> tuple[int, int, float, float]:
+    A = team_states[a_id]
+    B = team_states[b_id]
+    match_num_a = A.matches_played + 1
+    match_num_b = B.matches_played + 1
+    key = (a_id, b_id)
+    if prob_cache is not None and key in prob_cache:
+        prob_a = prob_cache[key]
+    else:
+        prob_a = calculate_win_probability(a_id, b_id, "bo3")
+        if prob_cache is not None:
+            prob_cache[key] = prob_a
+            prob_cache[(b_id, a_id)] = 1.0 - prob_a
+
+    if winner_id == a_id:
+        winner, loser = A, B
+        did_win_a, did_win_b = True, False
+        branch_prob = prob_a
+    elif winner_id == b_id:
+        winner, loser = B, A
+        did_win_a, did_win_b = False, True
+        branch_prob = 1.0 - prob_a
+    else:
+        raise ValueError(f"winner_id {winner_id} is not in match ({a_id}, {b_id})")
+
+    winner.record_win(loser.team_id)
+    loser.record_loss(winner.team_id)
+
+    apply_fantasy_points_for_team(
+        A, B.team_id, prob_a, did_win_a, match_num_a, "bo3",
+        player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id
+    )
+    apply_fantasy_points_for_team(
+        B, A.team_id, 1.0 - prob_a, did_win_b, match_num_b, "bo3",
+        player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id
+    )
+    _apply_elimination_penalty(loser, remaining_rounds_after)
+
+    return winner.team_id, loser.team_id, prob_a, branch_prob
+
+
+def _exact_weighted_player_totals(
+    team_slots: List[int],
+    vrs_ranks: Dict[int, int],
+    has_third_place_decider: bool = False,
+    progress_callback=None,
+) -> tuple[Dict[int, Dict], Dict, int]:
+    base_states = initialize_teams(team_slots, vrs_ranks)
+    player_rows_by_id, team_rank_by_id = _build_playoff_lookup_context(team_slots)
+    accum: Dict[int, Dict[int, Dict[str, float]]] = {tid: {} for tid in team_slots}
+    total_prob = 0.0
+    processed = 0
+    best_prob = -1.0
+    best_bracket = {"quarters": [], "semis": [], "final": []}
+
+    quarters = [
+        (team_slots[0], team_slots[1]),
+        (team_slots[2], team_slots[3]),
+        (team_slots[4], team_slots[5]),
+        (team_slots[6], team_slots[7]),
+    ]
+    total_outcomes = 256 if has_third_place_decider else 128
+    prob_cache: Dict[tuple[int, int], float] = {}
+
+    if progress_callback:
+        progress_callback(0, total_outcomes)
+
+    def recurse_qf(idx: int, states: Dict[int, TeamState], prob: float, qf_winners: List[int], qf_matches: List[dict]):
+        nonlocal total_prob, processed, best_prob, best_bracket
+        if idx == 4:
+            # Semifinal 1
+            for semi1_winner in (qf_winners[0], qf_winners[1]):
+                s1_states = _clone_team_states(states)
+                s1_winner, s1_loser, s1_p_win_a, s1_branch_p = _play_match_deterministic(
+                    s1_states, qf_winners[0], qf_winners[1], semi1_winner, remaining_rounds_after=1, prob_cache=prob_cache,
+                    player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id
+                )
+                semi1_match = {
+                    "winner": s1_winner,
+                    "loser": s1_loser,
+                    "p_win_a": s1_p_win_a,
+                    "teams": [qf_winners[0], qf_winners[1]],
+                }
+
+                # Semifinal 2
+                for semi2_winner in (qf_winners[2], qf_winners[3]):
+                    s2_states = _clone_team_states(s1_states)
+                    s2_winner, s2_loser, s2_p_win_a, s2_branch_p = _play_match_deterministic(
+                        s2_states, qf_winners[2], qf_winners[3], semi2_winner, remaining_rounds_after=1, prob_cache=prob_cache,
+                        player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id
+                    )
+                    semi2_match = {
+                        "winner": s2_winner,
+                        "loser": s2_loser,
+                        "p_win_a": s2_p_win_a,
+                        "teams": [qf_winners[2], qf_winners[3]],
+                    }
+
+                    # Final (and optional third-place decider)
+                    for final_winner in (s1_winner, s2_winner):
+                        f_states = _clone_team_states(s2_states)
+                        f_winner, f_loser, f_p_win_a, f_branch_p = _play_match_deterministic(
+                            f_states, s1_winner, s2_winner, final_winner, remaining_rounds_after=0, prob_cache=prob_cache,
+                            player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id
+                        )
+
+                        if has_third_place_decider:
+                            for third_winner in (s1_loser, s2_loser):
+                                t_states = _clone_team_states(f_states)
+                                t_winner, t_loser, t_p_win_a, t_branch_p = _play_match_deterministic(
+                                    t_states, s1_loser, s2_loser, third_winner, remaining_rounds_after=0, prob_cache=prob_cache,
+                                    player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id
+                                )
+                                path_prob = prob * s1_branch_p * s2_branch_p * f_branch_p * t_branch_p
+                                total_prob += path_prob
+                                processed += 1
+
+                                if path_prob > best_prob:
+                                    best_prob = path_prob
+                                    best_bracket = {
+                                        "quarters": list(qf_matches),
+                                        "semis": [semi1_match, semi2_match],
+                                        "final": [
+                                            {
+                                                "winner": f_winner,
+                                                "loser": f_loser,
+                                                "p_win_a": f_p_win_a,
+                                                "teams": [s1_winner, s2_winner],
+                                            }
+                                        ],
+                                        "third_place": [
+                                            {
+                                                "winner": t_winner,
+                                                "loser": t_loser,
+                                                "p_win_a": t_p_win_a,
+                                                "teams": [s1_loser, s2_loser],
+                                            }
+                                        ],
+                                    }
+
+                                for tid, ts in t_states.items():
+                                    for pid, p in ts.players.items():
+                                        bucket = accum[tid].setdefault(
+                                            pid,
+                                            {"total": 0.0, "rating": 0.0, "win": 0.0, "role": 0.0, "booster": 0.0},
+                                        )
+                                        bucket["total"] += path_prob * p.total_points
+                                        bucket["rating"] += path_prob * p.rating_points_total
+                                        bucket["win"] += path_prob * p.win_points_total
+                                        bucket["role"] += path_prob * p.role_points_total
+                                        bucket["booster"] += path_prob * p.booster_points_total
+
+                                if progress_callback:
+                                    progress_callback(processed, total_outcomes)
+                        else:
+                            path_prob = prob * s1_branch_p * s2_branch_p * f_branch_p
+                            total_prob += path_prob
+                            processed += 1
+
+                            if path_prob > best_prob:
+                                best_prob = path_prob
+                                best_bracket = {
+                                    "quarters": list(qf_matches),
+                                    "semis": [semi1_match, semi2_match],
+                                    "final": [
+                                        {
+                                            "winner": f_winner,
+                                            "loser": f_loser,
+                                            "p_win_a": f_p_win_a,
+                                            "teams": [s1_winner, s2_winner],
+                                        }
+                                    ],
+                                }
+
+                            for tid, ts in f_states.items():
+                                for pid, p in ts.players.items():
+                                    bucket = accum[tid].setdefault(
+                                        pid,
+                                        {"total": 0.0, "rating": 0.0, "win": 0.0, "role": 0.0, "booster": 0.0},
+                                    )
+                                    bucket["total"] += path_prob * p.total_points
+                                    bucket["rating"] += path_prob * p.rating_points_total
+                                    bucket["win"] += path_prob * p.win_points_total
+                                    bucket["role"] += path_prob * p.role_points_total
+                                    bucket["booster"] += path_prob * p.booster_points_total
+
+                            if progress_callback:
+                                progress_callback(processed, total_outcomes)
+            return
+
+        a_id, b_id = quarters[idx]
+        for winner_id in (a_id, b_id):
+            branch_states = _clone_team_states(states)
+            winner, loser, p_win_a, branch_prob = _play_match_deterministic(
+                branch_states, a_id, b_id, winner_id, remaining_rounds_after=2, prob_cache=prob_cache,
+                player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id
+            )
+            recurse_qf(
+                idx + 1,
+                branch_states,
+                prob * branch_prob,
+                qf_winners + [winner],
+                qf_matches + [{"winner": winner, "loser": loser, "p_win_a": p_win_a, "teams": [a_id, b_id]}],
+            )
+
+    recurse_qf(0, base_states, 1.0, [], [])
+
+    denom = total_prob if total_prob > 0 else 1.0
+    results: Dict[int, Dict] = {}
+    for tid in team_slots:
+        players_out: Dict[int, Dict[str, float]] = {}
+        for pid, sums in accum[tid].items():
+            players_out[pid] = {
+                "total_points": sums["total"] / denom,
+                "rating_points_total": sums["rating"] / denom,
+                "win_points_total": sums["win"] / denom,
+                "role_points_total": sums["role"] / denom,
+                "booster_points_total": sums["booster"] / denom,
+            }
+        results[tid] = {
+            "team_id": tid,
+            "wins": 0,
+            "losses": 0,
+            "players": players_out,
+        }
+
+    return results, best_bracket, total_outcomes
+
+
+def _average_player_totals(
+    team_slots: List[int], vrs_ranks: Dict[int, int], n_sims: int, progress_callback=None
+) -> Dict[int, Dict]:
     """
     Monte Carlo over the playoff bracket, returning expected fantasy components per player.
     """
     player_sums: Dict[int, Dict[int, Dict[str, float]]] = {tid: {} for tid in team_slots}
-    for _ in range(n_sims):
+    for i in range(n_sims):
         team_states, _ = _simulate_bracket(team_slots, vrs_ranks)
         for tid, ts in team_states.items():
             for pid, p in ts.players.items():
@@ -118,6 +507,8 @@ def _average_player_totals(team_slots: List[int], vrs_ranks: Dict[int, int], n_s
                 bucket["win"] += p.win_points_total
                 bucket["role"] += p.role_points_total
                 bucket["booster"] += p.booster_points_total
+        if progress_callback and ((i + 1) % 10 == 0 or (i + 1) == n_sims):
+            progress_callback(i + 1, n_sims)
 
     results: Dict[int, Dict] = {}
     for tid in team_slots:
@@ -139,6 +530,39 @@ def _average_player_totals(team_slots: List[int], vrs_ranks: Dict[int, int], n_s
     return results
 
 
+def _normalize_playoff_payload(payload: dict) -> dict:
+    slots: List[int] = payload.get("team_slots") or []
+    if len(slots) != 8:
+        raise HTTPException(status_code=400, detail="team_slots must contain 8 team IDs")
+    has_third_place_decider = bool(payload.get("has_third_place_decider", False))
+    return {
+        "team_slots": [int(x) for x in slots],
+        "has_third_place_decider": has_third_place_decider,
+    }
+
+
+def _compute_playoff_result(payload: dict, progress_callback=None) -> dict:
+    slots = payload["team_slots"]
+    has_third_place_decider = bool(payload.get("has_third_place_decider", False))
+
+    # vrs_ranks not relevant here (use default 999)
+    vrs_ranks = {tid: 999 for tid in slots}
+
+    exact_players, best_bracket, outcomes_count = _exact_weighted_player_totals(
+        slots,
+        vrs_ranks,
+        has_third_place_decider=has_third_place_decider,
+        progress_callback=progress_callback,
+    )
+    return {
+        "bracket": best_bracket,
+        "teams": exact_players,
+        "method": "exact_enumeration",
+        "outcomes_count": outcomes_count,
+        "has_third_place_decider": has_third_place_decider,
+    }
+
+
 @router.post("/run")
 def run_playoff(payload: dict):
     """
@@ -148,80 +572,290 @@ def run_playoff(payload: dict):
       - team_slots: list of 8 team_ids in bracket order:
           [QF1_A, QF1_B, QF2_A, QF2_B, QF3_A, QF3_B, QF4_A, QF4_B]
     """
-    slots: List[int] = payload.get("team_slots") or []
-    if len(slots) != 8:
-        raise HTTPException(status_code=400, detail="team_slots must contain 8 team IDs")
+    normalized = _normalize_playoff_payload(payload)
+    response = _compute_playoff_result(normalized)
+    save_latest_playoff(normalized, response)
+    return response
 
-    n_sims = int(payload.get("n_sims", 1))
-    if n_sims < 1:
-        raise HTTPException(status_code=400, detail="n_sims must be >= 1")
 
-    # Initialize teams; vrs_ranks not relevant here (use default 999)
-    vrs_ranks = {tid: 999 for tid in slots}
+def _run_playoff_job(job_id: str, payload: dict) -> None:
+    def _update_progress(processed: int, total: int) -> None:
+        with PLAYOFF_JOBS_LOCK:
+            job = PLAYOFF_JOBS.get(job_id)
+            if not job:
+                return
+            job["processed_sims"] = int(processed)
+            job["total_sims"] = int(total)
+            job["progress"] = 0.0 if total <= 0 else float(processed) / float(total)
+            job["updated_at"] = time.time()
 
-    if n_sims == 1:
-        team_states, match_results = _simulate_bracket(slots, vrs_ranks)
-        return {
-            "bracket": match_results,
-            "teams": {tid: _serialize_team(ts) for tid, ts in team_states.items()},
+    with PLAYOFF_JOBS_LOCK:
+        job = PLAYOFF_JOBS.get(job_id)
+        if not job:
+            return
+        job["status"] = "running"
+        job["updated_at"] = time.time()
+
+    try:
+        result = _compute_playoff_result(payload, progress_callback=_update_progress)
+        save_latest_playoff(payload, result)
+        with PLAYOFF_JOBS_LOCK:
+            job = PLAYOFF_JOBS.get(job_id)
+            if not job:
+                return
+            job["status"] = "completed"
+            job["result"] = result
+            total = int(job.get("total_sims", 128))
+            job["processed_sims"] = total
+            job["total_sims"] = total
+            job["progress"] = 1.0
+            job["updated_at"] = time.time()
+    except Exception as exc:
+        with PLAYOFF_JOBS_LOCK:
+            job = PLAYOFF_JOBS.get(job_id)
+            if not job:
+                return
+            job["status"] = "failed"
+            job["error"] = str(exc)
+            job["updated_at"] = time.time()
+
+
+@router.post("/start")
+def start_playoff(payload: dict):
+    normalized = _normalize_playoff_payload(payload)
+    total_outcomes = 256 if normalized.get("has_third_place_decider") else 128
+    job_id = str(int(time.time() * 1000000))
+    with PLAYOFF_JOBS_LOCK:
+        PLAYOFF_JOBS[job_id] = {
+            "status": "queued",
+            "error": "",
+            "progress": 0.0,
+            "processed_sims": 0,
+            "total_sims": int(total_outcomes),
+            "result": None,
+            "created_at": time.time(),
+            "updated_at": time.time(),
         }
 
-    # Monte Carlo: run many times and average player components. Return a sample bracket for display.
-    team_states, sample_bracket = _simulate_bracket(slots, vrs_ranks)
-    averaged_players = _average_player_totals(slots, vrs_ranks, n_sims)
+    worker = threading.Thread(target=_run_playoff_job, args=(job_id, normalized), daemon=True)
+    worker.start()
+    return {"job_id": job_id}
+
+
+@router.get("/job/{job_id}")
+def get_playoff_job(job_id: str):
+    with PLAYOFF_JOBS_LOCK:
+        job = PLAYOFF_JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="job_id not found")
+        out = dict(job)
     return {
-        "bracket": sample_bracket,
-        "teams": averaged_players,
-        "n_sims": n_sims,
+        "job_id": job_id,
+        "status": out.get("status", "queued"),
+        "error": out.get("error", ""),
+        "progress": out.get("progress", 0.0),
+        "processed_sims": out.get("processed_sims", 0),
+        "total_sims": out.get("total_sims", 0),
+        "result": out.get("result"),
     }
 
 
-def simulate_playoff_fantasy(team_slots: List[int], n_sims: int, return_runs: bool = False):
+def simulate_playoff_fantasy(team_slots: List[int], n_sims: int = 1, return_runs: bool = False):
     if n_sims <= 0:
         raise HTTPException(status_code=400, detail="n_sims must be positive")
     vrs_ranks = {tid: 999 for tid in team_slots}
-    player_sums: Dict[int, Dict[int, Dict[str, float]]] = {tid: {} for tid in team_slots}
-    run_points: List[Dict[int, float]] = []
-
-    for _ in range(n_sims):
-        team_states, _ = _simulate_bracket(team_slots, vrs_ranks)
-        run_totals: Dict[int, float] = {}
-        for tid, ts in team_states.items():
-            for pid, p in ts.players.items():
-                bucket = player_sums[tid].setdefault(
-                    pid,
-                    {
-                        "total": 0.0,
-                        "rating": 0.0,
-                        "win": 0.0,
-                        "role": 0.0,
-                        "booster": 0.0,
-                    },
-                )
-                bucket["total"] += p.total_points
-                bucket["rating"] += p.rating_points_total
-                bucket["win"] += p.win_points_total
-                bucket["role"] += p.role_points_total
-                bucket["booster"] += p.booster_points_total
-                run_totals[pid] = p.total_points
-        run_points.append(run_totals)
+    exact_results, _, _ = _exact_weighted_player_totals(team_slots, vrs_ranks, has_third_place_decider=False)
 
     results: Dict[int, Dict] = {}
     for tid in team_slots:
         players_out: Dict[int, Dict[str, float]] = {}
-        for pid, sums in player_sums[tid].items():
+        for pid, comps in (exact_results.get(tid, {}).get("players", {}) or {}).items():
             players_out[pid] = {
-                "total": sums["total"] / float(n_sims),
-                "rating": sums["rating"] / float(n_sims),
-                "win": sums["win"] / float(n_sims),
-                "role": sums["role"] / float(n_sims),
-                "booster": sums["booster"] / float(n_sims),
+                "total": float(comps.get("total_points", 0.0)),
+                "rating": float(comps.get("rating_points_total", 0.0)),
+                "win": float(comps.get("win_points_total", 0.0)),
+                "role": float(comps.get("role_points_total", 0.0)),
+                "booster": float(comps.get("booster_points_total", 0.0)),
             }
         results[tid] = {"players": players_out}
 
     if return_runs:
-        return results, run_points
+        return results, []
     return results
+
+
+def _build_players_info_from_sim_results(sim_results: Dict, exclude: set[int]):
+    players_info = []
+    for tid, team_res in (sim_results or {}).items():
+        tid_int = int(tid)
+        for pid_key, comps in (team_res.get("players", {}) or {}).items():
+            pid = int(pid_key)
+            if pid in exclude:
+                continue
+            row = get_player(pid)
+            if not row:
+                continue
+            players_info.append(
+                {
+                    "player_id": pid,
+                    "name": row.get("name", f"Player {pid}"),
+                    "team_id": tid_int,
+                    "price": int(row.get("price", 0)),
+                    "rating_ev": float(comps.get("rating_points_total", comps.get("rating", 0.0))),
+                    "win_ev": float(comps.get("win_points_total", comps.get("win", 0.0))),
+                    "role_ev": float(comps.get("role_points_total", comps.get("role", 0.0))),
+                    "booster_ev": float(comps.get("booster_points_total", comps.get("booster", 0.0))),
+                    "total_ev": float(comps.get("total_points", comps.get("total", 0.0))),
+                }
+            )
+    return players_info
+
+
+def _optimize_playoff_teams(
+    players_info: list[dict],
+    include: set[int],
+    budget: int,
+    max_per_team: int,
+    progress_callback=None,
+):
+    if len(players_info) < 5:
+        return {"error": "Not enough players after exclusions"}
+
+    available_ids = {p["player_id"] for p in players_info}
+    missing_includes = [pid for pid in include if pid not in available_ids]
+    if missing_includes:
+        return {"error": f"Included players not available in bracket teams: {missing_includes}"}
+
+    valid_teams = []
+    players_info_sorted = sorted(players_info, key=lambda x: -x["total_ev"])
+    role_scores_by_player = {}
+    for p in players_info_sorted:
+        pid = int(p["player_id"])
+        role_scores_by_player[pid] = extract_role_scores_for_player(get_player(pid) or {})
+
+    total_combinations = math.comb(len(players_info_sorted), 5)
+    processed_combinations = 0
+    if progress_callback:
+        progress_callback(0, total_combinations)
+    for combo in itertools.combinations(players_info_sorted, 5):
+        processed_combinations += 1
+        if progress_callback and (processed_combinations % 1000 == 0 or processed_combinations == total_combinations):
+            progress_callback(processed_combinations, total_combinations)
+
+        combo_ids = {p["player_id"] for p in combo}
+        if include and not include.issubset(combo_ids):
+            continue
+        total_cost = sum(p["price"] for p in combo)
+        if total_cost > budget:
+            continue
+
+        team_counts = {}
+        valid = True
+        for p in combo:
+            team_counts[p["team_id"]] = team_counts.get(p["team_id"], 0) + 1
+            if team_counts[p["team_id"]] > max_per_team:
+                valid = False
+                break
+        if not valid:
+            continue
+
+        combo_pid_list = [int(p["player_id"]) for p in combo]
+        assignment, _ = best_role_assignment_for_team(combo_pid_list, role_scores_by_player)
+        if assignment is None:
+            continue
+
+        total_ev = float(sum(p["total_ev"] for p in combo))
+        valid_teams.append(
+            {
+                "total_ev": total_ev,
+                "cost": int(total_cost),
+                "players": [
+                    {
+                        "player_id": p["player_id"],
+                        "name": p["name"],
+                        "team_id": p["team_id"],
+                        "price": p["price"],
+                        "rating_ev": p["rating_ev"],
+                        "win_ev": p["win_ev"],
+                        "role_ev": p["role_ev"],
+                        "booster_ev": p["booster_ev"],
+                        "total_ev": p["total_ev"],
+                        "role_name": str(assignment.get(int(p["player_id"]), "-")),
+                    }
+                    for p in combo
+                ],
+            }
+        )
+
+    valid_teams.sort(key=lambda x: x["total_ev"], reverse=True)
+    return {
+        "top_teams": valid_teams[:10],
+        "all_teams": valid_teams,
+        "player_count": len(players_info),
+        "processed_combinations": int(processed_combinations),
+        "total_combinations": int(total_combinations),
+    }
+
+
+def _run_playoff_best_team_job(job_id: str, payload: dict | None = None) -> None:
+    def _update_progress(processed: int, total: int) -> None:
+        with PLAYOFF_BEST_TEAM_JOBS_LOCK:
+            job = PLAYOFF_BEST_TEAM_JOBS.get(job_id)
+            if not job:
+                return
+            job["processed_combinations"] = int(processed)
+            job["total_combinations"] = int(total)
+            job["progress"] = 0.0 if total <= 0 else float(processed) / float(total)
+            job["updated_at"] = time.time()
+
+    with PLAYOFF_BEST_TEAM_JOBS_LOCK:
+        job = PLAYOFF_BEST_TEAM_JOBS.get(job_id)
+        if not job:
+            return
+        job["status"] = "running"
+        job["updated_at"] = time.time()
+
+    try:
+        latest = load_latest_playoff()
+        if not latest:
+            raise HTTPException(status_code=404, detail="No stored playoff simulation found. Run Playoff Bracket first.")
+
+        body = payload or {}
+        budget = int(body.get("budget", 1_000_000))
+        max_per_team = int(body.get("max_per_team", 2))
+        include = set(body.get("include_player_ids") or [])
+        exclude = set(body.get("exclude_player_ids") or [])
+
+        latest_results = latest.get("results", {}) or {}
+        sim_results = latest_results.get("teams", {}) or {}
+        players_info = _build_players_info_from_sim_results(sim_results, exclude)
+        result = _optimize_playoff_teams(
+            players_info, include, budget, max_per_team, progress_callback=_update_progress
+        )
+
+        with PLAYOFF_BEST_TEAM_JOBS_LOCK:
+            job = PLAYOFF_BEST_TEAM_JOBS.get(job_id)
+            if not job:
+                return
+            job["status"] = "completed"
+            job["result"] = result
+            total = int(job.get("total_combinations", 0))
+            done = int(job.get("processed_combinations", 0))
+            if done <= 0 and total <= 0:
+                done = int(result.get("processed_combinations", 0))
+                total = int(result.get("total_combinations", 0))
+            job["processed_combinations"] = done
+            job["total_combinations"] = total
+            job["progress"] = 0.0 if total <= 0 else min(1.0, float(done) / float(total))
+            job["updated_at"] = time.time()
+    except Exception as exc:
+        with PLAYOFF_BEST_TEAM_JOBS_LOCK:
+            job = PLAYOFF_BEST_TEAM_JOBS.get(job_id)
+            if not job:
+                return
+            job["status"] = "failed"
+            job["error"] = str(exc)
+            job["updated_at"] = time.time()
 
 
 @router.post("/best-team")
@@ -233,113 +867,95 @@ def best_team_playoff(payload: dict):
     if len(slots) != 8:
         raise HTTPException(status_code=400, detail="team_slots must contain 8 team IDs")
 
-    n_sims = int(payload.get("n_sims", 200))
     budget = int(payload.get("budget", 1_000_000))
     max_per_team = int(payload.get("max_per_team", 2))
     include = set(payload.get("include_player_ids") or [])
     exclude = set(payload.get("exclude_player_ids") or [])
 
-    sim_results, run_points = simulate_playoff_fantasy(slots, n_sims, return_runs=True)
+    sim_results = simulate_playoff_fantasy(slots, return_runs=False)
+    players_info = _build_players_info_from_sim_results(sim_results, exclude)
+    return _optimize_playoff_teams(players_info, include, budget, max_per_team)
 
-    players_info = []
-    for tid, team_res in sim_results.items():
-        for pid_key, comps in team_res.get("players", {}).items():
-            pid = int(pid_key)
-            if pid in exclude:
-                continue
-            row = get_player(pid)
-            if not row:
-                continue
-            name = row.get("name", f"Player {pid}")
-            price = row.get("price", 0)
-            roles_json = row.get("roles_json", "")
-            rating_ev = float(comps.get("rating_points_total", comps.get("rating", 0.0)))
-            win_ev = float(comps.get("win_points_total", comps.get("win", 0.0)))
-            role_ev = float(comps.get("role_points_total", comps.get("role", 0.0)))
-            booster_ev = float(comps.get("booster_points_total", comps.get("booster", 0.0)))
-            total_ev = float(comps.get("total_points", comps.get("total", 0.0)))
 
-            players_info.append(
-                {
-                    "player_id": pid,
-                    "name": name,
-                    "team_id": tid,
-                    "price": price,
-                    "rating_ev": rating_ev,
-                    "win_ev": win_ev,
-                    "role_ev": role_ev,
-                    "booster_ev": booster_ev,
-                    "total_ev": total_ev,
-                    "roles_json": roles_json,
-                }
-            )
+@router.post("/best-team/from-latest")
+def best_team_playoff_from_latest(payload: dict | None = None):
+    latest = load_latest_playoff()
+    if not latest:
+        raise HTTPException(status_code=404, detail="No stored playoff simulation found. Run Playoff Bracket first.")
 
-    if len(players_info) < 5:
-        return {"error": "Not enough players after exclusions"}
+    body = payload or {}
+    budget = int(body.get("budget", 1_000_000))
+    max_per_team = int(body.get("max_per_team", 2))
+    include = set(body.get("include_player_ids") or [])
+    exclude = set(body.get("exclude_player_ids") or [])
 
-    # Ensure included players exist within the available set
-    available_ids = {p["player_id"] for p in players_info}
-    missing_includes = [pid for pid in include if pid not in available_ids]
-    if missing_includes:
-        return {"error": f"Included players not available in bracket teams: {missing_includes}"}
+    latest_results = latest.get("results", {}) or {}
+    sim_results = latest_results.get("teams", {}) or {}
+    players_info = _build_players_info_from_sim_results(sim_results, exclude)
+    return _optimize_playoff_teams(players_info, include, budget, max_per_team)
 
-    valid_teams = []
-    players_info_sorted = sorted(players_info, key=lambda x: -x["total_ev"])
 
-    for combo in itertools.combinations(players_info_sorted, 5):
-        if include and not include.issubset({p["player_id"] for p in combo}):
-            continue
-        total_cost = sum(p["price"] for p in combo)
-        if total_cost > budget:
-            continue
-        counts = {}
-        valid = True
-        for p in combo:
-            counts[p["team_id"]] = counts.get(p["team_id"], 0) + 1
-            if counts[p["team_id"]] > max_per_team:
-                valid = False
-                break
-        if not valid:
-            continue
+@router.post("/best-team/from-latest/start")
+def start_best_team_playoff_from_latest(payload: dict | None = None):
+    latest = load_latest_playoff()
+    if not latest:
+        raise HTTPException(status_code=404, detail="No stored playoff simulation found. Run Playoff Bracket first.")
 
-        # Bracket-aware expected total: sum player points per simulation, then average
-        combo_pids = [p["player_id"] for p in combo]
-        agg = 0.0
-        for run in run_points:
-            agg += sum(run.get(pid, 0.0) for pid in combo_pids)
-        total_ev = agg / float(n_sims)
-        valid_teams.append(
-            {
-                "total_ev": total_ev,
-                "cost": total_cost,
-                "players": combo,
-            }
-        )
-
-    valid_teams.sort(key=lambda x: x["total_ev"], reverse=True)
-
-    def serialize_team(entry):
-        return {
-            "total_ev": entry["total_ev"],
-            "cost": entry["cost"],
-            "players": [
-                {
-                    "player_id": p["player_id"],
-                    "name": p["name"],
-                    "team_id": p["team_id"],
-                    "price": p["price"],
-                    "rating_ev": p["rating_ev"],
-                    "win_ev": p["win_ev"],
-                    "role_ev": p["role_ev"],
-                    "booster_ev": p["booster_ev"],
-                    "total_ev": p["total_ev"],
-                    "role_name": p.get("best_role", "-"),
-                }
-                for p in entry["players"]
-            ],
+    job_id = uuid.uuid4().hex
+    with PLAYOFF_BEST_TEAM_JOBS_LOCK:
+        PLAYOFF_BEST_TEAM_JOBS[job_id] = {
+            "status": "queued",
+            "error": "",
+            "progress": 0.0,
+            "processed_combinations": 0,
+            "total_combinations": 0,
+            "result": None,
+            "created_at": time.time(),
+            "updated_at": time.time(),
         }
 
-    all_serialized = [serialize_team(t) for t in valid_teams]
-    top_teams = all_serialized[:10]
+    worker = threading.Thread(target=_run_playoff_best_team_job, args=(job_id, payload or {}), daemon=True)
+    worker.start()
+    return {"job_id": job_id}
 
-    return {"top_teams": top_teams, "all_teams": all_serialized, "player_count": len(players_info)}
+
+@router.get("/best-team/job/{job_id}")
+def get_best_team_playoff_job(job_id: str):
+    with PLAYOFF_BEST_TEAM_JOBS_LOCK:
+        job = PLAYOFF_BEST_TEAM_JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="job_id not found")
+        out = dict(job)
+    return {
+        "job_id": job_id,
+        "status": out.get("status", "queued"),
+        "error": out.get("error", ""),
+        "progress": out.get("progress", 0.0),
+        "processed_combinations": out.get("processed_combinations", 0),
+        "total_combinations": out.get("total_combinations", 0),
+        "result": out.get("result"),
+    }
+
+
+@router.get("/latest")
+def get_latest_playoff():
+    latest = load_latest_playoff()
+    if not latest:
+        return {"exists": False}
+    return {
+        "exists": True,
+        "payload": latest["payload"],
+        "results": latest["results"],
+        "updated_at": latest["updated_at"],
+    }
+
+
+@router.delete("/latest")
+def reset_latest_playoff():
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM playoff_simulation_state WHERE singleton_id = 1")
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "ok"}

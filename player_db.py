@@ -184,7 +184,20 @@ def get_player(player_id: int) -> Optional[Dict[str, Any]]:
             "SELECT * FROM players WHERE player_id = ?",
             (player_id,),
         ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        out = dict(row)
+        try:
+            from event_db import get_active_event_id, get_event_price
+
+            active_event_id = get_active_event_id()
+            event_price = get_event_price(player_id, active_event_id)
+            out["active_event_id"] = active_event_id
+            if event_price is not None:
+                out["price"] = int(event_price)
+        except Exception:
+            pass
+        return out
     finally:
         conn.close()
 
@@ -199,7 +212,20 @@ def get_player_by_name(name: str) -> Optional[Dict[str, Any]]:
             "SELECT * FROM players WHERE lower(name) = lower(?)",
             (name,),
         ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        out = dict(row)
+        try:
+            from event_db import get_active_event_id, get_event_price
+
+            active_event_id = get_active_event_id()
+            event_price = get_event_price(int(out["player_id"]), active_event_id)
+            out["active_event_id"] = active_event_id
+            if event_price is not None:
+                out["price"] = int(event_price)
+        except Exception:
+            pass
+        return out
     finally:
         conn.close()
 
@@ -210,7 +236,20 @@ def get_all_players() -> List[Dict[str, Any]]:
         rows = conn.execute(
             "SELECT * FROM players ORDER BY rating DESC, name"
         ).fetchall()
-        return [dict(r) for r in rows]
+        players = [dict(r) for r in rows]
+        try:
+            from event_db import get_active_event_id, get_event_price_map
+
+            active_event_id = get_active_event_id()
+            price_map = get_event_price_map(active_event_id)
+            for p in players:
+                pid = int(p["player_id"])
+                if pid in price_map:
+                    p["price"] = int(price_map[pid])
+                p["active_event_id"] = active_event_id
+        except Exception:
+            pass
+        return players
     finally:
         conn.close()
 

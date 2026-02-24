@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 
 const tabs = [
   { key: "view", label: "Database" },
+  { key: "events", label: "Events" },
   { key: "sim", label: "Swiss Group Stage" },
   { key: "playoff", label: "Playoff Bracket" },
   { key: "admin", label: "Data Management" },
@@ -135,7 +136,7 @@ function GroupStageTab({
     setBusy(true);
     setRunMessage("");
     setProcessedSims(0);
-    setTotalSims(Number(sims || 0));
+    setTotalSims(128);
     setEtaSeconds(null);
     const vrs = {};
     teams.forEach((t) => {
@@ -1201,24 +1202,86 @@ function BracketTab({ teams, teamLookup }) {
 }
 
 function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters }) {
+  const [playoffTab, setPlayoffTab] = useState("stage");
+  const [events, setEvents] = useState([]);
+  const [selectedEventId, setSelectedEventId] = useState("");
+  const [eventTeamNames, setEventTeamNames] = useState(new Set());
+  const [latestPayload, setLatestPayload] = useState(null);
+  const [updatedAt, setUpdatedAt] = useState("");
   const [slots, setSlots] = useState(Array(8).fill(""));
+  const [hasThirdPlaceDecider, setHasThirdPlaceDecider] = useState(false);
   const [results, setResults] = useState(null);
   const [busy, setBusy] = useState(false);
   const [topTeams, setTopTeams] = useState(null);
   const [allTeams, setAllTeams] = useState(null);
   const [baseTeams, setBaseTeams] = useState(null);
+  const [filteredCount, setFilteredCount] = useState(0);
   const [page, setPage] = useState(0);
   const [topMessage, setTopMessage] = useState("");
-  const [sims, setSims] = useState("200");
   const [includeSet, setIncludeSet] = useState(new Set());
   const [excludeSet, setExcludeSet] = useState(new Set());
+  const [includeTeamSet, setIncludeTeamSet] = useState(new Set());
+  const [excludeTeamSet, setExcludeTeamSet] = useState(new Set());
+  const [appliedIncludeSet, setAppliedIncludeSet] = useState(new Set());
+  const [appliedExcludeSet, setAppliedExcludeSet] = useState(new Set());
+  const [appliedIncludeTeamSet, setAppliedIncludeTeamSet] = useState(new Set());
+  const [appliedExcludeTeamSet, setAppliedExcludeTeamSet] = useState(new Set());
+  const [comboSearch, setComboSearch] = useState("");
   const [showFilterModal, setShowFilterModal] = useState(false);
+  const [filterSearch, setFilterSearch] = useState("");
   const [sortKey, setSortKey] = useState("ev_desc");
+  const [processedSims, setProcessedSims] = useState(0);
+  const [totalSims, setTotalSims] = useState(0);
+  const [processedCombos, setProcessedCombos] = useState(0);
+  const [totalCombos, setTotalCombos] = useState(0);
+  const [topEtaSeconds, setTopEtaSeconds] = useState(null);
+  const [etaSeconds, setEtaSeconds] = useState(null);
+  const [runMessage, setRunMessage] = useState("");
+  const playoffPollingRef = useRef(false);
+  const normalizeTeamName = (name) => String(name || "").trim().toLowerCase();
   const playerLookup = useMemo(() => {
     const m = {};
     players.forEach((p) => (m[p.player_id] = p.name));
     return m;
   }, [players]);
+  const playerNameById = playerLookup;
+  const filteredTeams = useMemo(() => {
+    if (!selectedEventId) return [];
+    if (!eventTeamNames || eventTeamNames.size === 0) return [];
+    return teams.filter((t) => eventTeamNames.has(normalizeTeamName(t.name)));
+  }, [teams, selectedEventId, eventTeamNames]);
+  const playoffTeamsForFilters = useMemo(() => {
+    const selectedIds = Array.from(new Set(slots.map((s) => Number(s)).filter((id) => Number.isFinite(id) && id > 0)));
+    const byId = new Map(teams.map((t) => [Number(t.team_id), t]));
+    return selectedIds
+      .map((id) => byId.get(id))
+      .filter(Boolean)
+      .sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+  }, [slots, teams]);
+  const teamPlayerIds = (teamId) => {
+    const team = teams.find((t) => Number(t.team_id) === Number(teamId));
+    if (!team) return [];
+    return [team.player1_id, team.player2_id, team.player3_id, team.player4_id, team.player5_id]
+      .map((pid) => Number(pid))
+      .filter((pid) => Number.isFinite(pid) && pid > 0);
+  };
+  const buildEffectivePlayerFilters = (playerInclude, playerExclude, teamInclude, teamExclude) => {
+    const include = new Set(playerInclude || []);
+    const exclude = new Set(playerExclude || []);
+    Array.from(teamInclude || []).forEach((tid) => {
+      teamPlayerIds(tid).forEach((pid) => include.add(pid));
+    });
+    Array.from(teamExclude || []).forEach((tid) => {
+      teamPlayerIds(tid).forEach((pid) => exclude.add(pid));
+    });
+    // Include wins over exclude for conflicting picks.
+    Array.from(include).forEach((pid) => exclude.delete(pid));
+    return { include, exclude };
+  };
+  const effectiveAppliedFilters = useMemo(
+    () => buildEffectivePlayerFilters(appliedIncludeSet, appliedExcludeSet, appliedIncludeTeamSet, appliedExcludeTeamSet),
+    [appliedIncludeSet, appliedExcludeSet, appliedIncludeTeamSet, appliedExcludeTeamSet, teams]
+  );
 
   const setSlot = (idx, val) => {
     setSlots((prev) => {
@@ -1228,55 +1291,217 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters }) {
     });
   };
 
+  const loadEventsForPlayoff = async () => {
+    const data = await api.get("/events/");
+    if (data?.detail) return;
+    const allEvents = Array.isArray(data.events) ? data.events : [];
+    setEvents(allEvents);
+    const active = data.active_event_id;
+    const fallback = allEvents.length > 0 ? allEvents[0].event_id : "";
+    const nextSelected = active ?? fallback;
+    setSelectedEventId(nextSelected === "" ? "" : String(nextSelected));
+  };
+
+  const loadEventTeams = async (eventId) => {
+    if (!eventId) {
+      setEventTeamNames(new Set());
+      return;
+    }
+    const data = await api.get(`/events/${eventId}`);
+    if (data?.detail) return;
+    setEventTeamNames(new Set((data.teams || []).map((t) => normalizeTeamName(t.team_name))));
+  };
+
+  const loadLatestPlayoff = async () => {
+    const data = await api.get("/playoff/latest");
+    if (!data?.exists) {
+      setLatestPayload(null);
+      setResults(null);
+      setUpdatedAt("");
+      return;
+    }
+    const payload = data.payload || {};
+    setLatestPayload(payload);
+    setSlots((payload.team_slots || []).map((x) => String(x)));
+    setHasThirdPlaceDecider(Boolean(payload.has_third_place_decider));
+    setResults(data.results || null);
+    setUpdatedAt(data.updated_at ? new Date(Number(data.updated_at) * 1000).toISOString() : "");
+  };
+
+  useEffect(() => {
+    loadEventsForPlayoff();
+    loadLatestPlayoff();
+  }, []);
+
+  useEffect(() => {
+    loadEventTeams(selectedEventId);
+  }, [selectedEventId]);
+
+  useEffect(() => {
+    const allowed = new Set(filteredTeams.map((t) => t.team_id));
+    setSlots((prev) => prev.map((v) => (allowed.has(Number(v)) ? v : "")));
+  }, [filteredTeams]);
+
   const run = async () => {
     const ids = slots.map((s) => Number(s));
     if (ids.some((id) => !id)) return;
     setBusy(true);
-    const data = await api.post("/playoff/run", { team_slots: ids, n_sims: Number(sims || 1) });
-    setResults(data);
-    setTopTeams(null);
-    setBusy(false);
+    setRunMessage("");
+    setProcessedSims(0);
+    setTotalSims(hasThirdPlaceDecider ? 256 : 128);
+    setEtaSeconds(null);
+
+    const pollPlayoffJob = async (jobId, startedAtMs) => {
+      if (!jobId) return;
+      if (playoffPollingRef.current) return;
+      playoffPollingRef.current = true;
+      try {
+        let done = false;
+        while (!done) {
+          const status = await api.get(`/playoff/job/${jobId}`);
+          if (status?.detail) {
+            setRunMessage(String(status.detail));
+            return;
+          }
+          const processed = Number(status.processed_sims || 0);
+          const total = Number(status.total_sims || 0);
+          setProcessedSims(processed);
+          setTotalSims(total);
+          if (processed > 0 && total > processed) {
+            const elapsedSec = Math.max(0.001, (Date.now() - startedAtMs) / 1000);
+            const rate = processed / elapsedSec;
+            if (rate > 0) setEtaSeconds((total - processed) / rate);
+          } else if (total > 0 && processed >= total) {
+            setEtaSeconds(0);
+          }
+
+          if (status.status === "failed") {
+            setRunMessage(status.error || "Playoff run failed.");
+            return;
+          }
+          if (status.status === "completed") {
+            const data = status.result || null;
+            setResults(data);
+            setLatestPayload({ team_slots: ids, has_third_place_decider: hasThirdPlaceDecider });
+            setUpdatedAt(new Date().toISOString());
+            setTopTeams(null);
+            setAllTeams(null);
+            setBaseTeams(null);
+            setTopMessage("");
+            done = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+      } finally {
+        playoffPollingRef.current = false;
+      }
+    };
+
+    try {
+      const start = await api.post("/playoff/start", {
+        team_slots: ids,
+        has_third_place_decider: hasThirdPlaceDecider,
+      });
+      if (start?.detail) {
+        setRunMessage(String(start.detail));
+        return;
+      }
+      const jobId = start?.job_id;
+      if (!jobId) {
+        setRunMessage("Failed to start playoff job.");
+        return;
+      }
+      await pollPlayoffJob(jobId, Date.now());
+    } finally {
+      setBusy(false);
+    }
   };
 
   const findTopTeams = async () => {
-    const ids = slots.map((s) => Number(s));
-    if (ids.some((id) => !id)) return;
     setBusy(true);
     setTopMessage("");
     setAllTeams(null);
     setBaseTeams(null);
     setPage(0);
-    const data = await api.post("/playoff/best-team", {
-      team_slots: ids,
-      n_sims: Number(sims || 200),
-    });
-    if (data.error) {
-      setTopMessage(data.error);
-      setTopTeams([]);
-      setAllTeams([]);
-      setBaseTeams([]);
-    } else if (data.top_teams && data.top_teams.length > 0) {
-      const all = data.all_teams || [];
-      setBaseTeams(all);
-      // apply filters after fetch
-      const filtered = applyFilters(all, includeSet, excludeSet);
-      if (filtered.length === 0) {
+    setProcessedCombos(0);
+    setTotalCombos(0);
+    setTopEtaSeconds(null);
+    try {
+      const start = await api.post("/playoff/best-team/from-latest/start", {
+        include_player_ids: Array.from(effectiveAppliedFilters.include),
+        exclude_player_ids: Array.from(effectiveAppliedFilters.exclude),
+      });
+      if (start?.detail) {
+        setTopMessage(String(start.detail));
         setTopTeams([]);
         setAllTeams([]);
-        setTopMessage("No teams after filters. Adjust include/exclude selections.");
-      } else {
-        const sorted = sortTeams(filtered, sortKey);
-        setAllTeams(sorted);
-        setTopTeams(sorted.slice(0, 10));
-        setTopMessage("");
+        setBaseTeams([]);
+        setFilteredCount(0);
+        return;
       }
-    } else {
-      setTopTeams([]);
-      setAllTeams([]);
-      setBaseTeams([]);
-      setTopMessage("No valid teams found. Try lowering budget/max-per-team or adjusting bracket slots.");
+      const jobId = start?.job_id;
+      if (!jobId) {
+        setTopMessage("Failed to start Top 5 generation job.");
+        return;
+      }
+
+      let done = false;
+      const startedAtMs = Date.now();
+      while (!done) {
+        const status = await api.get(`/playoff/best-team/job/${jobId}`);
+        if (status?.detail) {
+          setTopMessage(String(status.detail));
+          return;
+        }
+        const processed = Number(status.processed_combinations || 0);
+        const total = Number(status.total_combinations || 0);
+        setProcessedCombos(processed);
+        setTotalCombos(total);
+        if (processed > 0 && total > processed) {
+          const elapsedSec = Math.max(0.001, (Date.now() - startedAtMs) / 1000);
+          const rate = processed / elapsedSec;
+          if (rate > 0) setTopEtaSeconds((total - processed) / rate);
+        } else if (total > 0 && processed >= total) {
+          setTopEtaSeconds(0);
+        }
+
+        if (status.status === "failed") {
+          setTopMessage(status.error || "Top 5 generation failed.");
+          setTopTeams([]);
+          setAllTeams([]);
+          setBaseTeams([]);
+          setFilteredCount(0);
+          return;
+        }
+        if (status.status === "completed") {
+          const data = status.result || {};
+          if (data.error) {
+            setTopMessage(data.error);
+            setTopTeams([]);
+            setAllTeams([]);
+            setBaseTeams([]);
+            setFilteredCount(0);
+          } else if (data.top_teams && data.top_teams.length > 0) {
+            const all = data.all_teams || [];
+            setBaseTeams(all);
+            applyTop5ViewFilters(all);
+            setTopMessage("");
+          } else {
+            setTopTeams([]);
+            setAllTeams([]);
+            setBaseTeams([]);
+            setFilteredCount(0);
+            setTopMessage("No valid teams found from stored playoff valuations.");
+          }
+          done = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+    } finally {
+      setBusy(false);
     }
-    setBusy(false);
   };
 
   const slotLabels = [
@@ -1290,94 +1515,375 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters }) {
     "QF4 - Bottom Right (bottom half)",
   ];
 
+  const resetStoredPlayoff = async () => {
+    await api.delete("/playoff/latest");
+    setLatestPayload(null);
+    setResults(null);
+    setUpdatedAt("");
+    setTopTeams(null);
+    setAllTeams(null);
+    setBaseTeams(null);
+    setFilteredCount(0);
+    setTopMessage("");
+  };
+
+  const modalMatches = useMemo(() => {
+    const q = filterSearch.trim().toLowerCase();
+    if (!q) return [];
+    return players
+      .filter((p) => String(p.name || "").toLowerCase().includes(q))
+      .slice(0, 25);
+  }, [players, filterSearch]);
+
+  useEffect(() => {
+    if (!baseTeams) return;
+    applyTop5ViewFilters(baseTeams);
+  }, [baseTeams, effectiveAppliedFilters, comboSearch, sortKey]);
+
+  const applyTop5ViewFilters = (teamsIn) => {
+    const base = Array.isArray(teamsIn) ? teamsIn : [];
+    let filtered = applyFilters(base, effectiveAppliedFilters.include, effectiveAppliedFilters.exclude);
+    const q = comboSearch.trim().toLowerCase();
+    if (q) {
+      filtered = filtered.filter((team) => {
+        if (String(team.cost ?? "").includes(q) || String(team.total_ev ?? "").includes(q)) return true;
+        return (team.players || []).some((p) => {
+          const name = String(p.name || "").toLowerCase();
+          const teamName = String(teamLookup[p.team_id] || "").toLowerCase();
+          return (
+            name.includes(q) ||
+            teamName.includes(q) ||
+            String(p.player_id).includes(q) ||
+            String(p.team_id).includes(q)
+          );
+        });
+      });
+    }
+    const sorted = sortTeams(filtered, sortKey);
+    setAllTeams(sorted);
+    setTopTeams(sorted.slice(0, 10));
+    setFilteredCount(sorted.length);
+    setPage(0);
+  };
+
+  const formatEta = (seconds) => {
+    if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return "-";
+    const s = Math.max(0, Math.round(seconds));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const r = s % 60;
+    if (h > 0) return `${h}h ${m}m ${r}s`;
+    if (m > 0) return `${m}m ${r}s`;
+    return `${r}s`;
+  };
+
   return (
     <Section title="Playoff Bracket (BO3)">
-      <div className="grid two">
-        {slots.map((val, idx) => (
+      <div className="stack">
+        <div className="grid three">
           <Select
-            key={idx}
-            label={slotLabels[idx]}
-            value={val}
-            onChange={(v) => setSlot(idx, v)}
-            options={[{ value: "", label: "Select team" }, ...teams.map((t) => ({ value: t.team_id, label: `${t.name} (${t.team_id})` }))]}
-          />
-        ))}
-      </div>
-      <div className="grid three">
-        <Input label="# Sims" value={sims} onChange={setSims} />
-        <div className="field">
-          <span>Include/Exclude</span>
-          <button className="secondary" onClick={() => setShowFilterModal(true)} disabled={slots.some((s) => !s)}>
-            Select Players
-          </button>
-          <p className="muted">
-            Include {includeSet.size} | Exclude {excludeSet.size}
-          </p>
-        </div>
-      </div>
-      <div className="grid two">
-        <Select
-          label="Sort by"
-          value={sortKey}
-          onChange={(v) => {
-            setSortKey(v);
-            if (allTeams) {
-              const sorted = sortTeams(allTeams, v);
-              setAllTeams(sorted);
-              setTopTeams(sorted.slice(0, 10));
-              setPage(0);
+            label="Event"
+            value={selectedEventId}
+            onChange={setSelectedEventId}
+            options={
+              events.length > 0
+                ? events.map((e) => ({ value: String(e.event_id), label: `Event ${e.event_id}` }))
+                : [{ value: "", label: "No events imported" }]
             }
-          }}
-          options={[
-            { value: "ev_desc", label: "EV desc" },
-            { value: "ev_asc", label: "EV asc" },
-            { value: "cost_asc", label: "Cost asc" },
-            { value: "cost_desc", label: "Cost desc" },
-            { value: "cpp_desc", label: "Value (EV/Cost) desc" },
-          ]}
-        />
+          />
+          <div className="field">
+            <span>Teams In Event</span>
+            <div className="pill">{filteredTeams.length}</div>
+          </div>
+          <div className="field">
+            <span>Stored Valuations</span>
+            <div className="pill">{results ? "Loaded" : "None"}</div>
+          </div>
+        </div>
+
+        <div className="tab-bar small">
+          <button className={playoffTab === "stage" ? "tab active" : "tab"} onClick={() => setPlayoffTab("stage")}>
+            Bracket Stage
+          </button>
+          <button className={playoffTab === "top5" ? "tab active" : "tab"} onClick={() => setPlayoffTab("top5")}>
+            Top 5 Teams
+          </button>
+        </div>
+
+        {playoffTab === "stage" && (
+          <>
+            <div className="grid two">
+              {slots.map((val, idx) => (
+                <Select
+                  key={idx}
+                  label={slotLabels[idx]}
+                  value={val}
+                  onChange={(v) => setSlot(idx, v)}
+                  options={[
+                    { value: "", label: "Select team" },
+                    ...filteredTeams.map((t) => ({ value: t.team_id, label: `${t.name} (${t.team_id})` })),
+                  ]}
+                />
+              ))}
+            </div>
+            <div className="actions">
+              <label className="checkbox-inline">
+                <input
+                  type="checkbox"
+                  checked={hasThirdPlaceDecider}
+                  onChange={(e) => setHasThirdPlaceDecider(e.target.checked)}
+                  disabled={busy}
+                />
+                <span>Third-place decider match</span>
+              </label>
+              <button className="primary" onClick={run} disabled={busy || slots.some((s) => !s)}>
+                {busy ? "Running..." : "Run Playoff And Store Valuations"}
+              </button>
+              <button className="danger" onClick={resetStoredPlayoff} disabled={busy || !results}>
+                Reset Stored Valuations
+              </button>
+              {updatedAt && <p className="muted">Stored: {new Date(updatedAt).toLocaleString()}</p>}
+            </div>
+          </>
+        )}
+
+        {playoffTab === "top5" && (
+          <>
+            {!results && (
+              <div className="card sub">
+                <p className="muted">Run Playoff Bracket in the Bracket Stage tab first.</p>
+              </div>
+            )}
+            {results && (
+              <>
+                <div className="actions">
+                  <button className="primary" onClick={findTopTeams} disabled={busy || !results}>
+                    {busy ? "Working..." : "Generate & Store Team Combos"}
+                  </button>
+                </div>
+                <div className="card sub">
+                  <h3>Top Teams (Filtered)</h3>
+                  <div className="top5-filters">
+                    <div className="grid two">
+                      <div className="field">
+                        <span>Included Players</span>
+                        <div className="chips">
+                          {Array.from(includeSet).length === 0 && <span className="muted">None</span>}
+                          {Array.from(includeSet).sort((a, b) => a - b).map((pid) => (
+                            <span key={`p-inc-${pid}`} className="chip active">
+                              {playerNameById[pid] || `Player ${pid}`}
+                              <button
+                                className="close"
+                                style={{ marginLeft: 8, padding: "2px 6px" }}
+                                onClick={() =>
+                                  setIncludeSet((prev) => {
+                                    const next = new Set(prev);
+                                    next.delete(pid);
+                                    return next;
+                                  })
+                                }
+                              >
+                                x
+                              </button>
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                      <div className="field">
+                        <span>Excluded Players</span>
+                        <div className="chips">
+                          {Array.from(excludeSet).length === 0 && <span className="muted">None</span>}
+                          {Array.from(excludeSet).sort((a, b) => a - b).map((pid) => (
+                            <span key={`p-exc-${pid}`} className="chip active">
+                              {playerNameById[pid] || `Player ${pid}`}
+                              <button
+                                className="close"
+                                style={{ marginLeft: 8, padding: "2px 6px" }}
+                                onClick={() =>
+                                  setExcludeSet((prev) => {
+                                    const next = new Set(prev);
+                                    next.delete(pid);
+                                    return next;
+                                  })
+                                }
+                              >
+                                x
+                              </button>
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="grid two">
+                      <div className="field">
+                        <span>Included Teams</span>
+                        <div className="chips">
+                          {Array.from(includeTeamSet).length === 0 && <span className="muted">None</span>}
+                          {Array.from(includeTeamSet).sort((a, b) => a - b).map((tid) => (
+                            <span key={`t-inc-${tid}`} className="chip active">
+                              {teamLookup[tid] || `Team ${tid}`}
+                              <button
+                                className="close"
+                                style={{ marginLeft: 8, padding: "2px 6px" }}
+                                onClick={() =>
+                                  setIncludeTeamSet((prev) => {
+                                    const next = new Set(prev);
+                                    next.delete(tid);
+                                    return next;
+                                  })
+                                }
+                              >
+                                x
+                              </button>
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                      <div className="field">
+                        <span>Excluded Teams</span>
+                        <div className="chips">
+                          {Array.from(excludeTeamSet).length === 0 && <span className="muted">None</span>}
+                          {Array.from(excludeTeamSet).sort((a, b) => a - b).map((tid) => (
+                            <span key={`t-exc-${tid}`} className="chip active">
+                              {teamLookup[tid] || `Team ${tid}`}
+                              <button
+                                className="close"
+                                style={{ marginLeft: 8, padding: "2px 6px" }}
+                                onClick={() =>
+                                  setExcludeTeamSet((prev) => {
+                                    const next = new Set(prev);
+                                    next.delete(tid);
+                                    return next;
+                                  })
+                                }
+                              >
+                                x
+                              </button>
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="field">
+                      <span>Bracket Teams</span>
+                      <div className="chips">
+                        {playoffTeamsForFilters.length === 0 && <span className="muted">Select playoff slots first.</span>}
+                        {playoffTeamsForFilters.map((t) => {
+                          const tid = Number(t.team_id);
+                          const isIncluded = includeTeamSet.has(tid);
+                          const isExcluded = excludeTeamSet.has(tid);
+                          return (
+                            <span key={`filter-team-${tid}`} className="chip" style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                              <span>{t.name} ({tid})</span>
+                              <button
+                                className={isIncluded ? "chip active" : "chip"}
+                                style={{ padding: "2px 8px" }}
+                                onClick={() => {
+                                  setIncludeTeamSet((prev) => {
+                                    const next = new Set(prev);
+                                    if (next.has(tid)) next.delete(tid);
+                                    else next.add(tid);
+                                    return next;
+                                  });
+                                  setExcludeTeamSet((prev) => {
+                                    const next = new Set(prev);
+                                    next.delete(tid);
+                                    return next;
+                                  });
+                                }}
+                              >
+                                {isIncluded ? "Included" : "Include"}
+                              </button>
+                              <button
+                                className={isExcluded ? "chip active" : "chip"}
+                                style={{ padding: "2px 8px" }}
+                                onClick={() => {
+                                  setExcludeTeamSet((prev) => {
+                                    const next = new Set(prev);
+                                    if (next.has(tid)) next.delete(tid);
+                                    else next.add(tid);
+                                    return next;
+                                  });
+                                  setIncludeTeamSet((prev) => {
+                                    const next = new Set(prev);
+                                    next.delete(tid);
+                                    return next;
+                                  });
+                                }}
+                              >
+                                {isExcluded ? "Excluded" : "Exclude"}
+                              </button>
+                            </span>
+                          );
+                        })}
+                      </div>
+                    </div>
+                    <div className="actions top5-filter-actions">
+                      <button className="secondary" onClick={() => setShowFilterModal(true)} disabled={!latestPayload}>
+                        Include/Exclude by Name
+                      </button>
+                      <button
+                        className="primary"
+                        onClick={() => {
+                          setAppliedIncludeSet(new Set(Array.from(includeSet)));
+                          setAppliedExcludeSet(new Set(Array.from(excludeSet)));
+                          setAppliedIncludeTeamSet(new Set(Array.from(includeTeamSet)));
+                          setAppliedExcludeTeamSet(new Set(Array.from(excludeTeamSet)));
+                        }}
+                        disabled={!latestPayload}
+                      >
+                        Apply Filters
+                      </button>
+                    </div>
+                    <div className="grid three top5-controls">
+                      <Input label="Search Combos" value={comboSearch} onChange={setComboSearch} placeholder="Player/team name or id" />
+                      <Select
+                        label="Sort by"
+                        value={sortKey}
+                        onChange={setSortKey}
+                        options={[
+                          { value: "ev_desc", label: "EV desc" },
+                          { value: "ev_asc", label: "EV asc" },
+                          { value: "cost_asc", label: "Cost asc" },
+                          { value: "cost_desc", label: "Cost desc" },
+                          { value: "cpp_desc", label: "Value (EV/Cost) desc" },
+                        ]}
+                      />
+                      <div className="field top5-counter">
+                        <span>Filtered / Stored</span>
+                        <p className="muted">{filteredCount} / {(baseTeams || []).length}</p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
+          </>
+        )}
       </div>
-      <div className="actions">
-        <button className="primary" onClick={run} disabled={busy || slots.some((s) => !s)}>
-          {busy ? "Running..." : "Run Playoff"}
-        </button>
-        <button className="primary" onClick={findTopTeams} disabled={busy || slots.some((s) => !s)}>
-          {busy ? "Working..." : "Find Best 5 Team"}
-        </button>
-      </div>
-      {busy && (
+      {playoffTab === "stage" && busy && (
         <div className="card sub">
-          <p className="muted">Simulating bracket and evaluating lineups...</p>
+          <p className="muted">
+            Calculated outcomes: {processedSims.toLocaleString()} / {totalSims.toLocaleString() || (hasThirdPlaceDecider ? 256 : 128)}
+          </p>
+          <p className="muted">ETA: {formatEta(etaSeconds)}</p>
           <div className="progress">
-            <div className="progress-bar" />
+            <div
+              className="progress-bar determinate"
+              style={{ width: `${totalSims > 0 ? Math.min(100, (processedSims / totalSims) * 100) : 0}%` }}
+            />
           </div>
         </div>
       )}
-      {results && (
+      {playoffTab === "stage" && runMessage && (
+        <div className="card sub">
+          <p className="muted">{runMessage}</p>
+        </div>
+      )}
+      {playoffTab === "stage" && results && (
         <div className="stack">
           <div className="card sub">
-            <h3>Quarterfinals</h3>
-            {results.bracket.quarters.map((m, i) => (
-              <p key={i}>
-                {teamLookup[m.teams[0]]} vs {teamLookup[m.teams[1]]} — Winner: {teamLookup[m.winner]}
-              </p>
-            ))}
-          </div>
-          <div className="card sub">
-            <h3>Semifinals</h3>
-            {results.bracket.semis.map((m, i) => (
-              <p key={i}>
-                {teamLookup[m.teams[0]]} vs {teamLookup[m.teams[1]]} — Winner: {teamLookup[m.winner]}
-              </p>
-            ))}
-          </div>
-          <div className="card sub">
-            <h3>Final</h3>
-            {results.bracket.final.map((m, i) => (
-              <p key={i}>
-                {teamLookup[m.teams[0]]} vs {teamLookup[m.teams[1]]} — Winner: {teamLookup[m.winner]}
-              </p>
-            ))}
+            <h3>Player Expected Values</h3>
           </div>
           <div className="grid two">
             {Object.entries(results.teams).map(([tid, data]) => (
@@ -1412,7 +1918,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters }) {
           </div>
         </div>
       )}
-      {topTeams && topTeams.length > 0 && (
+      {playoffTab === "top5" && topTeams && topTeams.length > 0 && (
         <div className="card sub">
           <h3>Top Teams</h3>
           {topTeams.map((team, idx) => (
@@ -1425,6 +1931,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters }) {
                   <tr>
                     <th>Player</th>
                     <th>Team</th>
+                    <th>Assigned Role</th>
                     <th>Cost</th>
                     <th>Total EV</th>
                     <th>Rating</th>
@@ -1438,6 +1945,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters }) {
                     <tr key={p.player_id}>
                       <td>{p.name}</td>
                       <td>{teamLookup[p.team_id] || p.team_id}</td>
+                      <td>{roleLabel(p.role_name)}</td>
                       <td>{p.price}</td>
                       <td>{p.total_ev.toFixed(2)}</td>
                       <td>{p.rating_ev.toFixed(2)}</td>
@@ -1452,9 +1960,9 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters }) {
           ))}
         </div>
       )}
-      {allTeams && allTeams.length > 0 && (
+      {playoffTab === "top5" && allTeams && allTeams.length > 0 && (
         <div className="card sub">
-          <h3>All Teams ({allTeams.length})</h3>
+          <h3>All Filtered Teams ({filteredCount})</h3>
           <div className="actions">
             <button className="secondary" onClick={() => setPage((p) => Math.max(0, p - 1))} disabled={page === 0}>
               Prev 200
@@ -1467,7 +1975,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters }) {
               Next 200
             </button>
             <p className="muted">
-              Page {page + 1} showing {Math.min(200, allTeams.length - page * 200)} of {allTeams.length}
+              Page {page + 1} showing {Math.min(200, Math.max(0, filteredCount - page * 200))} of {filteredCount}
             </p>
           </div>
           <table>
@@ -1485,14 +1993,33 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters }) {
                   <td>{idx + 1 + page * 200}</td>
                   <td>{team.total_ev.toFixed(2)}</td>
                   <td>{team.cost}</td>
-                  <td>{team.players.map((p) => `${p.name} (${teamLookup[p.team_id] || p.team_id})`).join(", ")}</td>
+                  <td>{team.players.map((p) => `${p.name} (${teamLookup[p.team_id] || p.team_id}, ${roleLabel(p.role_name)})`).join(", ")}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
       )}
-      {topMessage && (
+      {playoffTab === "top5" && busy && totalCombos > 0 && (
+        <div className="card sub">
+          <p className="muted">
+            Processing combinations: {processedCombos.toLocaleString()} / {totalCombos.toLocaleString()}
+          </p>
+          <p className="muted">ETA: {formatEta(topEtaSeconds)}</p>
+          <div className="progress">
+            <div
+              className="progress-bar determinate"
+              style={{ width: `${totalCombos > 0 ? Math.min(100, (processedCombos / totalCombos) * 100) : 0}%` }}
+            />
+          </div>
+        </div>
+      )}
+      {playoffTab === "top5" && baseTeams && filteredCount === 0 && (
+        <div className="card sub">
+          <p className="muted">No team combinations match current include/exclude/search filters.</p>
+        </div>
+      )}
+      {playoffTab === "top5" && topMessage && (
         <div className="card sub">
           <p className="muted">{topMessage}</p>
         </div>
@@ -1508,58 +2035,79 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters }) {
               </button>
             </header>
             <div className="modal-body">
-              <p className="muted">Choose from teams in the current bracket slots.</p>
-              <div className="grid two">
-                {slots
-                  .map((s) => Number(s))
-                  .filter(Boolean)
-                  .map((tid) => {
-                    const team = teams.find((t) => t.team_id === tid);
-                    const roster = [team?.player1_id, team?.player2_id, team?.player3_id, team?.player4_id, team?.player5_id].filter(Boolean);
-                    return (
-                      <div key={tid} className="card sub">
-                        <h4>{teamLookup[tid] || `Team ${tid}`}</h4>
-                        {roster.map((pid) => (
-                          <div key={pid} className="field" style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                            <div style={{ flex: 1 }}>
-                              {playerLookup[pid] || pid} <span className="muted">({pid})</span>
-                            </div>
-                            <label>
-                              <input
-                                type="checkbox"
-                                checked={includeSet.has(pid)}
-                                onChange={(e) => {
-                                  setIncludeSet((prev) => {
-                                    const next = new Set(prev);
-                                    if (e.target.checked) next.add(pid);
-                                    else next.delete(pid);
-                                    return next;
-                                  });
-                                }}
-                              />{" "}
-                              Include
-                            </label>
-                            <label>
-                              <input
-                                type="checkbox"
-                                checked={excludeSet.has(pid)}
-                                onChange={(e) => {
-                                  setExcludeSet((prev) => {
-                                    const next = new Set(prev);
-                                    if (e.target.checked) next.add(pid);
-                                    else next.delete(pid);
-                                    return next;
-                                  });
-                                }}
-                              />{" "}
-                              Exclude
-                            </label>
-                          </div>
-                        ))}
-                      </div>
-                    );
-                  })}
-              </div>
+              <Input
+                label="Search player name"
+                value={filterSearch}
+                onChange={setFilterSearch}
+                placeholder="Type e.g. zy to find ZywOo"
+              />
+              {filterSearch.trim().length === 0 && <p className="muted">Start typing a player name.</p>}
+              {filterSearch.trim().length > 0 && modalMatches.length === 0 && <p className="muted">No matching players.</p>}
+              {modalMatches.length > 0 && (
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Player</th>
+                      <th>ID</th>
+                      <th>Include</th>
+                      <th>Exclude</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {modalMatches.map((p) => {
+                      const pid = Number(p.player_id);
+                      const isIncluded = includeSet.has(pid);
+                      const isExcluded = excludeSet.has(pid);
+                      return (
+                        <tr key={pid}>
+                          <td>{p.name}</td>
+                          <td>{pid}</td>
+                          <td>
+                            <button
+                              className={isIncluded ? "chip active" : "chip"}
+                              onClick={() => {
+                                setIncludeSet((prev) => {
+                                  const next = new Set(prev);
+                                  if (next.has(pid)) next.delete(pid);
+                                  else next.add(pid);
+                                  return next;
+                                });
+                                setExcludeSet((prev) => {
+                                  const next = new Set(prev);
+                                  next.delete(pid);
+                                  return next;
+                                });
+                              }}
+                            >
+                              {isIncluded ? "Included" : "Include"}
+                            </button>
+                          </td>
+                          <td>
+                            <button
+                              className={isExcluded ? "chip active" : "chip"}
+                              onClick={() => {
+                                setExcludeSet((prev) => {
+                                  const next = new Set(prev);
+                                  if (next.has(pid)) next.delete(pid);
+                                  else next.add(pid);
+                                  return next;
+                                });
+                                setIncludeSet((prev) => {
+                                  const next = new Set(prev);
+                                  next.delete(pid);
+                                  return next;
+                                });
+                              }}
+                            >
+                              {isExcluded ? "Excluded" : "Exclude"}
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )}
             </div>
             <div className="actions">
               <button className="primary" onClick={() => setShowFilterModal(false)}>
@@ -1570,6 +2118,328 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters }) {
         </div>
       )}
     </Section>
+  );
+}
+
+function EventsTab({ refreshData, notify, players }) {
+  const [eventId, setEventId] = useState("");
+  const [events, setEvents] = useState([]);
+  const [activeEventId, setActiveEventId] = useState(null);
+  const [selectedEventId, setSelectedEventId] = useState(null);
+  const [selectedEvent, setSelectedEvent] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+
+  const playerById = useMemo(() => {
+    const out = {};
+    (players || []).forEach((p) => {
+      out[p.player_id] = p;
+    });
+    return out;
+  }, [players]);
+
+  const hasJsonEntries = (raw) => {
+    if (!raw) return false;
+    try {
+      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (Array.isArray(parsed)) return parsed.length > 0;
+      if (parsed && typeof parsed === "object") return Object.keys(parsed).length > 0;
+      return false;
+    } catch {
+      return false;
+    }
+  };
+
+  const hasTopTierRatings = (player) => {
+    if (!player) return false;
+    const tiers = [5, 10, 20, 30, 50];
+    return tiers.every((tier) => {
+      const rating = Number(player[`rating_top${tier}`]);
+      const maps = Number(player[`maps_top${tier}`]);
+      return Number.isFinite(rating) && Number.isFinite(maps) && maps > 0;
+    });
+  };
+
+  const isPlayerComplete = (playerId) => {
+    const p = playerById[Number(playerId)];
+    if (!p) return false;
+    const hasCore = typeof p.name === "string" && p.name.trim().length > 0 && Number.isFinite(Number(p.rating));
+    const hasRolesAndBoosters = hasJsonEntries(p.boosters_json) && hasJsonEntries(p.roles_json);
+    return hasCore && hasRolesAndBoosters && hasTopTierRatings(p);
+  };
+
+  const loadEvents = async () => {
+    const res = await api.get("/events/");
+    if (res?.detail) {
+      setMessage(String(res.detail));
+      return;
+    }
+    setEvents(res.events || []);
+    setActiveEventId(res.active_event_id ?? null);
+    if (!selectedEventId && Array.isArray(res.events) && res.events.length > 0) {
+      setSelectedEventId(res.events[0].event_id);
+    }
+  };
+
+  const loadEventDetail = async (targetEventId) => {
+    if (!targetEventId) {
+      setSelectedEvent(null);
+      return;
+    }
+    const detail = await api.get(`/events/${targetEventId}`);
+    if (detail?.detail) {
+      setMessage(String(detail.detail));
+      return;
+    }
+    setSelectedEvent(detail);
+  };
+
+  useEffect(() => {
+    loadEvents();
+  }, []);
+
+  useEffect(() => {
+    if (!selectedEventId) return;
+    loadEventDetail(selectedEventId);
+  }, [selectedEventId]);
+
+  const importEvent = async () => {
+    if (!eventId.trim()) {
+      setMessage("Enter an event id first.");
+      return;
+    }
+    setBusy(true);
+    setMessage("");
+    try {
+      const res = await api.post("/events/import-hltv-event", { event_id: eventId.trim() });
+      if (res?.detail) {
+        setMessage(String(res.detail));
+        return;
+      }
+      setActiveEventId(res.active_event_id ?? Number(eventId.trim()));
+      setSelectedEventId(Number(res.event_id));
+      setEventId("");
+      setMessage(`Imported event ${res.event_id}: players ${res.imported_players ?? 0}, teams ${res.imported_teams ?? 0}.`);
+      notify("Event imported");
+      await loadEvents();
+      await loadEventDetail(Number(res.event_id));
+      await refreshData();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const refreshAll = async () => {
+    setBusy(true);
+    setMessage("");
+    try {
+      await loadEvents();
+      if (selectedEventId) {
+        await loadEventDetail(selectedEventId);
+      }
+      await refreshData();
+      notify("Refreshed events and player data");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const fetchTopRatingsForEventPlayers = async () => {
+    const ids = Array.from(
+      new Set(
+        (selectedEvent?.players || [])
+          .map((p) => Number(p.player_id))
+          .filter((x) => Number.isFinite(x) && x > 0)
+      )
+    );
+    if (ids.length === 0) {
+      setMessage("No players found in selected event.");
+      return;
+    }
+
+    setBusy(true);
+    setMessage("");
+    try {
+      const res = await api.post("/players/fetch-top-ratings-batch", {
+        player_ids: ids,
+        headless: true,
+        min_delay_seconds: 10,
+        max_delay_seconds: 18,
+        retries: 2,
+        retry_backoff_seconds: 25,
+      });
+      if (res?.detail) {
+        setMessage(String(res.detail));
+        return;
+      }
+
+      const ok = Number(res.ok || 0);
+      const failed = Number(res.failed || 0);
+      setMessage(`Top-X batch complete for event ${selectedEvent?.event_id}: ${ok} succeeded, ${failed} failed.`);
+      notify(`Top-X batch done: ${ok} ok, ${failed} failed`);
+
+      await refreshData();
+      if (selectedEventId) {
+        await loadEventDetail(selectedEventId);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const activateEvent = async (targetEventId) => {
+    setBusy(true);
+    setMessage("");
+    try {
+      const res = await api.post("/events/activate", { event_id: Number(targetEventId) });
+      if (res?.detail) {
+        setMessage(String(res.detail));
+        return;
+      }
+      setActiveEventId(res.active_event_id);
+      notify(`Active event set to ${res.active_event_id}`);
+      await refreshData();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const groupedPlayers = useMemo(() => {
+    const byTeam = {};
+    (selectedEvent?.players || []).forEach((p) => {
+      const teamName = p.team_name || "Unknown Team";
+      if (!byTeam[teamName]) byTeam[teamName] = [];
+      byTeam[teamName].push(p);
+    });
+    return byTeam;
+  }, [selectedEvent]);
+
+  return (
+    <div className="stack">
+      <Section title="Events">
+        <div className="stack">
+          <p className="muted">
+            Import an HLTV event id to store event teams and event-specific player prices. The active event price is used across simulations.
+          </p>
+          <div className="grid three">
+            <Input label="Event ID" value={eventId} onChange={setEventId} placeholder="e.g. 12345" />
+            <div className="field">
+              <span>Import</span>
+              <button className="primary" onClick={importEvent} disabled={busy}>
+                {busy ? "Working..." : "Import Event"}
+              </button>
+            </div>
+            <div className="field">
+              <span>Active Event</span>
+              <div className="pill">{activeEventId ? `Event ${activeEventId}` : "None"}</div>
+            </div>
+          </div>
+          <div className="actions" style={{ marginTop: 0 }}>
+            <button className="secondary" onClick={refreshAll} disabled={busy}>
+              {busy ? "Working..." : "Refresh All"}
+            </button>
+            <button
+              className="primary"
+              onClick={fetchTopRatingsForEventPlayers}
+              disabled={busy || !selectedEvent || (selectedEvent?.players || []).length === 0}
+            >
+              {busy ? "Working..." : "Fetch Top X For Event Players"}
+            </button>
+          </div>
+
+          {events.length > 0 && (
+            <div className="card sub">
+              <h4>Imported Events</h4>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Event</th>
+                    <th>Imported</th>
+                    <th>Teams</th>
+                    <th>Players</th>
+                    <th>Price Range</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {events.map((ev) => (
+                    <tr key={ev.event_id} className={selectedEventId === ev.event_id ? "row-active" : ""}>
+                      <td>{ev.event_id}</td>
+                      <td>{ev.imported_at ? new Date(ev.imported_at).toLocaleString() : "-"}</td>
+                      <td>{ev.team_count ?? 0}</td>
+                      <td>{ev.player_count ?? 0}</td>
+                      <td>
+                        {ev.min_price ?? "-"} - {ev.max_price ?? "-"}
+                      </td>
+                      <td>
+                        <div className="actions" style={{ marginTop: 0 }}>
+                          <button
+                            className="secondary"
+                            onClick={() => setSelectedEventId(ev.event_id)}
+                            disabled={busy}
+                          >
+                            View
+                          </button>
+                          <button
+                            className={activeEventId === ev.event_id ? "primary" : "secondary"}
+                            onClick={() => activateEvent(ev.event_id)}
+                            disabled={busy || activeEventId === ev.event_id}
+                          >
+                            {activeEventId === ev.event_id ? "Active" : "Set Active"}
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {selectedEvent && (
+            <div className="card sub">
+              <h4>Event {selectedEvent.event_id} Teams & Prices</h4>
+              <div className="grid two">
+                {Object.entries(groupedPlayers).map(([teamName, teamPlayers]) => (
+                  <div key={teamName} className="card sub">
+                    <h4>{teamName}</h4>
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Status</th>
+                          <th>Player</th>
+                          <th>ID</th>
+                          <th>Price</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {teamPlayers.map((p) => {
+                          const complete = isPlayerComplete(p.player_id);
+                          return (
+                          <tr key={`${teamName}-${p.player_id}`}>
+                            <td className="status-cell">
+                              <span
+                                className={`status-dot ${complete ? "ok" : "missing"}`}
+                                title={complete ? "All player data present" : "Missing player data"}
+                              />
+                            </td>
+                            <td>{p.player_name || `Player ${p.player_id}`}</td>
+                            <td>{p.player_id}</td>
+                            <td>{p.price}</td>
+                          </tr>
+                        )})}
+                      </tbody>
+                    </table>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {message && <p className="muted">{message}</p>}
+        </div>
+      </Section>
+    </div>
   );
 }
 
@@ -1673,6 +2543,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
 
   const [boosterForm, setBoosterForm] = useState({});
   const [roleForm, setRoleForm] = useState({});
+  const [topFetchBusyByPlayer, setTopFetchBusyByPlayer] = useState({});
 
   useEffect(() => {
     if (selectedPlayer) {
@@ -1895,6 +2766,23 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
     setShowTeamModal(true);
   };
 
+  const fetchTopRatingsForPlayer = async (playerId, playerName) => {
+    setTopFetchBusyByPlayer((prev) => ({ ...prev, [playerId]: true }));
+    try {
+      const res = await api.post(`/players/${playerId}/fetch-top-ratings`, {});
+      if (res?.detail) {
+        notify(`Top X fetch failed for ${playerName || `player ${playerId}`}: ${res.detail}`);
+        return;
+      }
+      await refresh();
+      notify(`Top X ratings fetched for ${playerName || `player ${playerId}`}`);
+    } catch (e) {
+      notify(`Top X fetch failed for ${playerName || `player ${playerId}`}`);
+    } finally {
+      setTopFetchBusyByPlayer((prev) => ({ ...prev, [playerId]: false }));
+    }
+  };
+
   const hasJsonEntries = (raw) => {
     if (!raw) return false;
     try {
@@ -1951,8 +2839,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
           return toNum(a.price) - toNum(b.price);
         case "team_asc":
           return ((playerTeamLookup[a.player_id] || [])[0] || "").localeCompare(((playerTeamLookup[b.player_id] || [])[0] || ""));
-        case "topx_desc":
-          return Number(hasTopXRatings(b)) - Number(hasTopXRatings(a));
         case "boost_desc":
           return Number(hasBoostersAndRoles(b)) - Number(hasBoostersAndRoles(a));
         case "name_asc":
@@ -2039,7 +2925,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
                   { value: "price_desc", label: "Price high-low" },
                   { value: "price_asc", label: "Price low-high" },
                   { value: "team_asc", label: "Team A-Z" },
-                  { value: "topx_desc", label: "Top X imported first" },
                   { value: "boost_desc", label: "Boost/Role imported first" },
                 ]}
               />
@@ -2059,8 +2944,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
                 <col style={{ width: "18%" }} />
                 <col style={{ width: "14%" }} />
                 <col style={{ width: "14%" }} />
-                <col style={{ width: "10%" }} />
-                <col style={{ width: "12%" }} />
+                <col style={{ width: "22%" }} />
               </colgroup>
               <thead>
                 <tr>
@@ -2069,7 +2953,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
                   <th>Team</th>
                   <th>Rating</th>
                   <th>Price</th>
-                  <th>Top X</th>
                   <th title="Boosters and Roles imported">Boost/Role</th>
                 </tr>
               </thead>
@@ -2088,12 +2971,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
                     <td>{(playerTeamLookup[p.player_id] || []).join(", ") || "-"}</td>
                     <td>{Number(p.rating || 0).toFixed(2)}</td>
                     <td>{p.price}</td>
-                    <td className="status-cell">
-                      <span
-                        className={hasTopXRatings(p) ? "status-dot ok" : "status-dot missing"}
-                        title={hasTopXRatings(p) ? "Top X ratings imported" : "Top X ratings missing"}
-                      />
-                    </td>
                     <td className="status-cell">
                       <span
                         className={hasBoostersAndRoles(p) ? "status-dot ok" : "status-dot missing"}
@@ -2193,17 +3070,35 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
                 </button>
               </div>
               {playerTab === "info" && (
-                <div className="grid three">
-                  <Input label="Rating Top5" value={playerForm.rating_top5} onChange={(v) => setPlayerForm((p) => ({ ...p, rating_top5: v }))} />
-                  <Input label="Maps Top5" value={playerForm.maps_top5} onChange={(v) => setPlayerForm((p) => ({ ...p, maps_top5: v }))} />
-                  <Input label="Rating Top10" value={playerForm.rating_top10} onChange={(v) => setPlayerForm((p) => ({ ...p, rating_top10: v }))} />
-                  <Input label="Maps Top10" value={playerForm.maps_top10} onChange={(v) => setPlayerForm((p) => ({ ...p, maps_top10: v }))} />
-                  <Input label="Rating Top20" value={playerForm.rating_top20} onChange={(v) => setPlayerForm((p) => ({ ...p, rating_top20: v }))} />
-                  <Input label="Maps Top20" value={playerForm.maps_top20} onChange={(v) => setPlayerForm((p) => ({ ...p, maps_top20: v }))} />
-                  <Input label="Rating Top30" value={playerForm.rating_top30} onChange={(v) => setPlayerForm((p) => ({ ...p, rating_top30: v }))} />
-                  <Input label="Maps Top30" value={playerForm.maps_top30} onChange={(v) => setPlayerForm((p) => ({ ...p, maps_top30: v }))} />
-                  <Input label="Rating Top50" value={playerForm.rating_top50} onChange={(v) => setPlayerForm((p) => ({ ...p, rating_top50: v }))} />
-                  <Input label="Maps Top50" value={playerForm.maps_top50} onChange={(v) => setPlayerForm((p) => ({ ...p, maps_top50: v }))} />
+                <div className="stack">
+                  <div className="actions" style={{ marginTop: 0 }}>
+                    <button
+                      className="primary"
+                      onClick={() => fetchTopRatingsForPlayer(Number(playerForm.player_id), playerForm.name)}
+                      disabled={!playerForm.player_id || Boolean(topFetchBusyByPlayer[Number(playerForm.player_id)])}
+                    >
+                      {topFetchBusyByPlayer[Number(playerForm.player_id)] ? "Fetching..." : "Fetch Top X"}
+                    </button>
+                    <span className="muted" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span
+                        className={hasTopXRatings(playerForm) ? "status-dot ok" : "status-dot missing"}
+                        title={hasTopXRatings(playerForm) ? "Top X ratings imported" : "Top X ratings missing"}
+                      />
+                      {hasTopXRatings(playerForm) ? "Top X ratings imported" : "Top X ratings missing"}
+                    </span>
+                  </div>
+                  <div className="grid three">
+                    <Input label="Rating Top5" value={playerForm.rating_top5} onChange={(v) => setPlayerForm((p) => ({ ...p, rating_top5: v }))} />
+                    <Input label="Maps Top5" value={playerForm.maps_top5} onChange={(v) => setPlayerForm((p) => ({ ...p, maps_top5: v }))} />
+                    <Input label="Rating Top10" value={playerForm.rating_top10} onChange={(v) => setPlayerForm((p) => ({ ...p, rating_top10: v }))} />
+                    <Input label="Maps Top10" value={playerForm.maps_top10} onChange={(v) => setPlayerForm((p) => ({ ...p, maps_top10: v }))} />
+                    <Input label="Rating Top20" value={playerForm.rating_top20} onChange={(v) => setPlayerForm((p) => ({ ...p, rating_top20: v }))} />
+                    <Input label="Maps Top20" value={playerForm.maps_top20} onChange={(v) => setPlayerForm((p) => ({ ...p, maps_top20: v }))} />
+                    <Input label="Rating Top30" value={playerForm.rating_top30} onChange={(v) => setPlayerForm((p) => ({ ...p, rating_top30: v }))} />
+                    <Input label="Maps Top30" value={playerForm.maps_top30} onChange={(v) => setPlayerForm((p) => ({ ...p, maps_top30: v }))} />
+                    <Input label="Rating Top50" value={playerForm.rating_top50} onChange={(v) => setPlayerForm((p) => ({ ...p, rating_top50: v }))} />
+                    <Input label="Maps Top50" value={playerForm.maps_top50} onChange={(v) => setPlayerForm((p) => ({ ...p, maps_top50: v }))} />
+                  </div>
                 </div>
               )}
               {playerTab === "boosters" && (
@@ -2396,10 +3291,8 @@ function AdminTab({ refresh, notify, teams, players }) {
   const [dataTab, setDataTab] = useState("trigger");
   const [triggerJson, setTriggerJson] = useState("");
   const [triggerUpdatedPlayers, setTriggerUpdatedPlayers] = useState([]);
-  const [eventId, setEventId] = useState("");
   const [importResult, setImportResult] = useState("");
   const [importBusy, setImportBusy] = useState(false);
-  const [eventBusy, setEventBusy] = useState(false);
   const [wipeBusy, setWipeBusy] = useState(false);
   const [selectedTopTeamIds, setSelectedTopTeamIds] = useState([]);
   const [topTeamIndex, setTopTeamIndex] = useState(0);
@@ -2446,24 +3339,6 @@ function AdminTab({ refresh, notify, teams, players }) {
       refresh();
     } finally {
       setImportBusy(false);
-    }
-  };
-
-  const importByEvent = async () => {
-    if (!eventId.trim()) {
-      setImportResult("Enter an event id first.");
-      return;
-    }
-    setEventBusy(true);
-    setImportResult("");
-    try {
-      const res = await api.post("/admin/import-hltv-event", { event_id: eventId.trim() });
-      const msg = `Imported players: ${res.imported_players ?? 0}, teams: ${res.imported_teams ?? 0}`;
-      setImportResult(msg);
-      notify("Fantasy import complete");
-      refresh();
-    } finally {
-      setEventBusy(false);
     }
   };
 
@@ -2568,9 +3443,6 @@ function AdminTab({ refresh, notify, teams, players }) {
           <button className={dataTab === "trigger" ? "tab active" : "tab"} onClick={() => setDataTab("trigger")}>
             Trigger Rates
           </button>
-          <button className={dataTab === "event" ? "tab active" : "tab"} onClick={() => setDataTab("event")}>
-            HLTV Event
-          </button>
           <button className={dataTab === "top" ? "tab active" : "tab"} onClick={() => setDataTab("top")}>
             Top Ratings
           </button>
@@ -2611,17 +3483,6 @@ function AdminTab({ refresh, notify, teams, players }) {
                 </ul>
               </div>
             )}
-          </div>
-        )}
-
-        {dataTab === "event" && (
-          <div className="stack">
-            <Input label="HLTV Event ID" value={eventId} onChange={setEventId} placeholder="e.g. 12345" />
-            <div className="actions">
-              <button className="primary" onClick={importByEvent} disabled={eventBusy}>
-                {eventBusy ? "Importing..." : "Import by Event ID"}
-              </button>
-            </div>
           </div>
         )}
 
@@ -2913,11 +3774,16 @@ function BoosterCalculatorTab() {
 
 function SwissTab({ teams, teamLookup }) {
   const [swissTab, setSwissTab] = useState("group");
+  const [events, setEvents] = useState([]);
+  const [selectedEventId, setSelectedEventId] = useState("");
+  const [eventTeamNames, setEventTeamNames] = useState(new Set());
   const [selectedTeamIds, setSelectedTeamIds] = useState([]);
   const [boMode, setBoMode] = useState("elim_qual");
   const [simCount, setSimCount] = useState("200");
   const [simResults, setSimResults] = useState(null);
   const [simUpdatedAt, setSimUpdatedAt] = useState("");
+
+  const normalizeTeamName = (name) => String(name || "").trim().toLowerCase();
 
   const loadStoredSimulation = async () => {
     const data = await api.get("/simulate/latest");
@@ -2930,9 +3796,59 @@ function SwissTab({ teams, teamLookup }) {
     setSimUpdatedAt(data.updated_at || "");
   };
 
+  const loadEventsForSwiss = async () => {
+    const data = await api.get("/events/");
+    if (data?.detail) return;
+
+    const allEvents = Array.isArray(data.events) ? data.events : [];
+    setEvents(allEvents);
+
+    const active = data.active_event_id;
+    const fallback = allEvents.length > 0 ? allEvents[0].event_id : "";
+    const nextSelected = active ?? fallback;
+    setSelectedEventId(nextSelected === "" ? "" : String(nextSelected));
+  };
+
+  const loadEventTeams = async (eventId) => {
+    if (!eventId) {
+      setEventTeamNames(new Set());
+      return;
+    }
+    const data = await api.get(`/events/${eventId}`);
+    if (data?.detail) return;
+
+    const names = new Set(
+      (data.teams || []).map((t) => normalizeTeamName(t.team_name))
+    );
+    setEventTeamNames(names);
+  };
+
   useEffect(() => {
     loadStoredSimulation();
+    loadEventsForSwiss();
   }, []);
+
+  useEffect(() => {
+    loadEventTeams(selectedEventId);
+  }, [selectedEventId]);
+
+  const filteredTeams = useMemo(() => {
+    if (!selectedEventId) return [];
+    if (!eventTeamNames || eventTeamNames.size === 0) return [];
+    return teams.filter((t) => eventTeamNames.has(normalizeTeamName(t.name)));
+  }, [teams, selectedEventId, eventTeamNames]);
+
+  useEffect(() => {
+    const allowed = new Set(filteredTeams.map((t) => t.team_id));
+    setSelectedTeamIds((prev) => prev.filter((id) => allowed.has(id)));
+
+    const resultTeamIds = Object.keys(simResults || {}).map((k) => Number(k));
+    const hasOutOfEventResults = resultTeamIds.some((id) => !allowed.has(id));
+    if (hasOutOfEventResults) {
+      setSimResults(null);
+      setSimUpdatedAt("");
+    }
+  }, [filteredTeams]);
 
   const resetStoredSimulation = async () => {
     await api.delete("/simulate/latest");
@@ -2945,6 +3861,32 @@ function SwissTab({ teams, teamLookup }) {
 
   return (
     <div className="stack">
+      <Section title="Swiss Event">
+        <div className="grid three">
+          <Select
+            label="Event"
+            value={selectedEventId}
+            onChange={setSelectedEventId}
+            options={
+              events.length > 0
+                ? events.map((e) => ({ value: String(e.event_id), label: `Event ${e.event_id}` }))
+                : [{ value: "", label: "No events imported" }]
+            }
+          />
+          <div className="field">
+            <span>Teams In Event</span>
+            <div className="pill">{filteredTeams.length}</div>
+          </div>
+          <div className="field">
+            <span>Selection</span>
+            <div className="pill">{selectedTeamIds.length} selected</div>
+          </div>
+        </div>
+        {events.length === 0 && (
+          <p className="muted">Import an event in the Events tab first.</p>
+        )}
+      </Section>
+
       <div className="tab-bar small">
         <button className={swissTab === "group" ? "tab active" : "tab"} onClick={() => setSwissTab("group")}>
           Group Stage
@@ -2955,13 +3897,10 @@ function SwissTab({ teams, teamLookup }) {
         <button className={swissTab === "single" ? "tab active" : "tab"} onClick={() => setSwissTab("single")}>
           Bracket Simulator
         </button>
-        <button className={swissTab === "booster" ? "tab active" : "tab"} onClick={() => setSwissTab("booster")}>
-          Booster Calculator
-        </button>
       </div>
       {swissTab === "group" && (
         <GroupStageTab
-          teams={teams}
+          teams={filteredTeams}
           teamLookup={teamLookup}
           selected={selectedTeamIds}
           setSelected={setSelectedTeamIds}
@@ -2981,8 +3920,7 @@ function SwissTab({ teams, teamLookup }) {
       {swissTab === "top5" && (
         <TopTeamsTab teamLookup={teamLookup} selected={selectedTeamIds} bo={boMode} sims={simCount} results={simResults} />
       )}
-      {swissTab === "single" && <BracketTab teams={teams} teamLookup={teamLookup} />}
-      {swissTab === "booster" && <BoosterCalculatorTab />}
+      {swissTab === "single" && <BracketTab teams={filteredTeams} teamLookup={teamLookup} />}
     </div>
   );
 }
@@ -3072,6 +4010,7 @@ export default function App() {
 
   const contentMap = {
     view: <DatabaseTab players={players} teams={teams} loading={loading} error={error} refresh={load} notify={notify} />,
+    events: <EventsTab refreshData={load} notify={notify} players={players} />,
     sim: <SwissTab teams={teams} teamLookup={teamLookup} />,
     playoff: <PlayoffTab teams={teams} teamLookup={teamLookup} players={players} sortTeams={sortTeams} applyFilters={applyFilters} />,
     admin: <AdminTab refresh={load} notify={notify} teams={teams} players={players} />,

@@ -6,6 +6,22 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Definition
 Set-Location $root
 
+# Ensure no stale backend is already bound to 127.0.0.1:8000
+try {
+    $listeners = netstat -ano | Select-String "127.0.0.1:8000" | Where-Object { $_.Line -match "LISTENING" }
+    foreach ($line in $listeners) {
+        $parts = ($line -replace "\s+", " ").Trim().Split(" ")
+        if ($parts.Length -ge 5) {
+            $pid = [int]$parts[-1]
+            if ($pid -gt 0) {
+                Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+} catch {
+    # Non-fatal: continue startup even if netstat parsing fails
+}
+
 # 1) Python venv + backend deps
 $venvPath = Join-Path $root ".venv"
 if (-not (Test-Path $venvPath)) {
