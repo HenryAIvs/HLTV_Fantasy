@@ -7,11 +7,12 @@ from typing import Any, Dict, List, Optional
 import requests
 from fastapi import APIRouter, HTTPException
 
-from db_admin import wipe_database
-from event_db import set_active_event, upsert_event_snapshot
-from player_db import add_or_update_player
-from team_db import add_or_update_team, get_team_by_name
-from team_strength import PARAMS_PATH
+from backend.data.db_admin import wipe_database
+from backend.data.event_db import set_active_event, upsert_event_snapshot
+from backend.data.player_db import add_or_update_player, get_player
+from backend.data.team_db import add_or_update_team, get_team_by_name
+from backend.services.rating_picker import pick_match_rating
+from backend.services.team_strength import PARAMS_PATH
 from swiss_stage.fantasy_scoring import (
     compute_rating_points,
     compute_role_points,
@@ -60,7 +61,6 @@ def _import_money_draft_data(money: Dict[str, Any], event_id: Optional[int] = No
             pid = pid_obj.get("playerId")
             name = p_data.get("name", "").strip()
             cost = entry.get("cost", 0)
-            rating = float(p_data.get("stats", {}).get("rating", 1.0))
 
             if pid is None or not name:
                 continue
@@ -72,7 +72,9 @@ def _import_money_draft_data(money: Dict[str, Any], event_id: Optional[int] = No
             add_or_update_player(
                 player_id=pid,
                 name=name,
-                rating=rating,
+                # Do not import overall rating from event JSON.
+                # Overall rating is sourced from player stats page fetch (Top-X flow).
+                rating=None,
                 price=int(cost),
                 best_role="",
                 major_win_pct=0.0,
@@ -90,7 +92,9 @@ def _import_money_draft_data(money: Dict[str, Any], event_id: Optional[int] = No
         add_or_update_team(
             name=team_name,
             hltv_rank=hltv_rank,
+            hltv_points=int((existing_team or {}).get("hltv_points") or 0),
             vrs_rank=vrs_rank,
+            vrs_points=int((existing_team or {}).get("vrs_points") or 0),
             win_rate=win_rate,
             player_ids=ids,
         )
@@ -198,7 +202,7 @@ def import_trigger_rates(payload: Dict[str, Any]):
         role_map_raw = entry.get("roleIdToTriggerRate", {}) or {}
 
         # Preserve existing core info so NOT NULL cols are satisfied
-        from player_db import get_player  # local import to avoid circular
+        from backend.data.player_db import get_player  # local import to avoid circular
 
         existing = get_player(int(pid))
         name = (existing or {}).get("name") or f"Player {pid}"
@@ -346,7 +350,7 @@ def import_top_ratings(payload: Dict[str, Any]):
         raise HTTPException(status_code=400, detail="No supported tiers found (expect top 5/10/20/30/50)")
 
     # Ensure NOT NULL fields are present by pulling existing row
-    from player_db import get_player  # local import to avoid circular
+    from backend.data.player_db import get_player  # local import to avoid circular
 
     existing = get_player(int(player_id)) or {}
     name = existing.get("name") or f"Player {player_id}"
@@ -449,25 +453,44 @@ def booster_calc(payload: Dict[str, Any]):
     Utility calculator for per-match and expected fantasy components.
     Payload:
       {
-        "rating": float,
+        "player_id": int,            # required; loads Top-X profile for match rating prediction
         "major_pct": float,
         "minor_pct": float,
         "win_prob": float,           # expected per-match win probability [0,1]
+        "opponent_ranks": [int...],  # required; one rank per match
         "booster_rates": [float...], # trigger rates per match (typically 5)
         "matches": int,              # optional, default 5
         "expected_games": float      # optional, e.g. 4.2
       }
     """
     try:
-        rating = float(payload.get("rating", 1.0))
         major_pct = float(payload.get("major_pct", 0.0))
         minor_pct = float(payload.get("minor_pct", 0.0))
         win_prob = float(payload.get("win_prob", 0.5))
     except Exception:
-        raise HTTPException(status_code=400, detail="rating, major_pct, minor_pct, win_prob must be numeric")
+        raise HTTPException(status_code=400, detail="major_pct, minor_pct, win_prob must be numeric")
 
     if not (0.0 <= win_prob <= 1.0):
         raise HTTPException(status_code=400, detail="win_prob must be between 0 and 1")
+
+    player_id = payload.get("player_id")
+    if player_id is None or str(player_id).strip() == "":
+        raise HTTPException(status_code=400, detail="player_id is required")
+    try:
+        pid = int(player_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="player_id must be an integer")
+    picker_row: Optional[Dict[str, Any]] = get_player(pid)
+    if not picker_row:
+        raise HTTPException(status_code=404, detail=f"player_id {pid} not found")
+
+    raw_opponent_ranks = payload.get("opponent_ranks", []) or []
+    opponent_ranks: List[int] = []
+    for r in raw_opponent_ranks:
+        try:
+            opponent_ranks.append(int(r))
+        except Exception:
+            continue
 
     raw_rates = payload.get("booster_rates", []) or []
     booster_rates: List[float] = []
@@ -482,26 +505,36 @@ def booster_calc(payload: Dict[str, Any]):
         matches = 1
     if matches > 10:
         matches = 10
+    if len(opponent_ranks) < matches:
+        raise HTTPException(status_code=400, detail=f"opponent_ranks must contain at least {matches} values")
 
     player = PlayerState(
-        player_id=0,
-        rating=rating,
+        player_id=pid,
+        rating=float(picker_row.get("rating", 1.0)),
         major_pct=major_pct,
         minor_pct=minor_pct,
         boosters=booster_rates,
     )
 
-    rating_points = compute_rating_points(player)
     role_points = compute_role_points(player)
     win_points = compute_win_points(win_prob, did_win=True)
 
     per_match = []
+    rating_points_sum = 0.0
     for match_no in range(1, matches + 1):
+        opp_rank = opponent_ranks[match_no - 1]
+        match_rating = float(pick_match_rating(picker_row, int(opp_rank)))
+
+        player.rating = match_rating
+        rating_points = compute_rating_points(player)
         booster_points = compute_booster_points(player, match_no)
         total_points = rating_points + role_points + win_points + booster_points
+        rating_points_sum += rating_points
         per_match.append(
             {
                 "match_number": match_no,
+                "opponent_rank": int(opp_rank),
+                "match_rating": match_rating,
                 "rating_points": rating_points,
                 "role_points": role_points,
                 "win_points": win_points,
@@ -510,8 +543,9 @@ def booster_calc(payload: Dict[str, Any]):
             }
         )
 
+    avg_rating_points = (rating_points_sum / float(matches)) if matches > 0 else 0.0
     out: Dict[str, Any] = {
-        "rating_points": rating_points,
+        "rating_points": avg_rating_points,
         "role_points": role_points,
         "win_points": win_points,
         "per_match": per_match,
@@ -531,7 +565,7 @@ def booster_calc(payload: Dict[str, Any]):
         if whole < matches and frac > 0:
             expected_booster += frac * per_match[whole]["booster_points"]
 
-        base_no_booster = (rating_points + role_points + win_points) * expected_games
+        base_no_booster = (avg_rating_points + role_points + win_points) * expected_games
         expected_total = base_no_booster + expected_booster
 
         out["expected_games"] = expected_games

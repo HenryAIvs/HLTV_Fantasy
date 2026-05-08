@@ -10,9 +10,9 @@
 body { margin: 0; }
 
 .layout {
-  max-width: 1200px;
+  max-width: 1480px;
   margin: 0 auto;
-  padding: 16px 20px 40px;
+  padding: 18px 28px 40px;
 }
 
 .hero {
@@ -123,6 +123,23 @@ tr:hover { background: #111827; }
   margin: 0;
 }
 
+.inline-status {
+  margin: -4px 0 0;
+  font-size: 13px;
+}
+
+.inline-status.info {
+  color: #93c5fd;
+}
+
+.inline-status.success {
+  color: #86efac;
+}
+
+.inline-status.error {
+  color: #fca5a5;
+}
+
 .field {
   display: flex;
   flex-direction: column;
@@ -151,6 +168,21 @@ button.primary {
   color: white;
   border-radius: 10px;
   cursor: pointer;
+}
+
+.button-with-spinner {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.button-spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: #ffffff;
+  animation: spin 0.8s linear infinite;
 }
 
 button.danger {
@@ -274,6 +306,389 @@ button.danger {
   gap: 6px;
 }
 
+.players-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.players-batch-toolbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 16px;
+}
+
+.players-batch-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.players-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid #1f2a44;
+  border-radius: 10px;
+  background: #0a1329;
+}
+
+table.players-table {
+  min-width: 1040px;
+  table-layout: auto;
+}
+
+.teams-controls {
+  margin-top: 2px;
+  margin-bottom: 10px;
+  padding: 12px;
+  border: 1px solid #243556;
+  border-radius: 12px;
+  background: linear-gradient(180deg, #0d1832 0%, #0b1428 100%);
+}
+
+.teams-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.teams-meta {
+  font-size: 12px;
+  color: #93aed7;
+  border: 1px solid #2e436a;
+  background: #12203f;
+  border-radius: 999px;
+  padding: 5px 10px;
+  white-space: nowrap;
+}
+
+.teams-filters {
+  gap: 14px;
+}
+
+.rating-tier-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(130px, 1fr));
+  gap: 8px;
+}
+
+.rating-tier-card {
+  background: linear-gradient(180deg, #1a2540 0%, #131d33 100%);
+  border: 1px solid #31456f;
+  border-radius: 6px;
+  padding: 10px 10px 8px;
+  text-align: center;
+}
+
+.rating-tier-value {
+  color: #e5edff;
+  font-size: 34px;
+  line-height: 1.05;
+  font-weight: 700;
+}
+
+.rating-tier-label {
+  color: #9bb2d9;
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.rating-tier-maps {
+  color: #7f97bf;
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.booster-tier-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(180px, 1fr));
+  gap: 8px;
+}
+
+.booster-tier-card {
+  background: linear-gradient(180deg, #16223a 0%, #111a2d 100%);
+  border: 1px solid #2d4069;
+  border-radius: 8px;
+  padding: 10px;
+  text-align: center;
+}
+
+.booster-tier-label {
+  color: #9bb2d9;
+  font-size: 12px;
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.booster-tier-value {
+  color: #e5edff;
+  font-size: 24px;
+  line-height: 1.1;
+  font-weight: 700;
+  margin-top: 4px;
+}
+
+.booster-tier-delta {
+  font-size: 12px;
+  margin-top: 4px;
+  color: #94a3b8;
+}
+
+.booster-tier-delta.better {
+  color: #22c55e;
+}
+
+.booster-tier-delta.worse {
+  color: #ef4444;
+}
+
+.booster-tier-delta.equal {
+  color: #93c5fd;
+}
+
+.role-tier-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(190px, 1fr));
+  gap: 8px;
+}
+
+.role-tier-card {
+  background: linear-gradient(180deg, #152338 0%, #101a2a 100%);
+  border: 1px solid #2d4069;
+  border-radius: 8px;
+  padding: 10px;
+  text-align: center;
+}
+
+.role-tier-card.gold {
+  border-color: #c89c2a;
+  box-shadow: inset 0 0 0 1px rgba(200, 156, 42, 0.28);
+}
+
+.role-tier-card.silver {
+  border-color: #93a1b6;
+  box-shadow: inset 0 0 0 1px rgba(147, 161, 182, 0.28);
+}
+
+.role-tier-card.bronze {
+  border-color: #a7704a;
+  box-shadow: inset 0 0 0 1px rgba(167, 112, 74, 0.28);
+}
+
+.role-tier-label {
+  color: #d5e2ff;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.role-tier-medal {
+  margin: 6px auto 4px;
+  width: fit-content;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  border: 1px solid transparent;
+}
+
+.role-tier-medal.gold {
+  color: #ffea9a;
+  background: rgba(182, 134, 20, 0.2);
+  border-color: #c89c2a;
+}
+
+.role-tier-medal.silver {
+  color: #e2e8f0;
+  background: rgba(120, 133, 153, 0.2);
+  border-color: #93a1b6;
+}
+
+.role-tier-medal.bronze {
+  color: #ffd7bf;
+  background: rgba(147, 89, 58, 0.2);
+  border-color: #a7704a;
+}
+
+.role-tier-split {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+  color: #93aed7;
+  font-size: 12px;
+  margin-top: 6px;
+}
+
+.role-tier-expected {
+  color: #e5edff;
+  font-size: 20px;
+  font-weight: 700;
+  margin-top: 8px;
+}
+
+.team-detail-block {
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  background: transparent;
+}
+
+.team-detail-heading {
+  margin: 0 0 12px;
+  color: #b9ceef;
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.team-roster-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(170px, 1fr));
+  gap: 14px;
+}
+
+.team-player-tile {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  padding: 16px 4px;
+  min-height: 130px;
+  text-align: left;
+  cursor: pointer;
+  transition: transform 0.15s ease, background 0.15s ease;
+  border-bottom: 2px solid #2a3f67;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.team-player-tile:hover:not(:disabled) {
+  background: rgba(24, 43, 78, 0.34);
+  transform: translateY(-1px);
+}
+
+.team-player-tile:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.team-player-slot {
+  color: #8cabd7;
+  font-size: 13px;
+  margin-bottom: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.team-player-name {
+  color: #e8f1ff;
+  font-size: 28px;
+  line-height: 1.2;
+  font-weight: 700;
+  word-break: break-word;
+}
+
+.team-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.team-stat-card {
+  border: 1px solid #2b436d;
+  border-radius: 10px;
+  background: #101d35;
+  padding: 14px;
+}
+
+.team-stat-label {
+  color: #9eb6dd;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.team-stat-value {
+  margin-top: 4px;
+  color: #ecf3ff;
+  font-size: 38px;
+  line-height: 1;
+  font-weight: 700;
+}
+
+.player-summary {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  box-shadow: none;
+}
+
+.player-summary-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+
+.player-summary-chip {
+  border: 1px solid #34507f;
+  background: #12213f;
+  border-radius: 999px;
+  padding: 7px 12px;
+  color: #c6d8f3;
+  white-space: nowrap;
+  font-size: 14px;
+  line-height: 1.1;
+}
+
+.player-summary-rating {
+  border-color: #5f84c7;
+  background: rgba(37, 70, 123, 0.55);
+  color: #e8f1ff;
+  font-weight: 700;
+  font-size: 16px;
+}
+
+.player-summary-teams {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.player-summary-teams-wrap {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.player-summary-team-btn {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.player-summary-team-btn:hover {
+  border-color: #74a6ff;
+  color: #e9f3ff;
+  background: rgba(28, 55, 100, 0.72);
+}
+
+.player-modal-title {
+  margin: 0;
+  font-size: 24px;
+  font-weight: 700;
+  color: #eef4ff;
+}
+
 .modal-backdrop {
   position: fixed;
   inset: 0;
@@ -289,10 +704,16 @@ button.danger {
   border: 1px solid #1f2a44;
   border-radius: 12px;
   width: 90%;
-  max-width: 900px;
+  max-width: 1120px;
   max-height: 90vh;
   overflow: auto;
   padding: 16px;
+}
+
+.modal.team-modal {
+  max-width: 1220px;
+  width: 94%;
+  padding: 20px;
 }
 
 .modal-header {
@@ -306,6 +727,24 @@ button.danger {
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+.inline-link-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: #9fc5ff;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.inline-link-btn:hover {
+  color: #dcecff;
 }
 
 .tab-bar.small {
@@ -342,12 +781,22 @@ button.danger {
 }
 
 .close {
-  background: transparent;
-  border: 1px solid #24304f;
-  color: #e2e8f0;
-  border-radius: 8px;
-  padding: 6px 10px;
+  background: none;
+  border: none;
+  color: #cbd5e1;
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 28px;
+  line-height: 1;
+  padding: 0;
   cursor: pointer;
+}
+
+.close:hover {
+  color: #ffffff;
 }
 
 button.secondary {
@@ -395,6 +844,69 @@ tbody tr { cursor: pointer; }
   transition: width 0.12s linear;
 }
 
+.value-chart-wrap {
+  width: 100%;
+  height: 380px;
+  border: 1px solid #253a5e;
+  border-radius: 10px;
+  padding: 6px;
+  background: linear-gradient(180deg, #0f1a31 0%, #0d162a 100%);
+}
+
+@media (max-width: 1100px) {
+  .team-roster-grid {
+    grid-template-columns: repeat(3, minmax(120px, 1fr));
+  }
+
+  .rating-tier-grid {
+    grid-template-columns: repeat(3, minmax(130px, 1fr));
+  }
+
+  .booster-tier-grid {
+    grid-template-columns: repeat(2, minmax(180px, 1fr));
+  }
+
+  .role-tier-grid {
+    grid-template-columns: repeat(2, minmax(190px, 1fr));
+  }
+}
+
+@media (max-width: 720px) {
+  .team-roster-grid {
+    grid-template-columns: repeat(2, minmax(120px, 1fr));
+  }
+
+  .team-stats-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .teams-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .teams-meta {
+    width: fit-content;
+  }
+
+  .players-batch-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .rating-tier-grid {
+    grid-template-columns: repeat(2, minmax(130px, 1fr));
+  }
+
+  .booster-tier-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .role-tier-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 @keyframes indeterminate {
   0% {
     transform: translateX(-100%);
@@ -404,5 +916,14 @@ tbody tr { cursor: pointer; }
   }
   100% {
     transform: translateX(120%);
+  }
+}
+
+@keyframes spin {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
   }
 }

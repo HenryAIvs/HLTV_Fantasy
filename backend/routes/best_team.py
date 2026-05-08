@@ -9,10 +9,10 @@ import uuid
 from fastapi import APIRouter, HTTPException
 
 from backend.routes.simulation import load_latest_simulation
-from player_db import DB_PATH, get_player
-from role_assignment import best_role_assignment_for_team, extract_role_scores_for_player
+from backend.data.player_db import DB_PATH, get_player
+from backend.services.role_assignment import best_role_assignment_for_team, extract_role_scores_for_player
 from swiss_stage.fantasy_montecarlo import simulate_swiss_fantasy
-from team_db import get_all_teams
+from backend.data.team_db import get_all_teams
 
 router = APIRouter()
 

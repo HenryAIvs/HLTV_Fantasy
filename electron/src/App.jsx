@@ -1,4 +1,15 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import {
+  CartesianGrid,
+  ComposedChart,
+  Legend,
+  Line,
+  ResponsiveContainer,
+  Scatter,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 
 const tabs = [
   { key: "view", label: "Database" },
@@ -8,18 +19,73 @@ const tabs = [
   { key: "admin", label: "Data Management" },
 ];
 
+const parseJsonSafe = async (res) => {
+  const text = await res.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { detail: text };
+  }
+};
+
+const requestJson = async (path, init) => {
+  const res = await fetch(`http://127.0.0.1:8000${path}`, init);
+  const data = await parseJsonSafe(res);
+  if (!res.ok) {
+    const detail = data?.detail || `HTTP ${res.status}`;
+    throw new Error(String(detail));
+  }
+  return data;
+};
+
 const api = window.api || {
-  get: (path) => fetch(`http://127.0.0.1:8000${path}`).then((r) => r.json()),
+  get: (path) => requestJson(path),
   post: (path, body) =>
-    fetch(`http://127.0.0.1:8000${path}`, {
+    requestJson(path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-    }).then((r) => r.json()),
+    }),
   delete: (path) =>
-    fetch(`http://127.0.0.1:8000${path}`, {
+    requestJson(path, {
       method: "DELETE",
-    }).then((r) => r.json()),
+    }),
+  openExternal: async (url) => {
+    if (typeof window !== "undefined" && typeof window.open === "function") {
+      window.open(url, "_blank", "noopener,noreferrer");
+    }
+    return { status: "ok" };
+  },
+  openHltvPage: async (url) => {
+    if (typeof window !== "undefined" && typeof window.open === "function") {
+      window.open(url, "_blank", "noopener,noreferrer");
+    }
+    return { status: "ok", url };
+  },
+  readOpenedHltvPageText: async () => ({ status: "ok", url: "", text: "" }),
+};
+
+const TOP_RATING_TIERS = [5, 10, 20, 30, 50];
+
+const slugifyHltvPlayerName = (name) => {
+  const asciiName = String(name || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "");
+  const slug = asciiName.replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "").toLowerCase();
+  return slug || "player";
+};
+
+const buildHltvPlayerStatsUrl = (playerId, playerName) => {
+  const pid = Number(playerId);
+  if (!Number.isFinite(pid) || pid <= 0) return "";
+  return `https://www.hltv.org/stats/players/${pid}/${slugifyHltvPlayerName(playerName)}`;
+};
+
+const formatTopxImportedAt = (unixSeconds) => {
+  const ts = Number(unixSeconds);
+  if (!Number.isFinite(ts) || ts <= 0) return "Not imported yet";
+  return new Date(ts * 1000).toLocaleString();
 };
 
 const TabButton = ({ active, onClick, children }) => (
@@ -79,6 +145,324 @@ const roleLabel = (roleName) => {
   return roleName || "-";
 };
 
+const buildNiceStepAxis = (values, step = 0.05) => {
+  const finite = (values || []).filter((value) => Number.isFinite(value));
+  if (finite.length === 0) {
+    return { domain: ["auto", "auto"], ticks: undefined };
+  }
+
+  let min = Math.min(...finite);
+  let max = Math.max(...finite);
+  const stepValue = Number(step) || 0.05;
+
+  min = Math.floor(min / stepValue) * stepValue - stepValue;
+  max = Math.ceil(max / stepValue) * stepValue + stepValue;
+  if (min === max) {
+    min -= stepValue;
+    max += stepValue;
+  }
+
+  min = Number(min.toFixed(4));
+  max = Number(max.toFixed(4));
+
+  const ticks = [];
+  for (let value = min; value <= max + stepValue / 2; value += stepValue) {
+    ticks.push(Number(value.toFixed(2)));
+  }
+
+  return {
+    domain: [min, max],
+    ticks,
+  };
+};
+
+const buildPlayerValueRows = (teamCombos) => {
+  const byId = new Map();
+  (teamCombos || []).forEach((team) => {
+    (team?.players || []).forEach((p) => {
+      const pid = Number(p?.player_id);
+      if (!Number.isFinite(pid) || pid <= 0) return;
+      const price = Number(p?.price);
+      const points = Number(p?.total_ev);
+      const cur = byId.get(pid) || {
+        player_id: pid,
+        name: p?.name || `Player ${pid}`,
+        price: Number.isFinite(price) ? price : 0,
+        points_sum: 0,
+        n: 0,
+      };
+      if (Number.isFinite(price) && price > 0) cur.price = price;
+      if (Number.isFinite(points)) {
+        cur.points_sum += points;
+        cur.n += 1;
+      }
+      byId.set(pid, cur);
+    });
+  });
+
+  const rows = Array.from(byId.values())
+    .map((r) => {
+      const avgPoints = r.n > 0 ? r.points_sum / r.n : 0;
+      return {
+        player_id: r.player_id,
+        name: r.name,
+        price: r.price,
+        points: avgPoints,
+      };
+    })
+    .filter((r) => Number.isFinite(r.price) && Number.isFinite(r.points))
+    .sort((a, b) => b.points - a.points);
+
+  if (rows.length === 0) return { rows: [], slope: 0, intercept: 0 };
+
+  const xMean = rows.reduce((s, r) => s + r.price, 0) / rows.length;
+  const yMean = rows.reduce((s, r) => s + r.points, 0) / rows.length;
+  const num = rows.reduce((s, r) => s + (r.price - xMean) * (r.points - yMean), 0);
+  const den = rows.reduce((s, r) => s + (r.price - xMean) ** 2, 0);
+  const slope = den > 0 ? num / den : 0;
+  const intercept = yMean - slope * xMean;
+
+  const withDistance = rows.map((r) => {
+    const onLine = intercept + slope * r.price;
+    return {
+      ...r,
+      on_line: onLine,
+      distance: r.points - onLine,
+    };
+  });
+
+  return { rows: withDistance, slope, intercept };
+};
+
+const buildPlayerValueRowsFromSimulation = (simResults, players) => {
+  const playerById = new Map();
+  (players || []).forEach((p) => {
+    const pid = Number(p?.player_id);
+    if (!Number.isFinite(pid) || pid <= 0) return;
+    playerById.set(pid, p);
+  });
+
+  const raw = simResults && typeof simResults === "object" ? simResults : {};
+  const teamMap = raw.teams && typeof raw.teams === "object" ? raw.teams : raw;
+  const byId = new Map();
+
+  Object.entries(teamMap || {}).forEach(([tid, teamData]) => {
+    const playersData = teamData?.players || {};
+    Object.entries(playersData).forEach(([pidRaw, comps]) => {
+      const pid = Number(pidRaw);
+      if (!Number.isFinite(pid) || pid <= 0) return;
+      const player = playerById.get(pid) || {};
+      const pointsCandidates = [
+        Number(comps?.total_points),
+        Number(comps?.total),
+        Number(comps?.expected_total_points),
+      ];
+      const points = pointsCandidates.find((v) => Number.isFinite(v));
+      if (!Number.isFinite(points)) return;
+
+      const price = Number(player?.price);
+      byId.set(pid, {
+        player_id: pid,
+        name: player?.name || `Player ${pid}`,
+        team_id: Number(player?.team_id || tid || 0),
+        price: Number.isFinite(price) ? price : 0,
+        points,
+      });
+    });
+  });
+
+  const rows = Array.from(byId.values())
+    .filter((r) => Number.isFinite(r.price) && Number.isFinite(r.points))
+    .sort((a, b) => b.points - a.points);
+
+  if (rows.length === 0) return { rows: [], slope: 0, intercept: 0 };
+
+  const xMean = rows.reduce((s, r) => s + r.price, 0) / rows.length;
+  const yMean = rows.reduce((s, r) => s + r.points, 0) / rows.length;
+  const num = rows.reduce((s, r) => s + (r.price - xMean) * (r.points - yMean), 0);
+  const den = rows.reduce((s, r) => s + (r.price - xMean) ** 2, 0);
+  const slope = den > 0 ? num / den : 0;
+  const intercept = yMean - slope * xMean;
+
+  const withDistance = rows.map((r) => {
+    const onLine = intercept + slope * r.price;
+    return {
+      ...r,
+      on_line: onLine,
+      distance: r.points - onLine,
+    };
+  });
+
+  return { rows: withDistance, slope, intercept };
+};
+
+function PriceVsPointsPanel({ title, rows, slope, intercept }) {
+  const [search, setSearch] = useState("");
+  const [sortBy, setSortBy] = useState("distance_desc");
+  const minPrice = useMemo(() => Math.min(...rows.map((r) => Number(r.price))), [rows]);
+  const maxPrice = useMemo(() => Math.max(...rows.map((r) => Number(r.price))), [rows]);
+  const chartRows = useMemo(
+    () =>
+      [...rows]
+        .sort((a, b) => a.price - b.price)
+        .map((r) => ({
+          ...r,
+          trend: r.on_line,
+        })),
+    [rows]
+  );
+  const filteredRows = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    let out = [...rows];
+    if (q) {
+      out = out.filter(
+        (r) =>
+          String(r.name || "").toLowerCase().includes(q) ||
+          String(r.player_id || "").includes(q) ||
+          String(r.team_id || "").includes(q)
+      );
+    }
+    switch (sortBy) {
+      case "points_desc":
+        out.sort((a, b) => b.points - a.points);
+        break;
+      case "price_asc":
+        out.sort((a, b) => a.price - b.price);
+        break;
+      case "price_desc":
+        out.sort((a, b) => b.price - a.price);
+        break;
+      case "distance_abs_desc":
+        out.sort((a, b) => Math.abs(b.distance) - Math.abs(a.distance));
+        break;
+      case "distance_asc":
+        out.sort((a, b) => a.distance - b.distance);
+        break;
+      case "name_asc":
+        out.sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+        break;
+      case "distance_desc":
+      default:
+        out.sort((a, b) => b.distance - a.distance);
+        break;
+    }
+    return out;
+  }, [rows, search, sortBy]);
+
+  const PlayerValueTooltip = ({ active, payload }) => {
+    if (!active || !payload || payload.length === 0) return null;
+    const scatterEntry = payload.find((p) => p?.dataKey === "points") || payload[0];
+    const d = scatterEntry?.payload;
+    if (!d) return null;
+    return (
+      <div style={{ background: "#0e1f3f", border: "1px solid #2f5ca5", borderRadius: 10, color: "#dcecff", padding: 10 }}>
+        <div style={{ fontWeight: 700 }}>{d.name} ({d.player_id})</div>
+        <div>Points: {Number(d.points).toFixed(2)}</div>
+        <div>Average line: {Number(d.trend).toFixed(2)}</div>
+        <div>Distance: {Number(d.distance) >= 0 ? "+" : ""}{Number(d.distance).toFixed(2)}</div>
+        <div>Price: {d.price}</div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="card sub">
+      <h3>{title}</h3>
+      {rows.length === 0 ? (
+        <p className="muted">Generate player valuation data first to view price vs points.</p>
+      ) : (
+        <div className="stack">
+          <div className="value-chart-wrap">
+            <ResponsiveContainer width="100%" height={380}>
+              <ComposedChart data={chartRows} margin={{ top: 12, right: 18, left: 6, bottom: 12 }}>
+                <CartesianGrid stroke="#284061" strokeDasharray="3 3" />
+                <XAxis
+                  type="number"
+                  dataKey="price"
+                  domain={[minPrice, maxPrice]}
+                  tick={{ fill: "#9fc5ff", fontSize: 12 }}
+                  axisLine={{ stroke: "#365a89" }}
+                  tickLine={{ stroke: "#365a89" }}
+                  name="Price"
+                />
+                <YAxis
+                  type="number"
+                  dataKey="points"
+                  tick={{ fill: "#9fc5ff", fontSize: 12 }}
+                  axisLine={{ stroke: "#365a89" }}
+                  tickLine={{ stroke: "#365a89" }}
+                  name="Points"
+                />
+                <Tooltip
+                  shared={false}
+                  cursor={false}
+                  content={<PlayerValueTooltip />}
+                />
+                <Legend wrapperStyle={{ color: "#9fc5ff" }} />
+                <Line
+                  type="linear"
+                  dataKey="trend"
+                  name="Average line"
+                  stroke="#35a2ff"
+                  strokeWidth={2}
+                  dot={false}
+                  isAnimationActive={false}
+                />
+                <Scatter name="Players" dataKey="points" fill="#4fc3ff" />
+              </ComposedChart>
+            </ResponsiveContainer>
+          </div>
+          <p className="muted">Trend line (average): points = {intercept.toFixed(2)} + {slope.toFixed(4)} x price</p>
+          <div className="grid two">
+            <Input label="Search Players" value={search} onChange={setSearch} placeholder="name, player id, or team id" />
+            <Select
+              label="Sort Table"
+              value={sortBy}
+              onChange={setSortBy}
+              options={[
+                { value: "distance_desc", label: "Distance (high to low)" },
+                { value: "distance_asc", label: "Distance (low to high)" },
+                { value: "distance_abs_desc", label: "Distance (abs high to low)" },
+                { value: "points_desc", label: "Points (high to low)" },
+                { value: "price_asc", label: "Price (low to high)" },
+                { value: "price_desc", label: "Price (high to low)" },
+                { value: "name_asc", label: "Name (A-Z)" },
+              ]}
+            />
+          </div>
+          <p className="muted">
+            Showing {filteredRows.length} of {rows.length} players
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th>Player</th>
+                <th>Player ID</th>
+                <th>Price</th>
+                <th>Points</th>
+                <th>On Line</th>
+                <th>Distance</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredRows.map((r) => (
+                <tr key={`dist-${r.player_id}`}>
+                  <td>{r.name}</td>
+                  <td>{r.player_id}</td>
+                  <td>{r.price}</td>
+                  <td>{r.points.toFixed(2)}</td>
+                  <td>{r.on_line.toFixed(2)}</td>
+                  <td>{r.distance >= 0 ? "+" : ""}{r.distance.toFixed(2)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function GroupStageTab({
   teams,
   teamLookup,
@@ -92,6 +476,7 @@ function GroupStageTab({
   setResults,
   simUpdatedAt,
   onResetSimulation,
+  onOpenPlayer,
 }) {
   const [busy, setBusy] = useState(false);
   const [processedSims, setProcessedSims] = useState(0);
@@ -357,7 +742,9 @@ function GroupStageTab({
                     {Object.entries(data.players || {}).map(([pid, comps]) => (
                       <tr key={pid}>
                         <td className="player-col" title={String(playerLookup[Number(pid)] || pid)}>
-                          {playerLookup[Number(pid)] || pid}
+                          <button className="inline-link-btn" onClick={() => onOpenPlayer && onOpenPlayer(Number(pid))}>
+                            {playerLookup[Number(pid)] || pid}
+                          </button>
                         </td>
                         <td>{comps.total.toFixed(2)}</td>
                         <td>{comps.rating.toFixed(2)}</td>
@@ -377,7 +764,7 @@ function GroupStageTab({
   );
 }
 
-function TopTeamsTab({ teamLookup, selected, bo, sims, results }) {
+function TopTeamsTab({ teamLookup, selected, bo, sims, results, onOpenPlayer }) {
   const [busy, setBusy] = useState(false);
   const [generationBusy, setGenerationBusy] = useState(false);
   const [cacheId, setCacheId] = useState("");
@@ -669,7 +1056,6 @@ function TopTeamsTab({ teamLookup, selected, bo, sims, results }) {
     });
     return m;
   }, [allPlayers]);
-
   const includedIds = useMemo(() => Array.from(parseIdsToSet(includeInput)).sort((a, b) => a - b), [includeInput]);
   const excludedIds = useMemo(() => Array.from(parseIdsToSet(excludeInput)).sort((a, b) => a - b), [excludeInput]);
 
@@ -896,7 +1282,11 @@ function TopTeamsTab({ teamLookup, selected, bo, sims, results }) {
                   <tbody>
                     {team.players.map((p) => (
                       <tr key={p.player_id}>
-                        <td>{p.name}</td>
+                        <td>
+                          <button className="inline-link-btn" onClick={() => onOpenPlayer && onOpenPlayer(Number(p.player_id))}>
+                            {p.name}
+                          </button>
+                        </td>
                         <td>{teamLookup[p.team_id] || p.team_id}</td>
                         <td>{roleLabel(p.role_name)}</td>
                         <td>{p.price}</td>
@@ -1201,7 +1591,36 @@ function BracketTab({ teams, teamLookup }) {
   );
 }
 
-function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters }) {
+function SwissPlayerValueTab({ results, players }) {
+  const valueData = useMemo(() => buildPlayerValueRowsFromSimulation(results, players), [results, players]);
+
+  return (
+    <Section title="Player Value">
+      <div className="stack">
+        {!results && (
+          <div className="card sub">
+            <p className="muted">Run Swiss Group Stage first.</p>
+          </div>
+        )}
+        {results && (
+          <div className="card sub">
+            <p className="muted">Loaded {valueData.rows.length} players from Swiss valuations.</p>
+          </div>
+        )}
+        {results && (
+          <PriceVsPointsPanel
+            title="Player Price vs Points (Swiss)"
+            rows={valueData.rows}
+            slope={valueData.slope}
+            intercept={valueData.intercept}
+          />
+        )}
+      </div>
+    </Section>
+  );
+}
+
+function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpenPlayer }) {
   const [playoffTab, setPlayoffTab] = useState("stage");
   const [events, setEvents] = useState([]);
   const [selectedEventId, setSelectedEventId] = useState("");
@@ -1243,6 +1662,27 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters }) {
     const m = {};
     players.forEach((p) => (m[p.player_id] = p.name));
     return m;
+  }, [players]);
+  const teamByName = useMemo(() => {
+    const m = {};
+    teams.forEach((t) => {
+      const key = String(t?.name || "").trim().toLowerCase();
+      if (key) m[key] = t.team_id;
+    });
+    return m;
+  }, [teams]);
+  const teamPlayerOptions = useMemo(() => {
+    const safePlayers = Array.isArray(players)
+      ? players.filter((p) => p && p.player_id !== null && p.player_id !== undefined)
+      : [];
+    const sorted = [...safePlayers].sort((a, b) => String(a?.name || "").localeCompare(String(b?.name || "")));
+    return [
+      { value: "", label: "-" },
+      ...sorted.map((p) => ({
+        value: String(p.player_id),
+        label: p.name || `Player ${p.player_id}`,
+      })),
+    ];
   }, [players]);
   const playerNameById = playerLookup;
   const filteredTeams = useMemo(() => {
@@ -1565,6 +2005,10 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters }) {
     setFilteredCount(sorted.length);
     setPage(0);
   };
+  const playoffPlayerValueData = useMemo(
+    () => buildPlayerValueRowsFromSimulation(results, players),
+    [results, players]
+  );
 
   const formatEta = (seconds) => {
     if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return "-";
@@ -1607,6 +2051,9 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters }) {
           </button>
           <button className={playoffTab === "top5" ? "tab active" : "tab"} onClick={() => setPlayoffTab("top5")}>
             Top 5 Teams
+          </button>
+          <button className={playoffTab === "value" ? "tab active" : "tab"} onClick={() => setPlayoffTab("value")}>
+            Player Value
           </button>
         </div>
 
@@ -1903,7 +2350,11 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters }) {
                   <tbody>
                     {Object.entries(data.players || {}).map(([pid, comps]) => (
                       <tr key={pid}>
-                        <td>{playerLookup[Number(pid)] || pid}</td>
+                        <td>
+                          <button className="inline-link-btn" onClick={() => onOpenPlayer && onOpenPlayer(Number(pid))}>
+                            {playerLookup[Number(pid)] || pid}
+                          </button>
+                        </td>
                         <td>{comps.total_points.toFixed(2)}</td>
                         <td>{comps.rating_points_total.toFixed(2)}</td>
                         <td>{comps.win_points_total.toFixed(2)}</td>
@@ -1943,7 +2394,11 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters }) {
                 <tbody>
                   {team.players.map((p) => (
                     <tr key={p.player_id}>
-                      <td>{p.name}</td>
+                      <td>
+                        <button className="inline-link-btn" onClick={() => onOpenPlayer && onOpenPlayer(Number(p.player_id))}>
+                          {p.name}
+                        </button>
+                      </td>
                       <td>{teamLookup[p.team_id] || p.team_id}</td>
                       <td>{roleLabel(p.role_name)}</td>
                       <td>{p.price}</td>
@@ -2019,6 +2474,19 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters }) {
           <p className="muted">No team combinations match current include/exclude/search filters.</p>
         </div>
       )}
+      {playoffTab === "value" && results && (
+        <PriceVsPointsPanel
+          title="Player Price vs Points (Playoff)"
+          rows={playoffPlayerValueData.rows}
+          slope={playoffPlayerValueData.slope}
+          intercept={playoffPlayerValueData.intercept}
+        />
+      )}
+      {playoffTab === "value" && !results && (
+        <div className="card sub">
+          <p className="muted">Run Playoff Bracket first.</p>
+        </div>
+      )}
       {playoffTab === "top5" && topMessage && (
         <div className="card sub">
           <p className="muted">{topMessage}</p>
@@ -2031,7 +2499,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters }) {
             <header className="modal-header">
               <h3>Select Players to Include/Exclude</h3>
               <button className="close" onClick={() => setShowFilterModal(false)}>
-                ✕
+                &times;
               </button>
             </header>
             <div className="modal-body">
@@ -2150,22 +2618,12 @@ function EventsTab({ refreshData, notify, players }) {
     }
   };
 
-  const hasTopTierRatings = (player) => {
-    if (!player) return false;
-    const tiers = [5, 10, 20, 30, 50];
-    return tiers.every((tier) => {
-      const rating = Number(player[`rating_top${tier}`]);
-      const maps = Number(player[`maps_top${tier}`]);
-      return Number.isFinite(rating) && Number.isFinite(maps) && maps > 0;
-    });
-  };
-
   const isPlayerComplete = (playerId) => {
     const p = playerById[Number(playerId)];
     if (!p) return false;
     const hasCore = typeof p.name === "string" && p.name.trim().length > 0 && Number.isFinite(Number(p.rating));
     const hasRolesAndBoosters = hasJsonEntries(p.boosters_json) && hasJsonEntries(p.roles_json);
-    return hasCore && hasRolesAndBoosters && hasTopTierRatings(p);
+    return hasCore && hasRolesAndBoosters;
   };
 
   const loadEvents = async () => {
@@ -2244,49 +2702,6 @@ function EventsTab({ refreshData, notify, players }) {
     }
   };
 
-  const fetchTopRatingsForEventPlayers = async () => {
-    const ids = Array.from(
-      new Set(
-        (selectedEvent?.players || [])
-          .map((p) => Number(p.player_id))
-          .filter((x) => Number.isFinite(x) && x > 0)
-      )
-    );
-    if (ids.length === 0) {
-      setMessage("No players found in selected event.");
-      return;
-    }
-
-    setBusy(true);
-    setMessage("");
-    try {
-      const res = await api.post("/players/fetch-top-ratings-batch", {
-        player_ids: ids,
-        headless: true,
-        min_delay_seconds: 10,
-        max_delay_seconds: 18,
-        retries: 2,
-        retry_backoff_seconds: 25,
-      });
-      if (res?.detail) {
-        setMessage(String(res.detail));
-        return;
-      }
-
-      const ok = Number(res.ok || 0);
-      const failed = Number(res.failed || 0);
-      setMessage(`Top-X batch complete for event ${selectedEvent?.event_id}: ${ok} succeeded, ${failed} failed.`);
-      notify(`Top-X batch done: ${ok} ok, ${failed} failed`);
-
-      await refreshData();
-      if (selectedEventId) {
-        await loadEventDetail(selectedEventId);
-      }
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const activateEvent = async (targetEventId) => {
     setBusy(true);
     setMessage("");
@@ -2337,13 +2752,6 @@ function EventsTab({ refreshData, notify, players }) {
           <div className="actions" style={{ marginTop: 0 }}>
             <button className="secondary" onClick={refreshAll} disabled={busy}>
               {busy ? "Working..." : "Refresh All"}
-            </button>
-            <button
-              className="primary"
-              onClick={fetchTopRatingsForEventPlayers}
-              disabled={busy || !selectedEvent || (selectedEvent?.players || []).length === 0}
-            >
-              {busy ? "Working..." : "Fetch Top X For Event Players"}
             </button>
           </div>
 
@@ -2443,7 +2851,276 @@ function EventsTab({ refreshData, notify, players }) {
   );
 }
 
-function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
+function MatchesDataPanel({ notify }) {
+  const [recentResults, setRecentResults] = useState([]);
+  const [recentResultsLoading, setRecentResultsLoading] = useState(false);
+  const [recentResultsError, setRecentResultsError] = useState("");
+  const [recentResultsPages, setRecentResultsPages] = useState("3");
+  const [recentResultsOffset, setRecentResultsOffset] = useState(0);
+  const [selectedMatchUrl, setSelectedMatchUrl] = useState("");
+  const [selectedMatchRow, setSelectedMatchRow] = useState(null);
+  const [showMatchModal, setShowMatchModal] = useState(false);
+  const initialLoadRef = useRef(false);
+
+  const loadStoredRecentResults = async (offset = 0) => {
+    const safeOffset = Math.max(0, Number(offset) || 0);
+    setRecentResultsLoading(true);
+    setRecentResultsError("");
+    try {
+      const res = await api.get(`/events/hltv-results?limit=100&offset=${safeOffset}`);
+      if (res?.detail) {
+        setRecentResults([]);
+        setRecentResultsError(String(res.detail));
+      } else {
+        setRecentResults(Array.isArray(res?.results) ? res.results : []);
+        setRecentResultsOffset(safeOffset);
+      }
+    } catch (e) {
+      setRecentResults([]);
+      setRecentResultsError("Failed to load stored HLTV results.");
+    } finally {
+      setRecentResultsLoading(false);
+    }
+  };
+
+  const importRecentResultsToDb = async () => {
+    const pages = Math.max(1, Math.min(30, Number(recentResultsPages) || 1));
+    setRecentResultsLoading(true);
+    setRecentResultsError("");
+    try {
+      const res = await api.post("/events/hltv-results/import", {
+        pages,
+        start_offset: 0,
+        page_stride: 100,
+        per_page_limit: 100,
+      });
+      if (res?.detail) {
+        setRecentResultsError(String(res.detail));
+        return;
+      }
+      if (notify) {
+        notify(
+          `Imported HLTV results: ${res.fetched || 0} fetched, ${res.inserted || 0} inserted, ${res.updated || 0} updated, ${res.enriched_matches || 0} enriched`
+        );
+      }
+      await loadStoredRecentResults(0);
+    } catch (e) {
+      setRecentResultsError("Failed to import/store HLTV results.");
+    } finally {
+      setRecentResultsLoading(false);
+    }
+  };
+
+  const clearStoredResults = async () => {
+    setRecentResultsLoading(true);
+    setRecentResultsError("");
+    try {
+      const res = await api.delete("/events/hltv-results");
+      if (res?.detail) {
+        setRecentResultsError(String(res.detail));
+        return;
+      }
+      setRecentResults([]);
+      setRecentResultsOffset(0);
+      setSelectedMatchUrl("");
+      setSelectedMatchRow(null);
+      setShowMatchModal(false);
+      if (notify) notify(`Deleted ${Number(res?.deleted || 0)} stored matches`);
+    } catch (e) {
+      setRecentResultsError("Failed to delete stored HLTV results.");
+    } finally {
+      setRecentResultsLoading(false);
+    }
+  };
+
+  const openMatchModal = (row) => {
+    const url = String(row?.match_url || "").trim();
+    if (!url) return;
+    setSelectedMatchUrl(url);
+    setSelectedMatchRow(row || null);
+    setShowMatchModal(true);
+  };
+
+  useEffect(() => {
+    if (initialLoadRef.current) return;
+    initialLoadRef.current = true;
+    loadStoredRecentResults(0);
+  }, []);
+
+  return (
+    <div className="stack">
+      <div className="grid three">
+        <Input
+          label="# Pages To Import (100 each)"
+          value={recentResultsPages}
+          onChange={setRecentResultsPages}
+          placeholder="e.g. 3"
+        />
+      </div>
+      <div className="actions" style={{ marginTop: 0 }}>
+        <button className="primary" onClick={importRecentResultsToDb} disabled={recentResultsLoading}>
+          {recentResultsLoading ? "Importing..." : "Import HLTV Results To SQL"}
+        </button>
+        <button className="danger" onClick={clearStoredResults} disabled={recentResultsLoading}>
+          {recentResultsLoading ? "Deleting..." : "Delete All Stored Matches"}
+        </button>
+        <button className="secondary" onClick={loadStoredRecentResults} disabled={recentResultsLoading}>
+          {recentResultsLoading ? "Loading..." : "Reload Stored Results"}
+        </button>
+        <span className="muted">{recentResults.length} loaded</span>
+      </div>
+      <div className="actions" style={{ marginTop: 0 }}>
+        <button
+          className="secondary"
+          onClick={() => loadStoredRecentResults(Math.max(0, recentResultsOffset - 100))}
+          disabled={recentResultsLoading || recentResultsOffset <= 0}
+        >
+          Prev 100
+        </button>
+        <button
+          className="secondary"
+          onClick={() => loadStoredRecentResults(recentResultsOffset + 100)}
+          disabled={recentResultsLoading || recentResults.length < 100}
+        >
+          Next 100
+        </button>
+        <span className="muted">Offset: {recentResultsOffset}</span>
+      </div>
+      {recentResultsError && <p className="error">{recentResultsError}</p>}
+      {!recentResultsLoading && !recentResultsError && recentResults.length === 0 && <p className="muted">No results loaded yet.</p>}
+      {recentResults.length > 0 && (
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Team A</th>
+              <th>Score</th>
+              <th>Team B</th>
+              <th>Winner</th>
+              <th>Date Played</th>
+              <th>Match</th>
+            </tr>
+          </thead>
+          <tbody>
+            {recentResults.map((r, idx) => {
+              const s1 = Number(r?.score1);
+              const s2 = Number(r?.score2);
+              const scoreText = Number.isFinite(s1) && Number.isFinite(s2) ? `${s1} - ${s2}` : "-";
+              return (
+                <tr
+                  key={`hltv-res-${idx}-${r?.match_url || ""}`}
+                  className={String(r?.match_url || "") === selectedMatchUrl ? "row-active" : ""}
+                  onClick={() => openMatchModal(r)}
+                >
+                  <td>{idx + 1}</td>
+                  <td>{r?.team1 || "-"}</td>
+                  <td>{scoreText}</td>
+                  <td>{r?.team2 || "-"}</td>
+                  <td>{r?.winner || "-"}</td>
+                  <td>{r?.match_date || "-"}</td>
+                  <td>
+                    {r?.match_url ? (
+                      <a href={String(r.match_url)} target="_blank" rel="noreferrer">
+                        Open
+                      </a>
+                    ) : (
+                      "-"
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+      {showMatchModal && selectedMatchRow && (
+        <div className="modal-backdrop" onClick={() => setShowMatchModal(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <header className="modal-header">
+              <h3 className="player-modal-title">
+                {selectedMatchRow?.team1 || "-"} vs {selectedMatchRow?.team2 || "-"}
+              </h3>
+              <button className="close" onClick={() => setShowMatchModal(false)}>
+                &times;
+              </button>
+            </header>
+            <div className="modal-body">
+              <p className="muted">
+                Date played: {selectedMatchRow?.match_date || "-"} | Final score:{" "}
+                {Number.isFinite(Number(selectedMatchRow?.score1)) && Number.isFinite(Number(selectedMatchRow?.score2))
+                  ? `${Number(selectedMatchRow.score1)} - ${Number(selectedMatchRow.score2)}`
+                  : "-"}
+              </p>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Team</th>
+                    <th>HLTV Rank</th>
+                    <th>HLTV Points</th>
+                    <th>VRS Rank</th>
+                    <th>VRS Points</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>{selectedMatchRow?.team1 || "-"}</td>
+                    <td>{selectedMatchRow?.hltv_rank_1 ?? "-"}</td>
+                    <td>{selectedMatchRow?.hltv_points_1 ?? "-"}</td>
+                    <td>{selectedMatchRow?.vrs_rank_1 ?? "-"}</td>
+                    <td>{selectedMatchRow?.vrs_points_1 ?? "-"}</td>
+                  </tr>
+                  <tr>
+                    <td>{selectedMatchRow?.team2 || "-"}</td>
+                    <td>{selectedMatchRow?.hltv_rank_2 ?? "-"}</td>
+                    <td>{selectedMatchRow?.hltv_points_2 ?? "-"}</td>
+                    <td>{selectedMatchRow?.vrs_rank_2 ?? "-"}</td>
+                    <td>{selectedMatchRow?.vrs_points_2 ?? "-"}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <h4>Maps Played</h4>
+              {(() => {
+                let maps = [];
+                try {
+                  const parsed = JSON.parse(String(selectedMatchRow?.maps_json || "[]"));
+                  if (Array.isArray(parsed)) maps = parsed;
+                } catch {}
+                if (maps.length === 0) return <p className="muted">No map details stored for this match.</p>;
+                return (
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Map</th>
+                        <th>{selectedMatchRow?.team1 || "Team 1"}</th>
+                        <th>{selectedMatchRow?.team2 || "Team 2"}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {maps.map((m, i) => (
+                        <tr key={`map-${i}-${m?.map || ""}`}>
+                          <td>{m?.map || "-"}</td>
+                          <td>{m?.score1 ?? "-"}</td>
+                          <td>{m?.score2 ?? "-"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                );
+              })()}
+            </div>
+            <div className="actions">
+              <button className="secondary" onClick={() => setShowMatchModal(false)}>
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlayerId, onOpenPlayerHandled }) {
   const [dbTab, setDbTab] = useState("players");
   const [playerSearch, setPlayerSearch] = useState("");
   const [playerSort, setPlayerSort] = useState("name_asc");
@@ -2456,12 +3133,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
     player_id: "",
     name: "",
     rating: "",
-    price: "",
-    best_role: "",
-    major_win_pct: "",
-    minor_win_pct: "",
-    boosters_json: "",
-    roles_json: "",
+    last_topx_import_at: "",
     rating_top5: "",
     maps_top5: "",
     rating_top10: "",
@@ -2473,14 +3145,32 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
     rating_top50: "",
     maps_top50: "",
   });
+  const [topRatingsBusy, setTopRatingsBusy] = useState(false);
+  const [playerTopxFeedback, setPlayerTopxFeedback] = useState(null);
+  const [batchTopRatingsBusy, setBatchTopRatingsBusy] = useState(false);
+  const [batchTopRatingsStatus, setBatchTopRatingsStatus] = useState("idle");
+  const [batchTopRatingsJobId, setBatchTopRatingsJobId] = useState("");
+  const [batchTopRatingsProcessed, setBatchTopRatingsProcessed] = useState(0);
+  const [batchTopRatingsTotal, setBatchTopRatingsTotal] = useState(0);
+  const [batchTopRatingsOk, setBatchTopRatingsOk] = useState(0);
+  const [batchTopRatingsFailed, setBatchTopRatingsFailed] = useState(0);
+  const [batchTopRatingsLastError, setBatchTopRatingsLastError] = useState("");
+  const [batchTopRatingsEtaSeconds, setBatchTopRatingsEtaSeconds] = useState(null);
+  const [playerCurve, setPlayerCurve] = useState(null);
+  const [playerCurveLoading, setPlayerCurveLoading] = useState(false);
+  const [playerCurveError, setPlayerCurveError] = useState("");
+  const batchTopRatingsPollingRef = useRef(false);
 
   const [selectedTeam, setSelectedTeam] = useState(null);
   const [showTeamModal, setShowTeamModal] = useState(false);
+  const [rankingsRefreshBusy, setRankingsRefreshBusy] = useState(false);
   const [teamForm, setTeamForm] = useState({
     team_id: "",
     name: "",
     hltv_rank: "",
+    hltv_points: "",
     vrs_rank: "",
+    vrs_points: "",
     win_rate: "",
     p1: "",
     p2: "",
@@ -2500,6 +3190,17 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
       ids.forEach((pid) => {
         if (!m[pid]) m[pid] = [];
         m[pid].push(t.name || `Team ${t.team_id}`);
+      });
+    });
+    return m;
+  }, [teams]);
+  const playerTeamLinks = useMemo(() => {
+    const m = {};
+    teams.forEach((t) => {
+      const ids = [t.player1_id, t.player2_id, t.player3_id, t.player4_id, t.player5_id].filter(Boolean);
+      ids.forEach((pid) => {
+        if (!m[pid]) m[pid] = [];
+        m[pid].push({ team_id: t.team_id, team_name: t.name || `Team ${t.team_id}` });
       });
     });
     return m;
@@ -2543,12 +3244,36 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
 
   const [boosterForm, setBoosterForm] = useState({});
   const [roleForm, setRoleForm] = useState({});
-  const [topFetchBusyByPlayer, setTopFetchBusyByPlayer] = useState({});
+  const boosterAverages = useMemo(() => {
+    const sums = {};
+    const counts = {};
+    for (const p of players || []) {
+      let parsed = {};
+      try {
+        parsed = p.boosters_json ? JSON.parse(p.boosters_json) : {};
+      } catch {
+        parsed = {};
+      }
+      for (const key of Object.keys(boosterNames)) {
+        const v = Number(parsed?.[key]);
+        if (!Number.isFinite(v)) continue;
+        sums[key] = (sums[key] || 0) + v;
+        counts[key] = (counts[key] || 0) + 1;
+      }
+    }
+    const avg = {};
+    for (const key of Object.keys(boosterNames)) {
+      if (counts[key] > 0) avg[key] = sums[key] / counts[key];
+    }
+    return avg;
+  }, [players]);
 
   useEffect(() => {
     if (selectedPlayer) {
       const p = players.find((x) => x.player_id === selectedPlayer);
       if (p) {
+        setTopRatingsBusy(false);
+        setPlayerTopxFeedback(null);
         let boostersObj = {};
         let rolesObj = {};
         try {
@@ -2558,36 +3283,11 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
           rolesObj = p.roles_json ? JSON.parse(p.roles_json) : {};
         } catch {}
 
-        // Derive best role/major/minor if missing from DB but present in roles JSON
-        let bestRole = p.best_role || "";
-        let majorPct = p.major_win_pct || "";
-        let minorPct = p.minor_win_pct || "";
-        if (rolesObj && Object.keys(rolesObj).length > 0) {
-          const best = Object.entries(rolesObj).reduce(
-            (acc, [rid, vals]) => {
-              const maj = Number(vals?.major ?? vals?.major_win_pct ?? 0);
-              if (maj > acc.maxMajor) {
-                return { role: rid, maxMajor: maj, minor: Number(vals?.minor ?? vals?.minor_win_pct ?? 0) };
-              }
-              return acc;
-            },
-            { role: bestRole || "", maxMajor: Number(majorPct || 0), minor: Number(minorPct || 0) }
-          );
-          bestRole = best.role;
-          majorPct = best.maxMajor || "";
-          minorPct = best.minor || "";
-        }
-
         setPlayerForm({
           player_id: p.player_id,
           name: p.name || "",
-          rating: p.rating || "",
-          price: p.price || "",
-          best_role: bestRole,
-          major_win_pct: majorPct,
-          minor_win_pct: minorPct,
-          boosters_json: p.boosters_json || "",
-          roles_json: p.roles_json || "",
+          rating: p.rating ?? "",
+          last_topx_import_at: p.last_topx_import_at ?? "",
           rating_top5: p.rating_top5 ?? "",
           maps_top5: p.maps_top5 ?? "",
           rating_top10: p.rating_top10 ?? "",
@@ -2601,10 +3301,53 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
         });
         setBoosterForm(boostersObj || {});
         setRoleForm(rolesObj || {});
-        setPlayerTab("info");
       }
     }
   }, [selectedPlayer, players]);
+
+  useEffect(() => {
+    if (!openPlayerId) return;
+    const pid = Number(openPlayerId);
+    if (!Number.isFinite(pid) || pid <= 0) {
+      if (onOpenPlayerHandled) onOpenPlayerHandled();
+      return;
+    }
+    setDbTab("players");
+    setSelectedPlayer(pid);
+    setShowPlayerModal(true);
+    setPlayerTab("info");
+    if (onOpenPlayerHandled) onOpenPlayerHandled();
+  }, [openPlayerId, onOpenPlayerHandled]);
+
+  useEffect(() => {
+    const pid = Number(selectedPlayer);
+    if (playerTab !== "topxGraph" || !showPlayerModal || !Number.isFinite(pid) || pid <= 0) {
+      if (!showPlayerModal || playerTab !== "topxGraph") {
+        setPlayerCurveError("");
+      }
+      return;
+    }
+    let cancelled = false;
+    const run = async () => {
+      setPlayerCurveLoading(true);
+      setPlayerCurveError("");
+      try {
+        const res = await api.get(`/players/${pid}/rating-curve`);
+        if (!cancelled) setPlayerCurve(res || null);
+      } catch (e) {
+        if (!cancelled) {
+          setPlayerCurve(null);
+          setPlayerCurveError("Failed to load Top-X graph.");
+        }
+      } finally {
+        if (!cancelled) setPlayerCurveLoading(false);
+      }
+    };
+    run();
+    return () => {
+      cancelled = true;
+    };
+  }, [playerTab, selectedPlayer, showPlayerModal, playerForm.last_topx_import_at]);
 
   useEffect(() => {
     if (selectedTeam) {
@@ -2614,76 +3357,19 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
           team_id: t.team_id,
           name: t.name || "",
           hltv_rank: t.hltv_rank || "",
+          hltv_points: t.hltv_points || "",
           vrs_rank: t.vrs_rank || "",
+          vrs_points: t.vrs_points || "",
           win_rate: t.win_rate || "",
-          p1: t.player1_id || "",
-          p2: t.player2_id || "",
-          p3: t.player3_id || "",
-          p4: t.player4_id || "",
-          p5: t.player5_id || "",
+          p1: t.player1_id ? String(t.player1_id) : "",
+          p2: t.player2_id ? String(t.player2_id) : "",
+          p3: t.player3_id ? String(t.player3_id) : "",
+          p4: t.player4_id ? String(t.player4_id) : "",
+          p5: t.player5_id ? String(t.player5_id) : "",
         });
       }
     }
   }, [selectedTeam, teams]);
-
-  const savePlayer = async () => {
-    if (!playerForm.player_id || !playerForm.name) return;
-    const num = (v) => (v === "" ? undefined : Number(v));
-    await api.post("/players/", {
-      player_id: Number(playerForm.player_id),
-      name: playerForm.name,
-      rating: num(playerForm.rating),
-      price: playerForm.price === "" ? undefined : Number(playerForm.price),
-      best_role: playerForm.best_role,
-      major_win_pct: num(playerForm.major_win_pct),
-      minor_win_pct: num(playerForm.minor_win_pct),
-      boosters_json: JSON.stringify(boosterForm || {}),
-      roles_json: JSON.stringify(roleForm || {}),
-      rating_top5: num(playerForm.rating_top5),
-      maps_top5: num(playerForm.maps_top5),
-      rating_top10: num(playerForm.rating_top10),
-      maps_top10: num(playerForm.maps_top10),
-      rating_top20: num(playerForm.rating_top20),
-      maps_top20: num(playerForm.maps_top20),
-      rating_top30: num(playerForm.rating_top30),
-      maps_top30: num(playerForm.maps_top30),
-      rating_top50: num(playerForm.rating_top50),
-      maps_top50: num(playerForm.maps_top50),
-    });
-    notify("Player saved");
-    refresh();
-    setShowPlayerModal(false);
-  };
-
-  const deletePlayer = async () => {
-    if (!selectedPlayer) return;
-    await api.delete(`/players/${selectedPlayer}`);
-    notify("Player deleted");
-    setSelectedPlayer(null);
-    setPlayerForm({
-      player_id: "",
-      name: "",
-      rating: "",
-      price: "",
-      best_role: "",
-      major_win_pct: "",
-      minor_win_pct: "",
-      boosters_json: "",
-      roles_json: "",
-      rating_top5: "",
-      maps_top5: "",
-      rating_top10: "",
-      maps_top10: "",
-      rating_top20: "",
-      maps_top20: "",
-      rating_top30: "",
-      maps_top30: "",
-      rating_top50: "",
-      maps_top50: "",
-    });
-    refresh();
-    setShowPlayerModal(false);
-  };
 
   const saveTeam = async () => {
     if (!teamForm.name) return;
@@ -2691,7 +3377,9 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
     await api.post("/teams/", {
       name: teamForm.name,
       hltv_rank: teamForm.hltv_rank === "" ? undefined : Number(teamForm.hltv_rank),
+      hltv_points: teamForm.hltv_points === "" ? undefined : Number(teamForm.hltv_points),
       vrs_rank: teamForm.vrs_rank === "" ? undefined : Number(teamForm.vrs_rank),
+      vrs_points: teamForm.vrs_points === "" ? undefined : Number(teamForm.vrs_points),
       win_rate: teamForm.win_rate === "" ? undefined : Number(teamForm.win_rate),
       player_ids: ids,
     });
@@ -2709,7 +3397,9 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
       team_id: "",
       name: "",
       hltv_rank: "",
+      hltv_points: "",
       vrs_rank: "",
+      vrs_points: "",
       win_rate: "",
       p1: "",
       p2: "",
@@ -2721,41 +3411,15 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
     setShowTeamModal(false);
   };
 
-  const newPlayer = () => {
-    setSelectedPlayer(null);
-    setPlayerForm({
-      player_id: "",
-      name: "",
-      rating: "",
-      price: "",
-      best_role: "",
-      major_win_pct: "",
-      minor_win_pct: "",
-      boosters_json: "",
-      roles_json: "",
-      rating_top5: "",
-      maps_top5: "",
-      rating_top10: "",
-      maps_top10: "",
-      rating_top20: "",
-      maps_top20: "",
-      rating_top30: "",
-      maps_top30: "",
-      rating_top50: "",
-      maps_top50: "",
-    });
-    setBoosterForm({});
-    setRoleForm({});
-    setShowPlayerModal(true);
-  };
-
   const newTeam = () => {
     setSelectedTeam(null);
     setTeamForm({
       team_id: "",
       name: "",
       hltv_rank: "",
+      hltv_points: "",
       vrs_rank: "",
+      vrs_points: "",
       win_rate: "",
       p1: "",
       p2: "",
@@ -2766,20 +3430,239 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
     setShowTeamModal(true);
   };
 
-  const fetchTopRatingsForPlayer = async (playerId, playerName) => {
-    setTopFetchBusyByPlayer((prev) => ({ ...prev, [playerId]: true }));
+  const fetchPlayerTopRatings = async () => {
+    const playerId = Number(playerForm.player_id);
+    if (!Number.isFinite(playerId) || playerId <= 0) {
+      setPlayerTopxFeedback({ kind: "error", message: "Player is missing a valid HLTV id." });
+      notify("Player is missing a valid HLTV id.");
+      return;
+    }
+    setTopRatingsBusy(true);
+    setPlayerTopxFeedback({ kind: "info", message: "Importing Top-X data from HLTV..." });
     try {
       const res = await api.post(`/players/${playerId}/fetch-top-ratings`, {});
-      if (res?.detail) {
-        notify(`Top X fetch failed for ${playerName || `player ${playerId}`}: ${res.detail}`);
-        return;
-      }
       await refresh();
-      notify(`Top X ratings fetched for ${playerName || `player ${playerId}`}`);
+      const rangeText = res?.startDate && res?.endDate ? ` (${res.startDate} to ${res.endDate})` : "";
+      setPlayerTopxFeedback({
+        kind: "success",
+        message: `Top-X import succeeded${rangeText}.`,
+      });
+      notify(`Top-X imported for ${playerForm.name || `player ${playerId}`}${rangeText}`);
     } catch (e) {
-      notify(`Top X fetch failed for ${playerName || `player ${playerId}`}`);
+      setPlayerTopxFeedback({
+        kind: "error",
+        message: `Import failed: ${e?.message || "unknown error"}`,
+      });
+      notify(`Top-X import failed: ${e?.message || "unknown error"}`);
     } finally {
-      setTopFetchBusyByPlayer((prev) => ({ ...prev, [playerId]: false }));
+      setTopRatingsBusy(false);
+    }
+  };
+
+  const openPlayerHltvPage = async () => {
+    const playerId = Number(playerForm.player_id);
+    if (!Number.isFinite(playerId) || playerId <= 0) {
+      notify("Player is missing a valid HLTV id.");
+      return;
+    }
+    const url = buildHltvPlayerStatsUrl(playerId, playerForm.name);
+    if (!url) {
+      notify("Failed to build the HLTV player URL.");
+      return;
+    }
+    try {
+      await api.openHltvPage(url);
+    } catch (e) {
+      notify(`Failed to open HLTV page: ${e?.message || "unknown error"}`);
+    }
+  };
+
+  const fetchPlayerTopRatingsFromOpenedPage = async () => {
+    const playerId = Number(playerForm.player_id);
+    if (!Number.isFinite(playerId) || playerId <= 0) {
+      setPlayerTopxFeedback({ kind: "error", message: "Player is missing a valid HLTV id." });
+      notify("Player is missing a valid HLTV id.");
+      return;
+    }
+    setTopRatingsBusy(true);
+    setPlayerTopxFeedback({ kind: "info", message: "Reading data from opened HLTV page..." });
+    try {
+      const opened = await api.readOpenedHltvPageText();
+      const sourceText = String(opened?.text || "").trim();
+      if (!sourceText) {
+        throw new Error("Opened HLTV page has no readable text yet. Wait for it to load and retry.");
+      }
+      const res = await api.post(`/players/${playerId}/fetch-top-ratings`, { text: sourceText });
+      await refresh();
+      const rangeText = res?.startDate && res?.endDate ? ` (${res.startDate} to ${res.endDate})` : "";
+      setPlayerTopxFeedback({
+        kind: "success",
+        message: `Top-X import succeeded from opened HLTV page${rangeText}.`,
+      });
+      notify(`Top-X imported for ${playerForm.name || `player ${playerId}`} from opened HLTV page${rangeText}`);
+    } catch (e) {
+      setPlayerTopxFeedback({
+        kind: "error",
+        message: `Import from opened page failed: ${e?.message || "unknown error"}`,
+      });
+      notify(`Import from opened page failed: ${e?.message || "unknown error"}`);
+    } finally {
+      setTopRatingsBusy(false);
+    }
+  };
+
+  const resetBatchTopRatingsProgress = () => {
+    setBatchTopRatingsStatus("idle");
+    setBatchTopRatingsJobId("");
+    setBatchTopRatingsProcessed(0);
+    setBatchTopRatingsTotal(0);
+    setBatchTopRatingsOk(0);
+    setBatchTopRatingsFailed(0);
+    setBatchTopRatingsLastError("");
+    setBatchTopRatingsEtaSeconds(null);
+  };
+
+  const formatBatchEta = (seconds) => {
+    if (!Number.isFinite(seconds) || seconds == null || seconds < 0) return "Calculating...";
+    if (seconds <= 1) return "<1s";
+    if (seconds < 60) return `${Math.round(seconds)}s`;
+    const minutes = Math.floor(seconds / 60);
+    const rem = Math.round(seconds % 60);
+    return `${minutes}m ${rem}s`;
+  };
+
+  const pollBatchTopRatingsJob = async (jobId, startedAtMs) => {
+    if (!jobId || batchTopRatingsPollingRef.current) return;
+    batchTopRatingsPollingRef.current = true;
+    try {
+      let done = false;
+      while (!done) {
+        const status = await api.get(`/players/fetch-top-ratings-batch/job/${jobId}`);
+        const processed = Number(status?.processed_players || 0);
+        const total = Number(status?.total_players || 0);
+        const ok = Number(status?.ok || 0);
+        const failed = Number(status?.failed || 0);
+        const nextStatus = String(status?.status || "queued");
+        const lastError = String(status?.last_error || status?.error || "");
+
+        setBatchTopRatingsStatus(nextStatus);
+        setBatchTopRatingsJobId(jobId);
+        setBatchTopRatingsProcessed(processed);
+        setBatchTopRatingsTotal(total);
+        setBatchTopRatingsOk(ok);
+        setBatchTopRatingsFailed(failed);
+        setBatchTopRatingsLastError(lastError);
+
+        if (processed > 0 && total > processed) {
+          const elapsedSec = Math.max(0.001, (Date.now() - startedAtMs) / 1000);
+          const rate = processed / elapsedSec;
+          if (rate > 0) {
+            setBatchTopRatingsEtaSeconds((total - processed) / rate);
+          }
+        } else if (total > 0 && processed >= total) {
+          setBatchTopRatingsEtaSeconds(0);
+        } else {
+          setBatchTopRatingsEtaSeconds(null);
+        }
+
+        if (nextStatus === "failed") {
+          setBatchTopRatingsBusy(false);
+          notify(lastError || "Top-X batch failed.");
+          done = true;
+          break;
+        }
+        if (nextStatus === "completed") {
+          setBatchTopRatingsBusy(false);
+          await refresh();
+          const rows = Array.isArray(status?.result?.results) ? status.result.results : Array.isArray(status?.results) ? status.results : [];
+          const failedRows = rows.filter((row) => row?.status !== "ok");
+          const failedPreview = failedRows
+            .slice(0, 3)
+            .map((row) => row?.player_name || `player ${row?.player_id}`)
+            .join(", ");
+          const failedSuffix = failedPreview ? ` | Failed: ${failedPreview}${failedRows.length > 3 ? "..." : ""}` : "";
+          notify(`Top-X batch finished: ok ${ok} failed ${failed}${failedSuffix}`);
+          done = true;
+          break;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+    } catch (e) {
+      setBatchTopRatingsBusy(false);
+      setBatchTopRatingsStatus("failed");
+      setBatchTopRatingsLastError(String(e?.message || "Failed to poll Top-X batch status."));
+      notify(`Top-X batch failed: ${e?.message || "unknown error"}`);
+    } finally {
+      batchTopRatingsPollingRef.current = false;
+    }
+  };
+
+  const importAllPlayerTopRatings = async () => {
+    const playerIds = (players || [])
+      .map((player) => Number(player?.player_id))
+      .filter((value) => Number.isFinite(value) && value > 0);
+    if (playerIds.length === 0) {
+      notify("No players available to import.");
+      return;
+    }
+    setBatchTopRatingsBusy(true);
+    setBatchTopRatingsStatus("queued");
+    setBatchTopRatingsProcessed(0);
+    setBatchTopRatingsTotal(playerIds.length);
+    setBatchTopRatingsOk(0);
+    setBatchTopRatingsFailed(0);
+    setBatchTopRatingsLastError("");
+    setBatchTopRatingsEtaSeconds(null);
+    try {
+      const start = await api.post("/players/fetch-top-ratings-batch/start", { player_ids: playerIds });
+      const jobId = String(start?.job_id || "");
+      if (!jobId) {
+        throw new Error("Failed to start Top-X batch job.");
+      }
+      setBatchTopRatingsJobId(jobId);
+      await pollBatchTopRatingsJob(jobId, Date.now());
+    } catch (e) {
+      setBatchTopRatingsStatus("failed");
+      setBatchTopRatingsLastError(String(e?.message || "Failed to start Top-X batch job."));
+      notify(`Top-X batch failed: ${e?.message || "unknown error"}`);
+    } finally {
+      setBatchTopRatingsBusy(false);
+    }
+  };
+
+  const openPlayerDetailsFromTeam = (playerId) => {
+    const pid = Number(playerId);
+    if (!Number.isFinite(pid) || pid <= 0) return;
+    setDbTab("players");
+    setShowTeamModal(false);
+    setSelectedPlayer(pid);
+    setShowPlayerModal(true);
+  };
+
+  const openTeamDetailsFromPlayer = (teamId) => {
+    if (!teamId) return;
+    setDbTab("teams");
+    setShowPlayerModal(false);
+    setSelectedTeam(teamId);
+    setShowTeamModal(true);
+  };
+
+  const refreshAllRankingsToday = async () => {
+    setRankingsRefreshBusy(true);
+    try {
+      const res = await api.post("/teams/refresh-rankings-today", {});
+      await refresh();
+      const hltv = res?.hltv || {};
+      const vrs = res?.vrs || {};
+      notify(
+        `Rankings refreshed: HLTV u:${hltv.updated || 0} i:${hltv.inserted || 0} f:${hltv.failed || 0} | ` +
+          `VRS u:${vrs.updated || 0} i:${vrs.inserted || 0} f:${vrs.failed || 0}`
+      );
+    } catch (e) {
+      notify(`Rankings refresh failed: ${e?.message || "unknown error"}`);
+    } finally {
+      setRankingsRefreshBusy(false);
     }
   };
 
@@ -2795,20 +3678,33 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
     }
   };
 
-  const hasTopXRatings = (player) => {
-    const tiers = [5, 10, 20, 30, 50];
-    return tiers.some((tier) => {
-      const rating = player[`rating_top${tier}`];
-      const maps = player[`maps_top${tier}`];
-      return rating !== null && rating !== undefined && rating !== "" && maps !== null && maps !== undefined && maps !== "";
-    });
-  };
-
   const hasBoostersAndRoles = (player) => hasJsonEntries(player.boosters_json) && hasJsonEntries(player.roles_json);
   const toNum = (v, fallback = 0) => {
     const n = Number(v);
     return Number.isFinite(n) ? n : fallback;
   };
+  const batchTopRatingsProgressPct =
+    batchTopRatingsTotal > 0 ? Math.min(100, Math.max(0, (batchTopRatingsProcessed / batchTopRatingsTotal) * 100)) : 0;
+  const showBatchTopRatingsProgress = batchTopRatingsStatus !== "idle";
+  const playerTopxRows = useMemo(() => {
+    const rows = Array.isArray(playerCurve?.bucket_rows) ? playerCurve.bucket_rows : [];
+    return rows
+      .map((row) => ({
+        tier: Number(row?.tier),
+        tierLabel: String(row?.tier_label || `Top ${Number(row?.tier)}`),
+        bucketRating: Number.isFinite(Number(row?.bucket_rating)) ? Number(row.bucket_rating) : null,
+        bucketDelta: Number.isFinite(Number(row?.bucket_delta)) ? Number(row.bucket_delta) : null,
+        maps: Number(row?.maps || 0),
+      }))
+      .filter((row) => Number.isFinite(row.tier) && row.tier > 0 && row.tier < 100)
+      .sort((a, b) => a.tier - b.tier);
+  }, [playerCurve]);
+  const playerTopxRatingAxis = useMemo(() => {
+    return buildNiceStepAxis(
+      playerTopxRows.map((row) => row.bucketRating),
+      0.05
+    );
+  }, [playerTopxRows]);
   const filteredSortedPlayers = useMemo(() => {
     const q = playerSearch.trim().toLowerCase();
     const list = players.filter((p) => {
@@ -2833,10 +3729,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
           return toNum(b.rating) - toNum(a.rating);
         case "rating_asc":
           return toNum(a.rating) - toNum(b.rating);
-        case "price_desc":
-          return toNum(b.price) - toNum(a.price);
-        case "price_asc":
-          return toNum(a.price) - toNum(b.price);
         case "team_asc":
           return ((playerTeamLookup[a.player_id] || [])[0] || "").localeCompare(((playerTeamLookup[b.player_id] || [])[0] || ""));
         case "boost_desc":
@@ -2899,6 +3791,9 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
         <button className={dbTab === "teams" ? "tab active" : "tab"} onClick={() => setDbTab("teams")}>
           Teams
         </button>
+        <button className={dbTab === "matches" ? "tab active" : "tab"} onClick={() => setDbTab("matches")}>
+          Matches
+        </button>
       </div>
 
       {dbTab === "players" && <Section title="Players">
@@ -2907,8 +3802,8 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
         ) : error ? (
           <p className="error">{error}</p>
         ) : (
-          <>
-            <p className="muted">Click a player row to view/edit details.</p>
+          <div className="players-panel">
+            <p className="muted">Click a player row to view details.</p>
             <div className="grid two">
               <Input label="Search Players" value={playerSearch} onChange={setPlayerSearch} placeholder="Name, ID, or team" />
               <Select
@@ -2922,13 +3817,59 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
                   { value: "id_desc", label: "ID high-low" },
                   { value: "rating_desc", label: "Rating high-low" },
                   { value: "rating_asc", label: "Rating low-high" },
-                  { value: "price_desc", label: "Price high-low" },
-                  { value: "price_asc", label: "Price low-high" },
                   { value: "team_asc", label: "Team A-Z" },
                   { value: "boost_desc", label: "Boost/Role imported first" },
                 ]}
               />
             </div>
+            <div className="card sub players-batch-toolbar">
+              <div className="players-batch-meta">
+                <p className="muted">Import all players&apos; Top-X data concurrently. For one player, open the player details and use the individual import button.</p>
+                <p className="muted">
+                  Players in DB: {players.length} | Visible: {filteredSortedPlayers.length}
+                  {batchTopRatingsJobId ? ` | Job ${batchTopRatingsJobId}` : ""}
+                </p>
+              </div>
+              <div className="actions" style={{ marginTop: 0 }}>
+                <button
+                  className="primary"
+                  onClick={importAllPlayerTopRatings}
+                  disabled={players.length === 0 || batchTopRatingsBusy}
+                >
+                  {batchTopRatingsBusy ? `Importing ${batchTopRatingsTotal} players...` : `Import All (${players.length})`}
+                </button>
+                {showBatchTopRatingsProgress && (
+                  <button className="secondary" onClick={resetBatchTopRatingsProgress} disabled={batchTopRatingsBusy}>
+                    Clear Progress
+                  </button>
+                )}
+              </div>
+            </div>
+            {showBatchTopRatingsProgress && (
+              <div className="card sub">
+                <p className="muted">
+                  Top-X progress: {batchTopRatingsProcessed.toLocaleString()} / {batchTopRatingsTotal.toLocaleString()} | ok{" "}
+                  {batchTopRatingsOk} | failed {batchTopRatingsFailed}
+                  {batchTopRatingsStatus === "running" && batchTopRatingsTotal > batchTopRatingsProcessed
+                    ? ` | ETA: ${formatBatchEta(batchTopRatingsEtaSeconds)}`
+                    : ""}
+                </p>
+                <div className="progress">
+                  <div className="progress-bar determinate" style={{ width: `${batchTopRatingsProgressPct}%` }} />
+                </div>
+                <p className="muted">
+                  Status:{" "}
+                  {batchTopRatingsStatus === "completed"
+                    ? "Completed"
+                    : batchTopRatingsStatus === "failed"
+                      ? "Failed"
+                      : batchTopRatingsStatus === "running"
+                        ? "Running"
+                        : "Queued"}
+                </p>
+                {batchTopRatingsLastError && <p className="muted">Last error: {batchTopRatingsLastError}</p>}
+              </div>
+            )}
             <p className="muted status-legend">
               <span>
                 <span className="status-dot ok" /> imported
@@ -2937,14 +3878,14 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
                 <span className="status-dot missing" /> missing
               </span>
             </p>
-            <table>
+            <div className="players-table-wrap">
+            <table className="players-table">
               <colgroup>
-                <col style={{ width: "12%" }} />
-                <col style={{ width: "20%" }} />
-                <col style={{ width: "18%" }} />
-                <col style={{ width: "14%" }} />
-                <col style={{ width: "14%" }} />
                 <col style={{ width: "22%" }} />
+                <col style={{ width: "16%" }} />
+                <col style={{ width: "30%" }} />
+                <col style={{ width: "16%" }} />
+                <col style={{ width: "16%" }} />
               </colgroup>
               <thead>
                 <tr>
@@ -2952,7 +3893,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
                   <th>ID</th>
                   <th>Team</th>
                   <th>Rating</th>
-                  <th>Price</th>
                   <th title="Boosters and Roles imported">Boost/Role</th>
                 </tr>
               </thead>
@@ -2965,15 +3905,14 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
                       setSelectedPlayer(p.player_id);
                       setShowPlayerModal(true);
                     }}
-                  >
-                    <td>{p.name}</td>
-                    <td>{p.player_id}</td>
-                    <td>{(playerTeamLookup[p.player_id] || []).join(", ") || "-"}</td>
-                    <td>{Number(p.rating || 0).toFixed(2)}</td>
-                    <td>{p.price}</td>
-                    <td className="status-cell">
-                      <span
-                        className={hasBoostersAndRoles(p) ? "status-dot ok" : "status-dot missing"}
+                    >
+                      <td>{p.name}</td>
+                      <td>{p.player_id}</td>
+                      <td>{(playerTeamLookup[p.player_id] || []).join(", ") || "-"}</td>
+                      <td>{Number(p.rating || 0).toFixed(2)}</td>
+                      <td className="status-cell">
+                        <span
+                          className={hasBoostersAndRoles(p) ? "status-dot ok" : "status-dot missing"}
                         title={hasBoostersAndRoles(p) ? "Boosters and roles imported" : "Boosters and roles missing"}
                       />
                     </td>
@@ -2981,86 +3920,50 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
                 ))}
               </tbody>
             </table>
-          </>
+            </div>
+          </div>
         )}
-        <div className="card sub" style={{ display: "none" }}>
-          <div className="actions">
-            <button className="primary" onClick={newPlayer}>
-              New Player
-            </button>
-          </div>
-          <div className="grid two">
-            <Input label="Player ID" value={playerForm.player_id} onChange={(v) => setPlayerForm((p) => ({ ...p, player_id: v }))} />
-            <Input label="Name" value={playerForm.name} onChange={(v) => setPlayerForm((p) => ({ ...p, name: v }))} />
-            <Input label="Rating" value={playerForm.rating} onChange={(v) => setPlayerForm((p) => ({ ...p, rating: v }))} />
-            <Input label="Price" value={playerForm.price} onChange={(v) => setPlayerForm((p) => ({ ...p, price: v }))} />
-            <Input label="Best Role" value={playerForm.best_role} onChange={(v) => setPlayerForm((p) => ({ ...p, best_role: v }))} />
-            <Input label="Major Win %" value={playerForm.major_win_pct} onChange={(v) => setPlayerForm((p) => ({ ...p, major_win_pct: v }))} />
-            <Input label="Minor Win %" value={playerForm.minor_win_pct} onChange={(v) => setPlayerForm((p) => ({ ...p, minor_win_pct: v }))} />
-          </div>
-          <div className="grid three">
-            <Input label="Rating Top5" value={playerForm.rating_top5} onChange={(v) => setPlayerForm((p) => ({ ...p, rating_top5: v }))} />
-            <Input label="Maps Top5" value={playerForm.maps_top5} onChange={(v) => setPlayerForm((p) => ({ ...p, maps_top5: v }))} />
-            <Input label="Rating Top10" value={playerForm.rating_top10} onChange={(v) => setPlayerForm((p) => ({ ...p, rating_top10: v }))} />
-            <Input label="Maps Top10" value={playerForm.maps_top10} onChange={(v) => setPlayerForm((p) => ({ ...p, maps_top10: v }))} />
-            <Input label="Rating Top20" value={playerForm.rating_top20} onChange={(v) => setPlayerForm((p) => ({ ...p, rating_top20: v }))} />
-            <Input label="Maps Top20" value={playerForm.maps_top20} onChange={(v) => setPlayerForm((p) => ({ ...p, maps_top20: v }))} />
-            <Input label="Rating Top30" value={playerForm.rating_top30} onChange={(v) => setPlayerForm((p) => ({ ...p, rating_top30: v }))} />
-            <Input label="Maps Top30" value={playerForm.maps_top30} onChange={(v) => setPlayerForm((p) => ({ ...p, maps_top30: v }))} />
-            <Input label="Rating Top50" value={playerForm.rating_top50} onChange={(v) => setPlayerForm((p) => ({ ...p, rating_top50: v }))} />
-            <Input label="Maps Top50" value={playerForm.maps_top50} onChange={(v) => setPlayerForm((p) => ({ ...p, maps_top50: v }))} />
-          </div>
-          <div className="grid two">
-            <label className="field">
-              <span>Boosters JSON</span>
-              <textarea
-                value={playerForm.boosters_json}
-                onChange={(e) => setPlayerForm((p) => ({ ...p, boosters_json: e.target.value }))}
-                rows={3}
-              />
-            </label>
-            <label className="field">
-              <span>Roles JSON</span>
-              <textarea
-                value={playerForm.roles_json}
-                onChange={(e) => setPlayerForm((p) => ({ ...p, roles_json: e.target.value }))}
-                rows={3}
-              />
-            </label>
-          </div>
-          <div className="actions">
-            <button className="primary" onClick={savePlayer} disabled={!playerForm.player_id || !playerForm.name}>
-              Save Player
-            </button>
-            <button className="danger" onClick={deletePlayer} disabled={!selectedPlayer}>
-              Delete Player
-            </button>
-          </div>
-        </div>
       </Section>}
 
       {showPlayerModal && (
         <div className="modal-backdrop" onClick={() => setShowPlayerModal(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <header className="modal-header">
-              <h3>{selectedPlayer ? "Edit Player" : "New Player"}</h3>
+              <h3 className="player-modal-title">{playerForm.name || "Player Details"}</h3>
               <button className="close" onClick={() => setShowPlayerModal(false)}>
-                ✕
+                &times;
               </button>
             </header>
             <div className="modal-body">
-              <div className="grid two">
-                <Input label="Player ID" value={playerForm.player_id} onChange={(v) => setPlayerForm((p) => ({ ...p, player_id: v }))} />
-                <Input label="Name" value={playerForm.name} onChange={(v) => setPlayerForm((p) => ({ ...p, name: v }))} />
-                <Input label="Rating" value={playerForm.rating} onChange={(v) => setPlayerForm((p) => ({ ...p, rating: v }))} />
-                <Input label="Price" value={playerForm.price} onChange={(v) => setPlayerForm((p) => ({ ...p, price: v }))} />
-                <Input label="Best Role" value={playerForm.best_role} onChange={(v) => setPlayerForm((p) => ({ ...p, best_role: v }))} />
-                <Input label="Major Win %" value={playerForm.major_win_pct} onChange={(v) => setPlayerForm((p) => ({ ...p, major_win_pct: v }))} />
-                <Input label="Minor Win %" value={playerForm.minor_win_pct} onChange={(v) => setPlayerForm((p) => ({ ...p, minor_win_pct: v }))} />
+              <div className="player-summary">
+                <div className="player-summary-meta">
+                  <span className="player-summary-chip player-summary-id">ID {playerForm.player_id || "-"}</span>
+                  <span className="player-summary-chip player-summary-rating">Rating {Number(playerForm.rating || 0).toFixed(2)}</span>
+                  <div className="player-summary-teams-wrap">
+                    {(playerTeamLinks[playerForm.player_id] || []).length > 0 ? (
+                      (playerTeamLinks[playerForm.player_id] || []).map((team) => (
+                        <button
+                          key={`${playerForm.player_id}-${team.team_id}`}
+                          type="button"
+                          className="player-summary-chip player-summary-team-btn"
+                          onClick={() => openTeamDetailsFromPlayer(team.team_id)}
+                          title={`Open ${team.team_name}`}
+                        >
+                          {team.team_name}
+                        </button>
+                      ))
+                    ) : (
+                      <span className="player-summary-chip player-summary-teams">-</span>
+                    )}
+                  </div>
+                </div>
               </div>
               <div className="tab-bar small">
                 <button className={playerTab === "info" ? "tab active" : "tab"} onClick={() => setPlayerTab("info")}>
                   Ratings
+                </button>
+                <button className={playerTab === "topxGraph" ? "tab active" : "tab"} onClick={() => setPlayerTab("topxGraph")}>
+                  Top X Graph
                 </button>
                 <button className={playerTab === "boosters" ? "tab active" : "tab"} onClick={() => setPlayerTab("boosters")}>
                   Boosters
@@ -3072,86 +3975,246 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
               {playerTab === "info" && (
                 <div className="stack">
                   <div className="actions" style={{ marginTop: 0 }}>
-                    <button
-                      className="primary"
-                      onClick={() => fetchTopRatingsForPlayer(Number(playerForm.player_id), playerForm.name)}
-                      disabled={!playerForm.player_id || Boolean(topFetchBusyByPlayer[Number(playerForm.player_id)])}
-                    >
-                      {topFetchBusyByPlayer[Number(playerForm.player_id)] ? "Fetching..." : "Fetch Top X"}
+                    <button className="secondary" onClick={openPlayerHltvPage} disabled={!playerForm.player_id || topRatingsBusy}>
+                      Open HLTV Page
                     </button>
-                    <span className="muted" style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <span
-                        className={hasTopXRatings(playerForm) ? "status-dot ok" : "status-dot missing"}
-                        title={hasTopXRatings(playerForm) ? "Top X ratings imported" : "Top X ratings missing"}
-                      />
-                      {hasTopXRatings(playerForm) ? "Top X ratings imported" : "Top X ratings missing"}
-                    </span>
+                    <button
+                      className="secondary"
+                      onClick={fetchPlayerTopRatingsFromOpenedPage}
+                      disabled={!playerForm.player_id || topRatingsBusy}
+                    >
+                      Import From Opened Page
+                    </button>
+                    <button
+                      className="primary button-with-spinner"
+                      onClick={fetchPlayerTopRatings}
+                      disabled={!playerForm.player_id || topRatingsBusy}
+                    >
+                      {topRatingsBusy && <span className="button-spinner" aria-hidden="true" />}
+                      <span>{topRatingsBusy ? "Importing..." : "Import Top-X Data"}</span>
+                    </button>
                   </div>
-                  <div className="grid three">
-                    <Input label="Rating Top5" value={playerForm.rating_top5} onChange={(v) => setPlayerForm((p) => ({ ...p, rating_top5: v }))} />
-                    <Input label="Maps Top5" value={playerForm.maps_top5} onChange={(v) => setPlayerForm((p) => ({ ...p, maps_top5: v }))} />
-                    <Input label="Rating Top10" value={playerForm.rating_top10} onChange={(v) => setPlayerForm((p) => ({ ...p, rating_top10: v }))} />
-                    <Input label="Maps Top10" value={playerForm.maps_top10} onChange={(v) => setPlayerForm((p) => ({ ...p, maps_top10: v }))} />
-                    <Input label="Rating Top20" value={playerForm.rating_top20} onChange={(v) => setPlayerForm((p) => ({ ...p, rating_top20: v }))} />
-                    <Input label="Maps Top20" value={playerForm.maps_top20} onChange={(v) => setPlayerForm((p) => ({ ...p, maps_top20: v }))} />
-                    <Input label="Rating Top30" value={playerForm.rating_top30} onChange={(v) => setPlayerForm((p) => ({ ...p, rating_top30: v }))} />
-                    <Input label="Maps Top30" value={playerForm.maps_top30} onChange={(v) => setPlayerForm((p) => ({ ...p, maps_top30: v }))} />
-                    <Input label="Rating Top50" value={playerForm.rating_top50} onChange={(v) => setPlayerForm((p) => ({ ...p, rating_top50: v }))} />
-                    <Input label="Maps Top50" value={playerForm.maps_top50} onChange={(v) => setPlayerForm((p) => ({ ...p, maps_top50: v }))} />
-                  </div>
+                  {playerTopxFeedback?.message && (
+                    <p className={`inline-status ${playerTopxFeedback.kind || "info"}`}>{playerTopxFeedback.message}</p>
+                  )}
+                  <p className="muted">
+                    Open HLTV Page loads the player page in an app window. Import From Opened Page reads that window text and avoids extra HLTV fetch requests.
+                  </p>
+                  <p className="muted">Last Top-X import: {formatTopxImportedAt(playerForm.last_topx_import_at)}</p>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Metric</th>
+                        {TOP_RATING_TIERS.map((tier) => (
+                          <th key={`head-${tier}`}>{`Top ${tier}`}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr>
+                        <td>Rating</td>
+                        {TOP_RATING_TIERS.map((tier) => {
+                          const ratingRaw = playerForm[`rating_top${tier}`];
+                          const rating =
+                            ratingRaw === "" || ratingRaw === null || ratingRaw === undefined ? NaN : Number(ratingRaw);
+                          return <td key={`rating-${tier}`}>{Number.isFinite(rating) ? rating.toFixed(2) : "-"}</td>;
+                        })}
+                      </tr>
+                      <tr>
+                        <td>Maps Played</td>
+                        {TOP_RATING_TIERS.map((tier) => {
+                          const mapsRaw = playerForm[`maps_top${tier}`];
+                          const maps = mapsRaw === "" || mapsRaw === null || mapsRaw === undefined ? NaN : Number(mapsRaw);
+                          return <td key={`maps-${tier}`}>{Number.isFinite(maps) ? Math.round(maps) : "-"}</td>;
+                        })}
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              {playerTab === "topxGraph" && (
+                <div className="stack">
+                  <p className="muted">
+                    Adjusted Top-X buckets use non-overlapping ranges: Top 5, 6-10, 11-20, 21-30, and 31-50.
+                  </p>
+                  <p className="muted">
+                    The last point is the 31-50 bucket derived from cumulative Top 50 minus Top 30, not raw cumulative Top 50.
+                  </p>
+                  {playerCurveLoading && <p className="muted">Loading Top-X graph...</p>}
+                  {playerCurveError && <p className="error">{playerCurveError}</p>}
+                  {!playerCurveLoading && !playerCurveError && playerTopxRows.length === 0 && (
+                    <p className="muted">No adjusted Top-X bucket data available yet.</p>
+                  )}
+                  {playerTopxRows.length > 0 && (
+                    <>
+                      <p className="muted">
+                        Overall rating: {Number(playerCurve?.base_rating || playerForm.rating || 0).toFixed(3)} | Sample maps:{" "}
+                        {Math.round(Number(playerCurve?.sample_maps || 0))}
+                      </p>
+                      <div className="value-chart-wrap">
+                        <ResponsiveContainer width="100%" height={320}>
+                          <ComposedChart data={playerTopxRows} margin={{ top: 12, right: 18, left: 6, bottom: 12 }}>
+                            <CartesianGrid stroke="#284061" strokeDasharray="3 3" />
+                            <XAxis
+                              dataKey="tierLabel"
+                              tick={{ fill: "#9fc5ff", fontSize: 12 }}
+                              axisLine={{ stroke: "#365a89" }}
+                              tickLine={{ stroke: "#365a89" }}
+                            />
+                            <YAxis
+                              tick={{ fill: "#9fc5ff", fontSize: 12 }}
+                              axisLine={{ stroke: "#365a89" }}
+                              tickLine={{ stroke: "#365a89" }}
+                              domain={playerTopxRatingAxis.domain}
+                              ticks={playerTopxRatingAxis.ticks}
+                              tickFormatter={(v) => Number(v).toFixed(2)}
+                            />
+                            <Tooltip
+                              contentStyle={{ background: "#0e1f3f", border: "1px solid #2f5ca5", borderRadius: 10, color: "#dcecff" }}
+                              formatter={(value, name) => {
+                                if (name === "Adjusted Rating") return [Number(value).toFixed(3), "Adjusted Rating"];
+                                return [value, name];
+                              }}
+                              labelFormatter={(_, payload) => {
+                                const row = payload?.[0]?.payload || {};
+                                const delta = Number(row.bucketDelta);
+                                const deltaText = Number.isFinite(delta) ? `${delta >= 0 ? "+" : ""}${delta.toFixed(3)}` : "N/A";
+                                return `${row.tierLabel || "-"} | Delta ${deltaText} | Maps ${Math.round(Number(row.maps || 0))}`;
+                              }}
+                            />
+                            <Legend wrapperStyle={{ color: "#9fc5ff" }} />
+                            <Line
+                              type="linear"
+                              dataKey="bucketRating"
+                              name="Adjusted Rating"
+                              stroke="#22d3ee"
+                              strokeWidth={2.2}
+                              dot={{ r: 4, fill: "#22d3ee", strokeWidth: 0 }}
+                              connectNulls={false}
+                              isAnimationActive={false}
+                            />
+                          </ComposedChart>
+                        </ResponsiveContainer>
+                      </div>
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Bucket</th>
+                            <th>Adjusted Rating</th>
+                            <th>Delta vs Overall</th>
+                            <th>Maps</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {playerTopxRows.map((row) => (
+                            <tr key={`topx-row-${row.tier}`}>
+                              <td>{row.tierLabel}</td>
+                              <td>{Number.isFinite(row.bucketRating) ? row.bucketRating.toFixed(3) : "-"}</td>
+                              <td>
+                                {Number.isFinite(row.bucketDelta)
+                                  ? `${row.bucketDelta >= 0 ? "+" : ""}${row.bucketDelta.toFixed(3)}`
+                                  : "-"}
+                              </td>
+                              <td>{Math.round(Number(row.maps || 0))}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </>
+                  )}
                 </div>
               )}
               {playerTab === "boosters" && (
-                <div className="grid two">
-                  {Object.entries(boosterNames).map(([id, label]) => (
-                    <Input
-                      key={id}
-                      label={`${label} (id ${id})`}
-                      value={boosterForm[id] ?? ""}
-                      onChange={(v) => setBoosterForm((prev) => ({ ...prev, [id]: v }))}
-                    />
-                  ))}
+                <div className="booster-tier-grid">
+                  {Object.entries(boosterNames).map(([id, label]) => {
+                    const value = Number(boosterForm[id]);
+                    const average = Number(boosterAverages[id]);
+                    const hasValue = Number.isFinite(value);
+                    const hasAverage = Number.isFinite(average);
+                    const percentText = hasValue ? `${Math.round(value * 100)}%` : "N/A";
+                    let deltaText = "vs avg: N/A";
+                    let deltaClass = "";
+                    if (hasValue && hasAverage) {
+                      const deltaPct = Math.round((value - average) * 100);
+                      if (deltaPct > 0) {
+                        deltaText = `+${deltaPct}% vs avg`;
+                        deltaClass = "better";
+                      } else if (deltaPct < 0) {
+                        deltaText = `${deltaPct}% vs avg`;
+                        deltaClass = "worse";
+                      } else {
+                        deltaText = "same as avg";
+                        deltaClass = "equal";
+                      }
+                    }
+                    return (
+                      <div key={id} className="booster-tier-card">
+                        <div className="booster-tier-label">{label}</div>
+                        <div className="booster-tier-value">{percentText}</div>
+                        <div className={`booster-tier-delta ${deltaClass}`}>{deltaText}</div>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
               {playerTab === "roles" && (
-                <div className="grid two">
-                  {Object.entries(roleNames).map(([id, label]) => (
-                    <div key={id} className="stack">
-                      <Input
-                        label={`${label} (id ${id}) - Major %`}
-                        value={roleForm[id]?.major ?? roleForm[id]?.major_win_pct ?? ""}
-                        onChange={(v) =>
-                          setRoleForm((prev) => ({
-                            ...prev,
-                            [id]: { ...(prev[id] || {}), major: v },
-                          }))
-                        }
-                      />
-                      <Input
-                        label={`${label} (id ${id}) - Minor %`}
-                        value={roleForm[id]?.minor ?? roleForm[id]?.minor_win_pct ?? ""}
-                        onChange={(v) =>
-                          setRoleForm((prev) => ({
-                            ...prev,
-                            [id]: { ...(prev[id] || {}), minor: v },
-                          }))
-                        }
-                      />
-                    </div>
-                  ))}
+                <div className="role-tier-grid">
+                  {(() => {
+                    const normalizeRate = (v) => {
+                      const n = Number(v);
+                      if (!Number.isFinite(n)) return null;
+                      if (n < 0) return 0;
+                      if (n > 1) return n / 100;
+                      return n;
+                    };
+
+                    const roleMetrics = Object.entries(roleNames).map(([id, label]) => {
+                      const majorRate = normalizeRate(roleForm[id]?.major ?? roleForm[id]?.major_win_pct);
+                      const minorRate = normalizeRate(roleForm[id]?.minor ?? roleForm[id]?.minor_win_pct);
+                      const hasRates = majorRate !== null && minorRate !== null;
+                      const expected = hasRates
+                        ? 5 * majorRate + 2 * minorRate - 2 * (1 - majorRate - minorRate)
+                        : null;
+                      return {
+                        id,
+                        label,
+                        hasRates,
+                        majorRate,
+                        minorRate,
+                        expected,
+                      };
+                    });
+
+                    const top3 = roleMetrics
+                      .filter((r) => Number.isFinite(r.expected))
+                      .sort((a, b) => b.expected - a.expected)
+                      .slice(0, 3);
+                    const rankById = {};
+                    top3.forEach((r, idx) => {
+                      rankById[r.id] = idx + 1;
+                    });
+
+                    return roleMetrics.map((r) => {
+                      const majorText = r.hasRates ? `${Math.round(r.majorRate * 100)}%` : "N/A";
+                      const minorText = r.hasRates ? `${Math.round(r.minorRate * 100)}%` : "N/A";
+                      const expectedText = Number.isFinite(r.expected) ? r.expected.toFixed(2) : "N/A";
+                      const rank = rankById[r.id] || null;
+                      const medalClass = rank === 1 ? "gold" : rank === 2 ? "silver" : rank === 3 ? "bronze" : "";
+
+                      return (
+                        <div key={r.id} className={`role-tier-card ${medalClass}`}>
+                          <div className="role-tier-label">{r.label}</div>
+                          <div className="role-tier-split">
+                            <span>Major: {majorText}</span>
+                            <span>Minor: {minorText}</span>
+                          </div>
+                          <div className="role-tier-expected">{expectedText} pts/game</div>
+                        </div>
+                      );
+                    });
+                  })()}
                 </div>
               )}
-            </div>
-            <div className="actions">
-              <button className="primary" onClick={savePlayer} disabled={!playerForm.player_id || !playerForm.name}>
-                Save Player
-              </button>
-              <button className="danger" onClick={deletePlayer} disabled={!selectedPlayer}>
-                Delete Player
-              </button>
-              <button className="secondary" onClick={() => setShowPlayerModal(false)}>
-                Close
-              </button>
             </div>
           </div>
         </div>
@@ -3159,30 +4222,56 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
 
       {showTeamModal && (
         <div className="modal-backdrop" onClick={() => setShowTeamModal(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
+          <div className="modal team-modal" onClick={(e) => e.stopPropagation()}>
             <header className="modal-header">
-              <h3>{selectedTeam ? "Edit Team" : "New Team"}</h3>
+              <h3 className="player-modal-title">{teamForm.name || "Team"}</h3>
               <button className="close" onClick={() => setShowTeamModal(false)}>
-                ✕
+                &times;
               </button>
             </header>
             <div className="modal-body">
-              <div className="grid two">
-                <Input label="Name" value={teamForm.name} onChange={(v) => setTeamForm((p) => ({ ...p, name: v }))} />
-                <Input label="HLTV Rank" value={teamForm.hltv_rank} onChange={(v) => setTeamForm((p) => ({ ...p, hltv_rank: v }))} />
-                <Input label="VRS Rank" value={teamForm.vrs_rank} onChange={(v) => setTeamForm((p) => ({ ...p, vrs_rank: v }))} />
-                <Input label="Win Rate" value={teamForm.win_rate} onChange={(v) => setTeamForm((p) => ({ ...p, win_rate: v }))} />
-                <Input label="Player 1 ID" value={teamForm.p1} onChange={(v) => setTeamForm((p) => ({ ...p, p1: v }))} />
-                <Input label="Player 2 ID" value={teamForm.p2} onChange={(v) => setTeamForm((p) => ({ ...p, p2: v }))} />
-                <Input label="Player 3 ID" value={teamForm.p3} onChange={(v) => setTeamForm((p) => ({ ...p, p3: v }))} />
-                <Input label="Player 4 ID" value={teamForm.p4} onChange={(v) => setTeamForm((p) => ({ ...p, p4: v }))} />
-                <Input label="Player 5 ID" value={teamForm.p5} onChange={(v) => setTeamForm((p) => ({ ...p, p5: v }))} />
-              </div>
+              <section className="team-detail-block">
+                <h4 className="team-detail-heading">Roster</h4>
+                <div className="team-roster-grid">
+                  {[teamForm.p1, teamForm.p2, teamForm.p3, teamForm.p4, teamForm.p5].map((pid, idx) => (
+                    <button
+                      type="button"
+                      className="team-player-tile"
+                      key={`team-player-${idx + 1}`}
+                      onClick={() => openPlayerDetailsFromTeam(pid)}
+                      disabled={!Number(pid)}
+                      title={Number(pid) ? `Open ${playerLookup[Number(pid)] || "player"}` : "No player"}
+                    >
+                      <div className="team-player-slot">Player {idx + 1}</div>
+                      <div className="team-player-name">{playerLookup[Number(pid)] || "-"}</div>
+                    </button>
+                  ))}
+                </div>
+              </section>
+
+              <section className="team-detail-block">
+                <h4 className="team-detail-heading">Rankings</h4>
+                <div className="team-stats-grid">
+                  <div className="team-stat-card">
+                    <div className="team-stat-label">HLTV Rank</div>
+                    <div className="team-stat-value">{teamForm.hltv_rank || "-"}</div>
+                  </div>
+                  <div className="team-stat-card">
+                    <div className="team-stat-label">HLTV Points</div>
+                    <div className="team-stat-value">{teamForm.hltv_points || "-"}</div>
+                  </div>
+                  <div className="team-stat-card">
+                    <div className="team-stat-label">VRS Rank</div>
+                    <div className="team-stat-value">{teamForm.vrs_rank || "-"}</div>
+                  </div>
+                  <div className="team-stat-card">
+                    <div className="team-stat-label">VRS Points</div>
+                    <div className="team-stat-value">{teamForm.vrs_points || "-"}</div>
+                  </div>
+                </div>
+              </section>
             </div>
             <div className="actions">
-              <button className="primary" onClick={saveTeam} disabled={!teamForm.name}>
-                Save Team
-              </button>
               <button className="danger" onClick={deleteTeam} disabled={!selectedTeam}>
                 Delete Team
               </button>
@@ -3201,23 +4290,31 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
           <p className="error">{error}</p>
         ) : (
           <>
-            <div className="grid two">
-              <Input label="Search Teams" value={teamSearch} onChange={setTeamSearch} placeholder="Name, ID, or player" />
-              <Select
-                label="Sort Teams"
-                value={teamSort}
-                onChange={setTeamSort}
-                options={[
-                  { value: "name_asc", label: "Name A-Z" },
-                  { value: "name_desc", label: "Name Z-A" },
-                  { value: "id_asc", label: "ID low-high" },
-                  { value: "id_desc", label: "ID high-low" },
-                  { value: "hltv_asc", label: "HLTV rank low-high" },
-                  { value: "hltv_desc", label: "HLTV rank high-low" },
-                  { value: "vrs_asc", label: "VRS rank low-high" },
-                  { value: "vrs_desc", label: "VRS rank high-low" },
-                ]}
-              />
+            <div className="teams-controls">
+              <div className="teams-toolbar">
+                <button className="primary" onClick={refreshAllRankingsToday} disabled={rankingsRefreshBusy || teams.length === 0}>
+                  {rankingsRefreshBusy ? "Refreshing Rankings..." : "Refresh Rankings (HLTV + VRS)"}
+                </button>
+                <span className="teams-meta">{filteredSortedTeams.length} teams shown</span>
+              </div>
+              <div className="grid two teams-filters">
+                <Input label="Search Teams" value={teamSearch} onChange={setTeamSearch} placeholder="Name, ID, or player" />
+                <Select
+                  label="Sort Teams"
+                  value={teamSort}
+                  onChange={setTeamSort}
+                  options={[
+                    { value: "name_asc", label: "Name A-Z" },
+                    { value: "name_desc", label: "Name Z-A" },
+                    { value: "id_asc", label: "ID low-high" },
+                    { value: "id_desc", label: "ID high-low" },
+                    { value: "hltv_asc", label: "HLTV rank low-high" },
+                    { value: "hltv_desc", label: "HLTV rank high-low" },
+                    { value: "vrs_asc", label: "VRS rank low-high" },
+                    { value: "vrs_desc", label: "VRS rank high-low" },
+                  ]}
+                />
+              </div>
             </div>
             <table>
               <thead>
@@ -3225,7 +4322,9 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
                   <th>Name</th>
                   <th>ID</th>
                   <th>HLTV Rank</th>
+                  <th>HLTV Points</th>
                   <th>VRS Rank</th>
+                  <th>VRS Points</th>
                   <th>Players</th>
                 </tr>
               </thead>
@@ -3242,7 +4341,9 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
                     <td>{t.name}</td>
                     <td>{t.team_id}</td>
                     <td>{t.hltv_rank}</td>
+                    <td>{t.hltv_points ?? "-"}</td>
                     <td>{t.vrs_rank}</td>
+                    <td>{t.vrs_points ?? "-"}</td>
                     <td>
                       {[t.player1_id, t.player2_id, t.player3_id, t.player4_id, t.player5_id]
                         .filter(Boolean)
@@ -3255,71 +4356,26 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify }) {
             </table>
           </>
         )}
-        <div className="card sub" style={{ display: "none" }}>
-          <div className="actions">
-            <button className="primary" onClick={newTeam}>
-              New Team
-            </button>
-          </div>
-          <div className="grid two">
-            <Input label="Name" value={teamForm.name} onChange={(v) => setTeamForm((p) => ({ ...p, name: v }))} />
-            <Input label="HLTV Rank" value={teamForm.hltv_rank} onChange={(v) => setTeamForm((p) => ({ ...p, hltv_rank: v }))} />
-            <Input label="VRS Rank" value={teamForm.vrs_rank} onChange={(v) => setTeamForm((p) => ({ ...p, vrs_rank: v }))} />
-            <Input label="Win Rate" value={teamForm.win_rate} onChange={(v) => setTeamForm((p) => ({ ...p, win_rate: v }))} />
-            <Input label="Player 1 ID" value={teamForm.p1} onChange={(v) => setTeamForm((p) => ({ ...p, p1: v }))} />
-            <Input label="Player 2 ID" value={teamForm.p2} onChange={(v) => setTeamForm((p) => ({ ...p, p2: v }))} />
-            <Input label="Player 3 ID" value={teamForm.p3} onChange={(v) => setTeamForm((p) => ({ ...p, p3: v }))} />
-            <Input label="Player 4 ID" value={teamForm.p4} onChange={(v) => setTeamForm((p) => ({ ...p, p4: v }))} />
-            <Input label="Player 5 ID" value={teamForm.p5} onChange={(v) => setTeamForm((p) => ({ ...p, p5: v }))} />
-          </div>
-          <div className="actions">
-            <button className="primary" onClick={saveTeam} disabled={!teamForm.name}>
-              Save Team
-            </button>
-            <button className="danger" onClick={deleteTeam} disabled={!selectedTeam}>
-              Delete Team
-            </button>
-          </div>
-        </div>
       </Section>}
+      {dbTab === "matches" && (
+        <Section title="Matches">
+          <MatchesDataPanel notify={notify} />
+        </Section>
+      )}
 
     </div>
   );
 }
 
-function AdminTab({ refresh, notify, teams, players }) {
+function AdminTab({ refresh, notify }) {
   const [dataTab, setDataTab] = useState("trigger");
   const [triggerJson, setTriggerJson] = useState("");
   const [triggerUpdatedPlayers, setTriggerUpdatedPlayers] = useState([]);
   const [importResult, setImportResult] = useState("");
   const [importBusy, setImportBusy] = useState(false);
   const [wipeBusy, setWipeBusy] = useState(false);
-  const [selectedTopTeamIds, setSelectedTopTeamIds] = useState([]);
-  const [topTeamIndex, setTopTeamIndex] = useState(0);
-  const [topRatingsByPlayer, setTopRatingsByPlayer] = useState({});
-  const [topBusy, setTopBusy] = useState(false);
   const [fitBusy, setFitBusy] = useState(false);
   const [fitRows, setFitRows] = useState([{ rankA: "", oddsA: "", rankB: "", oddsB: "" }]);
-  const playerNameLookup = useMemo(() => {
-    const map = {};
-    players.forEach((p) => (map[p.player_id] = p.name));
-    return map;
-  }, [players]);
-  const selectedTopTeams = useMemo(() => {
-    const selected = teams.filter((t) => selectedTopTeamIds.includes(t.team_id));
-    return selected.sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
-  }, [teams, selectedTopTeamIds]);
-  const currentTopTeam = selectedTopTeams[topTeamIndex] || null;
-  const currentTopRoster = currentTopTeam
-    ? [currentTopTeam.player1_id, currentTopTeam.player2_id, currentTopTeam.player3_id, currentTopTeam.player4_id, currentTopTeam.player5_id]
-        .filter(Boolean)
-    : [];
-
-  useEffect(() => {
-    if (topTeamIndex >= selectedTopTeams.length) {
-      setTopTeamIndex(Math.max(0, selectedTopTeams.length - 1));
-    }
-  }, [topTeamIndex, selectedTopTeams.length]);
 
   const importTriggers = async () => {
     if (!triggerJson.trim()) {
@@ -3348,60 +4404,6 @@ function AdminTab({ refresh, notify, teams, players }) {
     notify("Database wiped");
     setWipeBusy(false);
     refresh();
-  };
-
-  const toggleTopTeam = (teamId) => {
-    setSelectedTopTeamIds((prev) =>
-      prev.includes(teamId) ? prev.filter((x) => x !== teamId) : [...prev, teamId]
-    );
-  };
-
-  const selectAllTopTeams = () => {
-    setSelectedTopTeamIds(teams.map((t) => t.team_id));
-    setTopTeamIndex(0);
-  };
-
-  const clearTopTeams = () => {
-    setSelectedTopTeamIds([]);
-    setTopTeamIndex(0);
-  };
-
-  const importTopRatingsForCurrentTeam = async () => {
-    if (!currentTopTeam) {
-      setImportResult("Select teams first.");
-      return;
-    }
-    setTopBusy(true);
-    setImportResult("");
-    let updatedPlayers = 0;
-    const errors = [];
-    try {
-      for (const pid of currentTopRoster) {
-        const text = (topRatingsByPlayer[pid] || "").trim();
-        if (!text) continue;
-        const res = await api.post("/admin/import-top-ratings", { player_id: pid, text });
-        if (res?.updated_fields?.length) updatedPlayers += 1;
-      }
-
-      if (updatedPlayers === 0) {
-        setImportResult(`No player fields were filled for ${currentTopTeam.name}.`);
-      } else {
-        setImportResult(`Imported top ratings for ${updatedPlayers} player(s) on ${currentTopTeam.name}.`);
-      }
-
-      const nextIndex = topTeamIndex + 1;
-      if (nextIndex < selectedTopTeams.length) {
-        setTopTeamIndex(nextIndex);
-      } else {
-        notify("Top ratings import workflow complete");
-      }
-      refresh();
-    } catch (e) {
-      errors.push("One or more player imports failed.");
-      setImportResult(errors.join(" "));
-    } finally {
-      setTopBusy(false);
-    }
   };
 
   const fitWinrate = async () => {
@@ -3443,9 +4445,6 @@ function AdminTab({ refresh, notify, teams, players }) {
           <button className={dataTab === "trigger" ? "tab active" : "tab"} onClick={() => setDataTab("trigger")}>
             Trigger Rates
           </button>
-          <button className={dataTab === "top" ? "tab active" : "tab"} onClick={() => setDataTab("top")}>
-            Top Ratings
-          </button>
           <button className={dataTab === "fit" ? "tab active" : "tab"} onClick={() => setDataTab("fit")}>
             Winrate Fit
           </button>
@@ -3483,83 +4482,6 @@ function AdminTab({ refresh, notify, teams, players }) {
                 </ul>
               </div>
             )}
-          </div>
-        )}
-
-        {dataTab === "top" && (
-          <div className="stack">
-            <p className="muted">Select teams, then import top-X ratings team-by-team using five player fields.</p>
-            <div className="actions" style={{ marginTop: 0 }}>
-              <button className="secondary" onClick={selectAllTopTeams}>
-                Select All Teams
-              </button>
-              <button className="secondary" onClick={clearTopTeams} disabled={selectedTopTeamIds.length === 0}>
-                Clear Teams
-              </button>
-            </div>
-            <div className="chips">
-              {teams.map((t) => (
-                <button
-                  key={t.team_id}
-                  className={selectedTopTeamIds.includes(t.team_id) ? "chip active" : "chip"}
-                  onClick={() => toggleTopTeam(t.team_id)}
-                >
-                  {t.name} <Badge>id {t.team_id}</Badge>
-                </button>
-              ))}
-            </div>
-
-            {selectedTopTeams.length > 0 && currentTopTeam && (
-              <div className="card sub">
-                <h4>
-                  Team {topTeamIndex + 1} / {selectedTopTeams.length}: {currentTopTeam.name}
-                </h4>
-                {currentTopRoster.map((pid, idx) => (
-                  <label key={pid} className="field">
-                    <span>
-                      Player {idx + 1}: {playerNameLookup[pid] || `Player ${pid}`} (ID {pid})
-                    </span>
-                    <textarea
-                      rows={6}
-                      value={topRatingsByPlayer[pid] || ""}
-                      onChange={(e) =>
-                        setTopRatingsByPlayer((prev) => ({
-                          ...prev,
-                          [pid]: e.target.value,
-                        }))
-                      }
-                      placeholder="Paste the top 5/10/20/30/50 block here"
-                    />
-                  </label>
-                ))}
-                <div className="actions">
-                  <button
-                    className="secondary"
-                    onClick={() => setTopTeamIndex((i) => Math.max(0, i - 1))}
-                    disabled={topTeamIndex === 0 || topBusy}
-                  >
-                    Previous Team
-                  </button>
-                  <button className="primary" onClick={importTopRatingsForCurrentTeam} disabled={topBusy}>
-                    {topBusy ? "Importing..." : topTeamIndex + 1 < selectedTopTeams.length ? "Save & Next Team" : "Save Final Team"}
-                  </button>
-                  <button
-                    className="secondary"
-                    onClick={() => setTopTeamIndex((i) => Math.min(selectedTopTeams.length - 1, i + 1))}
-                    disabled={topTeamIndex >= selectedTopTeams.length - 1 || topBusy}
-                  >
-                    Next Team
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {selectedTopTeams.length === 0 && (
-              <p className="muted">No teams selected.</p>
-            )}
-            <div className="actions">
-              <p className="muted">Tip: You can leave a player field blank to skip that player.</p>
-            </div>
           </div>
         )}
 
@@ -3657,10 +4579,11 @@ function AdminTab({ refresh, notify, teams, players }) {
 }
 
 function BoosterCalculatorTab() {
-  const [rating, setRating] = useState("1.05");
+  const [playerId, setPlayerId] = useState("");
   const [majorPct, setMajorPct] = useState("0.30");
   const [minorPct, setMinorPct] = useState("0.20");
   const [winProb, setWinProb] = useState("0.50");
+  const [opponentRanks, setOpponentRanks] = useState("5,10,20,30,50");
   const [boosterRates, setBoosterRates] = useState("0.12,0.10,0.09,0.08,0.07");
   const [matches, setMatches] = useState("5");
   const [expectedGames, setExpectedGames] = useState("4.2");
@@ -3678,14 +4601,38 @@ function BoosterCalculatorTab() {
         .filter((x) => x.length > 0)
         .map((x) => Number(x))
         .filter((x) => Number.isFinite(x));
+      const oppRanks = opponentRanks
+        .split(",")
+        .map((x) => x.trim())
+        .filter((x) => x.length > 0)
+        .map((x) => Number(x))
+        .filter((x) => Number.isFinite(x))
+        .map((x) => Math.round(x));
+      const matchCount = Number(matches);
+      if (!Number.isFinite(Number(playerId)) || String(playerId).trim() === "") {
+        setError("Player ID is required.");
+        setResult(null);
+        return;
+      }
+      if (!Number.isFinite(matchCount) || matchCount < 1) {
+        setError("Match count must be at least 1.");
+        setResult(null);
+        return;
+      }
+      if (oppRanks.length < matchCount) {
+        setError(`Provide at least ${matchCount} opponent ranks.`);
+        setResult(null);
+        return;
+      }
 
       const payload = {
-        rating: Number(rating),
+        player_id: Number(playerId),
         major_pct: Number(majorPct),
         minor_pct: Number(minorPct),
         win_prob: Number(winProb),
+        opponent_ranks: oppRanks,
         booster_rates: rates,
-        matches: Number(matches),
+        matches: matchCount,
         expected_games: expectedGames === "" ? undefined : Number(expectedGames),
       };
 
@@ -3707,14 +4654,25 @@ function BoosterCalculatorTab() {
   return (
     <Section title="Booster Calculator">
       <div className="stack">
+        <p className="muted">
+          Uses the player&apos;s stored overall rating for each match. Opponent rank is recorded here but does not adjust rating.
+        </p>
         <div className="grid three">
-          <Input label="Rating" value={rating} onChange={setRating} />
+          <Input label="Player ID" value={playerId} onChange={setPlayerId} />
           <Input label="Role Major %" value={majorPct} onChange={setMajorPct} />
           <Input label="Role Minor %" value={minorPct} onChange={setMinorPct} />
           <Input label="Win Probability (0-1)" value={winProb} onChange={setWinProb} />
           <Input label="# Matches" value={matches} onChange={setMatches} />
           <Input label="Expected Games (optional)" value={expectedGames} onChange={setExpectedGames} />
         </div>
+        <label className="field">
+          <span>Opponent ranks per match (comma-separated)</span>
+          <input
+            value={opponentRanks}
+            onChange={(e) => setOpponentRanks(e.target.value)}
+            placeholder="e.g. 5,10,20,30,50"
+          />
+        </label>
         <label className="field">
           <span>Booster rates per match (comma-separated)</span>
           <input
@@ -3745,6 +4703,8 @@ function BoosterCalculatorTab() {
               <thead>
                 <tr>
                   <th>Match</th>
+                  <th>Opp Rank</th>
+                  <th>Match Rating</th>
                   <th>Rating</th>
                   <th>Role</th>
                   <th>Win</th>
@@ -3756,6 +4716,8 @@ function BoosterCalculatorTab() {
                 {(result.per_match || []).map((m) => (
                   <tr key={m.match_number}>
                     <td>{m.match_number}</td>
+                    <td>{m.opponent_rank ?? "-"}</td>
+                    <td>{m.match_rating?.toFixed?.(3) ?? "-"}</td>
                     <td>{m.rating_points?.toFixed?.(2)}</td>
                     <td>{m.role_points?.toFixed?.(2)}</td>
                     <td>{m.win_points?.toFixed?.(2)}</td>
@@ -3772,7 +4734,7 @@ function BoosterCalculatorTab() {
   );
 }
 
-function SwissTab({ teams, teamLookup }) {
+function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
   const [swissTab, setSwissTab] = useState("group");
   const [events, setEvents] = useState([]);
   const [selectedEventId, setSelectedEventId] = useState("");
@@ -3894,6 +4856,9 @@ function SwissTab({ teams, teamLookup }) {
         <button className={swissTab === "top5" ? "tab active" : "tab"} onClick={() => setSwissTab("top5")}>
           Top 5 Teams
         </button>
+        <button className={swissTab === "value" ? "tab active" : "tab"} onClick={() => setSwissTab("value")}>
+          Player Value
+        </button>
         <button className={swissTab === "single" ? "tab active" : "tab"} onClick={() => setSwissTab("single")}>
           Bracket Simulator
         </button>
@@ -3915,11 +4880,20 @@ function SwissTab({ teams, teamLookup }) {
           }}
           simUpdatedAt={simUpdatedAt}
           onResetSimulation={resetStoredSimulation}
+          onOpenPlayer={onOpenPlayer}
         />
       )}
       {swissTab === "top5" && (
-        <TopTeamsTab teamLookup={teamLookup} selected={selectedTeamIds} bo={boMode} sims={simCount} results={simResults} />
+        <TopTeamsTab
+          teamLookup={teamLookup}
+          selected={selectedTeamIds}
+          bo={boMode}
+          sims={simCount}
+          results={simResults}
+          onOpenPlayer={onOpenPlayer}
+        />
       )}
+      {swissTab === "value" && <SwissPlayerValueTab results={simResults} players={players} />}
       {swissTab === "single" && <BracketTab teams={filteredTeams} teamLookup={teamLookup} />}
     </div>
   );
@@ -3927,6 +4901,7 @@ function SwissTab({ teams, teamLookup }) {
 
 export default function App() {
   const [active, setActive] = useState("view");
+  const [openPlayerId, setOpenPlayerId] = useState(null);
   const [players, setPlayers] = useState([]);
   const [teams, setTeams] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -3966,6 +4941,12 @@ export default function App() {
   const notify = (msg) => {
     setToast(msg);
     setTimeout(() => setToast(""), 2000);
+  };
+  const handleOpenPlayerFromAnywhere = (playerId) => {
+    const pid = Number(playerId);
+    if (!Number.isFinite(pid) || pid <= 0) return;
+    setActive("view");
+    setOpenPlayerId(pid);
   };
 
   const sortTeams = (list, key) => {
@@ -4009,11 +4990,31 @@ export default function App() {
   };
 
   const contentMap = {
-    view: <DatabaseTab players={players} teams={teams} loading={loading} error={error} refresh={load} notify={notify} />,
+    view: (
+      <DatabaseTab
+        players={players}
+        teams={teams}
+        loading={loading}
+        error={error}
+        refresh={load}
+        notify={notify}
+        openPlayerId={openPlayerId}
+        onOpenPlayerHandled={() => setOpenPlayerId(null)}
+      />
+    ),
     events: <EventsTab refreshData={load} notify={notify} players={players} />,
-    sim: <SwissTab teams={teams} teamLookup={teamLookup} />,
-    playoff: <PlayoffTab teams={teams} teamLookup={teamLookup} players={players} sortTeams={sortTeams} applyFilters={applyFilters} />,
-    admin: <AdminTab refresh={load} notify={notify} teams={teams} players={players} />,
+    sim: <SwissTab teams={teams} teamLookup={teamLookup} players={players} onOpenPlayer={handleOpenPlayerFromAnywhere} />,
+    playoff: (
+      <PlayoffTab
+        teams={teams}
+        teamLookup={teamLookup}
+        players={players}
+        sortTeams={sortTeams}
+        applyFilters={applyFilters}
+        onOpenPlayer={handleOpenPlayerFromAnywhere}
+      />
+    ),
+    admin: <AdminTab refresh={load} notify={notify} />,
   };
 
   return (
@@ -4031,3 +5032,4 @@ export default function App() {
     </div>
   );
 }
+

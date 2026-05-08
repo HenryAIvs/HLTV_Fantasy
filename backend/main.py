@@ -3,19 +3,29 @@ FastAPI entrypoint that exposes the existing Python logic to the Electron UI.
 Run with: `python backend/main.py`
 """
 
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.routes import players, teams, simulation, bracket, best_team, playoff, admin, events
-from event_db import ensure_event_schema
-from player_db import ensure_schema
-from team_db import ensure_team_schema
+from backend.data.event_db import ensure_event_schema
+from backend.data.player_db import ensure_schema
+from backend.data.team_db import ensure_team_schema
 from backend.routes.simulation import ensure_simulation_schema
 from backend.routes.best_team import ensure_best_team_schema
 from backend.routes.playoff import ensure_playoff_schema
 
 
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+
+
 def create_app() -> FastAPI:
+    configure_logging()
     app = FastAPI(title="CS Fantasy API", version="0.1.0")
     app.add_middleware(
         CORSMiddleware,

@@ -1,18 +1,39 @@
-import { contextBridge } from "electron";
+import { contextBridge, ipcRenderer } from "electron";
 
 const API_BASE = "http://127.0.0.1:8000";
-const json = (r) => r.json();
+const parseJsonSafe = async (res) => {
+  const text = await res.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { detail: text };
+  }
+};
+
+const requestJson = async (path, init) => {
+  const res = await fetch(`${API_BASE}${path}`, init);
+  const data = await parseJsonSafe(res);
+  if (!res.ok) {
+    const detail = data?.detail || `HTTP ${res.status}`;
+    throw new Error(String(detail));
+  }
+  return data;
+};
 
 contextBridge.exposeInMainWorld("api", {
-  get: (path) => fetch(`${API_BASE}${path}`).then(json),
+  get: (path) => requestJson(path),
   post: (path, body) =>
-    fetch(`${API_BASE}${path}`, {
+    requestJson(path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-    }).then(json),
+    }),
   delete: (path) =>
-    fetch(`${API_BASE}${path}`, {
+    requestJson(path, {
       method: "DELETE",
-    }).then(json),
+    }),
+  openExternal: (url) => ipcRenderer.invoke("open-external", url),
+  openHltvPage: (url) => ipcRenderer.invoke("open-hltv-page", url),
+  readOpenedHltvPageText: () => ipcRenderer.invoke("read-opened-hltv-page-text"),
 });

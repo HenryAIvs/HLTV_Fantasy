@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
 from swiss_stage.fantasy_montecarlo import simulate_swiss_fantasy
-from team_db import get_all_teams
-from player_db import DB_PATH
+from backend.data.team_db import get_all_teams
+from backend.data.player_db import DB_PATH
 
 
 router = APIRouter()

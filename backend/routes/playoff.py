@@ -10,12 +10,12 @@ from typing import List, Dict
 
 from fastapi import APIRouter, HTTPException
 
-from player_db import DB_PATH
-from player_db import get_player
-from role_assignment import best_role_assignment_for_team, extract_role_scores_for_player
+from backend.data.player_db import DB_PATH
+from backend.data.player_db import get_player
+from backend.services.role_assignment import best_role_assignment_for_team, extract_role_scores_for_player
 from swiss_stage.team_initialization import initialize_teams
 from swiss_stage.swiss_models import TeamState, PlayerState
-from match_engine import simulate_match_outcome, apply_fantasy_points_for_team, calculate_win_probability
+from backend.services.match_engine import simulate_match_outcome, apply_fantasy_points_for_team, calculate_win_probability
 
 router = APIRouter()
 PLAYOFF_JOBS = {}

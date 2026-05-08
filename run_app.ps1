@@ -12,9 +12,9 @@ try {
     foreach ($line in $listeners) {
         $parts = ($line -replace "\s+", " ").Trim().Split(" ")
         if ($parts.Length -ge 5) {
-            $pid = [int]$parts[-1]
-            if ($pid -gt 0) {
-                Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+            $procId = [int]$parts[-1]
+            if ($procId -gt 0) {
+                Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
             }
         }
     }
@@ -29,6 +29,10 @@ if (-not (Test-Path $venvPath)) {
 }
 $venvPy = Join-Path $venvPath "Scripts\python.exe"
 
+# HLTV scraping defaults: headed browser and persistent profile for Cloudflare cookie reuse.
+$env:HLTV_HEADLESS = "0"
+$env:HLTV_PROFILE_DIR = Join-Path $root "hltv_profile_playwright"
+
 & $venvPy -m pip install --upgrade pip
 & $venvPy -m pip install -r requirements.txt
 
@@ -37,5 +41,19 @@ Push-Location (Join-Path $root "electron")
 if (-not (Test-Path (Join-Path $pwd "node_modules"))) {
     npm install
 }
-npm run app
+$buildOk = $false
+for ($attempt = 1; $attempt -le 3; $attempt++) {
+    cmd /c npm run -s renderer:build
+    if ($LASTEXITCODE -eq 0) {
+        $buildOk = $true
+        break
+    }
+    Start-Sleep -Seconds 2
+}
+if (-not $buildOk) {
+    throw "Renderer build failed after 3 attempts."
+}
+
+# Launch Electron directly to avoid flaky nested npm script spawning on some Windows setups.
+cmd /c .\node_modules\.bin\electron.cmd .
 Pop-Location
