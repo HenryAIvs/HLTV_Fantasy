@@ -1,6 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
-from playwright.sync_api import sync_playwright
+from backend.services.hltv_browser import fetch_hltv_json
 from player_db import add_or_update_player
 from team_db import add_or_update_team
 
@@ -8,10 +8,6 @@ from team_db import add_or_update_team
 class HLTVImportTab:
     def __init__(self, parent):
         self.frame = ttk.Frame(parent)
-        self.playwright = None
-        self.browser = None
-        self.context = None
-        self.page = None
 
         # (player_id, name, cost, team_name, rating)
         self.players = []
@@ -52,7 +48,7 @@ class HLTVImportTab:
         self.output.configure(yscrollcommand=sb.set)
 
     # ============================================================
-    # FETCH FANTASY JSON (NO SCRAPING)
+    # FETCH FANTASY JSON WITH SELENIUMBASE UC
     # ============================================================
 
     def fetch_players(self):
@@ -65,32 +61,8 @@ class HLTVImportTab:
         self.output.insert(tk.END, "Fetching HLTV Fantasy Data...\n")
 
         try:
-            if not self.playwright:
-                self.playwright = sync_playwright().start()
-
-            self.browser = self.playwright.chromium.launch(headless=False)
-            self.context = self.browser.new_context()
-            self.page = self.context.new_page()
-
-            url = f"https://www.hltv.org/fantasy/{event_id}/leagues/create"
-            self.page.goto(url, timeout=0)
-
-            # Accept cookies if present
-            try:
-                self.page.locator("button:has-text('Allow all cookies')").click(timeout=2500)
-            except:
-                pass
-
-            # Fetch Fantasy JSON directly
-            data = self.page.evaluate(
-                """
-                async () => {
-                    const jsonUrl = window.location.pathname.replace(/\\/leagues\\/create.*/, '/leagues/create/json');
-                    const res = await fetch(jsonUrl, { headers: { accept: 'application/json' }});
-                    return await res.json();
-                }
-                """
-            )
+            url = f"https://www.hltv.org/fantasy/{event_id}/leagues/create/json"
+            data = fetch_hltv_json(url)
 
             money = data.get("moneyDraftData", {})
             players_list = []
@@ -122,17 +94,6 @@ class HLTVImportTab:
 
         except Exception as e:
             messagebox.showerror("Error", str(e))
-        finally:
-            try:
-                if self.context:
-                    self.context.close()
-                if self.browser:
-                    self.browser.close()
-            except:
-                pass
-            self.context = None
-            self.browser = None
-            self.page = None
 
     # ============================================================
     # IMPORT TEAMS + PLAYERS INTO DB

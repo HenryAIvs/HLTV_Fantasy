@@ -4,13 +4,13 @@ import math
 import time
 from typing import Any, Dict, List, Optional
 
-import requests
 from fastapi import APIRouter, HTTPException
 
 from backend.data.db_admin import wipe_database
 from backend.data.event_db import set_active_event, upsert_event_snapshot
 from backend.data.player_db import add_or_update_player, get_player
 from backend.data.team_db import add_or_update_team, get_team_by_name
+from backend.services.hltv_browser import HLTVBrowserError, fetch_hltv_json
 from backend.services.rating_picker import pick_match_rating
 from backend.services.team_strength import PARAMS_PATH
 from swiss_stage.fantasy_scoring import (
@@ -158,11 +158,9 @@ def import_hltv_event(payload: Dict[str, Any]):
 
     url = f"https://www.hltv.org/fantasy/{event_id}/leagues/create/json"
     try:
-        resp = requests.get(url, headers={"accept": "application/json"}, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch HLTV data: {e}")
+        data = fetch_hltv_json(url)
+    except HLTVBrowserError as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch HLTV data with SeleniumBase UC: {e}")
 
     money = data.get("moneyDraftData", {})
     if not money:

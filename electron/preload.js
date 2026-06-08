@@ -34,6 +34,4 @@ contextBridge.exposeInMainWorld("api", {
       method: "DELETE",
     }),
   openExternal: (url) => ipcRenderer.invoke("open-external", url),
-  openHltvPage: (url) => ipcRenderer.invoke("open-hltv-page", url),
-  readOpenedHltvPageText: () => ipcRenderer.invoke("read-opened-hltv-page-text"),
 });

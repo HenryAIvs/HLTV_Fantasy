@@ -1,10 +1,11 @@
 import logging
-import os
 import re
 import time
 from datetime import date, datetime, timezone
 from html import unescape
 from typing import Dict, List
+
+from backend.services.hltv_browser import HLTVBrowserError, fetch_hltv_html
 
 
 class HLTVRankingError(RuntimeError):
@@ -193,40 +194,11 @@ def _extract_vrs_rankings(html: str) -> Dict[str, Dict[str, int | str]]:
     return rankings
 
 
-def _fetch_html_with_playwright(url: str, timeout_ms: int = 45000) -> str:
+def _fetch_html_with_uc_driver(url: str, timeout_ms: int = 45000, wait_text: str | None = "HLTV points") -> str:
     try:
-        from playwright.sync_api import sync_playwright
-    except Exception as exc:
-        raise HLTVRankingError(f"Playwright is not available for HLTV scraping: {exc}") from exc
-
-    headless = os.getenv("HLTV_HEADLESS", "0") == "1"
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=headless)
-        context = browser.new_context(
-            viewport={"width": 1400, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/123.0.0.0 Safari/537.36"
-            ),
-        )
-        page = context.new_page()
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            try:
-                page.locator("button:has-text('Allow all cookies')").click(timeout=2500)
-            except Exception:
-                pass
-            try:
-                page.locator("text=/HLTV points/i").first.wait_for(timeout=8000)
-            except Exception:
-                pass
-            page.wait_for_timeout(1500)
-            logger.info("HLTV Playwright page loaded: title='%s' final_url=%s headless=%s", page.title(), page.url, headless)
-            return page.content()
-        finally:
-            context.close()
-            browser.close()
+        return fetch_hltv_html(url, timeout_ms=timeout_ms, wait_text=wait_text)
+    except HLTVBrowserError as exc:
+        raise HLTVRankingError(str(exc)) from exc
 
 
 def _strip_html(text: str) -> str:
@@ -408,10 +380,10 @@ def get_recent_hltv_results(limit: int = 100, offsets: List[int] | None = None) 
 
         html = None
         try:
-            html = _fetch_html_with_playwright(url)
-            logger.info("HLTV Playwright results fetch succeeded: url=%s", url)
+            html = _fetch_html_with_uc_driver(url, wait_text=None)
+            logger.info("HLTV SeleniumBase UC results fetch succeeded: url=%s", url)
         except Exception as exc:
-            logger.warning("HLTV Playwright results fetch failed: url=%s error=%s", url, exc)
+            logger.warning("HLTV SeleniumBase UC results fetch failed: url=%s error=%s", url, exc)
             last_error = exc
             continue
 
@@ -470,9 +442,9 @@ def get_hltv_match_details(match_url: str) -> Dict[str, object]:
 
     html = None
     try:
-        html = _fetch_html_with_playwright(url)
+        html = _fetch_html_with_uc_driver(url, wait_text=None)
     except Exception as exc:
-        raise HLTVRankingError(f"Failed to fetch HLTV match details with Playwright: {exc}") from exc
+        raise HLTVRankingError(f"Failed to fetch HLTV match details with SeleniumBase UC: {exc}") from exc
 
     text = _strip_html(html)
     maps: List[Dict[str, object]] = []
@@ -511,10 +483,10 @@ def _get_rankings_map_for_date(
 
         html = None
         try:
-            html = _fetch_html_with_playwright(url)
-            logger.info("HLTV Playwright fetch succeeded: date=%s url=%s", on_date.isoformat(), url)
+            html = _fetch_html_with_uc_driver(url)
+            logger.info("HLTV SeleniumBase UC fetch succeeded: date=%s url=%s", on_date.isoformat(), url)
         except Exception as exc:
-            logger.warning("HLTV Playwright fetch failed: date=%s url=%s error=%s", on_date.isoformat(), url, exc)
+            logger.warning("HLTV SeleniumBase UC fetch failed: date=%s url=%s error=%s", on_date.isoformat(), url, exc)
             last_error = exc
             continue
 
@@ -547,10 +519,10 @@ def _get_vrs_rankings_map_for_date(
         logger.info("VRS ranking page fetch start: date=%s url=%s", on_date.isoformat(), url)
         html = None
         try:
-            html = _fetch_html_with_playwright(url)
-            logger.info("VRS Playwright fetch succeeded: date=%s url=%s", on_date.isoformat(), url)
+            html = _fetch_html_with_uc_driver(url, wait_text="points")
+            logger.info("VRS SeleniumBase UC fetch succeeded: date=%s url=%s", on_date.isoformat(), url)
         except Exception as exc:
-            logger.warning("VRS Playwright fetch failed: date=%s url=%s error=%s", on_date.isoformat(), url, exc)
+            logger.warning("VRS SeleniumBase UC fetch failed: date=%s url=%s error=%s", on_date.isoformat(), url, exc)
             last_error = exc
             continue
 
@@ -638,10 +610,10 @@ def get_latest_hltv_rankings() -> Dict[str, object]:
 
     html = None
     try:
-        html = _fetch_html_with_playwright(url)
-        logger.info("HLTV Playwright fetch succeeded for latest ranking")
+        html = _fetch_html_with_uc_driver(url)
+        logger.info("HLTV SeleniumBase UC fetch succeeded for latest ranking")
     except Exception as exc:
-        logger.warning("HLTV Playwright fetch failed for latest ranking: %s", exc)
+        logger.warning("HLTV SeleniumBase UC fetch failed for latest ranking: %s", exc)
         raise HLTVRankingError(f"Failed to fetch HLTV rankings page: {exc}") from exc
 
     rankings = _extract_rankings(html)
@@ -662,10 +634,10 @@ def get_latest_vrs_rankings() -> Dict[str, object]:
 
     html = None
     try:
-        html = _fetch_html_with_playwright(url)
-        logger.info("VRS Playwright fetch succeeded for latest ranking")
+        html = _fetch_html_with_uc_driver(url, wait_text="points")
+        logger.info("VRS SeleniumBase UC fetch succeeded for latest ranking")
     except Exception as exc:
-        logger.warning("VRS Playwright fetch failed for latest ranking: %s", exc)
+        logger.warning("VRS SeleniumBase UC fetch failed for latest ranking: %s", exc)
         raise HLTVRankingError(f"Failed to fetch VRS rankings page: {exc}") from exc
 
     rankings = _extract_vrs_rankings(html)

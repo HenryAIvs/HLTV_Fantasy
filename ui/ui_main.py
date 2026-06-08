@@ -6,7 +6,7 @@ from ui.ui_view import ViewTab
 from ui.ui_add import AddTab
 from ui.ui_edit import EditTab
 from ui.ui_simulation import SimulationTab
-from ui.ui_import_chromium import HLTVImportTab
+from ui.ui_import_hltv import HLTVImportTab
 from ui.ui_import_ratings import RatingsImportTab
 from ui.ui_bracket import BracketTab         
 from db_admin import wipe_database

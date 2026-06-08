@@ -1,6 +1,4 @@
-import itertools
 import json
-import math
 import random
 import sqlite3
 import threading
@@ -10,9 +8,8 @@ from typing import List, Dict
 
 from fastapi import APIRouter, HTTPException
 
-from backend.data.player_db import DB_PATH
-from backend.data.player_db import get_player
-from backend.services.role_assignment import best_role_assignment_for_team, extract_role_scores_for_player
+from backend.data.player_db import DB_PATH, get_player
+from backend.services.team_optimizer import optimize_rosters, parse_optimizer_payload
 from swiss_stage.team_initialization import initialize_teams
 from swiss_stage.swiss_models import TeamState, PlayerState
 from backend.services.match_engine import simulate_match_outcome, apply_fantasy_points_for_team, calculate_win_probability
@@ -718,83 +715,14 @@ def _optimize_playoff_teams(
     max_per_team: int,
     progress_callback=None,
 ):
-    if len(players_info) < 5:
-        return {"error": "Not enough players after exclusions"}
-
-    available_ids = {p["player_id"] for p in players_info}
-    missing_includes = [pid for pid in include if pid not in available_ids]
-    if missing_includes:
-        return {"error": f"Included players not available in bracket teams: {missing_includes}"}
-
-    valid_teams = []
-    players_info_sorted = sorted(players_info, key=lambda x: -x["total_ev"])
-    role_scores_by_player = {}
-    for p in players_info_sorted:
-        pid = int(p["player_id"])
-        role_scores_by_player[pid] = extract_role_scores_for_player(get_player(pid) or {})
-
-    total_combinations = math.comb(len(players_info_sorted), 5)
-    processed_combinations = 0
-    if progress_callback:
-        progress_callback(0, total_combinations)
-    for combo in itertools.combinations(players_info_sorted, 5):
-        processed_combinations += 1
-        if progress_callback and (processed_combinations % 1000 == 0 or processed_combinations == total_combinations):
-            progress_callback(processed_combinations, total_combinations)
-
-        combo_ids = {p["player_id"] for p in combo}
-        if include and not include.issubset(combo_ids):
-            continue
-        total_cost = sum(p["price"] for p in combo)
-        if total_cost > budget:
-            continue
-
-        team_counts = {}
-        valid = True
-        for p in combo:
-            team_counts[p["team_id"]] = team_counts.get(p["team_id"], 0) + 1
-            if team_counts[p["team_id"]] > max_per_team:
-                valid = False
-                break
-        if not valid:
-            continue
-
-        combo_pid_list = [int(p["player_id"]) for p in combo]
-        assignment, _ = best_role_assignment_for_team(combo_pid_list, role_scores_by_player)
-        if assignment is None:
-            continue
-
-        total_ev = float(sum(p["total_ev"] for p in combo))
-        valid_teams.append(
-            {
-                "total_ev": total_ev,
-                "cost": int(total_cost),
-                "players": [
-                    {
-                        "player_id": p["player_id"],
-                        "name": p["name"],
-                        "team_id": p["team_id"],
-                        "price": p["price"],
-                        "rating_ev": p["rating_ev"],
-                        "win_ev": p["win_ev"],
-                        "role_ev": p["role_ev"],
-                        "booster_ev": p["booster_ev"],
-                        "total_ev": p["total_ev"],
-                        "role_name": str(assignment.get(int(p["player_id"]), "-")),
-                    }
-                    for p in combo
-                ],
-            }
-        )
-
-    valid_teams.sort(key=lambda x: x["total_ev"], reverse=True)
-    return {
-        "top_teams": valid_teams[:10],
-        "all_teams": valid_teams,
-        "player_count": len(players_info),
-        "processed_combinations": int(processed_combinations),
-        "total_combinations": int(total_combinations),
-    }
+    return optimize_rosters(
+        players_info,
+        include,
+        budget,
+        max_per_team,
+        progress_callback=progress_callback,
+        include_error_suffix="in bracket teams",
+    )
 
 
 def _run_playoff_best_team_job(job_id: str, payload: dict | None = None) -> None:
@@ -821,10 +749,11 @@ def _run_playoff_best_team_job(job_id: str, payload: dict | None = None) -> None
             raise HTTPException(status_code=404, detail="No stored playoff simulation found. Run Playoff Bracket first.")
 
         body = payload or {}
-        budget = int(body.get("budget", 1_000_000))
-        max_per_team = int(body.get("max_per_team", 2))
-        include = set(body.get("include_player_ids") or [])
-        exclude = set(body.get("exclude_player_ids") or [])
+        options = parse_optimizer_payload(body)
+        budget = options["budget"]
+        max_per_team = options["max_per_team"]
+        include = options["include"]
+        exclude = options["exclude"]
 
         latest_results = latest.get("results", {}) or {}
         sim_results = latest_results.get("teams", {}) or {}
@@ -867,10 +796,11 @@ def best_team_playoff(payload: dict):
     if len(slots) != 8:
         raise HTTPException(status_code=400, detail="team_slots must contain 8 team IDs")
 
-    budget = int(payload.get("budget", 1_000_000))
-    max_per_team = int(payload.get("max_per_team", 2))
-    include = set(payload.get("include_player_ids") or [])
-    exclude = set(payload.get("exclude_player_ids") or [])
+    options = parse_optimizer_payload(payload)
+    budget = options["budget"]
+    max_per_team = options["max_per_team"]
+    include = options["include"]
+    exclude = options["exclude"]
 
     sim_results = simulate_playoff_fantasy(slots, return_runs=False)
     players_info = _build_players_info_from_sim_results(sim_results, exclude)
@@ -884,10 +814,11 @@ def best_team_playoff_from_latest(payload: dict | None = None):
         raise HTTPException(status_code=404, detail="No stored playoff simulation found. Run Playoff Bracket first.")
 
     body = payload or {}
-    budget = int(body.get("budget", 1_000_000))
-    max_per_team = int(body.get("max_per_team", 2))
-    include = set(body.get("include_player_ids") or [])
-    exclude = set(body.get("exclude_player_ids") or [])
+    options = parse_optimizer_payload(body)
+    budget = options["budget"]
+    max_per_team = options["max_per_team"]
+    include = options["include"]
+    exclude = options["exclude"]
 
     latest_results = latest.get("results", {}) or {}
     sim_results = latest_results.get("teams", {}) or {}

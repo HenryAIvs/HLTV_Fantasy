@@ -5,7 +5,6 @@ import json
 from datetime import date
 import logging
 
-import requests
 from fastapi import APIRouter, HTTPException
 
 from backend.routes.admin import _import_money_draft_data
@@ -35,6 +34,7 @@ from backend.data.event_db import (
     upsert_hltv_results,
 )
 from backend.data.team_db import get_all_teams
+from backend.services.hltv_browser import HLTVBrowserError, fetch_hltv_json
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -740,11 +740,9 @@ def import_hltv_event(payload: Dict[str, Any]):
 
     url = f"https://www.hltv.org/fantasy/{event_id}/leagues/create/json"
     try:
-        resp = requests.get(url, headers={"accept": "application/json"}, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch HLTV data: {exc}")
+        data = fetch_hltv_json(url)
+    except HLTVBrowserError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch HLTV data with SeleniumBase UC: {exc}")
 
     money = data.get("moneyDraftData", {})
     if not money:

@@ -1,11 +1,13 @@
 import time
 import re
+import json
+import sqlite3
 import threading
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
 
-from backend.data.player_db import add_or_update_player, delete_player, get_all_players, get_player
+from backend.data.player_db import DB_PATH, add_or_update_player, delete_player, get_all_players, get_player
 from backend.services.hltv_featured_ratings import HLTVFeaturedRatingsError, get_featured_ratings
 from backend.services.rating_curve import build_player_topx_graph
 
@@ -15,6 +17,7 @@ DEFAULT_TOPX_BATCH_CONCURRENCY = 1
 MAX_TOPX_BATCH_CONCURRENCY = 8
 TOPX_BATCH_JOBS = {}
 TOPX_BATCH_JOBS_LOCK = threading.Lock()
+TOPX_BATCH_WORKERS: dict[str, threading.Thread] = {}
 TIER_FIELD_MAP = {
     5: ("rating_top5", "maps_top5"),
     10: ("rating_top10", "maps_top10"),
@@ -26,6 +29,119 @@ TOP_RATING_TEXT_RE = re.compile(
     r"(?P<rating>\d+\.\d+)\s*vs\s*top\s*(?P<tier>\d+)\s*opponents.*?\(\s*(?P<maps>\d+)\s*maps",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+def _connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def ensure_topx_batch_schema() -> None:
+    conn = _connect()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS topx_batch_jobs (
+                job_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                items_json TEXT NOT NULL,
+                results_json TEXT NOT NULL,
+                error TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                progress REAL NOT NULL DEFAULT 0,
+                processed_players INTEGER NOT NULL DEFAULT 0,
+                total_players INTEGER NOT NULL DEFAULT 0,
+                ok INTEGER NOT NULL DEFAULT 0,
+                failed INTEGER NOT NULL DEFAULT 0,
+                concurrency INTEGER NOT NULL DEFAULT 1,
+                pause_requested INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                started_at REAL,
+                finished_at REAL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_topx_batch_jobs_updated ON topx_batch_jobs(updated_at DESC)")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _status_from_row(row: sqlite3.Row) -> dict:
+    out = dict(row)
+    out["items"] = json.loads(out.pop("items_json") or "[]")
+    out["results"] = json.loads(out.pop("results_json") or "[]")
+    out["pause_requested"] = bool(out.get("pause_requested"))
+    out["progress"] = float(out.get("progress") or 0.0)
+    return out
+
+
+def _get_stored_topx_job(job_id: str) -> dict | None:
+    ensure_topx_batch_schema()
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT * FROM topx_batch_jobs WHERE job_id = ?", (job_id,)).fetchone()
+        return _status_from_row(row) if row else None
+    finally:
+        conn.close()
+
+
+def _save_topx_job(job: dict) -> None:
+    ensure_topx_batch_schema()
+    now = time.time()
+    job["updated_at"] = now
+    conn = _connect()
+    try:
+        conn.execute(
+            """
+            INSERT INTO topx_batch_jobs (
+                job_id, status, items_json, results_json, error, last_error,
+                progress, processed_players, total_players, ok, failed, concurrency,
+                pause_requested, created_at, updated_at, started_at, finished_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                status = excluded.status,
+                items_json = excluded.items_json,
+                results_json = excluded.results_json,
+                error = excluded.error,
+                last_error = excluded.last_error,
+                progress = excluded.progress,
+                processed_players = excluded.processed_players,
+                total_players = excluded.total_players,
+                ok = excluded.ok,
+                failed = excluded.failed,
+                concurrency = excluded.concurrency,
+                pause_requested = excluded.pause_requested,
+                updated_at = excluded.updated_at,
+                started_at = excluded.started_at,
+                finished_at = excluded.finished_at
+            """,
+            (
+                str(job["job_id"]),
+                str(job.get("status") or "queued"),
+                json.dumps(job.get("items") or []),
+                json.dumps(job.get("results") or []),
+                str(job.get("error") or ""),
+                str(job.get("last_error") or ""),
+                float(job.get("progress") or 0.0),
+                int(job.get("processed_players") or 0),
+                int(job.get("total_players") or 0),
+                int(job.get("ok") or 0),
+                int(job.get("failed") or 0),
+                int(job.get("concurrency") or DEFAULT_TOPX_BATCH_CONCURRENCY),
+                1 if job.get("pause_requested") else 0,
+                float(job.get("created_at") or now),
+                now,
+                job.get("started_at"),
+                job.get("finished_at"),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _build_top_rating_updates(player: dict, featured: dict) -> dict:
@@ -284,53 +400,191 @@ def _run_top_ratings_batch(items: list[dict], concurrency: int, progress_callbac
     }
 
 
-def _run_top_ratings_batch_job(job_id: str, items: list[dict], concurrency: int) -> None:
+def _publish_topx_job(job: dict) -> None:
     with TOPX_BATCH_JOBS_LOCK:
-        job = TOPX_BATCH_JOBS.get(job_id)
-        if not job:
-            return
-        job["status"] = "running"
-        job["updated_at"] = time.time()
+        TOPX_BATCH_JOBS[str(job["job_id"])] = dict(job)
+    _save_topx_job(job)
 
-    def _update_progress(row: dict, processed: int, total: int, ok_count: int, failed_count: int) -> None:
+
+def _topx_job_response(job: dict) -> dict:
+    return {
+        "job_id": str(job["job_id"]),
+        "status": job.get("status", "queued"),
+        "error": job.get("error", ""),
+        "last_error": job.get("last_error", ""),
+        "progress": job.get("progress", 0.0),
+        "processed_players": job.get("processed_players", 0),
+        "total_players": job.get("total_players", 0),
+        "ok": job.get("ok", 0),
+        "failed": job.get("failed", 0),
+        "concurrency": job.get("concurrency", DEFAULT_TOPX_BATCH_CONCURRENCY),
+        "pause_requested": bool(job.get("pause_requested")),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+        "results": job.get("results", []),
+        "result": {
+            "status": "ok" if job.get("status") == "completed" else job.get("status", "queued"),
+            "total": job.get("total_players", 0),
+            "ok": job.get("ok", 0),
+            "failed": job.get("failed", 0),
+            "concurrency": job.get("concurrency", DEFAULT_TOPX_BATCH_CONCURRENCY),
+            "results": job.get("results", []),
+        } if job.get("status") in {"completed", "failed", "paused"} else None,
+    }
+
+
+def _stored_running_job_is_active(job_id: str) -> bool:
+    with TOPX_BATCH_JOBS_LOCK:
+        worker = TOPX_BATCH_WORKERS.get(job_id)
+        return bool(worker and worker.is_alive())
+
+
+def _get_topx_job_for_response(job_id: str) -> dict:
+    job = _get_stored_topx_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job_id not found")
+    if job.get("status") in {"queued", "running", "pausing"} and not _stored_running_job_is_active(job_id):
+        job["status"] = "paused"
+        job["last_error"] = job.get("last_error") or "Job was interrupted before completion. Resume to continue."
+        job["error"] = ""
+        job["pause_requested"] = False
+        _publish_topx_job(job)
+    return job
+
+
+def _run_top_ratings_batch_job(job_id: str) -> None:
+    job = _get_stored_topx_job(job_id)
+    if not job:
+        return
+
+    if job.get("pause_requested"):
+        job["status"] = "paused"
+        job["pause_requested"] = False
+        job["error"] = ""
+        job["last_error"] = job.get("last_error") or "Paused"
+        _publish_topx_job(job)
         with TOPX_BATCH_JOBS_LOCK:
-            job = TOPX_BATCH_JOBS.get(job_id)
-            if not job:
-                return
+            TOPX_BATCH_WORKERS.pop(job_id, None)
+        return
+
+    job["status"] = "running"
+    job["pause_requested"] = False
+    job["error"] = ""
+    job["started_at"] = job.get("started_at") or time.time()
+    job["finished_at"] = None
+    _publish_topx_job(job)
+
+    try:
+        items = job.get("items") or []
+        results = list(job.get("results") or [])
+        completed_ids = {int(row.get("player_id")) for row in results if row.get("player_id") is not None}
+        processed = len(results)
+        ok_count = sum(1 for row in results if row.get("status") == "ok")
+        failed_count = sum(1 for row in results if row.get("status") != "ok")
+        total = len(items)
+
+        def save_progress(row: dict | None = None) -> dict:
+            nonlocal processed, ok_count, failed_count, results, job
+            if row is not None:
+                results.append(row)
+                processed += 1
+                if row.get("status") == "ok":
+                    ok_count += 1
+                else:
+                    failed_count += 1
+                    job["last_error"] = str(row.get("detail") or "")
+            job["results"] = results
             job["processed_players"] = int(processed)
             job["total_players"] = int(total)
             job["ok"] = int(ok_count)
             job["failed"] = int(failed_count)
             job["progress"] = 0.0 if total <= 0 else float(processed) / float(total)
-            job["results"].append(row)
-            if row.get("status") != "ok":
-                job["last_error"] = str(row.get("detail") or "")
-            job["updated_at"] = time.time()
+            _publish_topx_job(job)
+            return job
 
-    try:
-        result = _run_top_ratings_batch(items, concurrency, progress_callback=_update_progress)
-        with TOPX_BATCH_JOBS_LOCK:
-            job = TOPX_BATCH_JOBS.get(job_id)
-            if not job:
+        save_progress()
+
+        for item in items:
+            latest = _get_stored_topx_job(job_id) or job
+            if latest.get("pause_requested"):
+                job.update(latest)
+                job["status"] = "paused"
+                job["pause_requested"] = False
+                job["last_error"] = job.get("last_error") or "Paused"
+                _publish_topx_job(job)
                 return
-            job["status"] = "completed"
-            job["result"] = result
-            job["processed_players"] = int(result["total"])
-            job["total_players"] = int(result["total"])
-            job["ok"] = int(result["ok"])
-            job["failed"] = int(result["failed"])
-            job["results"] = result["results"]
-            job["progress"] = 1.0
-            job["updated_at"] = time.time()
+
+            player_id = int(item["player_id"])
+            if player_id in completed_ids:
+                continue
+            player = get_player(player_id)
+            if not player:
+                row = {"status": "error", "player_id": player_id, "detail": "Player not found"}
+                completed_ids.add(player_id)
+                save_progress(row)
+                continue
+
+            player_name = player.get("name")
+            try:
+                featured_payload = _build_featured_payload(player, source_text=item.get("text"))
+                saved = _persist_featured_top_ratings(player, featured_payload)
+                row = {
+                    "status": "ok",
+                    "player_id": player_id,
+                    "player_name": player_name,
+                    "startDate": saved.get("startDate"),
+                    "endDate": saved.get("endDate"),
+                }
+            except HTTPException as exc:
+                row = {
+                    "status": "error",
+                    "player_id": player_id,
+                    "player_name": player_name,
+                    "detail": str(exc.detail),
+                }
+            except HLTVFeaturedRatingsError as exc:
+                row = {
+                    "status": "error",
+                    "player_id": player_id,
+                    "player_name": player_name,
+                    "detail": str(exc),
+                }
+            except Exception as exc:
+                row = {
+                    "status": "error",
+                    "player_id": player_id,
+                    "player_name": player_name,
+                    "detail": f"Failed fetching HLTV Top-X data: {exc}",
+                }
+
+            completed_ids.add(player_id)
+            save_progress(row)
+
+        job["status"] = "completed"
+        job["progress"] = 1.0
+        job["finished_at"] = time.time()
+        _publish_topx_job(job)
     except Exception as exc:
+        job["status"] = "failed"
+        job["error"] = str(exc)
+        job["last_error"] = str(exc)
+        job["finished_at"] = time.time()
+        _publish_topx_job(job)
+    finally:
         with TOPX_BATCH_JOBS_LOCK:
-            job = TOPX_BATCH_JOBS.get(job_id)
-            if not job:
-                return
-            job["status"] = "failed"
-            job["error"] = str(exc)
-            job["last_error"] = str(exc)
-            job["updated_at"] = time.time()
+            TOPX_BATCH_WORKERS.pop(job_id, None)
+
+
+def _start_topx_worker(job_id: str) -> None:
+    with TOPX_BATCH_JOBS_LOCK:
+        worker = TOPX_BATCH_WORKERS.get(job_id)
+        if worker and worker.is_alive():
+            return
+        worker = threading.Thread(target=_run_top_ratings_batch_job, args=(job_id,), daemon=True)
+        TOPX_BATCH_WORKERS[job_id] = worker
+        worker.start()
 
 
 @router.get("/")
@@ -338,12 +592,100 @@ def list_players():
     return get_all_players()
 
 
-@router.get("/{player_id}")
-def fetch_player(player_id: int):
-    player = get_player(player_id)
-    if not player:
-        raise HTTPException(status_code=404, detail="Player not found")
-    return player
+@router.post("/fetch-top-ratings-batch/start")
+def start_fetch_top_ratings_batch(payload: dict | None = None):
+    ensure_topx_batch_schema()
+    items = _normalize_top_ratings_batch_items(payload)
+    concurrency = _resolve_batch_concurrency((payload or {}).get("concurrency"), item_count=len(items))
+    job_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    latest = _get_latest_topx_batch_job(include_completed=False)
+    if latest and latest.get("status") in {"queued", "running", "pausing"}:
+        return {"job_id": latest["job_id"], "status": latest.get("status"), "reused": True}
+
+    now = time.time()
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "error": "",
+        "last_error": "",
+        "progress": 0.0,
+        "processed_players": 0,
+        "total_players": len(items),
+        "ok": 0,
+        "failed": 0,
+        "concurrency": concurrency,
+        "pause_requested": False,
+        "items": items,
+        "results": [],
+        "created_at": now,
+        "updated_at": now,
+        "started_at": None,
+        "finished_at": None,
+    }
+    _publish_topx_job(job)
+    _start_topx_worker(job_id)
+    return {"job_id": job_id, "status": "queued"}
+
+
+def _get_latest_topx_batch_job(*, include_completed: bool = True) -> dict | None:
+    ensure_topx_batch_schema()
+    statuses = "" if include_completed else "WHERE status IN ('queued', 'running', 'pausing', 'paused', 'failed')"
+    conn = _connect()
+    try:
+        row = conn.execute(
+            f"SELECT * FROM topx_batch_jobs {statuses} ORDER BY updated_at DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        return _get_topx_job_for_response(str(row["job_id"]))
+    finally:
+        conn.close()
+
+
+@router.get("/fetch-top-ratings-batch/latest")
+def get_latest_fetch_top_ratings_batch_job():
+    job = _get_latest_topx_batch_job()
+    if not job:
+        return {"exists": False}
+    return {"exists": True, **_topx_job_response(job)}
+
+
+@router.get("/fetch-top-ratings-batch/job/{job_id}")
+def get_fetch_top_ratings_batch_job(job_id: str):
+    return _topx_job_response(_get_topx_job_for_response(job_id))
+
+
+@router.post("/fetch-top-ratings-batch/job/{job_id}/pause")
+def pause_fetch_top_ratings_batch_job(job_id: str):
+    job = _get_topx_job_for_response(job_id)
+    if job.get("status") in {"completed", "failed"}:
+        return _topx_job_response(job)
+    job["pause_requested"] = True
+    job["status"] = "pausing" if job.get("status") == "running" or _stored_running_job_is_active(job_id) else "paused"
+    _publish_topx_job(job)
+    return _topx_job_response(job)
+
+
+@router.post("/fetch-top-ratings-batch/job/{job_id}/resume")
+def resume_fetch_top_ratings_batch_job(job_id: str):
+    job = _get_topx_job_for_response(job_id)
+    if job.get("status") == "completed":
+        return _topx_job_response(job)
+    if job.get("status") == "running" and _stored_running_job_is_active(job_id):
+        return _topx_job_response(job)
+    job["status"] = "queued"
+    job["pause_requested"] = False
+    job["error"] = ""
+    _publish_topx_job(job)
+    _start_topx_worker(job_id)
+    return _topx_job_response(_get_topx_job_for_response(job_id))
+
+
+@router.post("/fetch-top-ratings-batch")
+def fetch_top_ratings_batch(payload: dict | None = None):
+    items = _normalize_top_ratings_batch_items(payload)
+    concurrency = _resolve_batch_concurrency((payload or {}).get("concurrency"), item_count=len(items))
+    return _run_top_ratings_batch(items, concurrency)
 
 
 @router.get("/{player_id}/rating-curve")
@@ -357,71 +699,6 @@ def fetch_player_rating_curve(player_id: int):
         "player_name": player.get("name"),
         **curve,
     }
-
-
-@router.post("/fetch-top-ratings-batch/start")
-def start_fetch_top_ratings_batch(payload: dict | None = None):
-    items = _normalize_top_ratings_batch_items(payload)
-    concurrency = _resolve_batch_concurrency((payload or {}).get("concurrency"), item_count=len(items))
-    job_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
-    with TOPX_BATCH_JOBS_LOCK:
-        for existing_job_id, existing in TOPX_BATCH_JOBS.items():
-            if existing.get("status") in {"queued", "running"}:
-                return {
-                    "job_id": existing_job_id,
-                    "status": existing.get("status"),
-                    "reused": True,
-                }
-        TOPX_BATCH_JOBS[job_id] = {
-            "status": "queued",
-            "error": "",
-            "last_error": "",
-            "progress": 0.0,
-            "processed_players": 0,
-            "total_players": len(items),
-            "ok": 0,
-            "failed": 0,
-            "concurrency": concurrency,
-            "result": None,
-            "results": [],
-            "created_at": time.time(),
-            "updated_at": time.time(),
-        }
-
-    worker = threading.Thread(target=_run_top_ratings_batch_job, args=(job_id, items, concurrency), daemon=True)
-    worker.start()
-    return {"job_id": job_id}
-
-
-@router.get("/fetch-top-ratings-batch/job/{job_id}")
-def get_fetch_top_ratings_batch_job(job_id: str):
-    with TOPX_BATCH_JOBS_LOCK:
-        job = TOPX_BATCH_JOBS.get(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="job_id not found")
-        out = dict(job)
-
-    return {
-        "job_id": job_id,
-        "status": out.get("status", "queued"),
-        "error": out.get("error", ""),
-        "last_error": out.get("last_error", ""),
-        "progress": out.get("progress", 0.0),
-        "processed_players": out.get("processed_players", 0),
-        "total_players": out.get("total_players", 0),
-        "ok": out.get("ok", 0),
-        "failed": out.get("failed", 0),
-        "concurrency": out.get("concurrency", DEFAULT_TOPX_BATCH_CONCURRENCY),
-        "result": out.get("result"),
-        "results": out.get("results", []),
-    }
-
-
-@router.post("/fetch-top-ratings-batch")
-def fetch_top_ratings_batch(payload: dict | None = None):
-    items = _normalize_top_ratings_batch_items(payload)
-    concurrency = _resolve_batch_concurrency((payload or {}).get("concurrency"), item_count=len(items))
-    return _run_top_ratings_batch(items, concurrency)
 
 
 @router.post("/{player_id}/fetch-top-ratings")
@@ -444,6 +721,14 @@ def upsert_player(payload: dict):
         raise HTTPException(status_code=400, detail="player_id is required")
     add_or_update_player(**payload)
     return {"status": "ok"}
+
+
+@router.get("/{player_id}")
+def fetch_player(player_id: int):
+    player = get_player(player_id)
+    if not player:
+        raise HTTPException(status_code=404, detail="Player not found")
+    return player
 
 
 @router.delete("/{player_id}")

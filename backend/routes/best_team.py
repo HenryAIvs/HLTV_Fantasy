@@ -1,4 +1,3 @@
-import itertools
 import json
 import math
 import sqlite3
@@ -10,7 +9,11 @@ from fastapi import APIRouter, HTTPException
 
 from backend.routes.simulation import load_latest_simulation
 from backend.data.player_db import DB_PATH, get_player
-from backend.services.role_assignment import best_role_assignment_for_team, extract_role_scores_for_player
+from backend.services.team_optimizer import (
+    iter_valid_rosters,
+    parse_optimizer_payload,
+    serialize_roster,
+)
 from swiss_stage.fantasy_montecarlo import simulate_swiss_fantasy
 from backend.data.team_db import get_all_teams
 
@@ -209,10 +212,11 @@ def _query_cached_best_teams(cache_id: str, include_ids, exclude_ids, search_q: 
 
 
 def _compute_best_teams_from_results(results: dict, payload: dict, progress_callback=None, finalize_callback=None) -> dict:
-    budget = int(payload.get("budget", 1_000_000))
-    max_per_team = int(payload.get("max_per_team", 2))
-    exclude = set(payload.get("exclude_player_ids") or [])
-    include = set(payload.get("include_player_ids") or [])
+    options = parse_optimizer_payload(payload)
+    budget = options["budget"]
+    max_per_team = options["max_per_team"]
+    exclude = options["exclude"]
+    include = options["include"]
 
     team_name_map = {int(t["team_id"]): t.get("name", "") for t in get_all_teams()}
 
@@ -277,22 +281,15 @@ def _compute_best_teams_from_results(results: dict, payload: dict, progress_call
         if missing_includes:
             return {"error": f"Included players not available: {missing_includes}"}
 
-    role_scores_by_player = {}
-    for p in players_info:
-        pid = p["player_id"]
-        role_scores_by_player[pid] = extract_role_scores_for_player(get_player(pid) or {})
-
     players_info_sorted = sorted(players_info, key=lambda x: -x["total_ev"])
     total_combinations = math.comb(len(players_info_sorted), 5)
-    processed_combinations = 0
-    if progress_callback:
-        progress_callback(0, total_combinations)
 
     cache_id = uuid.uuid4().hex
     players_meta = {str(p["player_id"]): p for p in players_info_sorted}
     conn = _connect()
     top_entries = []
     total_valid = 0
+    processed_combinations = 0
     try:
         conn.execute("BEGIN")
         conn.execute(
@@ -303,36 +300,12 @@ def _compute_best_teams_from_results(results: dict, payload: dict, progress_call
             (cache_id, time.time(), len(players_info_sorted), json.dumps(players_meta)),
         )
 
-        for combo in itertools.combinations(players_info_sorted, 5):
-            processed_combinations += 1
-            if progress_callback and (processed_combinations % 1000 == 0 or processed_combinations == total_combinations):
-                progress_callback(processed_combinations, total_combinations)
-
-            combo_ids = [p["player_id"] for p in combo]
-            combo_set = set(combo_ids)
-            if include and not include.issubset(combo_set):
-                continue
-            total_cost = sum(p["price"] for p in combo)
-            if total_cost > budget:
-                continue
-
-            counts = {}
-            valid = True
-            for p in combo:
-                tid = p["team_id"]
-                counts[tid] = counts.get(tid, 0) + 1
-                if counts[tid] > max_per_team:
-                    valid = False
-                    break
-            if not valid:
-                continue
-
-            assignment, _ = best_role_assignment_for_team(combo_ids, role_scores_by_player)
-            if assignment is None:
-                continue
-
-            total_ev = float(sum(p["total_ev"] for p in combo))
-            role_names = [str(assignment.get(pid, "-")) for pid in combo_ids]
+        for roster in iter_valid_rosters(players_info_sorted, include, budget, max_per_team, progress_callback):
+            processed_combinations = int(roster["processed"])
+            combo_ids = roster["pids"]
+            total_cost = int(roster["cost"])
+            total_ev = float(roster["total_ev"])
+            role_names = roster["roles"]
             conn.execute(
                 """
                 INSERT INTO best_team_combos (
@@ -389,33 +362,17 @@ def _compute_best_teams_from_results(results: dict, payload: dict, progress_call
         conn.close()
 
     top_entries.sort(key=lambda x: x["total_ev"], reverse=True)
-    top_teams = []
-    for e in top_entries[:10]:
-        players = []
-        for pid, role_name in zip(e["pids"], e["roles"]):
-            meta = players_meta.get(str(pid), {})
-            players.append(
-                {
-                    "player_id": int(pid),
-                    "name": meta.get("name", f"Player {pid}"),
-                    "team_id": int(meta.get("team_id", 0)),
-                    "price": int(meta.get("price", 0)),
-                    "rating_ev": float(meta.get("rating_ev", 0.0)),
-                    "win_ev": float(meta.get("win_ev", 0.0)),
-                    "role_ev": float(meta.get("role_ev", 0.0)),
-                    "booster_ev": float(meta.get("booster_ev", 0.0)),
-                    "total_ev": float(meta.get("total_ev", 0.0)),
-                    "role_name": str(role_name),
-                }
-            )
-        top_teams.append({"total_ev": float(e["total_ev"]), "cost": int(e["cost"]), "players": players})
+    top_teams = [
+        serialize_roster(players_meta, entry["pids"], entry["roles"], entry["total_ev"], entry["cost"])
+        for entry in top_entries[:10]
+    ]
 
     return {
         "cache_id": cache_id,
         "top_teams": top_teams,
         "total_teams": int(total_valid),
         "player_count": len(players_info_sorted),
-        "processed_combinations": int(processed_combinations),
+        "processed_combinations": int(processed_combinations or total_combinations),
         "total_combinations": int(total_combinations),
     }
 

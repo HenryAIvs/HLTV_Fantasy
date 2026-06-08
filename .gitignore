@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+electron/node_modules/
 .venv/
 
 # Python cache/artifacts
@@ -7,13 +8,26 @@ __pycache__/
 *.py[cod]
 *.pyo
 
+# Frontend build artifacts
+electron/dist/
+
 # Databases and local data
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
+hltv_profile*/
 
 # OS / editor junk
 .DS_Store
 Thumbs.db
+.vscode/
 
 # Logs and coverage
 *.log
 coverage/
+downloaded_files/
+
+# Local environment
+.env
+*.env

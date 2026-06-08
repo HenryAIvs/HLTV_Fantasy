@@ -15,6 +15,7 @@ from backend.data.team_db import ensure_team_schema
 from backend.routes.simulation import ensure_simulation_schema
 from backend.routes.best_team import ensure_best_team_schema
 from backend.routes.playoff import ensure_playoff_schema
+from backend.routes.players import ensure_topx_batch_schema
 
 
 def configure_logging() -> None:
@@ -51,6 +52,7 @@ def create_app() -> FastAPI:
         ensure_simulation_schema()
         ensure_best_team_schema()
         ensure_playoff_schema()
+        ensure_topx_batch_schema()
 
     return app
 

@@ -57,30 +57,9 @@ const api = window.api || {
     }
     return { status: "ok" };
   },
-  openHltvPage: async (url) => {
-    if (typeof window !== "undefined" && typeof window.open === "function") {
-      window.open(url, "_blank", "noopener,noreferrer");
-    }
-    return { status: "ok", url };
-  },
-  readOpenedHltvPageText: async () => ({ status: "ok", url: "", text: "" }),
 };
 
 const TOP_RATING_TIERS = [5, 10, 20, 30, 50];
-
-const slugifyHltvPlayerName = (name) => {
-  const asciiName = String(name || "")
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "");
-  const slug = asciiName.replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "").toLowerCase();
-  return slug || "player";
-};
-
-const buildHltvPlayerStatsUrl = (playerId, playerName) => {
-  const pid = Number(playerId);
-  if (!Number.isFinite(pid) || pid <= 0) return "";
-  return `https://www.hltv.org/stats/players/${pid}/${slugifyHltvPlayerName(playerName)}`;
-};
 
 const formatTopxImportedAt = (unixSeconds) => {
   const ts = Number(unixSeconds);
@@ -2733,9 +2712,6 @@ function EventsTab({ refreshData, notify, players }) {
     <div className="stack">
       <Section title="Events">
         <div className="stack">
-          <p className="muted">
-            Import an HLTV event id to store event teams and event-specific player prices. The active event price is used across simulations.
-          </p>
           <div className="grid three">
             <Input label="Event ID" value={eventId} onChange={setEventId} placeholder="e.g. 12345" />
             <div className="field">
@@ -3459,61 +3435,10 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     }
   };
 
-  const openPlayerHltvPage = async () => {
-    const playerId = Number(playerForm.player_id);
-    if (!Number.isFinite(playerId) || playerId <= 0) {
-      notify("Player is missing a valid HLTV id.");
-      return;
-    }
-    const url = buildHltvPlayerStatsUrl(playerId, playerForm.name);
-    if (!url) {
-      notify("Failed to build the HLTV player URL.");
-      return;
-    }
-    try {
-      await api.openHltvPage(url);
-    } catch (e) {
-      notify(`Failed to open HLTV page: ${e?.message || "unknown error"}`);
-    }
-  };
-
-  const fetchPlayerTopRatingsFromOpenedPage = async () => {
-    const playerId = Number(playerForm.player_id);
-    if (!Number.isFinite(playerId) || playerId <= 0) {
-      setPlayerTopxFeedback({ kind: "error", message: "Player is missing a valid HLTV id." });
-      notify("Player is missing a valid HLTV id.");
-      return;
-    }
-    setTopRatingsBusy(true);
-    setPlayerTopxFeedback({ kind: "info", message: "Reading data from opened HLTV page..." });
-    try {
-      const opened = await api.readOpenedHltvPageText();
-      const sourceText = String(opened?.text || "").trim();
-      if (!sourceText) {
-        throw new Error("Opened HLTV page has no readable text yet. Wait for it to load and retry.");
-      }
-      const res = await api.post(`/players/${playerId}/fetch-top-ratings`, { text: sourceText });
-      await refresh();
-      const rangeText = res?.startDate && res?.endDate ? ` (${res.startDate} to ${res.endDate})` : "";
-      setPlayerTopxFeedback({
-        kind: "success",
-        message: `Top-X import succeeded from opened HLTV page${rangeText}.`,
-      });
-      notify(`Top-X imported for ${playerForm.name || `player ${playerId}`} from opened HLTV page${rangeText}`);
-    } catch (e) {
-      setPlayerTopxFeedback({
-        kind: "error",
-        message: `Import from opened page failed: ${e?.message || "unknown error"}`,
-      });
-      notify(`Import from opened page failed: ${e?.message || "unknown error"}`);
-    } finally {
-      setTopRatingsBusy(false);
-    }
-  };
-
   const resetBatchTopRatingsProgress = () => {
     setBatchTopRatingsStatus("idle");
     setBatchTopRatingsJobId("");
+    setBatchTopRatingsBusy(false);
     setBatchTopRatingsProcessed(0);
     setBatchTopRatingsTotal(0);
     setBatchTopRatingsOk(0);
@@ -3531,43 +3456,59 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     return `${minutes}m ${rem}s`;
   };
 
-  const pollBatchTopRatingsJob = async (jobId, startedAtMs) => {
+  const getBatchStartedAtMs = (status, fallback = Date.now()) => {
+    const startedAt = Number(status?.started_at || status?.created_at || 0);
+    return Number.isFinite(startedAt) && startedAt > 0 ? startedAt * 1000 : fallback;
+  };
+
+  const applyBatchTopRatingsStatus = (status, jobIdOverride = "") => {
+    const jobId = String(jobIdOverride || status?.job_id || "");
+    const processed = Number(status?.processed_players || 0);
+    const total = Number(status?.total_players || 0);
+    const ok = Number(status?.ok || 0);
+    const failed = Number(status?.failed || 0);
+    const nextStatus = String(status?.status || "queued");
+    const lastError = String(status?.last_error || status?.error || "");
+
+    setBatchTopRatingsStatus(nextStatus);
+    setBatchTopRatingsJobId(jobId);
+    setBatchTopRatingsProcessed(processed);
+    setBatchTopRatingsTotal(total);
+    setBatchTopRatingsOk(ok);
+    setBatchTopRatingsFailed(failed);
+    setBatchTopRatingsLastError(lastError);
+    setBatchTopRatingsBusy(["queued", "running", "pausing"].includes(nextStatus));
+
+    if (processed > 0 && total > processed) {
+      const elapsedSec = Math.max(0.001, (Date.now() - getBatchStartedAtMs(status)) / 1000);
+      const rate = processed / elapsedSec;
+      setBatchTopRatingsEtaSeconds(rate > 0 ? (total - processed) / rate : null);
+    } else if (total > 0 && processed >= total) {
+      setBatchTopRatingsEtaSeconds(0);
+    } else {
+      setBatchTopRatingsEtaSeconds(null);
+    }
+
+    return { jobId, processed, total, ok, failed, nextStatus, lastError };
+  };
+
+  const pollBatchTopRatingsJob = async (jobId) => {
     if (!jobId || batchTopRatingsPollingRef.current) return;
     batchTopRatingsPollingRef.current = true;
     try {
       let done = false;
       while (!done) {
         const status = await api.get(`/players/fetch-top-ratings-batch/job/${jobId}`);
-        const processed = Number(status?.processed_players || 0);
-        const total = Number(status?.total_players || 0);
-        const ok = Number(status?.ok || 0);
-        const failed = Number(status?.failed || 0);
-        const nextStatus = String(status?.status || "queued");
-        const lastError = String(status?.last_error || status?.error || "");
-
-        setBatchTopRatingsStatus(nextStatus);
-        setBatchTopRatingsJobId(jobId);
-        setBatchTopRatingsProcessed(processed);
-        setBatchTopRatingsTotal(total);
-        setBatchTopRatingsOk(ok);
-        setBatchTopRatingsFailed(failed);
-        setBatchTopRatingsLastError(lastError);
-
-        if (processed > 0 && total > processed) {
-          const elapsedSec = Math.max(0.001, (Date.now() - startedAtMs) / 1000);
-          const rate = processed / elapsedSec;
-          if (rate > 0) {
-            setBatchTopRatingsEtaSeconds((total - processed) / rate);
-          }
-        } else if (total > 0 && processed >= total) {
-          setBatchTopRatingsEtaSeconds(0);
-        } else {
-          setBatchTopRatingsEtaSeconds(null);
-        }
+        const { ok, failed, nextStatus, lastError } = applyBatchTopRatingsStatus(status, jobId);
 
         if (nextStatus === "failed") {
           setBatchTopRatingsBusy(false);
           notify(lastError || "Top-X batch failed.");
+          done = true;
+          break;
+        }
+        if (nextStatus === "paused") {
+          setBatchTopRatingsBusy(false);
           done = true;
           break;
         }
@@ -3621,7 +3562,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
         throw new Error("Failed to start Top-X batch job.");
       }
       setBatchTopRatingsJobId(jobId);
-      await pollBatchTopRatingsJob(jobId, Date.now());
+      await pollBatchTopRatingsJob(jobId);
     } catch (e) {
       setBatchTopRatingsStatus("failed");
       setBatchTopRatingsLastError(String(e?.message || "Failed to start Top-X batch job."));
@@ -3630,6 +3571,56 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
       setBatchTopRatingsBusy(false);
     }
   };
+
+  const pauseBatchTopRatingsJob = async () => {
+    if (!batchTopRatingsJobId) return;
+    try {
+      const status = await api.post(`/players/fetch-top-ratings-batch/job/${batchTopRatingsJobId}/pause`, {});
+      const applied = applyBatchTopRatingsStatus(status, batchTopRatingsJobId);
+      if (applied.nextStatus === "pausing") {
+        pollBatchTopRatingsJob(batchTopRatingsJobId);
+      }
+    } catch (e) {
+      notify(`Failed to pause Top-X batch: ${e?.message || "unknown error"}`);
+    }
+  };
+
+  const resumeBatchTopRatingsJob = async () => {
+    if (!batchTopRatingsJobId) return;
+    setBatchTopRatingsBusy(true);
+    try {
+      const status = await api.post(`/players/fetch-top-ratings-batch/job/${batchTopRatingsJobId}/resume`, {});
+      const applied = applyBatchTopRatingsStatus(status, batchTopRatingsJobId);
+      if (["queued", "running", "pausing"].includes(applied.nextStatus)) {
+        pollBatchTopRatingsJob(batchTopRatingsJobId);
+      }
+    } catch (e) {
+      setBatchTopRatingsBusy(false);
+      notify(`Failed to resume Top-X batch: ${e?.message || "unknown error"}`);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const hydrateLatestTopRatingsJob = async () => {
+      try {
+        const latest = await api.get("/players/fetch-top-ratings-batch/latest");
+        if (cancelled || !latest?.exists) return;
+        const applied = applyBatchTopRatingsStatus(latest);
+        if (["queued", "running", "pausing"].includes(applied.nextStatus)) {
+          pollBatchTopRatingsJob(applied.jobId);
+        }
+      } catch {
+        // The batch progress panel is optional on startup; failures should not block the database view.
+      }
+    };
+
+    hydrateLatestTopRatingsJob();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const openPlayerDetailsFromTeam = (playerId) => {
     const pid = Number(playerId);
@@ -3686,6 +3677,17 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
   const batchTopRatingsProgressPct =
     batchTopRatingsTotal > 0 ? Math.min(100, Math.max(0, (batchTopRatingsProcessed / batchTopRatingsTotal) * 100)) : 0;
   const showBatchTopRatingsProgress = batchTopRatingsStatus !== "idle";
+  const batchTopRatingsActive = ["queued", "running", "pausing"].includes(batchTopRatingsStatus);
+  const batchTopRatingsResumable = ["paused", "failed"].includes(batchTopRatingsStatus);
+  const batchTopRatingsStatusLabel =
+    {
+      completed: "Completed",
+      failed: "Failed",
+      paused: "Paused",
+      pausing: "Pausing",
+      running: "Running",
+      queued: "Queued",
+    }[batchTopRatingsStatus] || "Queued";
   const playerTopxRows = useMemo(() => {
     const rows = Array.isArray(playerCurve?.bucket_rows) ? playerCurve.bucket_rows : [];
     return rows
@@ -3803,7 +3805,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
           <p className="error">{error}</p>
         ) : (
           <div className="players-panel">
-            <p className="muted">Click a player row to view details.</p>
             <div className="grid two">
               <Input label="Search Players" value={playerSearch} onChange={setPlayerSearch} placeholder="Name, ID, or team" />
               <Select
@@ -3823,23 +3824,26 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
               />
             </div>
             <div className="card sub players-batch-toolbar">
-              <div className="players-batch-meta">
-                <p className="muted">Import all players&apos; Top-X data concurrently. For one player, open the player details and use the individual import button.</p>
-                <p className="muted">
-                  Players in DB: {players.length} | Visible: {filteredSortedPlayers.length}
-                  {batchTopRatingsJobId ? ` | Job ${batchTopRatingsJobId}` : ""}
-                </p>
-              </div>
               <div className="actions" style={{ marginTop: 0 }}>
                 <button
                   className="primary"
                   onClick={importAllPlayerTopRatings}
-                  disabled={players.length === 0 || batchTopRatingsBusy}
+                  disabled={players.length === 0 || batchTopRatingsActive}
                 >
-                  {batchTopRatingsBusy ? `Importing ${batchTopRatingsTotal} players...` : `Import All (${players.length})`}
+                  {batchTopRatingsActive ? `Importing ${batchTopRatingsTotal} players...` : `Import All (${players.length})`}
                 </button>
+                {batchTopRatingsActive && batchTopRatingsJobId && (
+                  <button className="secondary" onClick={pauseBatchTopRatingsJob} disabled={batchTopRatingsStatus === "pausing"}>
+                    {batchTopRatingsStatus === "pausing" ? "Pausing..." : "Pause"}
+                  </button>
+                )}
+                {batchTopRatingsResumable && batchTopRatingsJobId && (
+                  <button className="secondary" onClick={resumeBatchTopRatingsJob} disabled={batchTopRatingsBusy}>
+                    Resume
+                  </button>
+                )}
                 {showBatchTopRatingsProgress && (
-                  <button className="secondary" onClick={resetBatchTopRatingsProgress} disabled={batchTopRatingsBusy}>
+                  <button className="secondary" onClick={resetBatchTopRatingsProgress} disabled={batchTopRatingsActive}>
                     Clear Progress
                   </button>
                 )}
@@ -3850,7 +3854,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                 <p className="muted">
                   Top-X progress: {batchTopRatingsProcessed.toLocaleString()} / {batchTopRatingsTotal.toLocaleString()} | ok{" "}
                   {batchTopRatingsOk} | failed {batchTopRatingsFailed}
-                  {batchTopRatingsStatus === "running" && batchTopRatingsTotal > batchTopRatingsProcessed
+                  {["queued", "running", "pausing"].includes(batchTopRatingsStatus) && batchTopRatingsTotal > batchTopRatingsProcessed
                     ? ` | ETA: ${formatBatchEta(batchTopRatingsEtaSeconds)}`
                     : ""}
                 </p>
@@ -3858,26 +3862,11 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                   <div className="progress-bar determinate" style={{ width: `${batchTopRatingsProgressPct}%` }} />
                 </div>
                 <p className="muted">
-                  Status:{" "}
-                  {batchTopRatingsStatus === "completed"
-                    ? "Completed"
-                    : batchTopRatingsStatus === "failed"
-                      ? "Failed"
-                      : batchTopRatingsStatus === "running"
-                        ? "Running"
-                        : "Queued"}
+                  Status: {batchTopRatingsStatusLabel}
                 </p>
                 {batchTopRatingsLastError && <p className="muted">Last error: {batchTopRatingsLastError}</p>}
               </div>
             )}
-            <p className="muted status-legend">
-              <span>
-                <span className="status-dot ok" /> imported
-              </span>
-              <span>
-                <span className="status-dot missing" /> missing
-              </span>
-            </p>
             <div className="players-table-wrap">
             <table className="players-table">
               <colgroup>
@@ -3975,16 +3964,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
               {playerTab === "info" && (
                 <div className="stack">
                   <div className="actions" style={{ marginTop: 0 }}>
-                    <button className="secondary" onClick={openPlayerHltvPage} disabled={!playerForm.player_id || topRatingsBusy}>
-                      Open HLTV Page
-                    </button>
-                    <button
-                      className="secondary"
-                      onClick={fetchPlayerTopRatingsFromOpenedPage}
-                      disabled={!playerForm.player_id || topRatingsBusy}
-                    >
-                      Import From Opened Page
-                    </button>
                     <button
                       className="primary button-with-spinner"
                       onClick={fetchPlayerTopRatings}
@@ -3997,9 +3976,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                   {playerTopxFeedback?.message && (
                     <p className={`inline-status ${playerTopxFeedback.kind || "info"}`}>{playerTopxFeedback.message}</p>
                   )}
-                  <p className="muted">
-                    Open HLTV Page loads the player page in an app window. Import From Opened Page reads that window text and avoids extra HLTV fetch requests.
-                  </p>
                   <p className="muted">Last Top-X import: {formatTopxImportedAt(playerForm.last_topx_import_at)}</p>
                   <table>
                     <thead>
@@ -4034,12 +4010,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
               )}
               {playerTab === "topxGraph" && (
                 <div className="stack">
-                  <p className="muted">
-                    Adjusted Top-X buckets use non-overlapping ranges: Top 5, 6-10, 11-20, 21-30, and 31-50.
-                  </p>
-                  <p className="muted">
-                    The last point is the 31-50 bucket derived from cumulative Top 50 minus Top 30, not raw cumulative Top 50.
-                  </p>
                   {playerCurveLoading && <p className="muted">Loading Top-X graph...</p>}
                   {playerCurveError && <p className="error">{playerCurveError}</p>}
                   {!playerCurveLoading && !playerCurveError && playerTopxRows.length === 0 && (
@@ -4464,7 +4434,6 @@ function AdminTab({ refresh, notify }) {
                 placeholder="Paste the triggerRates JSON here"
               />
             </label>
-            <p className="muted">Paste the triggerRates JSON to update boosters and roles for all players.</p>
             <div className="actions">
               <button className="primary" onClick={importTriggers} disabled={importBusy}>
                 {importBusy ? "Importing..." : "Import Trigger Rates"}
@@ -4489,7 +4458,6 @@ function AdminTab({ refresh, notify }) {
           <div className="stack">
             <div className="card sub">
               <h4>Winrate Fit Samples</h4>
-              <p className="muted">Enter rank and odds per row. oddsA is used to imply P(A)=1/oddsA.</p>
               <table>
                 <thead>
                   <tr>
