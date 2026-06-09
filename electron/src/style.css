@@ -108,6 +108,28 @@ th { color: #a5b4fc; font-weight: 600; }
 tr:hover { background: #111827; }
 .row-active { background: #0f1b36; }
 
+.table-sort-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.table-sort-button span {
+  color: #cbd5e1;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.table-sort-button:hover {
+  color: #dbeafe;
+}
+
 .swiss-player-table td,
 .swiss-player-table th {
   white-space: nowrap;

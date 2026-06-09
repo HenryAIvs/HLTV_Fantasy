@@ -217,10 +217,13 @@ def _build_featured_payload(player: dict, *, source_text: str | None = None) -> 
 def _persist_featured_top_ratings(player: dict, featured_payload: dict) -> dict:
     player_id = int(player["player_id"])
     updates = _build_top_rating_updates(player, featured_payload.get("featured_ratings") or {})
+    overall_rating = featured_payload.get("overall_rating")
+    if overall_rating is not None:
+        updates["rating"] = float(overall_rating)
     add_or_update_player(
         player_id=player_id,
         name=player.get("name"),
-        rating=player.get("rating"),
+        rating=float(overall_rating) if overall_rating is not None else player.get("rating"),
         price=player.get("price"),
         best_role=player.get("best_role"),
         major_win_pct=player.get("major_win_pct"),
@@ -235,6 +238,7 @@ def _persist_featured_top_ratings(player: dict, featured_payload: dict) -> dict:
         "player_id": player_id,
         "startDate": featured_payload.get("startDate"),
         "endDate": featured_payload.get("endDate"),
+        "overall_rating": float(overall_rating) if overall_rating is not None else None,
         "updated_fields": sorted(updates.keys()),
         "player": get_player(player_id),
     }
@@ -337,6 +341,7 @@ def _run_top_ratings_batch(items: list[dict], concurrency: int, progress_callbac
                     "player_name": player_name,
                     "startDate": saved.get("startDate"),
                     "endDate": saved.get("endDate"),
+                    "overall_rating": saved.get("overall_rating"),
                 }
                 ok_count += 1
             except HTTPException as exc:
@@ -536,6 +541,7 @@ def _run_top_ratings_batch_job(job_id: str) -> None:
                     "player_name": player_name,
                     "startDate": saved.get("startDate"),
                     "endDate": saved.get("endDate"),
+                    "overall_rating": saved.get("overall_rating"),
                 }
             except HTTPException as exc:
                 row = {

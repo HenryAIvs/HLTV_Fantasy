@@ -3435,18 +3435,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     }
   };
 
-  const resetBatchTopRatingsProgress = () => {
-    setBatchTopRatingsStatus("idle");
-    setBatchTopRatingsJobId("");
-    setBatchTopRatingsBusy(false);
-    setBatchTopRatingsProcessed(0);
-    setBatchTopRatingsTotal(0);
-    setBatchTopRatingsOk(0);
-    setBatchTopRatingsFailed(0);
-    setBatchTopRatingsLastError("");
-    setBatchTopRatingsEtaSeconds(null);
-  };
-
   const formatBatchEta = (seconds) => {
     if (!Number.isFinite(seconds) || seconds == null || seconds < 0) return "Calculating...";
     if (seconds <= 1) return "<1s";
@@ -3514,6 +3502,8 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
         }
         if (nextStatus === "completed") {
           setBatchTopRatingsBusy(false);
+          setBatchTopRatingsStatus("idle");
+          setBatchTopRatingsEtaSeconds(null);
           await refresh();
           const rows = Array.isArray(status?.result?.results) ? status.result.results : Array.isArray(status?.results) ? status.results : [];
           const failedRows = rows.filter((row) => row?.status !== "ok");
@@ -3539,12 +3529,25 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     }
   };
 
-  const importAllPlayerTopRatings = async () => {
-    const playerIds = (players || [])
+  const playerHasCompleteTopRatings = (player) => {
+    if (!Number(player?.last_topx_import_at)) return false;
+    return TOP_RATING_TIERS.every((tier) => {
+      const rating = Number(player?.[`rating_top${tier}`]);
+      const maps = Number(player?.[`maps_top${tier}`]);
+      return Number.isFinite(rating) && rating > 0 && Number.isFinite(maps) && maps > 0;
+    });
+  };
+
+  const getTopRatingsBatchPlayerIds = (onlyMissing = false) =>
+    (players || [])
+      .filter((player) => !onlyMissing || !playerHasCompleteTopRatings(player))
       .map((player) => Number(player?.player_id))
       .filter((value) => Number.isFinite(value) && value > 0);
+
+  const importPlayerTopRatingsBatch = async (onlyMissing = false) => {
+    const playerIds = getTopRatingsBatchPlayerIds(onlyMissing);
     if (playerIds.length === 0) {
-      notify("No players available to import.");
+      notify(onlyMissing ? "No players are missing Top-X data." : "No players available to import.");
       return;
     }
     setBatchTopRatingsBusy(true);
@@ -3607,6 +3610,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
       try {
         const latest = await api.get("/players/fetch-top-ratings-batch/latest");
         if (cancelled || !latest?.exists) return;
+        if (latest?.status === "completed") return;
         const applied = applyBatchTopRatingsStatus(latest);
         if (["queued", "running", "pausing"].includes(applied.nextStatus)) {
           pollBatchTopRatingsJob(applied.jobId);
@@ -3674,11 +3678,33 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     const n = Number(v);
     return Number.isFinite(n) ? n : fallback;
   };
+  const setPlayerSortByColumn = (column) => {
+    const nextSort = {
+      name: playerSort === "name_asc" ? "name_desc" : "name_asc",
+      id: playerSort === "id_asc" ? "id_desc" : "id_asc",
+      team: playerSort === "team_asc" ? "team_desc" : "team_asc",
+      rating: playerSort === "rating_desc" ? "rating_asc" : "rating_desc",
+      boost: playerSort === "boost_desc" ? "boost_asc" : "boost_desc",
+    }[column];
+    if (nextSort) setPlayerSort(nextSort);
+  };
+  const playerSortArrow = (column) => {
+    const activeSorts = {
+      name: ["name_asc", "name_desc"],
+      id: ["id_asc", "id_desc"],
+      team: ["team_asc", "team_desc"],
+      rating: ["rating_asc", "rating_desc"],
+      boost: ["boost_asc", "boost_desc"],
+    }[column] || [];
+    if (!activeSorts.includes(playerSort)) return "↕";
+    return playerSort.endsWith("_asc") ? "↑" : "↓";
+  };
   const batchTopRatingsProgressPct =
     batchTopRatingsTotal > 0 ? Math.min(100, Math.max(0, (batchTopRatingsProcessed / batchTopRatingsTotal) * 100)) : 0;
   const showBatchTopRatingsProgress = batchTopRatingsStatus !== "idle";
   const batchTopRatingsActive = ["queued", "running", "pausing"].includes(batchTopRatingsStatus);
   const batchTopRatingsResumable = ["paused", "failed"].includes(batchTopRatingsStatus);
+  const missingTopRatingsCount = (players || []).filter((player) => !playerHasCompleteTopRatings(player)).length;
   const batchTopRatingsStatusLabel =
     {
       completed: "Completed",
@@ -3733,6 +3759,10 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
           return toNum(a.rating) - toNum(b.rating);
         case "team_asc":
           return ((playerTeamLookup[a.player_id] || [])[0] || "").localeCompare(((playerTeamLookup[b.player_id] || [])[0] || ""));
+        case "team_desc":
+          return ((playerTeamLookup[b.player_id] || [])[0] || "").localeCompare(((playerTeamLookup[a.player_id] || [])[0] || ""));
+        case "boost_asc":
+          return Number(hasBoostersAndRoles(a)) - Number(hasBoostersAndRoles(b));
         case "boost_desc":
           return Number(hasBoostersAndRoles(b)) - Number(hasBoostersAndRoles(a));
         case "name_asc":
@@ -3807,30 +3837,22 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
           <div className="players-panel">
             <div className="grid two">
               <Input label="Search Players" value={playerSearch} onChange={setPlayerSearch} placeholder="Name, ID, or team" />
-              <Select
-                label="Sort Players"
-                value={playerSort}
-                onChange={setPlayerSort}
-                options={[
-                  { value: "name_asc", label: "Name A-Z" },
-                  { value: "name_desc", label: "Name Z-A" },
-                  { value: "id_asc", label: "ID low-high" },
-                  { value: "id_desc", label: "ID high-low" },
-                  { value: "rating_desc", label: "Rating high-low" },
-                  { value: "rating_asc", label: "Rating low-high" },
-                  { value: "team_asc", label: "Team A-Z" },
-                  { value: "boost_desc", label: "Boost/Role imported first" },
-                ]}
-              />
             </div>
             <div className="card sub players-batch-toolbar">
               <div className="actions" style={{ marginTop: 0 }}>
                 <button
                   className="primary"
-                  onClick={importAllPlayerTopRatings}
+                  onClick={() => importPlayerTopRatingsBatch(false)}
                   disabled={players.length === 0 || batchTopRatingsActive}
                 >
                   {batchTopRatingsActive ? `Importing ${batchTopRatingsTotal} players...` : `Import All (${players.length})`}
+                </button>
+                <button
+                  className="secondary"
+                  onClick={() => importPlayerTopRatingsBatch(true)}
+                  disabled={missingTopRatingsCount === 0 || batchTopRatingsActive}
+                >
+                  {batchTopRatingsActive ? "Importing..." : `Import Missing (${missingTopRatingsCount})`}
                 </button>
                 {batchTopRatingsActive && batchTopRatingsJobId && (
                   <button className="secondary" onClick={pauseBatchTopRatingsJob} disabled={batchTopRatingsStatus === "pausing"}>
@@ -3840,11 +3862,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                 {batchTopRatingsResumable && batchTopRatingsJobId && (
                   <button className="secondary" onClick={resumeBatchTopRatingsJob} disabled={batchTopRatingsBusy}>
                     Resume
-                  </button>
-                )}
-                {showBatchTopRatingsProgress && (
-                  <button className="secondary" onClick={resetBatchTopRatingsProgress} disabled={batchTopRatingsActive}>
-                    Clear Progress
                   </button>
                 )}
               </div>
@@ -3878,11 +3895,31 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
               </colgroup>
               <thead>
                 <tr>
-                  <th>Name</th>
-                  <th>ID</th>
-                  <th>Team</th>
-                  <th>Rating</th>
-                  <th title="Boosters and Roles imported">Boost/Role</th>
+                  <th>
+                    <button className="table-sort-button" onClick={() => setPlayerSortByColumn("name")}>
+                      Name <span>{playerSortArrow("name")}</span>
+                    </button>
+                  </th>
+                  <th>
+                    <button className="table-sort-button" onClick={() => setPlayerSortByColumn("id")}>
+                      ID <span>{playerSortArrow("id")}</span>
+                    </button>
+                  </th>
+                  <th>
+                    <button className="table-sort-button" onClick={() => setPlayerSortByColumn("team")}>
+                      Team <span>{playerSortArrow("team")}</span>
+                    </button>
+                  </th>
+                  <th>
+                    <button className="table-sort-button" onClick={() => setPlayerSortByColumn("rating")}>
+                      Rating <span>{playerSortArrow("rating")}</span>
+                    </button>
+                  </th>
+                  <th title="Boosters and Roles imported">
+                    <button className="table-sort-button" onClick={() => setPlayerSortByColumn("boost")}>
+                      Boost/Role <span>{playerSortArrow("boost")}</span>
+                    </button>
+                  </th>
                 </tr>
               </thead>
               <tbody>

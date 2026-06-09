@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_TOP_BUCKETS = (5, 10, 20, 30, 50)
 
 _HLTV_PLAYER_STATS_URL = (
-    "https://www.hltv.org/stats/players/{player_id}/{slug}?startDate={start}&endDate={end}"
+    "https://www.hltv.org/stats/players/{player_id}/{slug}?startDate={start}&endDate={end}&csVersion=CS2"
 )
 
 # Regex fallback for HTML parsing (used only when caller has raw HTML)
@@ -25,6 +25,10 @@ _WS_RE = re.compile(r"\s+")
 _FEATURED_RATING_RE = re.compile(
     r"(?P<rating>\d+\.\d+)\s*vs\s*top\s*(?P<tier>\d+)\s*opponents.*?\(\s*(?P<maps>\d+)\s*maps?\s*\)",
     re.IGNORECASE,
+)
+_OVERALL_RATING_PATTERNS = (
+    re.compile(r"(?P<rating>\d+\.\d+)\s*Rating\s*3\.0", re.IGNORECASE),
+    re.compile(r"Rating\s*3\.0\s*(?P<rating>\d+\.\d+)", re.IGNORECASE),
 )
 
 class HLTVFeaturedRatingsError(RuntimeError):
@@ -42,9 +46,9 @@ def slugify_hltv_player_name(name: str | None) -> str:
     return slug or "player"
 
 
-def _last_6_months_range(end: date | None = None) -> tuple[str, str]:
+def _last_3_months_range(end: date | None = None) -> tuple[str, str]:
     end_d = end or date.today()
-    start_d = end_d - relativedelta(months=6)
+    start_d = end_d - relativedelta(months=3)
     return start_d.isoformat(), end_d.isoformat()
 
 
@@ -60,7 +64,7 @@ def build_hltv_player_stats_url(
         raise ValueError("player_id must be a positive integer")
     start, end = start_date, end_date
     if start is None or end is None:
-        start, end = _last_6_months_range()
+        start, end = _last_3_months_range()
     return _HLTV_PLAYER_STATS_URL.format(
         player_id=pid,
         slug=slugify_hltv_player_name(player_name),
@@ -88,7 +92,7 @@ def get_featured_ratings(
     timeout: int = 45,
 ) -> dict:
     buckets = tuple(tops or DEFAULT_TOP_BUCKETS)
-    start_date, end_date = _last_6_months_range()
+    start_date, end_date = _last_3_months_range()
     url = build_hltv_player_stats_url(
         player_id, player_name, start_date=start_date, end_date=end_date
     )
@@ -97,6 +101,7 @@ def get_featured_ratings(
     try:
         html = fetch_hltv_html(url, timeout_ms=timeout_ms, wait_text="Featured ratings")
         featured = parse_featured_ratings_html(html, tops=buckets)
+        overall_rating = parse_overall_rating_html(html)
     except HLTVBrowserError as exc:
         raise HLTVFeaturedRatingsError(str(exc)) from exc
 
@@ -111,18 +116,35 @@ def get_featured_ratings(
         "url": url,
         "startDate": start_date,
         "endDate": end_date,
+        "overall_rating": overall_rating,
         "featured_ratings": featured,
     }
+
+
+def _html_to_text(html: str) -> str:
+    html_no_scripts = _SCRIPT_RE.sub(" ", html or "")
+    html_no_scripts = _STYLE_RE.sub(" ", html_no_scripts)
+    text = _TAG_RE.sub(" ", html_no_scripts)
+    text = unescape(text)
+    return _WS_RE.sub(" ", text).strip()
+
+
+def parse_overall_rating_html(html: str) -> float | None:
+    text = _html_to_text(html)
+    for pattern in _OVERALL_RATING_PATTERNS:
+        match = pattern.search(text)
+        if not match:
+            continue
+        value = float(match.group("rating"))
+        if 0.0 < value < 3.0:
+            return value
+    return None
 
 
 def parse_featured_ratings_html(html: str, *, tops: list[int] | tuple[int, ...] | None = None) -> dict[int, dict[str, float | int]]:
     """Fallback HTML regex parser — used only when caller has raw HTML."""
     wanted = {int(t) for t in (tops or DEFAULT_TOP_BUCKETS)}
-    html_no_scripts = _SCRIPT_RE.sub(" ", html or "")
-    html_no_scripts = _STYLE_RE.sub(" ", html_no_scripts)
-    text = _TAG_RE.sub(" ", html_no_scripts)
-    text = unescape(text)
-    text = _WS_RE.sub(" ", text).strip()
+    text = _html_to_text(html)
 
     featured: dict[int, dict[str, float | int]] = {}
     for match in _FEATURED_RATING_RE.finditer(text):
