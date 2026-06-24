@@ -2,7 +2,7 @@ from typing import Dict, List, Tuple
 
 from fastapi import APIRouter, HTTPException
 from swiss_stage.team_initialization import initialize_teams
-from swiss_stage.pairing import generate_pairings
+from swiss_stage.pairing import buchholz_score, generate_pairings
 from swiss_stage.swiss_bracket import simulate_single_swiss_run
 from swiss_stage.swiss_models import TeamState
 
@@ -77,7 +77,7 @@ def _build_manual_round_view(team_states: Dict[int, TeamState]) -> Tuple[bool, i
     pool_items: List[Dict] = []
     for key in sorted(pools.keys(), key=lambda x: (x[0], x[1]), reverse=True):
         pool = pools[key]
-        pairings = generate_pairings(pool)
+        pairings = generate_pairings(pool, team_states)
         matches = []
         for idx, (a, b) in enumerate(pairings):
             matches.append(
@@ -86,6 +86,8 @@ def _build_manual_round_view(team_states: Dict[int, TeamState]) -> Tuple[bool, i
                     "team_a_id": a.team_id,
                     "team_b_id": b.team_id,
                     "record": f"{key[0]}-{key[1]}",
+                    "team_a_buchholz": buchholz_score(a, team_states),
+                    "team_b_buchholz": buchholz_score(b, team_states),
                 }
             )
         pool_items.append({"record": f"{key[0]}-{key[1]}", "matches": matches})
@@ -98,8 +100,9 @@ def _build_manual_round_view(team_states: Dict[int, TeamState]) -> Tuple[bool, i
             "qualified": t.qualified,
             "eliminated": t.eliminated,
             "vrs_rank": t.vrs_rank,
+            "buchholz": buchholz_score(t, team_states),
         }
-        for t in sorted(team_states.values(), key=lambda x: (-x.wins, x.losses, x.vrs_rank))
+        for t in sorted(team_states.values(), key=lambda x: (-x.wins, x.losses, -buchholz_score(x, team_states), x.vrs_rank))
     ]
     return done, round_no, pool_items, standings
 
@@ -120,7 +123,7 @@ def swiss_run(payload: dict):
 
     team_ids = payload["team_ids"]
     vrs_ranks = payload["vrs_ranks"]
-    bo3_mode = payload["bo3_mode"]
+    bo3_mode = "elim_qual"
 
     team_states = simulate_single_swiss_run(
         team_ids=team_ids,

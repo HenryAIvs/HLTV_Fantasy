@@ -156,6 +156,23 @@ def ensure_event_schema() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hltv_rank_hist_date ON hltv_rankings_history(snapshot_date DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_vrs_rank_hist_date ON vrs_rankings_history(snapshot_date DESC)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS historical_team_map_stats (
+                normalized_name TEXT NOT NULL,
+                team_name       TEXT NOT NULL,
+                hltv_team_id    INTEGER NOT NULL,
+                start_date      TEXT NOT NULL,
+                end_date        TEXT NOT NULL,
+                maps_json       TEXT NOT NULL,
+                source_url      TEXT,
+                imported_at     TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (normalized_name, start_date, end_date)
+            );
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hist_team_map_stats_team ON historical_team_map_stats(normalized_name)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hist_team_map_stats_window ON historical_team_map_stats(start_date, end_date)")
         conn.commit()
     finally:
         conn.close()
@@ -182,6 +199,64 @@ def _normalize_team_snapshot(team: Dict[str, Any]) -> Dict[str, Any]:
         "player_ids": player_ids,
         "prices_by_player": prices_by_player,
     }
+
+
+def get_historical_team_map_stats(normalized_name: str, start_date: str, end_date: str) -> Optional[Dict[str, Any]]:
+    ensure_event_schema()
+    conn = connect()
+    try:
+        row = conn.execute(
+            """
+            SELECT normalized_name, team_name, hltv_team_id, start_date, end_date, maps_json, source_url, imported_at
+            FROM historical_team_map_stats
+            WHERE normalized_name = ? AND start_date = ? AND end_date = ?
+            """,
+            (str(normalized_name), str(start_date), str(end_date)),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def upsert_historical_team_map_stats(
+    *,
+    normalized_name: str,
+    team_name: str,
+    hltv_team_id: int,
+    start_date: str,
+    end_date: str,
+    maps_json: str,
+    source_url: str,
+) -> None:
+    ensure_event_schema()
+    conn = connect()
+    try:
+        conn.execute(
+            """
+            INSERT INTO historical_team_map_stats (
+                normalized_name, team_name, hltv_team_id, start_date, end_date, maps_json, source_url, imported_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(normalized_name, start_date, end_date) DO UPDATE SET
+                team_name = excluded.team_name,
+                hltv_team_id = excluded.hltv_team_id,
+                maps_json = excluded.maps_json,
+                source_url = excluded.source_url,
+                imported_at = excluded.imported_at
+            """,
+            (
+                str(normalized_name),
+                str(team_name),
+                int(hltv_team_id),
+                str(start_date),
+                str(end_date),
+                str(maps_json or "[]"),
+                str(source_url or ""),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def upsert_event_snapshot(event_id: int, teams: List[Dict[str, Any]]) -> None:

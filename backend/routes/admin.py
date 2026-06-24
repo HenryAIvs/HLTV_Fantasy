@@ -47,9 +47,20 @@ def _import_money_draft_data(money: Dict[str, Any], event_id: Optional[int] = No
     event_teams_snapshot: List[Dict[str, Any]] = []
 
     for team_block in teams:
-        team_name = team_block.get("teamData", {}).get("name", "").strip()
+        team_data = team_block.get("teamData", {}) or {}
+        team_name = team_data.get("name", "").strip()
         if not team_name:
             continue
+        hltv_team_id = (
+            team_data.get("teamId")
+            or team_data.get("id")
+            or (team_data.get("fantasyTeamId", {}) or {}).get("teamId")
+            or (team_data.get("team", {}) or {}).get("teamId")
+        )
+        try:
+            hltv_team_id = int(hltv_team_id) if hltv_team_id is not None else None
+        except Exception:
+            hltv_team_id = None
 
         player_entries = team_block.get("players", []) or []
         player_ids = []
@@ -97,6 +108,7 @@ def _import_money_draft_data(money: Dict[str, Any], event_id: Optional[int] = No
             vrs_points=int((existing_team or {}).get("vrs_points") or 0),
             win_rate=win_rate,
             player_ids=ids,
+            hltv_team_id=hltv_team_id or (existing_team or {}).get("hltv_team_id"),
         )
         imported_teams += 1
         event_teams_snapshot.append(

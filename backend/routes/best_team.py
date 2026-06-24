@@ -14,6 +14,7 @@ from backend.services.team_optimizer import (
     parse_optimizer_payload,
     serialize_roster,
 )
+from backend.services.swiss_booster_assignment import optimize_swiss_boosters_for_roster
 from swiss_stage.fantasy_montecarlo import simulate_swiss_fantasy
 from backend.data.team_db import get_all_teams
 
@@ -60,10 +61,17 @@ def ensure_best_team_schema() -> None:
                 r2 TEXT NOT NULL,
                 r3 TEXT NOT NULL,
                 r4 TEXT NOT NULL,
-                r5 TEXT NOT NULL
+                r5 TEXT NOT NULL,
+                booster_assignments_json TEXT NOT NULL DEFAULT '[]'
             );
             """
         )
+        existing_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(best_team_combos)").fetchall()
+        }
+        if "booster_assignments_json" not in existing_cols:
+            conn.execute("ALTER TABLE best_team_combos ADD COLUMN booster_assignments_json TEXT NOT NULL DEFAULT '[]'")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_best_team_runs_created ON best_team_runs(created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_best_team_combos_cache_ev ON best_team_combos(cache_id, total_ev DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_best_team_combos_cache_cost ON best_team_combos(cache_id, cost ASC)")
@@ -90,6 +98,8 @@ def _order_by_sql(sort_key: str) -> str:
         return "cost DESC, total_ev DESC"
     if sort_key == "cpp_desc":
         return "(total_ev / CASE WHEN cost <= 0 THEN 1 ELSE cost END) DESC, total_ev DESC"
+    if sort_key == "cpp_asc":
+        return "(total_ev / CASE WHEN cost <= 0 THEN 1 ELSE cost END) ASC, total_ev DESC"
     return "total_ev DESC, id ASC"
 
 
@@ -133,9 +143,18 @@ def _build_query_filters(include_ids, exclude_ids, search_q: str, players_meta: 
 def _serialize_combo_row(row: sqlite3.Row, players_meta: dict) -> dict:
     pids = [int(row["p1_id"]), int(row["p2_id"]), int(row["p3_id"]), int(row["p4_id"]), int(row["p5_id"])]
     roles = [row["r1"], row["r2"], row["r3"], row["r4"], row["r5"]]
+    try:
+        booster_assignments = json.loads(row["booster_assignments_json"] or "[]")
+    except Exception:
+        booster_assignments = []
+    per_player_booster = {}
+    for assignment in booster_assignments or []:
+        pid = int(assignment.get("player_id", 0))
+        per_player_booster[pid] = per_player_booster.get(pid, 0.0) + float(assignment.get("expected_points", 0.0))
     players = []
     for pid, role_name in zip(pids, roles):
         meta = players_meta.get(str(pid)) or {}
+        booster_ev = float(per_player_booster.get(pid, meta.get("booster_ev", 0.0)))
         players.append(
             {
                 "player_id": pid,
@@ -145,8 +164,8 @@ def _serialize_combo_row(row: sqlite3.Row, players_meta: dict) -> dict:
                 "rating_ev": float(meta.get("rating_ev", 0.0)),
                 "win_ev": float(meta.get("win_ev", 0.0)),
                 "role_ev": float(meta.get("role_ev", 0.0)),
-                "booster_ev": float(meta.get("booster_ev", 0.0)),
-                "total_ev": float(meta.get("total_ev", 0.0)),
+                "booster_ev": booster_ev,
+                "total_ev": float(meta.get("rating_ev", 0.0)) + float(meta.get("win_ev", 0.0)) + float(meta.get("role_ev", 0.0)) + booster_ev,
                 "role_name": str(role_name),
             }
         )
@@ -154,6 +173,9 @@ def _serialize_combo_row(row: sqlite3.Row, players_meta: dict) -> dict:
         "total_ev": float(row["total_ev"]),
         "cost": int(row["cost"]),
         "players": players,
+        "booster_ev": sum(float(a.get("expected_points", 0.0)) for a in (booster_assignments or [])),
+        "average_booster_ev_per_player": sum(float(a.get("expected_points", 0.0)) for a in (booster_assignments or [])) / max(1, len(pids)),
+        "booster_assignments": booster_assignments or [],
     }
 
 
@@ -217,6 +239,10 @@ def _compute_best_teams_from_results(results: dict, payload: dict, progress_call
     max_per_team = options["max_per_team"]
     exclude = options["exclude"]
     include = options["include"]
+    try:
+        expected_maps = float((payload or {}).get("expected_maps", 2.4))
+    except Exception:
+        expected_maps = 2.4
 
     team_name_map = {int(t["team_id"]): t.get("name", "") for t in get_all_teams()}
 
@@ -241,22 +267,10 @@ def _compute_best_teams_from_results(results: dict, payload: dict, progress_call
             row = get_player(pid)
             if not row:
                 continue
-            boosters_json = row.get("boosters_json", "")
-            booster_ev = 0.0
-            try:
-                obj = json.loads(boosters_json) if boosters_json else {}
-                if isinstance(obj, dict) and obj:
-                    rates = [float(v) for v in obj.values() if isinstance(v, (int, float, str))]
-                    rates = [r for r in rates if math.isfinite(r)]
-                    if rates:
-                        booster_ev = 5.0 * (sum(rates) / len(rates)) * max(0.0, EG)
-            except Exception:
-                booster_ev = 0.0
-
             rating_ev = float(comps.get("rating", 0.0))
             win_ev = float(comps.get("win", 0.0))
             role_ev = float(comps.get("role", 0.0))
-            total_ev = rating_ev + win_ev + role_ev + booster_ev
+            total_ev = rating_ev + win_ev + role_ev
             players_info.append(
                 {
                     "player_id": pid,
@@ -267,7 +281,8 @@ def _compute_best_teams_from_results(results: dict, payload: dict, progress_call
                     "rating_ev": rating_ev,
                     "win_ev": win_ev,
                     "role_ev": role_ev,
-                    "booster_ev": booster_ev,
+                    "booster_ev": 0.0,
+                    "boosters_json": row.get("boosters_json", ""),
                     "total_ev": total_ev,
                 }
             )
@@ -304,15 +319,21 @@ def _compute_best_teams_from_results(results: dict, payload: dict, progress_call
             processed_combinations = int(roster["processed"])
             combo_ids = roster["pids"]
             total_cost = int(roster["cost"])
-            total_ev = float(roster["total_ev"])
+            booster_result = optimize_swiss_boosters_for_roster(
+                roster["players"],
+                {int(k): v for k, v in results.items()},
+                expected_maps=expected_maps,
+            )
+            booster_assignments = booster_result.get("assignments", [])
+            total_ev = float(roster["total_ev"]) + float(booster_result.get("total_expected_booster_points", 0.0))
             role_names = roster["roles"]
             conn.execute(
                 """
                 INSERT INTO best_team_combos (
                     cache_id, total_ev, cost,
                     p1_id, p2_id, p3_id, p4_id, p5_id,
-                    r1, r2, r3, r4, r5
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    r1, r2, r3, r4, r5, booster_assignments_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     cache_id,
@@ -328,11 +349,18 @@ def _compute_best_teams_from_results(results: dict, payload: dict, progress_call
                     role_names[2],
                     role_names[3],
                     role_names[4],
+                    json.dumps(booster_assignments),
                 ),
             )
             total_valid += 1
 
-            entry = {"total_ev": total_ev, "cost": int(total_cost), "pids": combo_ids, "roles": role_names}
+            entry = {
+                "total_ev": total_ev,
+                "cost": int(total_cost),
+                "pids": combo_ids,
+                "roles": role_names,
+                "booster_assignments": booster_assignments,
+            }
             if len(top_entries) < 10:
                 top_entries.append(entry)
             else:
@@ -363,7 +391,7 @@ def _compute_best_teams_from_results(results: dict, payload: dict, progress_call
 
     top_entries.sort(key=lambda x: x["total_ev"], reverse=True)
     top_teams = [
-        serialize_roster(players_meta, entry["pids"], entry["roles"], entry["total_ev"], entry["cost"])
+        serialize_roster(players_meta, entry["pids"], entry["roles"], entry["total_ev"], entry["cost"], entry.get("booster_assignments"))
         for entry in top_entries[:10]
     ]
 
@@ -452,7 +480,7 @@ def find_best_team(payload: dict):
     results = simulate_swiss_fantasy(
         team_ids=team_ids,
         vrs_ranks=payload["vrs_ranks"],
-        bo3_mode=payload["bo3_mode"],
+        bo3_mode="elim_qual",
         n_sims=int(payload["n_sims"]),
     )
     return _compute_best_teams_from_results(results, payload)

@@ -15,6 +15,7 @@ def simulate_single_swiss_run(
     vrs_ranks: Dict[int, int],
     bo3_mode: str,
     initialize_teams,
+    slot_counts: Dict[int, Dict[str, int]] | None = None,
 ) -> Dict[int, TeamState]:
     """
     Runs one full Swiss tournament and returns final TeamState objects.
@@ -34,6 +35,12 @@ def simulate_single_swiss_run(
         ]
         if not active:
             break
+
+        if slot_counts is not None:
+            for t in active:
+                record = f"{t.wins}-{t.losses}"
+                slot_counts.setdefault(t.team_id, {})
+                slot_counts[t.team_id][record] = slot_counts[t.team_id].get(record, 0) + 1
 
         run_round(team_states, bo3_mode)
 

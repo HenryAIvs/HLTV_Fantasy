@@ -10,7 +10,8 @@ from swiss_stage.swiss_bracket import simulate_single_swiss_run
 
 def _run_chunk(args: Tuple[List[int], Dict[int, int], str, int]) -> Tuple[
     Dict[int, Dict[str, int]],
-    Dict[int, Dict[int, Dict[str, float]]]
+    Dict[int, Dict[int, Dict[str, float]]],
+    Dict[int, Dict[str, int]],
 ]:
     """
     Worker function for a chunk of simulations.
@@ -39,6 +40,10 @@ def _run_chunk(args: Tuple[List[int], Dict[int, int], str, int]) -> Tuple[
     player_sums: Dict[int, Dict[int, Dict[str, float]]] = {
         tid: {} for tid in team_ids
     }
+    slot_counts: Dict[int, Dict[str, int]] = {
+        tid: {"0-0": 0, "1-0": 0, "0-1": 0, "2-0": 0, "1-1": 0, "0-2": 0, "2-1": 0, "1-2": 0, "2-2": 0}
+        for tid in team_ids
+    }
 
     for _ in range(n_sims_chunk):
         final_states = simulate_single_swiss_run(
@@ -46,6 +51,7 @@ def _run_chunk(args: Tuple[List[int], Dict[int, int], str, int]) -> Tuple[
             vrs_ranks=vrs_ranks,
             bo3_mode=bo3_mode,
             initialize_teams=initialize_teams,
+            slot_counts=slot_counts,
         )
 
         for tid, t in final_states.items():
@@ -71,7 +77,7 @@ def _run_chunk(args: Tuple[List[int], Dict[int, int], str, int]) -> Tuple[
                 bucket["role"] += p.role_points_total
                 bucket["booster"] += p.booster_points_total
 
-    return record_counts, player_sums
+    return record_counts, player_sums, slot_counts
 
 
 def simulate_swiss_fantasy(
@@ -137,6 +143,10 @@ def simulate_swiss_fantasy(
     total_player_sums: Dict[int, Dict[int, Dict[str, float]]] = {
         tid: {} for tid in team_ids
     }
+    total_slot_counts: Dict[int, Dict[str, int]] = {
+        tid: {"0-0": 0, "1-0": 0, "0-1": 0, "2-0": 0, "1-1": 0, "0-2": 0, "2-1": 0, "1-2": 0, "2-2": 0}
+        for tid in team_ids
+    }
     processed_sims = 0
     if progress_callback:
         progress_callback(processed_sims, n_sims)
@@ -144,8 +154,8 @@ def simulate_swiss_fantasy(
     # Run chunks in parallel
     if len(args_list) == 1:
         # single-worker fallback
-        rc, ps = _run_chunk(args_list[0])
-        results = [(rc, ps, args_list[0][3])]
+        rc, ps, sc = _run_chunk(args_list[0])
+        results = [(rc, ps, sc, args_list[0][3])]
         processed_sims += args_list[0][3]
         if progress_callback:
             progress_callback(processed_sims, n_sims)
@@ -155,14 +165,14 @@ def simulate_swiss_fantasy(
             results = []
             for fut in as_completed(futures):
                 sims_chunk = futures[fut]
-                rc, ps = fut.result()
-                results.append((rc, ps, sims_chunk))
+                rc, ps, sc = fut.result()
+                results.append((rc, ps, sc, sims_chunk))
                 processed_sims += sims_chunk
                 if progress_callback:
                     progress_callback(processed_sims, n_sims)
 
     # Merge partial results
-    for record_counts_chunk, player_sums_chunk, _ in results:
+    for record_counts_chunk, player_sums_chunk, slot_counts_chunk, _ in results:
         # records
         for tid, rec_map in record_counts_chunk.items():
             for rec, cnt in rec_map.items():
@@ -187,6 +197,10 @@ def simulate_swiss_fantasy(
                 bucket["role"] += comps["role"]
                 bucket["booster"] += comps["booster"]
 
+        for tid, slot_map in slot_counts_chunk.items():
+            for record, cnt in slot_map.items():
+                total_slot_counts[tid][record] += cnt
+
     # Convert counts to probabilities and sums to averages
     results_out: Dict[int, Dict] = {}
 
@@ -196,6 +210,11 @@ def simulate_swiss_fantasy(
         # record probabilities
         for rec, cnt in total_record_counts[tid].items():
             team_result[rec] = cnt / float(n_sims)
+
+        team_result["slot_probs"] = {
+            record: cnt / float(n_sims)
+            for record, cnt in total_slot_counts[tid].items()
+        }
 
         # expected fantasy points per player
         players_out: Dict[int, Dict[str, float]] = {}

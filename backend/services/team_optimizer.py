@@ -19,8 +19,9 @@ def parse_optimizer_payload(payload: dict | None) -> dict:
     }
 
 
-def serialize_roster_player(player: dict, role_name: str) -> dict:
+def serialize_roster_player(player: dict, role_name: str, booster_ev: float | None = None) -> dict:
     pid = int(player["player_id"])
+    player_booster_ev = float(player.get("booster_ev", 0.0) if booster_ev is None else booster_ev)
     return {
         "player_id": pid,
         "name": player.get("name", f"Player {pid}"),
@@ -29,18 +30,36 @@ def serialize_roster_player(player: dict, role_name: str) -> dict:
         "rating_ev": float(player.get("rating_ev", 0.0)),
         "win_ev": float(player.get("win_ev", 0.0)),
         "role_ev": float(player.get("role_ev", 0.0)),
-        "booster_ev": float(player.get("booster_ev", 0.0)),
-        "total_ev": float(player.get("total_ev", 0.0)),
+        "booster_ev": player_booster_ev,
+        "total_ev": float(player.get("rating_ev", 0.0)) + float(player.get("win_ev", 0.0)) + float(player.get("role_ev", 0.0)) + player_booster_ev,
         "role_name": str(role_name),
+        "components_available": bool(player.get("components_available", True)),
     }
 
 
-def serialize_roster(players_by_id: dict[str, dict], pids: Iterable[int], roles: Iterable[str], total_ev: float, cost: int) -> dict:
+def serialize_roster(
+    players_by_id: dict[str, dict],
+    pids: Iterable[int],
+    roles: Iterable[str],
+    total_ev: float,
+    cost: int,
+    booster_assignments: list[dict] | None = None,
+) -> dict:
+    per_player_booster = {}
+    for assignment in booster_assignments or []:
+        pid = int(assignment.get("player_id", 0))
+        per_player_booster[pid] = per_player_booster.get(pid, 0.0) + float(assignment.get("expected_points", 0.0))
     players = []
     for pid, role_name in zip(pids, roles):
         meta = players_by_id.get(str(pid), {})
-        players.append(serialize_roster_player(meta, str(role_name)))
-    return {"total_ev": float(total_ev), "cost": int(cost), "players": players}
+        players.append(serialize_roster_player(meta, str(role_name), per_player_booster.get(int(pid))))
+    return {
+        "total_ev": float(total_ev),
+        "cost": int(cost),
+        "players": players,
+        "booster_assignments": booster_assignments or [],
+        "booster_ev": sum(float(a.get("expected_points", 0.0)) for a in (booster_assignments or [])),
+    }
 
 
 def iter_valid_rosters(

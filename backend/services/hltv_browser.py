@@ -10,10 +10,10 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _DEFAULT_RECONNECT_TIME = float(os.getenv("HLTV_UC_RECONNECT_TIME", "4"))
-_FETCH_DELAY_MIN = float(os.getenv("HLTV_FETCH_DELAY_MIN", "8"))
-_FETCH_DELAY_MAX = float(os.getenv("HLTV_FETCH_DELAY_MAX", "15"))
-_WAIT_AFTER_LOAD_MIN = float(os.getenv("HLTV_UC_WAIT_AFTER_LOAD_MIN", os.getenv("HLTV_UC_WAIT_AFTER_LOAD", "1.2")))
-_WAIT_AFTER_LOAD_MAX = float(os.getenv("HLTV_UC_WAIT_AFTER_LOAD_MAX", "3.0"))
+_FETCH_DELAY_MIN = float(os.getenv("HLTV_FETCH_DELAY_MIN", "2"))
+_FETCH_DELAY_MAX = float(os.getenv("HLTV_FETCH_DELAY_MAX", "5"))
+_WAIT_AFTER_LOAD_MIN = float(os.getenv("HLTV_UC_WAIT_AFTER_LOAD_MIN", os.getenv("HLTV_UC_WAIT_AFTER_LOAD", "0.8")))
+_WAIT_AFTER_LOAD_MAX = float(os.getenv("HLTV_UC_WAIT_AFTER_LOAD_MAX", "1.8"))
 _DEFAULT_WINDOW_SIZE = (1400, 900)
 _FETCH_LOCK = threading.Lock()
 _LAST_FETCH_TIME = 0.0
@@ -163,6 +163,29 @@ def _wait_after_load() -> None:
     time.sleep(_random_range(_WAIT_AFTER_LOAD_MIN, _WAIT_AFTER_LOAD_MAX))
 
 
+def _is_dead_webdriver_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    needles = (
+        "connection refused",
+        "actively refused",
+        "max retries exceeded",
+        "newconnectionerror",
+        "invalid session id",
+        "disconnected",
+        "chrome not reachable",
+        "target window already closed",
+        "/window/handles",
+    )
+    return any(needle in text for needle in needles)
+
+
+def _quit_driver(driver: Any) -> None:
+    try:
+        driver.quit()
+    except Exception:
+        pass
+
+
 def fetch_hltv_html(
     url: str,
     *,
@@ -172,82 +195,104 @@ def fetch_hltv_html(
 ) -> str:
     with _FETCH_LOCK:
         _wait_for_rate_limit()
-        driver = None
-        profile_dir = None
-        headless = False
-        try:
-            driver, profile_dir, headless = _make_driver()
-            _open_hltv_url(driver, url, reconnect_time=reconnect_time)
-            _accept_cookies(driver)
-            if wait_text:
-                _wait_for_text(driver, wait_text, min(12.0, max(1.0, timeout_ms / 1000.0)))
-            _wait_after_load()
-            html = driver.page_source or ""
-            _mark_fetch_complete()
-            logger.info(
-                "HLTV SeleniumBase UC page loaded: title='%s' final_url=%s headless=%s profile_dir=%s",
-                getattr(driver, "title", ""),
-                getattr(driver, "current_url", url),
-                headless,
-                profile_dir,
-            )
-            return html
-        except Exception as exc:
-            raise HLTVBrowserError(f"Failed to fetch HLTV page with SeleniumBase UC: {exc}") from exc
-        finally:
-            if driver is not None:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
+        last_error: Exception | None = None
+        for attempt in range(2):
+            driver = None
+            profile_dir = None
+            headless = False
+            try:
+                driver, profile_dir, headless = _make_driver()
+                _open_hltv_url(driver, url, reconnect_time=reconnect_time)
+                _accept_cookies(driver)
+                if wait_text:
+                    _wait_for_text(driver, wait_text, min(12.0, max(1.0, timeout_ms / 1000.0)))
+                _wait_after_load()
+                html = driver.page_source or ""
+                _mark_fetch_complete()
+                logger.info(
+                    "HLTV SeleniumBase UC page loaded: title='%s' final_url=%s headless=%s profile_dir=%s",
+                    getattr(driver, "title", ""),
+                    getattr(driver, "current_url", url),
+                    headless,
+                    profile_dir,
+                )
+                return html
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0 and _is_dead_webdriver_error(exc):
+                    logger.warning("HLTV UC driver died while fetching %s; retrying with a fresh driver: %s", url, exc)
+                    if profile_dir is not None:
+                        _cleanup_profile_locks(profile_dir)
+                    time.sleep(1.0)
+                    continue
+                raise HLTVBrowserError(f"Failed to fetch HLTV page with SeleniumBase UC: {exc}") from exc
+            finally:
+                if driver is not None:
+                    _quit_driver(driver)
+        raise HLTVBrowserError(f"Failed to fetch HLTV page with SeleniumBase UC: {last_error}")
 
 
 def fetch_hltv_json(url: str, *, timeout_ms: int = 45000) -> dict[str, Any]:
     with _FETCH_LOCK:
         _wait_for_rate_limit()
-        driver = None
-        try:
-            driver, _, _ = _make_driver()
-            _open_hltv_url(driver, url)
-            _wait_after_load()
-
-            body_text = ""
+        last_error: Exception | None = None
+        for attempt in range(2):
+            driver = None
+            profile_dir = None
             try:
-                from selenium.webdriver.common.by import By
+                driver, profile_dir, _ = _make_driver()
+                _open_hltv_url(driver, url)
+                _wait_after_load()
 
-                body_text = driver.find_element(By.TAG_NAME, "body").text
-            except Exception:
                 body_text = ""
-
-            if body_text.strip():
                 try:
-                    data = json.loads(body_text)
-                    _mark_fetch_complete()
-                    return data
-                except Exception:
-                    pass
+                    from selenium.webdriver.common.by import By
 
-            script = """
-                const url = arguments[0];
-                const done = arguments[arguments.length - 1];
-                fetch(url, {headers: {accept: "application/json"}})
-                    .then((response) => response.text())
-                    .then((text) => done({ok: true, text}))
-                    .catch((error) => done({ok: false, error: String(error)}));
-            """
-            result = driver.execute_async_script(script, url)
-            if not result or not result.get("ok"):
-                raise HLTVBrowserError((result or {}).get("error") or "browser fetch failed")
-            data = json.loads(result.get("text") or "{}")
-            _mark_fetch_complete()
-            return data
-        except HLTVBrowserError:
-            raise
-        except Exception as exc:
-            raise HLTVBrowserError(f"Failed to fetch HLTV JSON with SeleniumBase UC: {exc}") from exc
-        finally:
-            if driver is not None:
-                try:
-                    driver.quit()
+                    body_text = driver.find_element(By.TAG_NAME, "body").text
                 except Exception:
-                    pass
+                    body_text = ""
+
+                if body_text.strip():
+                    try:
+                        data = json.loads(body_text)
+                        _mark_fetch_complete()
+                        return data
+                    except Exception:
+                        pass
+
+                script = """
+                    const url = arguments[0];
+                    const done = arguments[arguments.length - 1];
+                    fetch(url, {headers: {accept: "application/json"}})
+                        .then((response) => response.text())
+                        .then((text) => done({ok: true, text}))
+                        .catch((error) => done({ok: false, error: String(error)}));
+                """
+                result = driver.execute_async_script(script, url)
+                if not result or not result.get("ok"):
+                    raise HLTVBrowserError((result or {}).get("error") or "browser fetch failed")
+                data = json.loads(result.get("text") or "{}")
+                _mark_fetch_complete()
+                return data
+            except HLTVBrowserError as exc:
+                last_error = exc
+                if attempt == 0 and _is_dead_webdriver_error(exc):
+                    logger.warning("HLTV UC driver died while fetching JSON %s; retrying with a fresh driver: %s", url, exc)
+                    if profile_dir is not None:
+                        _cleanup_profile_locks(profile_dir)
+                    time.sleep(1.0)
+                    continue
+                raise
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0 and _is_dead_webdriver_error(exc):
+                    logger.warning("HLTV UC driver died while fetching JSON %s; retrying with a fresh driver: %s", url, exc)
+                    if profile_dir is not None:
+                        _cleanup_profile_locks(profile_dir)
+                    time.sleep(1.0)
+                    continue
+                raise HLTVBrowserError(f"Failed to fetch HLTV JSON with SeleniumBase UC: {exc}") from exc
+            finally:
+                if driver is not None:
+                    _quit_driver(driver)
+        raise HLTVBrowserError(f"Failed to fetch HLTV JSON with SeleniumBase UC: {last_error}")

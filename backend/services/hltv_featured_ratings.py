@@ -27,8 +27,8 @@ _FEATURED_RATING_RE = re.compile(
     re.IGNORECASE,
 )
 _OVERALL_RATING_PATTERNS = (
-    re.compile(r"(?P<rating>\d+\.\d+)\s*Rating\s*3\.0", re.IGNORECASE),
-    re.compile(r"Rating\s*3\.0\s*(?P<rating>\d+\.\d+)", re.IGNORECASE),
+    re.compile(r"(?P<rating>\d+\.\d+)\s*(?:[A-Z]+\s+)?Rating\s*3\.0", re.IGNORECASE),
+    re.compile(r"Rating\s*3\.0\s*(?:[A-Z]+\s+)?(?P<rating>\d+\.\d+)", re.IGNORECASE),
 )
 
 class HLTVFeaturedRatingsError(RuntimeError):
@@ -136,7 +136,7 @@ def parse_overall_rating_html(html: str) -> float | None:
         if not match:
             continue
         value = float(match.group("rating"))
-        if 0.0 < value < 3.0:
+        if 0.0 < value <= 3.0:
             return value
     return None
 

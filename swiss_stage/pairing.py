@@ -1,10 +1,31 @@
 # swiss_stage/pairing.py
 
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Mapping
 from swiss_stage.swiss_models import TeamState
 
 
-def generate_pairings(pool: List[TeamState]) -> List[Tuple[TeamState, TeamState]]:
+def buchholz_score(team: TeamState, all_teams: Mapping[int, TeamState] | None = None) -> int:
+    """
+    Sum of current match wins earned by opponents this team has already faced.
+    """
+    lookup = all_teams or {}
+    total = 0
+    for opponent_id in team.opponents_played:
+        opponent = lookup.get(int(opponent_id))
+        if opponent is not None:
+            total += int(opponent.wins)
+    return total
+
+
+def _pairing_strength_key(team: TeamState, all_teams: Mapping[int, TeamState] | None = None) -> Tuple[int, int, int]:
+    # Higher Buchholz is stronger. Lower VRS rank is stronger. Team id keeps ordering stable.
+    return (-buchholz_score(team, all_teams), int(team.vrs_rank), int(team.team_id))
+
+
+def generate_pairings(
+    pool: List[TeamState],
+    all_teams: Mapping[int, TeamState] | None = None,
+) -> List[Tuple[TeamState, TeamState]]:
     """
     Generate pairings for a Swiss pool.
 
@@ -16,17 +37,17 @@ def generate_pairings(pool: List[TeamState]) -> List[Tuple[TeamState, TeamState]
 
       - In all subsequent rounds:
           use a backtracking matcher that:
-            * sorts teams by vrs_rank ascending
+            * sorts teams by Buchholz descending, then vrs_rank ascending
             * attempts to pair without *any* rematches (based on opponents_played)
-            * prefers 'top vs bottom' style (1 vs N, 2 vs N-1, etc.)
+            * prefers strongest vs weakest inside the same record pool
             * if avoiding rematches is impossible, falls back to
-              the seeded 'top vs bottom' pairings.
+              strongest vs weakest pairings.
 
     This should fix cases where the old avoid_rematches logic stopped
     one rematch but allowed another.
     """
 
-    # sort by vrs_rank: lower is better
+    # Initial seed order: lower VRS rank is better
     pool_sorted = sorted(pool, key=lambda t: t.vrs_rank)
     n = len(pool_sorted)
     if n % 2 != 0:
@@ -46,10 +67,9 @@ def generate_pairings(pool: List[TeamState]) -> List[Tuple[TeamState, TeamState]
             base_pairs.append((A, B))
         return base_pairs
 
-    # For non-first rounds, try to find a full matching with no rematches.
+    # For non-first rounds, try to find a full Buchholz matching with no rematches.
 
-    # Build a quick lookup: team_id -> TeamState, although we already have objects
-    teams = pool_sorted[:]  # copy
+    teams = sorted(pool, key=lambda t: _pairing_strength_key(t, all_teams))
 
     # Backtracking search for pairings with no rematches
     best_pairs: List[Tuple[TeamState, TeamState]] = []
@@ -65,12 +85,12 @@ def generate_pairings(pool: List[TeamState]) -> List[Tuple[TeamState, TeamState]
             best_pairs = acc[:]
             return True
 
-        # pick the highest-seeded remaining team
+        # pick the strongest remaining team by Buchholz, then seed
         t0 = remaining[0]
         rest = remaining[1:]
 
         # candidate partners, in preferred order:
-        #   try bottom seed first (top vs bottom style), then upwards
+        #   try weakest remaining first (strongest vs weakest), then upwards
         indices = list(range(len(rest) - 1, -1, -1))  # from last to first
         for idx in indices:
             t1 = rest[idx]
@@ -90,12 +110,11 @@ def generate_pairings(pool: List[TeamState]) -> List[Tuple[TeamState, TeamState]
         # Found a rematch-free pairing set
         return best_pairs
 
-    # If we couldn't avoid rematches entirely, fall back to seeded top vs bottom:
-    # sort by vrs_rank and pair [0] vs [N-1], [1] vs [N-2], ...
+    # If we couldn't avoid rematches entirely, fall back to Buchholz strongest vs weakest.
     fallback_pairs: List[Tuple[TeamState, TeamState]] = []
     for i in range(n // 2):
-        A = pool_sorted[i]
-        B = pool_sorted[n - 1 - i]
+        A = teams[i]
+        B = teams[n - 1 - i]
         fallback_pairs.append((A, B))
 
     return fallback_pairs

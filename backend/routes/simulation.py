@@ -101,7 +101,7 @@ def _normalize_sim_payload(payload: dict) -> dict:
     return {
         "team_ids": team_ids,
         "vrs_ranks": vrs_ranks,
-        "bo3_mode": payload["bo3_mode"],
+        "bo3_mode": "elim_qual",
         "n_sims": int(payload["n_sims"]),
     }
 
@@ -160,7 +160,7 @@ def run_simulation(payload: dict):
     Expects:
       - team_ids: list[int]
       - vrs_ranks: dict[int, int]
-      - bo3_mode: str (elim_qual | all | none)
+      - bo3_mode: ignored; CS2 Swiss uses elim_qual
       - n_sims: int
     """
     normalized_payload = _normalize_sim_payload(payload)

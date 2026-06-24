@@ -19,12 +19,16 @@ def ensure_team_schema() -> None:
         """
         CREATE TABLE IF NOT EXISTS teams (
             team_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            hltv_team_id  INTEGER,
             name          TEXT NOT NULL UNIQUE,
             hltv_rank     INTEGER,
             hltv_points   INTEGER,
             vrs_rank      INTEGER,
             vrs_points    INTEGER,
             win_rate      REAL,
+            map_stats_json TEXT,
+            map_stats_imported_at TEXT,
+            map_stats_source_url TEXT,
 
             player1_id    INTEGER,
             player2_id    INTEGER,
@@ -43,10 +47,18 @@ def ensure_team_schema() -> None:
     # Backward-compatible migration for existing databases.
     cols = conn.execute("PRAGMA table_info(teams)").fetchall()
     col_names = {row["name"] for row in cols}
+    if "hltv_team_id" not in col_names:
+        conn.execute("ALTER TABLE teams ADD COLUMN hltv_team_id INTEGER")
     if "hltv_points" not in col_names:
         conn.execute("ALTER TABLE teams ADD COLUMN hltv_points INTEGER")
     if "vrs_points" not in col_names:
         conn.execute("ALTER TABLE teams ADD COLUMN vrs_points INTEGER")
+    if "map_stats_json" not in col_names:
+        conn.execute("ALTER TABLE teams ADD COLUMN map_stats_json TEXT")
+    if "map_stats_imported_at" not in col_names:
+        conn.execute("ALTER TABLE teams ADD COLUMN map_stats_imported_at TEXT")
+    if "map_stats_source_url" not in col_names:
+        conn.execute("ALTER TABLE teams ADD COLUMN map_stats_source_url TEXT")
     conn.commit()
     conn.close()
 
@@ -60,6 +72,7 @@ def add_or_update_team(
     vrs_points: Optional[int] = None,
     win_rate: float,
     player_ids: List[int],  # exactly 5 HLTV player IDs
+    hltv_team_id: Optional[int] = None,
 ) -> None:
     """Insert a new team or update existing team based on name."""
     if len(player_ids) != 5:
@@ -69,11 +82,12 @@ def add_or_update_team(
     conn.execute(
         """
         INSERT INTO teams (
-            name, hltv_rank, hltv_points, vrs_rank, win_rate,
+            hltv_team_id, name, hltv_rank, hltv_points, vrs_rank, win_rate,
             vrs_points,
             player1_id, player2_id, player3_id, player4_id, player5_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
+            hltv_team_id = COALESCE(excluded.hltv_team_id, teams.hltv_team_id),
             hltv_rank = excluded.hltv_rank,
             hltv_points = excluded.hltv_points,
             vrs_rank = excluded.vrs_rank,
@@ -86,6 +100,7 @@ def add_or_update_team(
             player5_id = excluded.player5_id;
         """,
         (
+            hltv_team_id,
             name,
             hltv_rank,
             hltv_points,
@@ -98,6 +113,29 @@ def add_or_update_team(
             player_ids[3],
             player_ids[4],
         ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_team_map_stats(
+    team_id: int,
+    *,
+    map_stats_json: str,
+    source_url: str,
+    hltv_team_id: Optional[int] = None,
+) -> None:
+    conn = connect()
+    conn.execute(
+        """
+        UPDATE teams
+        SET hltv_team_id = COALESCE(?, hltv_team_id),
+            map_stats_json = ?,
+            map_stats_source_url = ?,
+            map_stats_imported_at = datetime('now')
+        WHERE team_id = ?
+        """,
+        (hltv_team_id, map_stats_json, source_url, int(team_id)),
     )
     conn.commit()
     conn.close()

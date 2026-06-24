@@ -54,7 +54,7 @@ def run_round(team_states: Dict[int, TeamState], bo3_mode: str) -> None:
         if len(pool) % 2 != 0:
             raise ValueError("Pool has odd team count, which should not happen in Swiss.")
 
-        pairings = generate_pairings(pool)
+        pairings = generate_pairings(pool, team_states)
 
         for A, B in pairings:
             match_type = get_match_type(A, bo3_mode)

@@ -56,6 +56,7 @@ def ensure_topx_batch_schema() -> None:
                 failed INTEGER NOT NULL DEFAULT 0,
                 concurrency INTEGER NOT NULL DEFAULT 1,
                 pause_requested INTEGER NOT NULL DEFAULT 0,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
                 started_at REAL,
@@ -63,6 +64,10 @@ def ensure_topx_batch_schema() -> None:
             )
             """
         )
+        cols = conn.execute("PRAGMA table_info(topx_batch_jobs)").fetchall()
+        col_names = {row["name"] for row in cols}
+        if "cancel_requested" not in col_names:
+            conn.execute("ALTER TABLE topx_batch_jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_topx_batch_jobs_updated ON topx_batch_jobs(updated_at DESC)")
         conn.commit()
     finally:
@@ -74,6 +79,7 @@ def _status_from_row(row: sqlite3.Row) -> dict:
     out["items"] = json.loads(out.pop("items_json") or "[]")
     out["results"] = json.loads(out.pop("results_json") or "[]")
     out["pause_requested"] = bool(out.get("pause_requested"))
+    out["cancel_requested"] = bool(out.get("cancel_requested"))
     out["progress"] = float(out.get("progress") or 0.0)
     return out
 
@@ -99,9 +105,9 @@ def _save_topx_job(job: dict) -> None:
             INSERT INTO topx_batch_jobs (
                 job_id, status, items_json, results_json, error, last_error,
                 progress, processed_players, total_players, ok, failed, concurrency,
-                pause_requested, created_at, updated_at, started_at, finished_at
+                pause_requested, cancel_requested, created_at, updated_at, started_at, finished_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(job_id) DO UPDATE SET
                 status = excluded.status,
                 items_json = excluded.items_json,
@@ -115,6 +121,7 @@ def _save_topx_job(job: dict) -> None:
                 failed = excluded.failed,
                 concurrency = excluded.concurrency,
                 pause_requested = excluded.pause_requested,
+                cancel_requested = excluded.cancel_requested,
                 updated_at = excluded.updated_at,
                 started_at = excluded.started_at,
                 finished_at = excluded.finished_at
@@ -133,6 +140,7 @@ def _save_topx_job(job: dict) -> None:
                 int(job.get("failed") or 0),
                 int(job.get("concurrency") or DEFAULT_TOPX_BATCH_CONCURRENCY),
                 1 if job.get("pause_requested") else 0,
+                1 if job.get("cancel_requested") else 0,
                 float(job.get("created_at") or now),
                 now,
                 job.get("started_at"),
@@ -218,8 +226,6 @@ def _persist_featured_top_ratings(player: dict, featured_payload: dict) -> dict:
     player_id = int(player["player_id"])
     updates = _build_top_rating_updates(player, featured_payload.get("featured_ratings") or {})
     overall_rating = featured_payload.get("overall_rating")
-    if overall_rating is not None:
-        updates["rating"] = float(overall_rating)
     add_or_update_player(
         player_id=player_id,
         name=player.get("name"),
@@ -424,6 +430,7 @@ def _topx_job_response(job: dict) -> dict:
         "failed": job.get("failed", 0),
         "concurrency": job.get("concurrency", DEFAULT_TOPX_BATCH_CONCURRENCY),
         "pause_requested": bool(job.get("pause_requested")),
+        "cancel_requested": bool(job.get("cancel_requested")),
         "created_at": job.get("created_at"),
         "updated_at": job.get("updated_at"),
         "started_at": job.get("started_at"),
@@ -436,7 +443,7 @@ def _topx_job_response(job: dict) -> dict:
             "failed": job.get("failed", 0),
             "concurrency": job.get("concurrency", DEFAULT_TOPX_BATCH_CONCURRENCY),
             "results": job.get("results", []),
-        } if job.get("status") in {"completed", "failed", "paused"} else None,
+        } if job.get("status") in {"completed", "failed", "paused", "canceled"} else None,
     }
 
 
@@ -450,11 +457,12 @@ def _get_topx_job_for_response(job_id: str) -> dict:
     job = _get_stored_topx_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job_id not found")
-    if job.get("status") in {"queued", "running", "pausing"} and not _stored_running_job_is_active(job_id):
-        job["status"] = "paused"
+    if job.get("status") in {"queued", "running", "pausing", "canceling"} and not _stored_running_job_is_active(job_id):
+        job["status"] = "canceled" if job.get("cancel_requested") else "paused"
         job["last_error"] = job.get("last_error") or "Job was interrupted before completion. Resume to continue."
         job["error"] = ""
         job["pause_requested"] = False
+        job["cancel_requested"] = False
         _publish_topx_job(job)
     return job
 
@@ -464,11 +472,13 @@ def _run_top_ratings_batch_job(job_id: str) -> None:
     if not job:
         return
 
-    if job.get("pause_requested"):
-        job["status"] = "paused"
+    if job.get("cancel_requested") or job.get("pause_requested"):
+        job["status"] = "canceled" if job.get("cancel_requested") else "paused"
         job["pause_requested"] = False
+        job["cancel_requested"] = False
         job["error"] = ""
-        job["last_error"] = job.get("last_error") or "Paused"
+        job["last_error"] = job.get("last_error") or ("Canceled" if job["status"] == "canceled" else "Paused")
+        job["finished_at"] = time.time()
         _publish_topx_job(job)
         with TOPX_BATCH_JOBS_LOCK:
             TOPX_BATCH_WORKERS.pop(job_id, None)
@@ -476,6 +486,7 @@ def _run_top_ratings_batch_job(job_id: str) -> None:
 
     job["status"] = "running"
     job["pause_requested"] = False
+    job["cancel_requested"] = False
     job["error"] = ""
     job["started_at"] = job.get("started_at") or time.time()
     job["finished_at"] = None
@@ -506,6 +517,15 @@ def _run_top_ratings_batch_job(job_id: str) -> None:
             job["ok"] = int(ok_count)
             job["failed"] = int(failed_count)
             job["progress"] = 0.0 if total <= 0 else float(processed) / float(total)
+            latest = _get_stored_topx_job(job_id) or {}
+            if latest.get("cancel_requested"):
+                job["cancel_requested"] = True
+                job["pause_requested"] = False
+                job["status"] = "canceling"
+            if latest.get("pause_requested"):
+                job["pause_requested"] = True
+                if not job.get("cancel_requested"):
+                    job["status"] = "pausing"
             _publish_topx_job(job)
             return job
 
@@ -513,11 +533,13 @@ def _run_top_ratings_batch_job(job_id: str) -> None:
 
         for item in items:
             latest = _get_stored_topx_job(job_id) or job
-            if latest.get("pause_requested"):
+            if latest.get("cancel_requested") or latest.get("pause_requested"):
                 job.update(latest)
-                job["status"] = "paused"
+                job["status"] = "canceled" if latest.get("cancel_requested") else "paused"
                 job["pause_requested"] = False
-                job["last_error"] = job.get("last_error") or "Paused"
+                job["cancel_requested"] = False
+                job["last_error"] = job.get("last_error") or ("Canceled" if job["status"] == "canceled" else "Paused")
+                job["finished_at"] = time.time()
                 _publish_topx_job(job)
                 return
 
@@ -605,7 +627,7 @@ def start_fetch_top_ratings_batch(payload: dict | None = None):
     concurrency = _resolve_batch_concurrency((payload or {}).get("concurrency"), item_count=len(items))
     job_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
     latest = _get_latest_topx_batch_job(include_completed=False)
-    if latest and latest.get("status") in {"queued", "running", "pausing"}:
+    if latest and latest.get("status") in {"queued", "running", "pausing", "canceling"}:
         return {"job_id": latest["job_id"], "status": latest.get("status"), "reused": True}
 
     now = time.time()
@@ -621,6 +643,7 @@ def start_fetch_top_ratings_batch(payload: dict | None = None):
         "failed": 0,
         "concurrency": concurrency,
         "pause_requested": False,
+        "cancel_requested": False,
         "items": items,
         "results": [],
         "created_at": now,
@@ -635,7 +658,7 @@ def start_fetch_top_ratings_batch(payload: dict | None = None):
 
 def _get_latest_topx_batch_job(*, include_completed: bool = True) -> dict | None:
     ensure_topx_batch_schema()
-    statuses = "" if include_completed else "WHERE status IN ('queued', 'running', 'pausing', 'paused', 'failed')"
+    statuses = "" if include_completed else "WHERE status IN ('queued', 'running', 'pausing', 'canceling', 'paused', 'failed')"
     conn = _connect()
     try:
         row = conn.execute(
@@ -664,7 +687,9 @@ def get_fetch_top_ratings_batch_job(job_id: str):
 @router.post("/fetch-top-ratings-batch/job/{job_id}/pause")
 def pause_fetch_top_ratings_batch_job(job_id: str):
     job = _get_topx_job_for_response(job_id)
-    if job.get("status") in {"completed", "failed"}:
+    if job.get("status") in {"completed", "failed", "canceled"}:
+        return _topx_job_response(job)
+    if job.get("status") == "canceling" or job.get("cancel_requested"):
         return _topx_job_response(job)
     job["pause_requested"] = True
     job["status"] = "pausing" if job.get("status") == "running" or _stored_running_job_is_active(job_id) else "paused"
@@ -672,15 +697,32 @@ def pause_fetch_top_ratings_batch_job(job_id: str):
     return _topx_job_response(job)
 
 
+@router.post("/fetch-top-ratings-batch/job/{job_id}/cancel")
+def cancel_fetch_top_ratings_batch_job(job_id: str):
+    job = _get_topx_job_for_response(job_id)
+    if job.get("status") in {"completed", "failed", "canceled"}:
+        return _topx_job_response(job)
+    job["cancel_requested"] = True
+    job["pause_requested"] = False
+    job["last_error"] = "Cancel requested"
+    job["status"] = "canceling" if job.get("status") == "running" or _stored_running_job_is_active(job_id) else "canceled"
+    if job["status"] == "canceled":
+        job["cancel_requested"] = False
+        job["finished_at"] = time.time()
+    _publish_topx_job(job)
+    return _topx_job_response(job)
+
+
 @router.post("/fetch-top-ratings-batch/job/{job_id}/resume")
 def resume_fetch_top_ratings_batch_job(job_id: str):
     job = _get_topx_job_for_response(job_id)
-    if job.get("status") == "completed":
+    if job.get("status") in {"completed", "canceled"}:
         return _topx_job_response(job)
     if job.get("status") == "running" and _stored_running_job_is_active(job_id):
         return _topx_job_response(job)
     job["status"] = "queued"
     job["pause_requested"] = False
+    job["cancel_requested"] = False
     job["error"] = ""
     _publish_topx_job(job)
     _start_topx_worker(job_id)

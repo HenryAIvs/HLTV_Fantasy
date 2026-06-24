@@ -1,9 +1,11 @@
 import logging
 import re
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from html import unescape
 from typing import Dict, List
+
+from dateutil.relativedelta import relativedelta
 
 from backend.services.hltv_browser import HLTVBrowserError, fetch_hltv_html
 
@@ -27,6 +29,10 @@ _TEXT_ENTRY_RE = re.compile(
     r"#\s*(?P<rank>\d+)\s+"
     r"(?P<name>[A-Za-z0-9 .'\-+&/]+?)\s*"
     r"\(\s*(?P<points>[\d,]+)\s+HLTV\s+points\s*\)",
+    re.IGNORECASE,
+)
+_HLTV_TEAM_LINK_RE = re.compile(
+    r'href=["\']/team/(?P<team_id>\d+)/(?P<slug>[^"\'>?#]+)',
     re.IGNORECASE,
 )
 _VRS_TEXT_ENTRY_RE = re.compile(
@@ -67,11 +73,62 @@ _MAP_LINE_RE = re.compile(
     r"[^0-9]{0,32}(?P<score1>\d{1,2})\s*[-:]\s*(?P<score2>\d{1,2})",
     re.IGNORECASE,
 )
+_HLTV_MAP_NAMES = {
+    "mirage": "Mirage",
+    "inferno": "Inferno",
+    "nuke": "Nuke",
+    "ancient": "Ancient",
+    "anubis": "Anubis",
+    "dust2": "Dust2",
+    "dust 2": "Dust2",
+    "de dust2": "Dust2",
+    "train": "Train",
+    "overpass": "Overpass",
+    "vertigo": "Vertigo",
+    "cache": "Cache",
+    "cobblestone": "Cobblestone",
+}
+_TEAM_MAP_STATS_RE = re.compile(
+    r"\b(?P<map>Mirage|Inferno|Nuke|Ancient|Anubis|Dust2|Train|Overpass|Vertigo|Cache|Cobblestone)\b\s+"
+    r"Wins\s*/\s*draws\s*/\s*losses\s+"
+    r"(?P<wins>\d+)\s*/\s*(?P<draws>\d+)\s*/\s*(?P<losses>\d+)\s+"
+    r"Win\s+rate\s+(?P<win_rate>\d+(?:\.\d+)?)%\s+"
+    r"Total\s+rounds\s+(?P<rounds>\d+).*?"
+    r"Pick\s*%\s*(?P<pick>\d+(?:\.\d+)?)%\s+"
+    r"Ban\s*%\s*(?P<ban>\d+(?:\.\d+)?)%",
+    re.IGNORECASE | re.DOTALL,
+)
+_TEAM_MAP_NAME_RE = re.compile(
+    r"\b(Mirage|Inferno|Nuke|Ancient|Anubis|Dust2|Train|Overpass|Vertigo|Cache|Cobblestone)\b",
+    re.IGNORECASE,
+)
 
 
 def _build_hltv_ranking_url(on_date: date) -> str:
     month = on_date.strftime("%B").lower()
     return f"https://www.hltv.org/ranking/teams/{on_date.year}/{month}/{on_date.day}"
+
+
+_HLTV_WORLD_RANKING_WEEKDAY = 0  # Monday
+
+
+def _iter_hltv_world_ranking_probe_dates(
+    on_or_before_date: date, max_days_back: int
+) -> list[tuple[date, int]]:
+    """
+    HLTV world ranking archive snapshots are weekly Monday pages, not daily pages.
+    Return candidate snapshot dates on or before the requested date within range.
+    """
+    days_since_ranking_update = (on_or_before_date.weekday() - _HLTV_WORLD_RANKING_WEEKDAY) % 7
+    probe_date = on_or_before_date - timedelta(days=days_since_ranking_update)
+    earliest_date = on_or_before_date - timedelta(days=max_days_back)
+    probes: list[tuple[date, int]] = []
+
+    while probe_date >= earliest_date:
+        probes.append((probe_date, (on_or_before_date - probe_date).days))
+        probe_date -= timedelta(days=7)
+
+    return probes
 
 
 def _build_hltv_ranking_url_undated() -> str:
@@ -81,6 +138,25 @@ def _build_hltv_ranking_url_undated() -> str:
 def _build_vrs_ranking_url(on_date: date) -> str:
     month = on_date.strftime("%B").lower()
     return f"https://www.hltv.org/valve-ranking/teams/{on_date.year}/{month}/{on_date.day}"
+
+
+def slugify_hltv_team_name(name: str | None) -> str:
+    raw = str(name or "").strip().lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
+    return slug or "team"
+
+
+def _last_3_months_range(end: date | None = None) -> tuple[str, str]:
+    end_d = end or date.today()
+    start_d = end_d - relativedelta(months=3)
+    return start_d.isoformat(), end_d.isoformat()
+
+
+def _build_hltv_team_maps_url(team_id: int, slug: str, start_date: str | None = None, end_date: str | None = None) -> str:
+    url = f"https://www.hltv.org/stats/teams/maps/{int(team_id)}/{slugify_hltv_team_name(slug)}"
+    if start_date and end_date:
+        return f"{url}?startDate={start_date}&endDate={end_date}&csVersion=CS2"
+    return url
 
 
 def _build_vrs_ranking_url_undated() -> str:
@@ -111,11 +187,26 @@ def _candidate_ranking_urls(on_date: date) -> list[str]:
     return [dated, undated]
 
 
+def _extract_hltv_team_ids_by_slug(html: str) -> Dict[str, int]:
+    ids: Dict[str, int] = {}
+    for match in _HLTV_TEAM_LINK_RE.finditer(html or ""):
+        slug = unescape(match.group("slug") or "").strip().lower()
+        if not slug:
+            continue
+        try:
+            team_id = int(match.group("team_id"))
+        except Exception:
+            continue
+        ids.setdefault(slug, team_id)
+    return ids
+
+
 def _extract_rankings(html: str) -> Dict[str, Dict[str, int | str]]:
     t0 = time.perf_counter()
     rankings: Dict[str, Dict[str, int | str]] = {}
     found_any = False
     html_l = html.lower()
+    hltv_ids_by_slug = _extract_hltv_team_ids_by_slug(html)
 
     # Parse normalized visible text only. The old HTML-structure regex could
     # catastrophically backtrack and hang on modern HLTV pages.
@@ -133,11 +224,14 @@ def _extract_rankings(html: str) -> Dict[str, Dict[str, int | str]]:
         name = unescape(match.group("name")).strip()
         rank = int(match.group("rank"))
         points = int(match.group("points").replace(",", ""))
+        hltv_team_id = hltv_ids_by_slug.get(slugify_hltv_team_name(name))
         rankings[name.lower()] = {
             "team_name": name,
             "hltv_rating": rank,
             "points": points,
         }
+        if hltv_team_id:
+            rankings[name.lower()]["hltv_team_id"] = hltv_team_id
     logger.info("HLTV ranking text regex pass complete in %.3fs (teams=%d)", time.perf_counter() - t_re0, len(rankings))
 
     if not found_any:
@@ -208,6 +302,172 @@ def _strip_html(text: str) -> str:
     out = unescape(out)
     out = _WS_RE.sub(" ", out).strip()
     return out
+
+
+def _canonical_hltv_map_name(value: str) -> str:
+    raw = unescape(str(value or "")).strip()
+    key = raw.lower().replace("_", " ")
+    return _HLTV_MAP_NAMES.get(key, raw)
+
+
+def _class_blocks(html: str, class_token: str) -> List[str]:
+    if not html:
+        return []
+    starts = [
+        m.start()
+        for m in re.finditer(
+            rf'<[^>]+class=["\'][^"\']*\b{re.escape(class_token)}\b[^"\']*["\'][^>]*>',
+            html,
+            flags=re.IGNORECASE,
+        )
+    ]
+    blocks = []
+    for idx, start in enumerate(starts):
+        end = starts[idx + 1] if idx + 1 < len(starts) else len(html)
+        blocks.append(html[start:end])
+    return blocks
+
+
+def _first_class_text(html: str, class_token: str) -> str:
+    m = re.search(
+        rf'<[^>]+class=["\'][^"\']*\b{re.escape(class_token)}\b[^"\']*["\'][^>]*>(.*?)</[^>]+>',
+        html or "",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return _strip_html(m.group(1)) if m else ""
+
+
+def _extract_match_map_details(html: str) -> List[Dict[str, object]]:
+    maps: List[Dict[str, object]] = []
+    for block in _class_blocks(html, "mapholder"):
+        map_name = _canonical_hltv_map_name(_first_class_text(block, "mapname"))
+        if not map_name or map_name.lower() not in _HLTV_MAP_NAMES:
+            continue
+        scores = [
+            int(x)
+            for x in re.findall(
+                r'<[^>]+class=["\'][^"\']*\bresults-team-score\b[^"\']*["\'][^>]*>\s*(\d{1,2})\s*</',
+                block,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        ]
+        if len(scores) < 2:
+            continue
+        s1, s2 = int(scores[0]), int(scores[1])
+        if s1 < 0 or s2 < 0 or s1 == s2:
+            continue
+        maps.append({"map": map_name, "score1": s1, "score2": s2})
+    if maps:
+        return maps
+
+    # Markup fallback: only parse mapname blocks that also contain two nearby score nodes.
+    for match in re.finditer(
+        r'class=["\'][^"\']*\bmapname\b[^"\']*["\'][^>]*>(?P<map>.*?)</[^>]+>(?P<tail>.{0,2500}?results-team-score.*?results-team-score.*?)',
+        html or "",
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        map_name = _canonical_hltv_map_name(_strip_html(match.group("map")))
+        if not map_name or map_name.lower() not in _HLTV_MAP_NAMES:
+            continue
+        scores = [int(x) for x in re.findall(r"results-team-score[^>]*>\s*(\d{1,2})\s*</", match.group("tail"), flags=re.IGNORECASE)]
+        if len(scores) < 2:
+            continue
+        s1, s2 = scores[0], scores[1]
+        if s1 == s2:
+            continue
+        row = {"map": map_name, "score1": s1, "score2": s2}
+        if not any(existing == row for existing in maps):
+            maps.append(row)
+    return maps
+
+
+def _pct_from_block(block: str, label: str) -> float | None:
+    m = re.search(rf"{re.escape(label)}\s*%\s*(\d+(?:\.\d+)?)%", block, flags=re.IGNORECASE)
+    if not m:
+        return None
+    return float(m.group(1)) / 100.0
+
+
+def _int_from_block(block: str, label: str) -> int | None:
+    m = re.search(rf"{re.escape(label)}\s+(\d+)", block, flags=re.IGNORECASE)
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+def _parse_team_map_block(map_name: str, block: str) -> dict | None:
+    wdl = re.search(
+        r"Wins\s*/\s*draws\s*/\s*losses\s+(\d+)\s*/\s*(\d+)\s*/\s*(\d+)",
+        block,
+        flags=re.IGNORECASE,
+    )
+    win_rate_match = re.search(r"Win\s+rate\s+(\d+(?:\.\d+)?)%", block, flags=re.IGNORECASE)
+    rounds = _int_from_block(block, "Total rounds")
+    pick_rate = _pct_from_block(block, "Pick")
+    ban_rate = _pct_from_block(block, "Ban")
+    if not wdl or not win_rate_match or rounds is None or pick_rate is None or ban_rate is None:
+        return None
+    wins = int(wdl.group(1))
+    draws = int(wdl.group(2))
+    losses = int(wdl.group(3))
+    return {
+        "map": map_name,
+        "wins": wins,
+        "draws": draws,
+        "losses": losses,
+        "played": wins + draws + losses,
+        "win_rate": float(win_rate_match.group(1)) / 100.0,
+        "total_rounds": rounds,
+        "pick_rate": pick_rate,
+        "ban_rate": ban_rate,
+    }
+
+
+def _parse_team_map_stats_text(text: str) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    seen = set()
+    for match in _TEAM_MAP_STATS_RE.finditer(text):
+        map_name = str(match.group("map") or "").strip()
+        key = map_name.lower()
+        if not map_name or key in seen:
+            continue
+        wins = int(match.group("wins"))
+        draws = int(match.group("draws"))
+        losses = int(match.group("losses"))
+        rows.append(
+            {
+                "map": map_name,
+                "wins": wins,
+                "draws": draws,
+                "losses": losses,
+                "played": wins + draws + losses,
+                "win_rate": float(match.group("win_rate")) / 100.0,
+                "total_rounds": int(match.group("rounds")),
+                "pick_rate": float(match.group("pick")) / 100.0,
+                "ban_rate": float(match.group("ban")) / 100.0,
+            }
+        )
+        seen.add(key)
+
+    if rows:
+        return rows
+
+    overview_start = text.lower().find("map overview")
+    team_context_start = text.lower().find("team context")
+    scan = text[overview_start if overview_start >= 0 else 0 : team_context_start if team_context_start > overview_start else len(text)]
+    map_matches = list(_TEAM_MAP_NAME_RE.finditer(scan))
+    for idx, map_match in enumerate(map_matches):
+        map_name = map_match.group(1)
+        key = map_name.lower()
+        if key in seen:
+            continue
+        next_start = map_matches[idx + 1].start() if idx + 1 < len(map_matches) else len(scan)
+        block = scan[map_match.start() : next_start]
+        row = _parse_team_map_block(map_name, block)
+        if row:
+            rows.append(row)
+            seen.add(key)
+    return rows
 
 
 def _extract_block_by_class(html: str, class_token: str) -> str:
@@ -446,27 +706,57 @@ def get_hltv_match_details(match_url: str) -> Dict[str, object]:
     except Exception as exc:
         raise HLTVRankingError(f"Failed to fetch HLTV match details with SeleniumBase UC: {exc}") from exc
 
-    text = _strip_html(html)
-    maps: List[Dict[str, object]] = []
-    for m in _MAP_LINE_RE.finditer(text):
-        map_name = str(m.group("map") or "").strip()
-        s1 = int(m.group("score1"))
-        s2 = int(m.group("score2"))
-        key = (map_name.lower(), s1, s2)
-        if any((str(x.get("map", "")).lower(), int(x.get("score1", -1)), int(x.get("score2", -1))) == key for x in maps):
-            continue
-        maps.append(
-            {
-                "map": map_name,
-                "score1": s1,
-                "score2": s2,
-            }
-        )
+    maps = _extract_match_map_details(html)
+    logger.info("HLTV match details parsed: url=%s maps=%d", url, len(maps))
 
     return {
         "match_url": url,
         "maps": maps,
     }
+
+
+def get_hltv_team_map_stats_for_range(
+    team_id: int,
+    team_name: str | None = None,
+    *,
+    start_date: str,
+    end_date: str,
+) -> Dict[str, object]:
+    hltv_team_id = int(team_id)
+    if hltv_team_id <= 0:
+        raise HLTVRankingError("team_id must be a positive HLTV team id")
+    slug = slugify_hltv_team_name(team_name)
+    url = _build_hltv_team_maps_url(hltv_team_id, slug, start_date, end_date)
+    try:
+        html = _fetch_html_with_uc_driver(url, wait_text="Map overview")
+    except Exception as exc:
+        raise HLTVRankingError(f"Failed to fetch HLTV team map stats with SeleniumBase UC: {exc}") from exc
+
+    text = _strip_html(html)
+    rows = _parse_team_map_stats_text(text)
+    logger.info("HLTV team map stats parsed: team_id=%s rows=%d url=%s", hltv_team_id, len(rows), url)
+
+    if not rows:
+        if _is_cloudflare_challenge_html(html):
+            raise HLTVRankingError(
+                "HLTV team map stats page is behind a Cloudflare/interstitial challenge. "
+                "Open once in visible browser mode and complete challenge, then retry."
+            )
+        raise RankingPageParseError("Could not parse team map stats from HLTV page.")
+
+    return {
+        "team_id": hltv_team_id,
+        "team_name": team_name or "",
+        "url": url,
+        "startDate": start_date,
+        "endDate": end_date,
+        "maps": rows,
+    }
+
+
+def get_hltv_team_map_stats(team_id: int, team_name: str | None = None) -> Dict[str, object]:
+    start_date, end_date = _last_3_months_range()
+    return get_hltv_team_map_stats_for_range(team_id, team_name, start_date=start_date, end_date=end_date)
 
 
 def _get_rankings_map_for_date(
@@ -552,8 +842,7 @@ def get_all_hltv_rankings_on_or_before_date(
     if max_days_back < 0:
         raise ValueError("max_days_back must be >= 0")
 
-    for days_back in range(max_days_back + 1):
-        probe_date = on_or_before_date.fromordinal(on_or_before_date.toordinal() - days_back)
+    for probe_date, days_back in _iter_hltv_world_ranking_probe_dates(on_or_before_date, max_days_back):
         try:
             rankings, url = _get_rankings_map_for_date(probe_date, allow_undated_fallback=False)
             if rankings:
@@ -667,6 +956,7 @@ def get_team_hltv_rating_and_points_on_date(team_name: str, on_date: date) -> Di
         "url": url,
         "hltv_rating": int(data["hltv_rating"]),
         "points": int(data["points"]),
+        "hltv_team_id": int(data["hltv_team_id"]) if data.get("hltv_team_id") else None,
     }
 
 
@@ -705,6 +995,7 @@ def get_team_hltv_rating_and_points_on_or_before_date(
         "url": str(snapshot["url"]),
         "hltv_rating": int(data["hltv_rating"]),
         "points": int(data["points"]),
+        "hltv_team_id": int(data["hltv_team_id"]) if data.get("hltv_team_id") else None,
     }
 
 

@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
+  Bar,
+  BarChart,
   CartesianGrid,
   ComposedChart,
   Legend,
@@ -14,6 +16,7 @@ import {
 const tabs = [
   { key: "view", label: "Database" },
   { key: "events", label: "Events" },
+  { key: "modelLab", label: "Model Lab" },
   { key: "sim", label: "Swiss Group Stage" },
   { key: "playoff", label: "Playoff Bracket" },
   { key: "admin", label: "Data Management" },
@@ -102,6 +105,35 @@ const Select = ({ label, value, onChange, options }) => (
   </label>
 );
 
+const sortDirectionFor = (sortValue, ascValue, descValue) => {
+  if (sortValue === ascValue) return "asc";
+  if (sortValue === descValue) return "desc";
+  return "";
+};
+
+const nextSortValue = (sortValue, ascValue, descValue, defaultDirection = "asc") => {
+  if (sortValue === ascValue) return descValue;
+  if (sortValue === descValue) return ascValue;
+  return defaultDirection === "desc" ? descValue : ascValue;
+};
+
+const SortHeader = ({ children, sortValue, asc, desc, onChange, defaultDirection = "asc", title }) => {
+  const direction = sortDirectionFor(sortValue, asc, desc);
+  const arrow = direction === "asc" ? "↑" : direction === "desc" ? "↓" : "↕";
+  return (
+    <th title={title}>
+      <button
+        type="button"
+        className="table-sort-button"
+        onClick={() => onChange(nextSortValue(sortValue, asc, desc, defaultDirection))}
+        aria-sort={direction === "asc" ? "ascending" : direction === "desc" ? "descending" : "none"}
+      >
+        {children} <span>{arrow}</span>
+      </button>
+    </th>
+  );
+};
+
 const Badge = ({ children }) => <span className="badge">{children}</span>;
 const ROLE_NAME_MAP = {
   0: "Main AWP",
@@ -134,8 +166,14 @@ const buildNiceStepAxis = (values, step = 0.05) => {
   let max = Math.max(...finite);
   const stepValue = Number(step) || 0.05;
 
-  min = Math.floor(min / stepValue) * stepValue - stepValue;
-  max = Math.ceil(max / stepValue) * stepValue + stepValue;
+  min = Math.floor(min / stepValue) * stepValue;
+  max = Math.ceil(max / stepValue) * stepValue;
+  if (min >= Math.min(...finite)) {
+    min -= stepValue;
+  }
+  if (max <= Math.max(...finite)) {
+    max += stepValue;
+  }
   if (min === max) {
     min -= stepValue;
     max += stepValue;
@@ -275,7 +313,7 @@ const buildPlayerValueRowsFromSimulation = (simResults, players) => {
   return { rows: withDistance, slope, intercept };
 };
 
-function PriceVsPointsPanel({ title, rows, slope, intercept }) {
+function PriceVsPointsPanel({ title, rows, slope, intercept, showTable = true, onPointClick = null }) {
   const [search, setSearch] = useState("");
   const [sortBy, setSortBy] = useState("distance_desc");
   const minPrice = useMemo(() => Math.min(...rows.map((r) => Number(r.price))), [rows]);
@@ -302,6 +340,15 @@ function PriceVsPointsPanel({ title, rows, slope, intercept }) {
       );
     }
     switch (sortBy) {
+      case "player_id_asc":
+        out.sort((a, b) => Number(a.player_id) - Number(b.player_id));
+        break;
+      case "player_id_desc":
+        out.sort((a, b) => Number(b.player_id) - Number(a.player_id));
+        break;
+      case "points_asc":
+        out.sort((a, b) => a.points - b.points);
+        break;
       case "points_desc":
         out.sort((a, b) => b.points - a.points);
         break;
@@ -311,6 +358,12 @@ function PriceVsPointsPanel({ title, rows, slope, intercept }) {
       case "price_desc":
         out.sort((a, b) => b.price - a.price);
         break;
+      case "on_line_asc":
+        out.sort((a, b) => a.on_line - b.on_line);
+        break;
+      case "on_line_desc":
+        out.sort((a, b) => b.on_line - a.on_line);
+        break;
       case "distance_abs_desc":
         out.sort((a, b) => Math.abs(b.distance) - Math.abs(a.distance));
         break;
@@ -319,6 +372,9 @@ function PriceVsPointsPanel({ title, rows, slope, intercept }) {
         break;
       case "name_asc":
         out.sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+        break;
+      case "name_desc":
+        out.sort((a, b) => String(b.name || "").localeCompare(String(a.name || "")));
         break;
       case "distance_desc":
       default:
@@ -387,55 +443,53 @@ function PriceVsPointsPanel({ title, rows, slope, intercept }) {
                   dot={false}
                   isAnimationActive={false}
                 />
-                <Scatter name="Players" dataKey="points" fill="#4fc3ff" />
+                <Scatter
+                  name="Players"
+                  dataKey="points"
+                  fill="#4fc3ff"
+                  onClick={(payload) => {
+                    const row = payload?.payload || payload;
+                    if (row && onPointClick) onPointClick(row);
+                  }}
+                />
               </ComposedChart>
             </ResponsiveContainer>
           </div>
           <p className="muted">Trend line (average): points = {intercept.toFixed(2)} + {slope.toFixed(4)} x price</p>
-          <div className="grid two">
-            <Input label="Search Players" value={search} onChange={setSearch} placeholder="name, player id, or team id" />
-            <Select
-              label="Sort Table"
-              value={sortBy}
-              onChange={setSortBy}
-              options={[
-                { value: "distance_desc", label: "Distance (high to low)" },
-                { value: "distance_asc", label: "Distance (low to high)" },
-                { value: "distance_abs_desc", label: "Distance (abs high to low)" },
-                { value: "points_desc", label: "Points (high to low)" },
-                { value: "price_asc", label: "Price (low to high)" },
-                { value: "price_desc", label: "Price (high to low)" },
-                { value: "name_asc", label: "Name (A-Z)" },
-              ]}
-            />
-          </div>
-          <p className="muted">
-            Showing {filteredRows.length} of {rows.length} players
-          </p>
-          <table>
-            <thead>
-              <tr>
-                <th>Player</th>
-                <th>Player ID</th>
-                <th>Price</th>
-                <th>Points</th>
-                <th>On Line</th>
-                <th>Distance</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filteredRows.map((r) => (
-                <tr key={`dist-${r.player_id}`}>
-                  <td>{r.name}</td>
-                  <td>{r.player_id}</td>
-                  <td>{r.price}</td>
-                  <td>{r.points.toFixed(2)}</td>
-                  <td>{r.on_line.toFixed(2)}</td>
-                  <td>{r.distance >= 0 ? "+" : ""}{r.distance.toFixed(2)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          {showTable && (
+            <>
+              <div className="grid two">
+                <Input label="Search Players" value={search} onChange={setSearch} placeholder="name, player id, or team id" />
+              </div>
+              <p className="muted">
+                Showing {filteredRows.length} of {rows.length} players
+              </p>
+              <table>
+                <thead>
+                  <tr>
+                    <SortHeader sortValue={sortBy} asc="name_asc" desc="name_desc" onChange={setSortBy}>Player</SortHeader>
+                    <SortHeader sortValue={sortBy} asc="player_id_asc" desc="player_id_desc" onChange={setSortBy}>Player ID</SortHeader>
+                    <SortHeader sortValue={sortBy} asc="price_asc" desc="price_desc" onChange={setSortBy}>Price</SortHeader>
+                    <SortHeader sortValue={sortBy} asc="points_asc" desc="points_desc" defaultDirection="desc" onChange={setSortBy}>Points</SortHeader>
+                    <SortHeader sortValue={sortBy} asc="on_line_asc" desc="on_line_desc" defaultDirection="desc" onChange={setSortBy}>On Line</SortHeader>
+                    <SortHeader sortValue={sortBy} asc="distance_asc" desc="distance_desc" defaultDirection="desc" onChange={setSortBy}>Distance</SortHeader>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredRows.map((r) => (
+                    <tr key={`dist-${r.player_id}`}>
+                      <td>{r.name}</td>
+                      <td>{r.player_id}</td>
+                      <td>{r.price}</td>
+                      <td>{r.points.toFixed(2)}</td>
+                      <td>{r.on_line.toFixed(2)}</td>
+                      <td>{r.distance >= 0 ? "+" : ""}{r.distance.toFixed(2)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </>
+          )}
         </div>
       )}
     </div>
@@ -509,7 +563,7 @@ function GroupStageTab({
     const body = {
       team_ids: selected,
       vrs_ranks: vrs,
-      bo3_mode: bo,
+      bo3_mode: "elim_qual",
       n_sims: Number(sims || 0),
     };
     const pollSimulationJob = async (jobId, startedAtMs) => {
@@ -651,16 +705,10 @@ function GroupStageTab({
           ))}
         </div>
         <div className="grid three">
-          <Select
-            label="BO Mode"
-            value={bo}
-            onChange={setBo}
-            options={[
-              { value: "elim_qual", label: "BO3 on Elimination/Qualification Matches" },
-              { value: "all", label: "BO3 on All Matches" },
-              { value: "none", label: "No BO3 (All BO1)" },
-            ]}
-          />
+          <div className="field">
+            <span>Match Format</span>
+            <div className="pill">CS2 Swiss: BO3 on qualification/elimination</div>
+          </div>
           <Input label="# Sims" value={sims} onChange={setSims} />
           <div className="field">
             <span>Run</span>
@@ -1219,20 +1267,8 @@ function TopTeamsTab({ teamLookup, selected, bo, sims, results, onOpenPlayer }) 
                   Apply Filters
                 </button>
               </div>
-              <div className="grid three top5-controls">
+              <div className="grid two top5-controls">
                 <Input label="Search Combos" value={comboSearch} onChange={setComboSearch} placeholder="Player/team name or id" />
-                <Select
-                  label="Sort by"
-                  value={sortKey}
-                  onChange={setSortKey}
-                  options={[
-                    { value: "ev_desc", label: "EV desc" },
-                    { value: "ev_asc", label: "EV asc" },
-                    { value: "cost_asc", label: "Cost asc" },
-                    { value: "cost_desc", label: "Cost desc" },
-                    { value: "cpp_desc", label: "Value (EV/Cost) desc" },
-                  ]}
-                />
                 <div className="field top5-counter">
                   <span>Filtered / Stored</span>
                   <p className="muted">{filteredCount} / {totalTeams}</p>
@@ -1244,6 +1280,12 @@ function TopTeamsTab({ teamLookup, selected, bo, sims, results, onOpenPlayer }) 
                 <h4>
                   #{idx + 1} EV {team.total_ev.toFixed(2)} | Cost {team.cost}
                 </h4>
+                {Array.isArray(team.booster_assignments) && team.booster_assignments.length > 0 && (
+                  <p className="muted">
+                    Booster EV {Number(team.booster_ev || 0).toFixed(2)} | Avg/player{" "}
+                    {Number(team.average_booster_ev_per_player || 0).toFixed(2)}
+                  </p>
+                )}
                 <table>
                   <thead>
                     <tr>
@@ -1278,6 +1320,36 @@ function TopTeamsTab({ teamLookup, selected, bo, sims, results, onOpenPlayer }) 
                     ))}
                   </tbody>
                 </table>
+                {Array.isArray(team.booster_assignments) && team.booster_assignments.length > 0 && (
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Booster</th>
+                        <th>Player</th>
+                        <th>Match</th>
+                        <th>Record</th>
+                        <th>Format</th>
+                        <th>Slot %</th>
+                        <th>Trigger %</th>
+                        <th>EV</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {team.booster_assignments.map((assignment, assignmentIdx) => (
+                        <tr key={`booster-assignment-${idx}-${assignment.booster_id}-${assignmentIdx}`}>
+                          <td>{assignment.booster}</td>
+                          <td>{assignment.player}</td>
+                          <td>{assignment.match_number}</td>
+                          <td>{assignment.record}</td>
+                          <td>{assignment.match_format}</td>
+                          <td>{(Number(assignment.slot_probability || 0) * 100).toFixed(1)}%</td>
+                          <td>{(Number(assignment.adjusted_trigger_probability || 0) * 100).toFixed(1)}%</td>
+                          <td>{Number(assignment.expected_points || 0).toFixed(3)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
               </div>
             ))}
           </div>
@@ -1314,8 +1386,9 @@ function TopTeamsTab({ teamLookup, selected, bo, sims, results, onOpenPlayer }) 
               <thead>
                 <tr>
                   <th>#</th>
-                  <th>EV</th>
-                  <th>Cost</th>
+                  <SortHeader sortValue={sortKey} asc="ev_asc" desc="ev_desc" defaultDirection="desc" onChange={setSortKey}>EV</SortHeader>
+                  <SortHeader sortValue={sortKey} asc="cost_asc" desc="cost_desc" onChange={setSortKey}>Cost</SortHeader>
+                  <SortHeader sortValue={sortKey} asc="cpp_asc" desc="cpp_desc" defaultDirection="desc" onChange={setSortKey}>Value</SortHeader>
                   <th>Players</th>
                 </tr>
               </thead>
@@ -1325,6 +1398,7 @@ function TopTeamsTab({ teamLookup, selected, bo, sims, results, onOpenPlayer }) 
                     <td>{idx + 1 + page * 200}</td>
                     <td>{team.total_ev.toFixed(2)}</td>
                     <td>{team.cost}</td>
+                    <td>{(team.total_ev / (team.cost || 1)).toFixed(4)}</td>
                     <td>{team.players.map((p) => `${p.name} (${teamLookup[p.team_id] || p.team_id}, ${roleLabel(p.role_name)})`).join(", ")}</td>
                   </tr>
                 ))}
@@ -1628,6 +1702,17 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   const [showFilterModal, setShowFilterModal] = useState(false);
   const [filterSearch, setFilterSearch] = useState("");
   const [sortKey, setSortKey] = useState("ev_desc");
+  const [playoffBestMode, setPlayoffBestMode] = useState("average");
+  const [completedBracket, setCompletedBracket] = useState({
+    qf: ["", "", "", ""],
+    sf: ["", ""],
+    final: "",
+    third: "",
+  });
+  const [completedBracketResult, setCompletedBracketResult] = useState(null);
+  const [completedBracketMessage, setCompletedBracketMessage] = useState("");
+  const [showCompletedBracketGraph, setShowCompletedBracketGraph] = useState(false);
+  const [completedPlayerBreakdown, setCompletedPlayerBreakdown] = useState(null);
   const [processedSims, setProcessedSims] = useState(0);
   const [totalSims, setTotalSims] = useState(0);
   const [processedCombos, setProcessedCombos] = useState(0);
@@ -1708,6 +1793,170 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       next[idx] = val;
       return next;
     });
+  };
+  const playoffTeamOptions = useMemo(
+    () => [
+      { value: "", label: "Select team" },
+      ...filteredTeams.map((t) => ({ value: String(t.team_id), label: `${t.name} (${t.team_id})` })),
+    ],
+    [filteredTeams]
+  );
+  const teamInitials = (teamId) => {
+    const name = teamLookup[Number(teamId)] || "";
+    const parts = String(name).trim().split(/\s+/).filter(Boolean);
+    if (parts.length >= 2) return `${parts[0][0] || ""}${parts[1][0] || ""}`.toUpperCase();
+    return String(name || "?").slice(0, 2).toUpperCase();
+  };
+  const BracketTeamRow = ({ slotIndex, placeholder, muted = false }) => {
+    const selectedTeamId = slotIndex !== null && slotIndex !== undefined ? slots[slotIndex] : "";
+    const hasTeam = Boolean(selectedTeamId);
+    return (
+      <div className={`playoff-team-row ${muted ? "muted" : ""}`}>
+        <span className={`playoff-team-badge ${hasTeam ? "" : "empty"}`}>{hasTeam ? teamInitials(selectedTeamId) : "?"}</span>
+        {slotIndex !== null && slotIndex !== undefined ? (
+          <select value={selectedTeamId} onChange={(e) => setSlot(slotIndex, e.target.value)} disabled={busy}>
+            {playoffTeamOptions.map((option) => (
+              <option key={option.value || "empty"} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <span className="playoff-team-tbd">{placeholder || "TBD"}</span>
+        )}
+      </div>
+    );
+  };
+  const CompletedBracketTeamRow = ({ teamId, selected, onSelect, placeholder = "TBD", muted = false }) => {
+    const hasTeam = Boolean(teamId);
+    return (
+      <button
+        type="button"
+        className={`playoff-team-row completed-pick ${muted ? "muted" : ""} ${selected ? "active" : ""}`}
+        onClick={() => hasTeam && onSelect(String(teamId))}
+        disabled={!hasTeam}
+      >
+        <span className={`playoff-team-badge ${hasTeam ? "" : "empty"}`}>{hasTeam ? teamInitials(teamId) : "?"}</span>
+        <span>{hasTeam ? teamLookup[Number(teamId)] || `Team ${teamId}` : placeholder}</span>
+      </button>
+    );
+  };
+  const BracketMatchCard = ({ title, meta = "BO3", rows, className = "" }) => (
+    <div className={`playoff-match-card ${className}`}>
+      <div className="playoff-match-head">
+        <strong>{title}</strong>
+        <span>{meta}</span>
+      </div>
+      <div className="playoff-match-teams">{rows}</div>
+    </div>
+  );
+  const setCompletedPick = (round, index, value) => {
+    setCompletedBracket((prev) => {
+      const next = { ...prev, qf: [...prev.qf], sf: [...prev.sf] };
+      if (round === "qf") {
+        next.qf[index] = value;
+        if (index < 2) next.sf[0] = "";
+        else next.sf[1] = "";
+        next.final = "";
+        next.third = "";
+      } else if (round === "sf") {
+        next.sf[index] = value;
+        next.final = "";
+        next.third = "";
+      } else if (round === "final") {
+        next.final = value;
+      } else if (round === "third") {
+        next.third = value;
+      }
+      return next;
+    });
+    setCompletedBracketResult(null);
+    setCompletedBracketMessage("");
+  };
+  const completedBracketDerived = useMemo(() => {
+    const isPickedFrom = (value, ids) => Boolean(value) && ids.some((id) => String(id) === String(value));
+    const qfPairs = [
+      [slots[0], slots[1]],
+      [slots[2], slots[3]],
+      [slots[4], slots[5]],
+      [slots[6], slots[7]],
+    ];
+    const sfPairs = [
+      [completedBracket.qf[0], completedBracket.qf[1]],
+      [completedBracket.qf[2], completedBracket.qf[3]],
+    ];
+    const finalPair = [completedBracket.sf[0], completedBracket.sf[1]];
+    const thirdPair = [
+      sfPairs[0].find((id) => id && String(id) !== String(completedBracket.sf[0])) || "",
+      sfPairs[1].find((id) => id && String(id) !== String(completedBracket.sf[1])) || "",
+    ];
+    const complete =
+      completedBracket.qf.every((pick, idx) => isPickedFrom(pick, qfPairs[idx])) &&
+      completedBracket.sf.every((pick, idx) => isPickedFrom(pick, sfPairs[idx])) &&
+      isPickedFrom(completedBracket.final, finalPair) &&
+      (!hasThirdPlaceDecider || isPickedFrom(completedBracket.third, thirdPair));
+    return { qfPairs, sfPairs, finalPair, thirdPair, complete };
+  }, [slots, completedBracket, hasThirdPlaceDecider]);
+  const runCompletedBracket = async () => {
+    setBusy(true);
+    setCompletedBracketMessage("");
+    setCompletedBracketResult(null);
+    try {
+      const data = await api.post("/playoff/best-team/bracket-from-latest", {
+        qf_winners: completedBracket.qf.map((id) => Number(id)),
+        sf_winners: completedBracket.sf.map((id) => Number(id)),
+        final_winner: Number(completedBracket.final),
+        third_place_winner: hasThirdPlaceDecider ? Number(completedBracket.third) : 0,
+        include_player_ids: Array.from(effectiveAppliedFilters.include),
+        exclude_player_ids: Array.from(effectiveAppliedFilters.exclude),
+      });
+      if (data?.detail || data?.error) {
+        setCompletedBracketMessage(String(data.detail || data.error));
+        return;
+      }
+      const outcomeCount = Number(data?.outcomes_count || 0);
+      const playerValueCount = Array.isArray(data?.player_values) ? data.player_values.length : 0;
+      if (outcomeCount <= 0 || playerValueCount === 0) {
+        setCompletedBracketMessage(
+          "Completed bracket result had no stored outcome/player values. Re-run Playoff Bracket, then try this bracket again."
+        );
+        return;
+      }
+      setCompletedBracketResult(data);
+    } catch (e) {
+      setCompletedBracketMessage(e?.message || "Failed to evaluate completed bracket.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const playoffBestModeLabel = {
+    average: "Best Average Value",
+    single_outcome: "Highest Single-Outcome Ceiling",
+    most_outcomes: "Best In Most Outcomes",
+  }[playoffBestMode] || "Best Average Value";
+  const playoffTeamMetric = (team) => {
+    if (playoffBestMode === "single_outcome") return Number(team?.ceiling_points || 0);
+    if (playoffBestMode === "most_outcomes") return Number(team?.outcome_wins || 0);
+    return Number(team?.total_ev || 0);
+  };
+  const playoffOutcomeCount = Number(results?.outcomes_count || (hasThirdPlaceDecider ? 256 : 128));
+  const formatOutcomeWins = (value) => {
+    const n = Number(value || 0);
+    if (!Number.isFinite(n)) return "0";
+    return Math.abs(n - Math.round(n)) < 1e-9 ? String(Math.round(n)) : n.toFixed(1);
+  };
+  const playoffTeamMetricLabel = (team) => {
+    if (playoffBestMode === "single_outcome") {
+      return `Ceiling ${Number(team?.ceiling_points || 0).toFixed(2)} | Outcome prob ${(
+        Number(team?.ceiling_probability || 0) * 100
+      ).toFixed(1)}%`;
+    }
+    if (playoffBestMode === "most_outcomes") {
+      return `Outcome wins ${formatOutcomeWins(team?.outcome_wins)} / ${playoffOutcomeCount.toLocaleString()} | Win prob ${(
+        Number(team?.outcome_win_probability || 0) * 100
+      ).toFixed(1)}%`;
+    }
+    return `EV ${Number(team?.total_ev || 0).toFixed(2)}`;
   };
 
   const loadEventsForPlayoff = async () => {
@@ -1850,6 +2099,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       const start = await api.post("/playoff/best-team/from-latest/start", {
         include_player_ids: Array.from(effectiveAppliedFilters.include),
         exclude_player_ids: Array.from(effectiveAppliedFilters.exclude),
+        mode: playoffBestMode,
       });
       if (start?.detail) {
         setTopMessage(String(start.detail));
@@ -1923,17 +2173,6 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     }
   };
 
-  const slotLabels = [
-    "QF1 - Top Left",
-    "QF1 - Bottom Left",
-    "QF2 - Top Right",
-    "QF2 - Bottom Right",
-    "QF3 - Top Left (bottom half)",
-    "QF3 - Bottom Left (bottom half)",
-    "QF4 - Top Right (bottom half)",
-    "QF4 - Bottom Right (bottom half)",
-  ];
-
   const resetStoredPlayoff = async () => {
     await api.delete("/playoff/latest");
     setLatestPayload(null);
@@ -1957,7 +2196,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   useEffect(() => {
     if (!baseTeams) return;
     applyTop5ViewFilters(baseTeams);
-  }, [baseTeams, effectiveAppliedFilters, comboSearch, sortKey]);
+  }, [baseTeams, effectiveAppliedFilters, comboSearch, sortKey, playoffBestMode]);
 
   const applyTop5ViewFilters = (teamsIn) => {
     const base = Array.isArray(teamsIn) ? teamsIn : [];
@@ -1978,7 +2217,14 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
         });
       });
     }
-    const sorted = sortTeams(filtered, sortKey);
+    const sorted = [...filtered].sort((a, b) => {
+      if (sortKey === "cost_asc") return Number(a.cost || 0) - Number(b.cost || 0);
+      if (sortKey === "cost_desc") return Number(b.cost || 0) - Number(a.cost || 0);
+      if (sortKey === "cpp_asc") return playoffTeamMetric(a) / (Number(a.cost || 1)) - playoffTeamMetric(b) / (Number(b.cost || 1));
+      if (sortKey === "cpp_desc") return playoffTeamMetric(b) / (Number(b.cost || 1)) - playoffTeamMetric(a) / (Number(a.cost || 1));
+      if (sortKey === "ev_asc") return playoffTeamMetric(a) - playoffTeamMetric(b);
+      return playoffTeamMetric(b) - playoffTeamMetric(a);
+    });
     setAllTeams(sorted);
     setTopTeams(sorted.slice(0, 10));
     setFilteredCount(sorted.length);
@@ -1988,6 +2234,48 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     () => buildPlayerValueRowsFromSimulation(results, players),
     [results, players]
   );
+  const completedBracketValueData = useMemo(() => {
+    const rows = (completedBracketResult?.player_values || [])
+      .map((row) => ({
+        player_id: Number(row.player_id),
+        name: row.name || `Player ${row.player_id}`,
+        team_id: Number(row.team_id || 0),
+        price: Number(row.price || 0),
+        points: Number(row.points || 0),
+        rating: Number(row.rating || 0),
+        win: Number(row.win || 0),
+        role: Number(row.role || 0),
+        booster: Number(row.booster || 0),
+      }))
+      .filter((row) => Number.isFinite(row.price) && Number.isFinite(row.points))
+      .sort((a, b) => b.points - a.points);
+    if (rows.length === 0) return { rows: [], slope: 0, intercept: 0 };
+    const xMean = rows.reduce((sum, row) => sum + row.price, 0) / rows.length;
+    const yMean = rows.reduce((sum, row) => sum + row.points, 0) / rows.length;
+    const num = rows.reduce((sum, row) => sum + (row.price - xMean) * (row.points - yMean), 0);
+    const den = rows.reduce((sum, row) => sum + (row.price - xMean) ** 2, 0);
+    const slope = den > 0 ? num / den : 0;
+    const intercept = yMean - slope * xMean;
+    return {
+      rows: rows.map((row) => {
+        const onLine = intercept + slope * row.price;
+        return { ...row, on_line: onLine, distance: row.points - onLine };
+      }),
+      slope,
+      intercept,
+    };
+  }, [completedBracketResult?.player_values]);
+  const completedBreakdownValue = (row, key) => {
+    const candidates = {
+      total: [row?.points, row?.total_ev, row?.mode_score],
+      rating: [row?.rating, row?.rating_ev],
+      win: [row?.win, row?.win_ev],
+      role: [row?.role, row?.role_ev],
+      booster: [row?.booster, row?.booster_ev],
+    }[key] || [];
+    const value = candidates.map((v) => Number(v)).find((v) => Number.isFinite(v));
+    return Number.isFinite(value) ? value : 0;
+  };
 
   const formatEta = (seconds) => {
     if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return "-";
@@ -2031,6 +2319,9 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
           <button className={playoffTab === "top5" ? "tab active" : "tab"} onClick={() => setPlayoffTab("top5")}>
             Top 5 Teams
           </button>
+          <button className={playoffTab === "completed" ? "tab active" : "tab"} onClick={() => setPlayoffTab("completed")}>
+            Completed Bracket
+          </button>
           <button className={playoffTab === "value" ? "tab active" : "tab"} onClick={() => setPlayoffTab("value")}>
             Player Value
           </button>
@@ -2038,19 +2329,60 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
 
         {playoffTab === "stage" && (
           <>
-            <div className="grid two">
-              {slots.map((val, idx) => (
-                <Select
-                  key={idx}
-                  label={slotLabels[idx]}
-                  value={val}
-                  onChange={(v) => setSlot(idx, v)}
-                  options={[
-                    { value: "", label: "Select team" },
-                    ...filteredTeams.map((t) => ({ value: t.team_id, label: `${t.name} (${t.team_id})` })),
-                  ]}
+            <div className="playoff-bracket-shell">
+              <div className="playoff-bracket-column qf">
+                <h3>Quarter-finals</h3>
+                {[0, 2, 4, 6].map((slotStart, matchIdx) => (
+                  <BracketMatchCard
+                    key={`qf-${matchIdx}`}
+                    title={`QF ${matchIdx + 1}`}
+                    className="connector-out"
+                    rows={
+                      <>
+                        <BracketTeamRow slotIndex={slotStart} />
+                        <BracketTeamRow slotIndex={slotStart + 1} />
+                      </>
+                    }
+                  />
+                ))}
+              </div>
+              <div className="playoff-bracket-column sf">
+                <h3>Semi-finals</h3>
+                <BracketMatchCard
+                  title="SF 1"
+                  className="connector-in connector-out"
+                  rows={
+                    <>
+                      <BracketTeamRow placeholder="Winner QF 1" muted />
+                      <BracketTeamRow placeholder="Winner QF 2" muted />
+                    </>
+                  }
                 />
-              ))}
+                <BracketMatchCard
+                  title="SF 2"
+                  className="connector-in connector-out"
+                  rows={
+                    <>
+                      <BracketTeamRow placeholder="Winner QF 3" muted />
+                      <BracketTeamRow placeholder="Winner QF 4" muted />
+                    </>
+                  }
+                />
+              </div>
+              <div className="playoff-bracket-column final">
+                <h3>Grand final</h3>
+                <BracketMatchCard
+                  title="Final"
+                  meta="BO5"
+                  className="connector-in"
+                  rows={
+                    <>
+                      <BracketTeamRow placeholder="Winner SF 1" muted />
+                      <BracketTeamRow placeholder="Winner SF 2" muted />
+                    </>
+                  }
+                />
+              </div>
             </div>
             <div className="actions">
               <label className="checkbox-inline">
@@ -2083,12 +2415,22 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
             {results && (
               <>
                 <div className="actions">
+                  <Select
+                    label="Evaluation Mode"
+                    value={playoffBestMode}
+                    onChange={setPlayoffBestMode}
+                    options={[
+                      { value: "average", label: "Average player value" },
+                      { value: "single_outcome", label: "Most possible points in one outcome" },
+                      { value: "most_outcomes", label: "Best in most outcomes" },
+                    ]}
+                  />
                   <button className="primary" onClick={findTopTeams} disabled={busy || !results}>
                     {busy ? "Working..." : "Generate & Store Team Combos"}
                   </button>
                 </div>
                 <div className="card sub">
-                  <h3>Top Teams (Filtered)</h3>
+                  <h3>Top Teams (Filtered) - {playoffBestModeLabel}</h3>
                   <div className="top5-filters">
                     <div className="grid two">
                       <div className="field">
@@ -2261,20 +2603,8 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                         Apply Filters
                       </button>
                     </div>
-                    <div className="grid three top5-controls">
+                    <div className="grid two top5-controls">
                       <Input label="Search Combos" value={comboSearch} onChange={setComboSearch} placeholder="Player/team name or id" />
-                      <Select
-                        label="Sort by"
-                        value={sortKey}
-                        onChange={setSortKey}
-                        options={[
-                          { value: "ev_desc", label: "EV desc" },
-                          { value: "ev_asc", label: "EV asc" },
-                          { value: "cost_asc", label: "Cost asc" },
-                          { value: "cost_desc", label: "Cost desc" },
-                          { value: "cpp_desc", label: "Value (EV/Cost) desc" },
-                        ]}
-                      />
                       <div className="field top5-counter">
                         <span>Filtered / Stored</span>
                         <p className="muted">{filteredCount} / {(baseTeams || []).length}</p>
@@ -2285,6 +2615,256 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
               </>
             )}
           </>
+        )}
+
+        {playoffTab === "completed" && (
+          <div className="stack">
+            {!results && (
+              <div className="card sub">
+                <p className="muted">Run Playoff Bracket in the Bracket Stage tab first.</p>
+              </div>
+            )}
+            {results && (
+              <>
+                <div className="playoff-bracket-shell">
+                  <div className="playoff-bracket-column qf">
+                    <h3>Quarter-finals</h3>
+                    {completedBracketDerived.qfPairs.map((pair, idx) => (
+                      <BracketMatchCard
+                        key={`completed-qf-${idx}`}
+                        title={`QF ${idx + 1}`}
+                        className="connector-out"
+                        rows={
+                          <>
+                            {pair.map((teamId) => (
+                              <CompletedBracketTeamRow
+                                key={`completed-qf-${idx}-${teamId || "empty"}`}
+                                teamId={teamId}
+                                selected={Boolean(teamId) && String(completedBracket.qf[idx]) === String(teamId)}
+                                onSelect={(value) => setCompletedPick("qf", idx, value)}
+                              />
+                            ))}
+                          </>
+                        }
+                      />
+                    ))}
+                  </div>
+                  <div className="playoff-bracket-column sf">
+                    <h3>Semi-finals</h3>
+                    {completedBracketDerived.sfPairs.map((pair, idx) => (
+                      <BracketMatchCard
+                        key={`completed-sf-${idx}`}
+                        title={`SF ${idx + 1}`}
+                        className="connector-in connector-out"
+                        rows={
+                          <>
+                            {pair.map((teamId, rowIdx) => (
+                              <CompletedBracketTeamRow
+                                key={`completed-sf-${idx}-${rowIdx}-${teamId || "empty"}`}
+                                teamId={teamId}
+                                placeholder={`Winner QF ${idx * 2 + rowIdx + 1}`}
+                                muted={!teamId}
+                                selected={Boolean(teamId) && String(completedBracket.sf[idx]) === String(teamId)}
+                                onSelect={(value) => setCompletedPick("sf", idx, value)}
+                              />
+                            ))}
+                          </>
+                        }
+                      />
+                    ))}
+                    {hasThirdPlaceDecider && (
+                      <BracketMatchCard
+                        title="Third-place"
+                        className="connector-in"
+                        rows={
+                          <>
+                            {completedBracketDerived.thirdPair.map((teamId, idx) => (
+                              <CompletedBracketTeamRow
+                                key={`completed-third-${idx}-${teamId || "empty"}`}
+                                teamId={teamId}
+                                placeholder="SF loser"
+                                muted={!teamId}
+                                selected={Boolean(teamId) && String(completedBracket.third) === String(teamId)}
+                                onSelect={(value) => setCompletedPick("third", 0, value)}
+                              />
+                            ))}
+                          </>
+                        }
+                      />
+                    )}
+                  </div>
+                  <div className="playoff-bracket-column final">
+                    <h3>Grand final</h3>
+                    <BracketMatchCard
+                      title="Final"
+                      meta="BO5"
+                      className="connector-in"
+                      rows={
+                        <>
+                          {completedBracketDerived.finalPair.map((teamId, idx) => (
+                            <CompletedBracketTeamRow
+                              key={`completed-final-${idx}-${teamId || "empty"}`}
+                              teamId={teamId}
+                              placeholder={`Winner SF ${idx + 1}`}
+                              muted={!teamId}
+                              selected={Boolean(teamId) && String(completedBracket.final) === String(teamId)}
+                              onSelect={(value) => setCompletedPick("final", 0, value)}
+                            />
+                          ))}
+                        </>
+                      }
+                    />
+                  </div>
+                </div>
+                <div className="actions">
+                  <button className="primary" onClick={runCompletedBracket} disabled={busy || !completedBracketDerived.complete}>
+                    {busy ? "Evaluating..." : "Find Best Teams For Bracket"}
+                  </button>
+                </div>
+                {completedBracketMessage && (
+                  <div className="card sub">
+                    <p className="muted">{completedBracketMessage}</p>
+                  </div>
+                )}
+                {completedBracketResult && (
+                  <div className="stack">
+                    <div className="card sub">
+                    <h3>
+                      Bracket probability {(Number(completedBracketResult.bracket_probability || 0) * 100).toFixed(2)}%
+                    </h3>
+                    <p className="muted">
+                      Matched 1 of {Number(completedBracketResult.outcomes_count || 0).toLocaleString()} stored outcomes.
+                    </p>
+                    <div className="actions">
+                      <button className="secondary" onClick={() => setShowCompletedBracketGraph((prev) => !prev)}>
+                        {showCompletedBracketGraph ? "Hide Player Value Graph" : "Show Player Value Graph"}
+                      </button>
+                    </div>
+                    </div>
+                    {showCompletedBracketGraph && completedBracketValueData.rows.length > 0 && (
+                      <PriceVsPointsPanel
+                        title="Player Price vs Points (Completed Bracket)"
+                        rows={completedBracketValueData.rows}
+                        slope={completedBracketValueData.slope}
+                        intercept={completedBracketValueData.intercept}
+                        showTable={false}
+                        onPointClick={setCompletedPlayerBreakdown}
+                      />
+                    )}
+                    {(completedBracketResult.top_teams || [])[0] && (
+                      <div className="card sub">
+                        <h3>Best Team</h3>
+                        {(() => {
+                          const team = (completedBracketResult.top_teams || [])[0];
+                          return (
+                            <>
+                              <h4>
+                                Bracket score {Number(team.total_ev || 0).toFixed(2)} | Cost {team.cost}
+                              </h4>
+                              <table>
+                                <thead>
+                                  <tr>
+                                    <th>Player</th>
+                                    <th>Team</th>
+                                    <th>Assigned Role</th>
+                                    <th>Cost</th>
+                                    <th>Bracket Score</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {(team.players || []).map((p) => (
+                                    <tr key={p.player_id}>
+                                      <td>
+                                        <button className="inline-link-btn" onClick={() => setCompletedPlayerBreakdown(p)}>
+                                          {p.name}
+                                        </button>
+                                      </td>
+                                      <td>{teamLookup[p.team_id] || p.team_id}</td>
+                                      <td>{roleLabel(p.role_name)}</td>
+                                      <td>{p.price}</td>
+                                      <td>{Number(p.mode_score ?? p.total_ev ?? 0).toFixed(2)}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </>
+                          );
+                        })()}
+                      </div>
+                    )}
+                    <div className="card sub">
+                      <h3>Player Values</h3>
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Player</th>
+                            <th>Team</th>
+                            <th>Cost</th>
+                            <th>Bracket Score</th>
+                            <th>Value +/-</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {completedBracketValueData.rows.map((row) => (
+                            <tr key={row.player_id}>
+                              <td>
+                                <button className="inline-link-btn" onClick={() => setCompletedPlayerBreakdown(row)}>
+                                  {row.name}
+                                </button>
+                              </td>
+                              <td>{teamLookup[row.team_id] || row.team_id}</td>
+                              <td>{Number(row.price || 0).toLocaleString()}</td>
+                              <td>{Number(row.points || 0).toFixed(2)}</td>
+                              <td>{Number(row.distance || 0).toFixed(2)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <div className="card sub">
+                      <h3>Top Teams</h3>
+                      {(completedBracketResult.top_teams || []).length === 0 && (
+                        <p className="muted">No valid fantasy team matched the budget, per-team, and role constraints.</p>
+                      )}
+                      {(completedBracketResult.top_teams || []).map((team, idx) => (
+                      <div key={`completed-team-${idx}`} className="card sub">
+                        <h4>
+                          #{idx + 1} Bracket score {Number(team.total_ev || 0).toFixed(2)} | Cost {team.cost}
+                        </h4>
+                        <table>
+                          <thead>
+                            <tr>
+                              <th>Player</th>
+                              <th>Team</th>
+                              <th>Assigned Role</th>
+                              <th>Cost</th>
+                              <th>Bracket Score</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {(team.players || []).map((p) => (
+                              <tr key={p.player_id}>
+                                <td>
+                                  <button className="inline-link-btn" onClick={() => setCompletedPlayerBreakdown(p)}>
+                                    {p.name}
+                                  </button>
+                                </td>
+                                <td>{teamLookup[p.team_id] || p.team_id}</td>
+                                <td>{roleLabel(p.role_name)}</td>
+                                <td>{p.price}</td>
+                                <td>{Number(p.mode_score ?? p.total_ev ?? 0).toFixed(2)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ))}
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
         )}
       </div>
       {playoffTab === "stage" && busy && (
@@ -2354,7 +2934,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
           {topTeams.map((team, idx) => (
             <div key={idx} className="card sub">
               <h4>
-                #{idx + 1} EV {team.total_ev.toFixed(2)} | Cost {team.cost}
+                #{idx + 1} {playoffTeamMetricLabel(team)} | Cost {team.cost}
               </h4>
               <table>
                 <thead>
@@ -2364,6 +2944,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                     <th>Assigned Role</th>
                     <th>Cost</th>
                     <th>Total EV</th>
+                    <th>Mode Score</th>
                     <th>Rating</th>
                     <th>Win</th>
                     <th>Role</th>
@@ -2382,6 +2963,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                       <td>{roleLabel(p.role_name)}</td>
                       <td>{p.price}</td>
                       <td>{p.total_ev.toFixed(2)}</td>
+                      <td>{Number(p.mode_score ?? p.total_ev ?? 0).toFixed(2)}</td>
                       <td>{p.rating_ev.toFixed(2)}</td>
                       <td>{p.win_ev.toFixed(2)}</td>
                       <td>{p.role_ev.toFixed(2)}</td>
@@ -2416,8 +2998,9 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
             <thead>
               <tr>
                 <th>#</th>
-                <th>EV</th>
-                <th>Cost</th>
+                <SortHeader sortValue={sortKey} asc="ev_asc" desc="ev_desc" defaultDirection="desc" onChange={setSortKey}>Mode Score</SortHeader>
+                <SortHeader sortValue={sortKey} asc="cost_asc" desc="cost_desc" onChange={setSortKey}>Cost</SortHeader>
+                <SortHeader sortValue={sortKey} asc="cpp_asc" desc="cpp_desc" defaultDirection="desc" onChange={setSortKey}>Value</SortHeader>
                 <th>Players</th>
               </tr>
             </thead>
@@ -2425,8 +3008,9 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
               {allTeams.slice(page * 200, page * 200 + 200).map((team, idx) => (
                 <tr key={idx + page * 200}>
                   <td>{idx + 1 + page * 200}</td>
-                  <td>{team.total_ev.toFixed(2)}</td>
+                  <td>{playoffTeamMetric(team).toFixed(2)}</td>
                   <td>{team.cost}</td>
+                  <td>{(playoffTeamMetric(team) / (team.cost || 1)).toFixed(4)}</td>
                   <td>{team.players.map((p) => `${p.name} (${teamLookup[p.team_id] || p.team_id}, ${roleLabel(p.role_name)})`).join(", ")}</td>
                 </tr>
               ))}
@@ -2560,6 +3144,55 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
               <button className="primary" onClick={() => setShowFilterModal(false)}>
                 Done
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {completedPlayerBreakdown && (
+        <div className="modal-backdrop" onClick={() => setCompletedPlayerBreakdown(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <header className="modal-header">
+              <h3>{completedPlayerBreakdown.name || `Player ${completedPlayerBreakdown.player_id}`} Point Sources</h3>
+              <button className="close" onClick={() => setCompletedPlayerBreakdown(null)}>
+                &times;
+              </button>
+            </header>
+            <div className="modal-body">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Source</th>
+                    <th>Points</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Rating</td>
+                    <td>{completedBreakdownValue(completedPlayerBreakdown, "rating").toFixed(2)}</td>
+                  </tr>
+                  <tr>
+                    <td>Win</td>
+                    <td>{completedBreakdownValue(completedPlayerBreakdown, "win").toFixed(2)}</td>
+                  </tr>
+                  <tr>
+                    <td>Role</td>
+                    <td>{completedBreakdownValue(completedPlayerBreakdown, "role").toFixed(2)}</td>
+                  </tr>
+                  <tr>
+                    <td>Booster</td>
+                    <td>{completedBreakdownValue(completedPlayerBreakdown, "booster").toFixed(2)}</td>
+                  </tr>
+                  <tr>
+                    <td><strong>Total</strong></td>
+                    <td><strong>{completedBreakdownValue(completedPlayerBreakdown, "total").toFixed(2)}</strong></td>
+                  </tr>
+                </tbody>
+              </table>
+              {completedPlayerBreakdown.components_available === false && (
+                  <p className="muted">
+                    This stored bracket was generated before source components were saved. Re-run the playoff bracket to see rating, win, role, and booster split accurately.
+                  </p>
+              )}
             </div>
           </div>
         </div>
@@ -2831,12 +3464,134 @@ function MatchesDataPanel({ notify }) {
   const [recentResults, setRecentResults] = useState([]);
   const [recentResultsLoading, setRecentResultsLoading] = useState(false);
   const [recentResultsError, setRecentResultsError] = useState("");
+  const [recentResultsImportMode, setRecentResultsImportMode] = useState("until_date");
   const [recentResultsPages, setRecentResultsPages] = useState("3");
+  const [recentResultsUntilYear, setRecentResultsUntilYear] = useState("");
+  const [recentResultsUntilMonth, setRecentResultsUntilMonth] = useState("");
+  const [recentResultsUntilDay, setRecentResultsUntilDay] = useState("");
+  const [recentResultsMaxHltvRank, setRecentResultsMaxHltvRank] = useState("0");
+  const [recentResultsRankFilterMode, setRecentResultsRankFilterMode] = useState("both");
   const [recentResultsOffset, setRecentResultsOffset] = useState(0);
+  const [recentResultsImporting, setRecentResultsImporting] = useState(false);
+  const [recentResultsImportProcessed, setRecentResultsImportProcessed] = useState(0);
+  const [recentResultsImportTotal, setRecentResultsImportTotal] = useState(0);
+  const [recentResultsImportEtaSeconds, setRecentResultsImportEtaSeconds] = useState(null);
+  const [recentResultsImportPhase, setRecentResultsImportPhase] = useState("");
+  const [recentResultsImportCurrent, setRecentResultsImportCurrent] = useState("");
+  const [recentResultsImportJobId, setRecentResultsImportJobId] = useState("");
+  const [recentResultsImportStatus, setRecentResultsImportStatus] = useState("");
+  const [recentResultsRankingDatesDone, setRecentResultsRankingDatesDone] = useState(0);
+  const [recentResultsRankingDatesTotal, setRecentResultsRankingDatesTotal] = useState(0);
   const [selectedMatchUrl, setSelectedMatchUrl] = useState("");
   const [selectedMatchRow, setSelectedMatchRow] = useState(null);
   const [showMatchModal, setShowMatchModal] = useState(false);
   const initialLoadRef = useRef(false);
+  const recentResultsImportPollingRef = useRef(false);
+  const recentResultsImportEtaRef = useRef({
+    phase: "",
+    total: 0,
+    lastProcessed: 0,
+    lastAt: 0,
+    rate: null,
+  });
+  const RECENT_RESULTS_IMPORT_JOB_ID_KEY = "hltv_results_import_job_id";
+  const RECENT_RESULTS_IMPORT_JOB_STARTED_AT_KEY = "hltv_results_import_job_started_at";
+  const recentResultsImportProgressPct =
+    recentResultsImportTotal > 0
+      ? Math.min(100, Math.max(0, (recentResultsImportProcessed / recentResultsImportTotal) * 100))
+      : 0;
+  const recentResultsImportIndeterminate = recentResultsImporting && recentResultsImportTotal <= 0;
+  const recentResultsImportActive = ["queued", "running", "pausing"].includes(recentResultsImportStatus);
+  const recentResultsImportResumable = ["paused", "failed"].includes(recentResultsImportStatus);
+  const recentResultsBusy = recentResultsLoading || recentResultsImportActive;
+
+  const formatRecentResultsEta = (seconds) => {
+    if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return "-";
+    const s = Math.max(0, Math.round(seconds));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const r = s % 60;
+    if (h > 0) return `${h}h ${m}m ${r}s`;
+    if (m > 0) return `${m}m ${r}s`;
+    return `${r}s`;
+  };
+  const formatRecentResultsImportPhase = (phase) => {
+    const labels = {
+      queued: "Queued",
+      fetching_results: "Fetching result pages",
+      filtering_by_rank: "Filtering by HLTV rank",
+      fetching_match_details: "Fetching match details",
+      storing_results: "Saving matches",
+      deduping_results: "Removing duplicates",
+      enriching_points: "Finding rankings",
+      completed: "Completed",
+      failed: "Failed",
+    };
+    return labels[phase] || "Importing";
+  };
+
+  const updateRecentResultsEta = (phase, processed, total) => {
+    const now = Date.now();
+    const state = recentResultsImportEtaRef.current;
+    const changedScope = state.phase !== phase || state.total !== total || processed < state.lastProcessed;
+    if (changedScope) {
+      recentResultsImportEtaRef.current = {
+        phase,
+        total,
+        lastProcessed: processed,
+        lastAt: now,
+        rate: null,
+      };
+      setRecentResultsImportEtaSeconds(total > 0 && processed >= total ? 0 : null);
+      return;
+    }
+
+    const delta = processed - state.lastProcessed;
+    const elapsedSec = Math.max(0.001, (now - state.lastAt) / 1000);
+    if (delta > 0 && total > processed) {
+      const instantRate = delta / elapsedSec;
+      const nextRate = state.rate == null ? instantRate : state.rate * 0.65 + instantRate * 0.35;
+      recentResultsImportEtaRef.current = {
+        ...state,
+        lastProcessed: processed,
+        lastAt: now,
+        rate: nextRate,
+      };
+      setRecentResultsImportEtaSeconds(nextRate > 0 ? (total - processed) / nextRate : null);
+    } else if (total > 0 && processed >= total) {
+      recentResultsImportEtaRef.current = {
+        ...state,
+        lastProcessed: processed,
+        lastAt: now,
+      };
+      setRecentResultsImportEtaSeconds(0);
+    } else if (state.rate == null) {
+      setRecentResultsImportEtaSeconds(null);
+    }
+  };
+
+  const buildRecentResultsUntilDate = () => {
+    const year = String(recentResultsUntilYear || "").trim();
+    const month = String(recentResultsUntilMonth || "").trim().padStart(2, "0");
+    const day = String(recentResultsUntilDay || "").trim().padStart(2, "0");
+    if (!/^\d{4}$/.test(year) || !/^\d{2}$/.test(month) || !/^\d{2}$/.test(day)) return "";
+    const date = new Date(`${year}-${month}-${day}T00:00:00Z`);
+    if (
+      Number.isNaN(date.getTime()) ||
+      date.getUTCFullYear() !== Number(year) ||
+      date.getUTCMonth() + 1 !== Number(month) ||
+      date.getUTCDate() !== Number(day)
+    ) {
+      return "";
+    }
+    return `${year}-${month}-${day}`;
+  };
+
+  const clearRecentResultsImportStorage = () => {
+    localStorage.removeItem(RECENT_RESULTS_IMPORT_JOB_ID_KEY);
+    localStorage.removeItem(RECENT_RESULTS_IMPORT_JOB_STARTED_AT_KEY);
+    setRecentResultsImportJobId("");
+  };
 
   const loadStoredRecentResults = async (offset = 0) => {
     const safeOffset = Math.max(0, Number(offset) || 0);
@@ -2859,31 +3614,162 @@ function MatchesDataPanel({ notify }) {
     }
   };
 
+  const pollRecentResultsImportJob = async (jobId, startedAtMs) => {
+    if (!jobId || recentResultsImportPollingRef.current) return;
+    recentResultsImportPollingRef.current = true;
+    setRecentResultsImporting(true);
+    try {
+      let done = false;
+      while (!done) {
+        const status = await api.get(`/events/hltv-results/import/job/${jobId}`);
+        if (status?.detail) {
+          setRecentResultsError(String(status.detail));
+          clearRecentResultsImportStorage();
+          return;
+        }
+
+        const processed = Number(status.processed_units || 0);
+        const total = Number(status.total_units || 0);
+        setRecentResultsImportProcessed(processed);
+        setRecentResultsImportTotal(total);
+        const phase = String(status.phase || status.status || "");
+        setRecentResultsImportPhase(phase);
+        setRecentResultsImportCurrent(String(status.current || ""));
+        setRecentResultsImportStatus(String(status.status || ""));
+        setRecentResultsImportJobId(String(status.job_id || jobId));
+        setRecentResultsRankingDatesDone(Number(status.ranking_dates_done || 0));
+        setRecentResultsRankingDatesTotal(Number(status.ranking_dates_total || 0));
+
+        updateRecentResultsEta(phase, processed, total);
+
+        if (status.status === "failed") {
+          setRecentResultsError(status.error || "Failed to import/store HLTV results.");
+          done = true;
+          break;
+        }
+        if (status.status === "paused") {
+          done = true;
+          break;
+        }
+        if (status.status === "completed") {
+          const res = status.result || {};
+          if (notify) {
+            notify(
+              `Imported HLTV results: ${res.kept ?? res.fetched ?? 0} kept, ${res.rank_filtered_out || 0} rank-filtered, ${res.date_filtered_out || 0} date-filtered, ${res.inserted || 0} inserted, ${res.updated || 0} updated`
+            );
+          }
+          clearRecentResultsImportStorage();
+          await loadStoredRecentResults(0);
+          done = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    } catch (e) {
+      setRecentResultsError(e?.message || "Failed to import/store HLTV results.");
+      clearRecentResultsImportStorage();
+    } finally {
+      recentResultsImportPollingRef.current = false;
+      setRecentResultsImporting(false);
+    }
+  };
+
   const importRecentResultsToDb = async () => {
-    const pages = Math.max(1, Math.min(30, Number(recentResultsPages) || 1));
-    setRecentResultsLoading(true);
+    const importMode = recentResultsImportMode === "max_pages" ? "max_pages" : "until_date";
+    const untilDate = buildRecentResultsUntilDate();
+    const pages = Math.max(1, Number(recentResultsPages) || 1);
+    const maxHltvRank = Math.max(0, Math.min(500, Number(recentResultsMaxHltvRank) || 0));
+    if (importMode === "until_date" && !untilDate) {
+      setRecentResultsError("Enter a valid Import Back To Date before starting date mode.");
+      return;
+    }
+    setRecentResultsImporting(true);
+    setRecentResultsImportProcessed(0);
+    setRecentResultsImportTotal(importMode === "until_date" ? 0 : pages);
+    setRecentResultsImportEtaSeconds(null);
+    recentResultsImportEtaRef.current = { phase: "", total: 0, lastProcessed: 0, lastAt: 0, rate: null };
+    setRecentResultsImportPhase("queued");
+    setRecentResultsImportCurrent("");
+    setRecentResultsRankingDatesDone(0);
+    setRecentResultsRankingDatesTotal(0);
     setRecentResultsError("");
     try {
-      const res = await api.post("/events/hltv-results/import", {
-        pages,
+      const start = await api.post("/events/hltv-results/import/start", {
+        import_mode: importMode,
+        pages: importMode === "max_pages" ? pages : 1,
         start_offset: 0,
         page_stride: 100,
         per_page_limit: 100,
+        until_date: importMode === "until_date" ? untilDate : "",
+        max_hltv_rank: maxHltvRank,
+        rank_filter_mode: recentResultsRankFilterMode,
       });
-      if (res?.detail) {
-        setRecentResultsError(String(res.detail));
+      if (start?.detail) {
+        setRecentResultsError(String(start.detail));
         return;
       }
-      if (notify) {
-        notify(
-          `Imported HLTV results: ${res.fetched || 0} fetched, ${res.inserted || 0} inserted, ${res.updated || 0} updated, ${res.enriched_matches || 0} enriched`
-        );
+      const jobId = start?.job_id;
+      if (!jobId) {
+        setRecentResultsError("Failed to start HLTV results import job.");
+        return;
       }
-      await loadStoredRecentResults(0);
+      const startedAt = Date.now();
+      setRecentResultsImportJobId(String(jobId));
+      setRecentResultsImportStatus("queued");
+      localStorage.setItem(RECENT_RESULTS_IMPORT_JOB_ID_KEY, String(jobId));
+      localStorage.setItem(RECENT_RESULTS_IMPORT_JOB_STARTED_AT_KEY, String(startedAt));
+      await pollRecentResultsImportJob(jobId, startedAt);
     } catch (e) {
-      setRecentResultsError("Failed to import/store HLTV results.");
+      setRecentResultsError(e?.message || "Failed to import/store HLTV results.");
+      clearRecentResultsImportStorage();
     } finally {
-      setRecentResultsLoading(false);
+      if (!recentResultsImportPollingRef.current) setRecentResultsImporting(false);
+    }
+  };
+
+  const pauseRecentResultsImportJob = async () => {
+    const jobId = recentResultsImportJobId || localStorage.getItem(RECENT_RESULTS_IMPORT_JOB_ID_KEY);
+    if (!jobId) return;
+    setRecentResultsImportStatus("pausing");
+    setRecentResultsImportCurrent("Pausing after current request");
+    try {
+      const status = await api.post(`/events/hltv-results/import/job/${jobId}/pause`, {});
+      if (status?.detail) {
+        setRecentResultsError(String(status.detail));
+        return;
+      }
+      setRecentResultsImportStatus(String(status.status || "pausing"));
+      setRecentResultsImportPhase(String(status.phase || status.status || ""));
+      setRecentResultsImportCurrent(String(status.current || ""));
+      setRecentResultsRankingDatesDone(Number(status.ranking_dates_done || 0));
+      setRecentResultsRankingDatesTotal(Number(status.ranking_dates_total || 0));
+    } catch (e) {
+      setRecentResultsError(e?.message || "Failed to pause HLTV results import.");
+    }
+  };
+
+  const resumeRecentResultsImportJob = async () => {
+    const jobId = recentResultsImportJobId || localStorage.getItem(RECENT_RESULTS_IMPORT_JOB_ID_KEY);
+    if (!jobId) return;
+    setRecentResultsImporting(true);
+    setRecentResultsImportStatus("queued");
+    recentResultsImportEtaRef.current = { phase: "", total: 0, lastProcessed: 0, lastAt: 0, rate: null };
+    setRecentResultsImportEtaSeconds(null);
+    setRecentResultsError("");
+    try {
+      const status = await api.post(`/events/hltv-results/import/job/${jobId}/resume`, {});
+      if (status?.detail) {
+        setRecentResultsError(String(status.detail));
+        return;
+      }
+      const startedAt = Date.now();
+      localStorage.setItem(RECENT_RESULTS_IMPORT_JOB_ID_KEY, String(jobId));
+      localStorage.setItem(RECENT_RESULTS_IMPORT_JOB_STARTED_AT_KEY, String(startedAt));
+      await pollRecentResultsImportJob(jobId, startedAt);
+    } catch (e) {
+      setRecentResultsError(e?.message || "Failed to resume HLTV results import.");
+    } finally {
+      if (!recentResultsImportPollingRef.current) setRecentResultsImporting(false);
     }
   };
 
@@ -2909,54 +3795,188 @@ function MatchesDataPanel({ notify }) {
     }
   };
 
-  const openMatchModal = (row) => {
+  const openMatchModal = async (row) => {
     const url = String(row?.match_url || "").trim();
     if (!url) return;
     setSelectedMatchUrl(url);
     setSelectedMatchRow(row || null);
     setShowMatchModal(true);
+    try {
+      const details = await api.get(`/events/hltv-results/match-details?match_url=${encodeURIComponent(url)}`);
+      const maps = Array.isArray(details?.maps) ? details.maps : [];
+      const stored = details?.stored || {};
+      const nextRow = {
+        ...(row || {}),
+        ...(stored || {}),
+        maps_json: JSON.stringify(maps),
+      };
+      setSelectedMatchRow(nextRow);
+      setRecentResults((prev) => prev.map((item) => (String(item?.match_url || "") === url ? nextRow : item)));
+    } catch {
+      // Keep the stored row visible if live detail refresh fails.
+    }
   };
 
   useEffect(() => {
     if (initialLoadRef.current) return;
     initialLoadRef.current = true;
     loadStoredRecentResults(0);
+    const jobId = localStorage.getItem(RECENT_RESULTS_IMPORT_JOB_ID_KEY);
+    if (jobId) {
+      const startedAt = Number(localStorage.getItem(RECENT_RESULTS_IMPORT_JOB_STARTED_AT_KEY) || Date.now());
+      pollRecentResultsImportJob(jobId, startedAt);
+    } else {
+      api
+        .get("/events/hltv-results/import/latest")
+        .then((latest) => {
+          if (!latest?.exists) return;
+          const status = String(latest.status || "");
+          if (!["queued", "running", "pausing", "paused", "failed"].includes(status)) return;
+          const latestJobId = String(latest.job_id || "");
+          if (!latestJobId) return;
+          setRecentResultsImportJobId(latestJobId);
+          setRecentResultsImportStatus(status);
+          setRecentResultsImportProcessed(Number(latest.processed_units || 0));
+          setRecentResultsImportTotal(Number(latest.total_units || 0));
+          setRecentResultsImportPhase(String(latest.phase || status));
+          setRecentResultsImportCurrent(String(latest.current || ""));
+          setRecentResultsRankingDatesDone(Number(latest.ranking_dates_done || 0));
+          setRecentResultsRankingDatesTotal(Number(latest.ranking_dates_total || 0));
+          const startedAt = Date.now();
+          localStorage.setItem(RECENT_RESULTS_IMPORT_JOB_ID_KEY, latestJobId);
+          localStorage.setItem(RECENT_RESULTS_IMPORT_JOB_STARTED_AT_KEY, String(startedAt));
+          if (["queued", "running", "pausing"].includes(status)) pollRecentResultsImportJob(latestJobId, startedAt);
+        })
+        .catch(() => {});
+    }
   }, []);
 
   return (
     <div className="stack">
-      <div className="grid three">
+      <div className="grid four">
+        <Select
+          label="Import Mode"
+          value={recentResultsImportMode}
+          onChange={setRecentResultsImportMode}
+          options={[
+            { value: "until_date", label: "Until date" },
+            { value: "max_pages", label: "Max pages" },
+          ]}
+        />
+        {recentResultsImportMode === "until_date" ? (
+          <label className="field">
+            <span>Import Back To Date</span>
+            <div className="date-input-group">
+              <input
+                value={recentResultsUntilYear}
+                onChange={(e) => setRecentResultsUntilYear(e.target.value.replace(/\D/g, "").slice(0, 4))}
+                placeholder="YYYY"
+                inputMode="numeric"
+              />
+              <input
+                value={recentResultsUntilMonth}
+                onChange={(e) => setRecentResultsUntilMonth(e.target.value.replace(/\D/g, "").slice(0, 2))}
+                onBlur={() => setRecentResultsUntilMonth((value) => (value ? String(value).padStart(2, "0") : ""))}
+                placeholder="MM"
+                inputMode="numeric"
+              />
+              <input
+                value={recentResultsUntilDay}
+                onChange={(e) => setRecentResultsUntilDay(e.target.value.replace(/\D/g, "").slice(0, 2))}
+                onBlur={() => setRecentResultsUntilDay((value) => (value ? String(value).padStart(2, "0") : ""))}
+                placeholder="DD"
+                inputMode="numeric"
+              />
+            </div>
+          </label>
+        ) : (
+          <Input
+            label="Pages"
+            value={recentResultsPages}
+            onChange={setRecentResultsPages}
+            placeholder="e.g. 30"
+          />
+        )}
         <Input
-          label="# Pages To Import (100 each)"
-          value={recentResultsPages}
-          onChange={setRecentResultsPages}
-          placeholder="e.g. 3"
+          label="Max HLTV Rank"
+          value={recentResultsMaxHltvRank}
+          onChange={setRecentResultsMaxHltvRank}
+          placeholder="0 = all ranks"
+        />
+        <Select
+          label="Rank Filter"
+          value={recentResultsRankFilterMode}
+          onChange={setRecentResultsRankFilterMode}
+          options={[
+            { value: "both", label: "Both teams" },
+            { value: "either", label: "Either team" },
+          ]}
         />
       </div>
       <div className="actions" style={{ marginTop: 0 }}>
-        <button className="primary" onClick={importRecentResultsToDb} disabled={recentResultsLoading}>
-          {recentResultsLoading ? "Importing..." : "Import HLTV Results To SQL"}
+        <button className="primary" onClick={importRecentResultsToDb} disabled={recentResultsBusy || recentResultsImportResumable}>
+          {recentResultsImporting ? "Importing..." : "Import HLTV Results To SQL"}
         </button>
-        <button className="danger" onClick={clearStoredResults} disabled={recentResultsLoading}>
+        {recentResultsImportActive && recentResultsImportJobId && (
+          <button className="secondary" onClick={pauseRecentResultsImportJob} disabled={recentResultsImportStatus === "pausing"}>
+            {recentResultsImportStatus === "pausing" ? "Pausing..." : "Pause"}
+          </button>
+        )}
+        {recentResultsImportResumable && recentResultsImportJobId && (
+          <button className="secondary" onClick={resumeRecentResultsImportJob}>
+            Resume
+          </button>
+        )}
+        <button className="danger" onClick={clearStoredResults} disabled={recentResultsBusy}>
           {recentResultsLoading ? "Deleting..." : "Delete All Stored Matches"}
         </button>
-        <button className="secondary" onClick={loadStoredRecentResults} disabled={recentResultsLoading}>
+        <button className="secondary" onClick={loadStoredRecentResults} disabled={recentResultsBusy}>
           {recentResultsLoading ? "Loading..." : "Reload Stored Results"}
         </button>
         <span className="muted">{recentResults.length} loaded</span>
       </div>
+      {recentResultsImporting && (
+        <div className="card sub">
+          <p className="muted">
+            {formatRecentResultsImportPhase(recentResultsImportPhase)}:{" "}
+            {recentResultsImportTotal > 0
+              ? `${recentResultsImportProcessed.toLocaleString()} / ${recentResultsImportTotal.toLocaleString()} | ETA: ${formatRecentResultsEta(recentResultsImportEtaSeconds)}`
+              : `${recentResultsImportProcessed.toLocaleString()} pages fetched`}
+          </p>
+          <div className="progress">
+            <div
+              className={`progress-bar ${recentResultsImportIndeterminate ? "" : "determinate"}`}
+              style={recentResultsImportIndeterminate ? undefined : { width: `${recentResultsImportProgressPct}%` }}
+            />
+          </div>
+          {recentResultsRankingDatesTotal > 0 && (
+            <p className="muted">
+              Ranking dates checked: {recentResultsRankingDatesDone.toLocaleString()} /{" "}
+              {recentResultsRankingDatesTotal.toLocaleString()}
+            </p>
+          )}
+          {recentResultsImportCurrent && <p className="muted">{recentResultsImportCurrent}</p>}
+        </div>
+      )}
+      {!recentResultsImporting && recentResultsImportResumable && recentResultsImportJobId && (
+        <div className="card sub">
+          <p className="muted">
+            {formatRecentResultsImportPhase(recentResultsImportPhase)}: {recentResultsImportCurrent || "Import can be resumed."}
+          </p>
+        </div>
+      )}
       <div className="actions" style={{ marginTop: 0 }}>
         <button
           className="secondary"
           onClick={() => loadStoredRecentResults(Math.max(0, recentResultsOffset - 100))}
-          disabled={recentResultsLoading || recentResultsOffset <= 0}
+          disabled={recentResultsBusy || recentResultsOffset <= 0}
         >
           Prev 100
         </button>
         <button
           className="secondary"
           onClick={() => loadStoredRecentResults(recentResultsOffset + 100)}
-          disabled={recentResultsLoading || recentResults.length < 100}
+          disabled={recentResultsBusy || recentResults.length < 100}
         >
           Next 100
         </button>
@@ -3140,14 +4160,27 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
   const [selectedTeam, setSelectedTeam] = useState(null);
   const [showTeamModal, setShowTeamModal] = useState(false);
   const [rankingsRefreshBusy, setRankingsRefreshBusy] = useState(false);
+  const [mapStatsJobStatus, setMapStatsJobStatus] = useState("idle");
+  const [mapStatsJobId, setMapStatsJobId] = useState("");
+  const [mapStatsJobProcessed, setMapStatsJobProcessed] = useState(0);
+  const [mapStatsJobTotal, setMapStatsJobTotal] = useState(0);
+  const [mapStatsJobOk, setMapStatsJobOk] = useState(0);
+  const [mapStatsJobFailed, setMapStatsJobFailed] = useState(0);
+  const [mapStatsJobLastError, setMapStatsJobLastError] = useState("");
+  const [mapStatsJobEtaSeconds, setMapStatsJobEtaSeconds] = useState(null);
+  const mapStatsJobPollingRef = useRef(false);
   const [teamForm, setTeamForm] = useState({
     team_id: "",
+    hltv_team_id: "",
     name: "",
     hltv_rank: "",
     hltv_points: "",
     vrs_rank: "",
     vrs_points: "",
     win_rate: "",
+    map_stats_json: "",
+    map_stats_imported_at: "",
+    map_stats_source_url: "",
     p1: "",
     p2: "",
     p3: "",
@@ -3331,12 +4364,16 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
       if (t) {
         setTeamForm({
           team_id: t.team_id,
+          hltv_team_id: t.hltv_team_id ?? "",
           name: t.name || "",
           hltv_rank: t.hltv_rank || "",
           hltv_points: t.hltv_points || "",
           vrs_rank: t.vrs_rank || "",
           vrs_points: t.vrs_points || "",
           win_rate: t.win_rate || "",
+          map_stats_json: t.map_stats_json || "",
+          map_stats_imported_at: t.map_stats_imported_at || "",
+          map_stats_source_url: t.map_stats_source_url || "",
           p1: t.player1_id ? String(t.player1_id) : "",
           p2: t.player2_id ? String(t.player2_id) : "",
           p3: t.player3_id ? String(t.player3_id) : "",
@@ -3352,6 +4389,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     const ids = [teamForm.p1, teamForm.p2, teamForm.p3, teamForm.p4, teamForm.p5].map((x) => Number(x || 0));
     await api.post("/teams/", {
       name: teamForm.name,
+      hltv_team_id: teamForm.hltv_team_id === "" ? undefined : Number(teamForm.hltv_team_id),
       hltv_rank: teamForm.hltv_rank === "" ? undefined : Number(teamForm.hltv_rank),
       hltv_points: teamForm.hltv_points === "" ? undefined : Number(teamForm.hltv_points),
       vrs_rank: teamForm.vrs_rank === "" ? undefined : Number(teamForm.vrs_rank),
@@ -3371,12 +4409,16 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     setSelectedTeam(null);
     setTeamForm({
       team_id: "",
+      hltv_team_id: "",
       name: "",
       hltv_rank: "",
       hltv_points: "",
       vrs_rank: "",
       vrs_points: "",
       win_rate: "",
+      map_stats_json: "",
+      map_stats_imported_at: "",
+      map_stats_source_url: "",
       p1: "",
       p2: "",
       p3: "",
@@ -3391,12 +4433,16 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     setSelectedTeam(null);
     setTeamForm({
       team_id: "",
+      hltv_team_id: "",
       name: "",
       hltv_rank: "",
       hltv_points: "",
       vrs_rank: "",
       vrs_points: "",
       win_rate: "",
+      map_stats_json: "",
+      map_stats_imported_at: "",
+      map_stats_source_url: "",
       p1: "",
       p2: "",
       p3: "",
@@ -3465,7 +4511,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     setBatchTopRatingsOk(ok);
     setBatchTopRatingsFailed(failed);
     setBatchTopRatingsLastError(lastError);
-    setBatchTopRatingsBusy(["queued", "running", "pausing"].includes(nextStatus));
+    setBatchTopRatingsBusy(["queued", "running", "pausing", "canceling"].includes(nextStatus));
 
     if (processed > 0 && total > processed) {
       const elapsedSec = Math.max(0.001, (Date.now() - getBatchStartedAtMs(status)) / 1000);
@@ -3496,6 +4542,11 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
           break;
         }
         if (nextStatus === "paused") {
+          setBatchTopRatingsBusy(false);
+          done = true;
+          break;
+        }
+        if (nextStatus === "canceled") {
           setBatchTopRatingsBusy(false);
           done = true;
           break;
@@ -3577,14 +4628,33 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
 
   const pauseBatchTopRatingsJob = async () => {
     if (!batchTopRatingsJobId) return;
+    setBatchTopRatingsStatus("pausing");
+    setBatchTopRatingsBusy(true);
     try {
       const status = await api.post(`/players/fetch-top-ratings-batch/job/${batchTopRatingsJobId}/pause`, {});
       const applied = applyBatchTopRatingsStatus(status, batchTopRatingsJobId);
-      if (applied.nextStatus === "pausing") {
+      if (["pausing", "running", "queued"].includes(applied.nextStatus)) {
         pollBatchTopRatingsJob(batchTopRatingsJobId);
       }
     } catch (e) {
+      setBatchTopRatingsStatus("running");
       notify(`Failed to pause Top-X batch: ${e?.message || "unknown error"}`);
+    }
+  };
+
+  const cancelBatchTopRatingsJob = async () => {
+    if (!batchTopRatingsJobId) return;
+    setBatchTopRatingsStatus("canceling");
+    setBatchTopRatingsBusy(true);
+    try {
+      const status = await api.post(`/players/fetch-top-ratings-batch/job/${batchTopRatingsJobId}/cancel`, {});
+      const applied = applyBatchTopRatingsStatus(status, batchTopRatingsJobId);
+      if (["canceling", "running", "queued", "pausing"].includes(applied.nextStatus)) {
+        pollBatchTopRatingsJob(batchTopRatingsJobId);
+      }
+    } catch (e) {
+      setBatchTopRatingsBusy(false);
+      notify(`Failed to cancel Top-X batch: ${e?.message || "unknown error"}`);
     }
   };
 
@@ -3612,7 +4682,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
         if (cancelled || !latest?.exists) return;
         if (latest?.status === "completed") return;
         const applied = applyBatchTopRatingsStatus(latest);
-        if (["queued", "running", "pausing"].includes(applied.nextStatus)) {
+        if (["queued", "running", "pausing", "canceling"].includes(applied.nextStatus)) {
           pollBatchTopRatingsJob(applied.jobId);
         }
       } catch {
@@ -3621,6 +4691,177 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     };
 
     hydrateLatestTopRatingsJob();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const applyMapStatsJobStatus = (status, jobIdOverride = "") => {
+    const jobId = String(jobIdOverride || status?.job_id || "");
+    const processed = Number(status?.processed_teams || 0);
+    const total = Number(status?.total_teams || 0);
+    const ok = Number(status?.ok || 0);
+    const failed = Number(status?.failed || 0);
+    const nextStatus = String(status?.status || "queued");
+    const lastError = String(status?.last_error || status?.error || "");
+
+    setMapStatsJobStatus(nextStatus);
+    setMapStatsJobId(jobId);
+    setMapStatsJobProcessed(processed);
+    setMapStatsJobTotal(total);
+    setMapStatsJobOk(ok);
+    setMapStatsJobFailed(failed);
+    setMapStatsJobLastError(lastError);
+
+    const startedAtMs = getBatchStartedAtMs(status);
+    if (processed > 0 && total > processed && ["queued", "running", "pausing", "canceling"].includes(nextStatus)) {
+      const elapsedSeconds = Math.max(1, (Date.now() - startedAtMs) / 1000);
+      const rate = processed / elapsedSeconds;
+      setMapStatsJobEtaSeconds(rate > 0 ? (total - processed) / rate : null);
+    } else if (total > 0 && processed >= total) {
+      setMapStatsJobEtaSeconds(0);
+    } else {
+      setMapStatsJobEtaSeconds(null);
+    }
+
+    return { jobId, processed, total, ok, failed, nextStatus, lastError };
+  };
+
+  const pollMapStatsJob = async (jobId) => {
+    if (!jobId || mapStatsJobPollingRef.current) return;
+    mapStatsJobPollingRef.current = true;
+    const refreshOpenTeamMapStats = async () => {
+      if (!selectedTeam) return;
+      try {
+        const refreshedTeam = await api.get(`/teams/${selectedTeam}`);
+        setTeamForm((prev) => ({
+          ...prev,
+          hltv_team_id: refreshedTeam?.hltv_team_id ?? prev.hltv_team_id,
+          map_stats_json: refreshedTeam?.map_stats_json || "",
+          map_stats_imported_at: refreshedTeam?.map_stats_imported_at || "",
+          map_stats_source_url: refreshedTeam?.map_stats_source_url || "",
+        }));
+      } catch {
+        // The main list refresh still covers this; the direct modal refresh is just for immediacy.
+      }
+    };
+    try {
+      let done = false;
+      while (!done) {
+        const status = await api.get(`/teams/map-stats-import/job/${jobId}`);
+        const { ok, failed, nextStatus, lastError } = applyMapStatsJobStatus(status, jobId);
+
+        if (nextStatus === "completed") {
+          notify(`Map stats imported: ${ok} ok, ${failed} failed`);
+          await refresh();
+          await refreshOpenTeamMapStats();
+          done = true;
+          break;
+        }
+        if (nextStatus === "failed") {
+          notify(lastError || "Map stats import failed.");
+          done = true;
+          break;
+        }
+        if (["paused", "canceled"].includes(nextStatus)) {
+          await refresh();
+          await refreshOpenTeamMapStats();
+          done = true;
+          break;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+      }
+    } catch (e) {
+      setMapStatsJobStatus("failed");
+      setMapStatsJobLastError(String(e?.message || "Failed to poll map stats job."));
+      notify(`Map stats import failed: ${e?.message || "unknown error"}`);
+    } finally {
+      mapStatsJobPollingRef.current = false;
+    }
+  };
+
+  const startMapStatsImportJob = async (missingOnly = false, teamIds = []) => {
+    setMapStatsJobStatus("queued");
+    setMapStatsJobProcessed(0);
+    setMapStatsJobTotal(0);
+    setMapStatsJobOk(0);
+    setMapStatsJobFailed(0);
+    setMapStatsJobLastError("");
+    setMapStatsJobEtaSeconds(null);
+    try {
+      const start = await api.post("/teams/map-stats-import/start", { missing_only: missingOnly, team_ids: teamIds });
+      const jobId = String(start?.job_id || "");
+      if (!jobId) throw new Error("Failed to start map stats import job.");
+      setMapStatsJobId(jobId);
+      await pollMapStatsJob(jobId);
+    } catch (e) {
+      setMapStatsJobStatus("failed");
+      setMapStatsJobLastError(String(e?.message || "Failed to start map stats import job."));
+      notify(`Map stats import failed: ${e?.message || "unknown error"}`);
+    }
+  };
+
+  const pauseMapStatsJob = async () => {
+    if (!mapStatsJobId) return;
+    setMapStatsJobStatus("pausing");
+    try {
+      const status = await api.post(`/teams/map-stats-import/job/${mapStatsJobId}/pause`, {});
+      const applied = applyMapStatsJobStatus(status, mapStatsJobId);
+      if (["pausing", "running", "queued"].includes(applied.nextStatus)) {
+        pollMapStatsJob(mapStatsJobId);
+      }
+    } catch (e) {
+      setMapStatsJobStatus("running");
+      notify(`Failed to pause map stats import: ${e?.message || "unknown error"}`);
+    }
+  };
+
+  const cancelMapStatsJob = async () => {
+    if (!mapStatsJobId) return;
+    setMapStatsJobStatus("canceling");
+    try {
+      const status = await api.post(`/teams/map-stats-import/job/${mapStatsJobId}/cancel`, {});
+      const applied = applyMapStatsJobStatus(status, mapStatsJobId);
+      if (["canceling", "running", "queued", "pausing"].includes(applied.nextStatus)) {
+        pollMapStatsJob(mapStatsJobId);
+      }
+    } catch (e) {
+      notify(`Failed to cancel map stats import: ${e?.message || "unknown error"}`);
+    }
+  };
+
+  const resumeMapStatsJob = async () => {
+    if (!mapStatsJobId) return;
+    try {
+      const status = await api.post(`/teams/map-stats-import/job/${mapStatsJobId}/resume`, {});
+      const applied = applyMapStatsJobStatus(status, mapStatsJobId);
+      if (["queued", "running", "pausing"].includes(applied.nextStatus)) {
+        pollMapStatsJob(mapStatsJobId);
+      }
+    } catch (e) {
+      notify(`Failed to resume map stats import: ${e?.message || "unknown error"}`);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const hydrateLatestMapStatsJob = async () => {
+      try {
+        const latest = await api.get("/teams/map-stats-import/latest");
+        if (cancelled || !latest?.exists) return;
+        if (latest?.status === "completed") return;
+        const applied = applyMapStatsJobStatus(latest);
+        if (["queued", "running", "pausing", "canceling"].includes(applied.nextStatus)) {
+          pollMapStatsJob(applied.jobId);
+        }
+      } catch {
+        // The map-stats progress panel is optional on startup.
+      }
+    };
+
+    hydrateLatestMapStatsJob();
     return () => {
       cancelled = true;
     };
@@ -3661,6 +4902,11 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     }
   };
 
+  const refreshSelectedTeamMapStats = async () => {
+    if (!selectedTeam) return;
+    await startMapStatsImportJob(false, [selectedTeam]);
+  };
+
   const hasJsonEntries = (raw) => {
     if (!raw) return false;
     try {
@@ -3674,59 +4920,121 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
   };
 
   const hasBoostersAndRoles = (player) => hasJsonEntries(player.boosters_json) && hasJsonEntries(player.roles_json);
+  const currentMapPool = ["Mirage", "Inferno", "Nuke", "Ancient", "Anubis", "Dust2", "Overpass"];
+  const canonicalMapName = (value) => {
+    const raw = String(value || "").trim();
+    const key = raw.toLowerCase().replace(/_/g, " ");
+    if (key === "dust 2" || key === "dust2" || key === "de dust2") return "Dust2";
+    const found = currentMapPool.find((map) => map.toLowerCase() === key);
+    return found || raw;
+  };
+  const formatTeamPct = (value, digits = 1) => {
+    const n = Number(value);
+    return Number.isFinite(n) ? `${(n * 100).toFixed(digits)}%` : "-";
+  };
+  const teamMapStatsRows = useMemo(() => {
+    try {
+      const parsed = JSON.parse(String(teamForm.map_stats_json || "[]"));
+      if (!Array.isArray(parsed)) return [];
+      const byMap = {};
+      parsed.forEach((row) => {
+        const map = canonicalMapName(row?.map);
+        if (map) byMap[map] = row;
+      });
+      return currentMapPool
+        .map((map) => {
+          const row = byMap[map];
+          if (!row) return null;
+          return {
+            map,
+            played: Number(row.played || 0),
+            winRate: Number(row.win_rate || 0),
+            pickRate: Number(row.pick_rate || 0),
+            banRate: Number(row.ban_rate || 0),
+          };
+        })
+        .filter(Boolean);
+    } catch {
+      return [];
+    }
+  }, [teamForm.map_stats_json]);
+  const teamMapStatsTotalPlayed = useMemo(
+    () => teamMapStatsRows.reduce((sum, row) => sum + Math.max(0, Number(row.played || 0)), 0),
+    [teamMapStatsRows]
+  );
   const toNum = (v, fallback = 0) => {
     const n = Number(v);
     return Number.isFinite(n) ? n : fallback;
   };
-  const setPlayerSortByColumn = (column) => {
-    const nextSort = {
-      name: playerSort === "name_asc" ? "name_desc" : "name_asc",
-      id: playerSort === "id_asc" ? "id_desc" : "id_asc",
-      team: playerSort === "team_asc" ? "team_desc" : "team_asc",
-      rating: playerSort === "rating_desc" ? "rating_asc" : "rating_desc",
-      boost: playerSort === "boost_desc" ? "boost_asc" : "boost_desc",
-    }[column];
-    if (nextSort) setPlayerSort(nextSort);
-  };
-  const playerSortArrow = (column) => {
-    const activeSorts = {
-      name: ["name_asc", "name_desc"],
-      id: ["id_asc", "id_desc"],
-      team: ["team_asc", "team_desc"],
-      rating: ["rating_asc", "rating_desc"],
-      boost: ["boost_asc", "boost_desc"],
-    }[column] || [];
-    if (!activeSorts.includes(playerSort)) return "↕";
-    return playerSort.endsWith("_asc") ? "↑" : "↓";
-  };
   const batchTopRatingsProgressPct =
     batchTopRatingsTotal > 0 ? Math.min(100, Math.max(0, (batchTopRatingsProcessed / batchTopRatingsTotal) * 100)) : 0;
   const showBatchTopRatingsProgress = batchTopRatingsStatus !== "idle";
-  const batchTopRatingsActive = ["queued", "running", "pausing"].includes(batchTopRatingsStatus);
+  const batchTopRatingsActive = ["queued", "running", "pausing", "canceling"].includes(batchTopRatingsStatus);
   const batchTopRatingsResumable = ["paused", "failed"].includes(batchTopRatingsStatus);
+  const mapStatsJobProgressPct =
+    mapStatsJobTotal > 0 ? Math.min(100, Math.max(0, (mapStatsJobProcessed / mapStatsJobTotal) * 100)) : 0;
+  const showMapStatsJobProgress = mapStatsJobStatus !== "idle" && mapStatsJobStatus !== "completed";
+  const mapStatsJobActive = ["queued", "running", "pausing", "canceling"].includes(mapStatsJobStatus);
+  const mapStatsJobResumable = ["paused", "failed"].includes(mapStatsJobStatus);
   const missingTopRatingsCount = (players || []).filter((player) => !playerHasCompleteTopRatings(player)).length;
   const batchTopRatingsStatusLabel =
     {
       completed: "Completed",
       failed: "Failed",
+      canceled: "Canceled",
+      canceling: "Canceling",
       paused: "Paused",
       pausing: "Pausing",
       running: "Running",
       queued: "Queued",
     }[batchTopRatingsStatus] || "Queued";
-  const playerTopxRows = useMemo(() => {
+  const mapStatsJobStatusLabel =
+    {
+      completed: "Completed",
+      failed: "Failed",
+      canceled: "Canceled",
+      canceling: "Canceling",
+      paused: "Paused",
+      pausing: "Pausing",
+      running: "Running",
+      queued: "Queued",
+    }[mapStatsJobStatus] || "Queued";
+  const playerTopxBucketRows = useMemo(() => {
     const rows = Array.isArray(playerCurve?.bucket_rows) ? playerCurve.bucket_rows : [];
     return rows
       .map((row) => ({
         tier: Number(row?.tier),
         tierLabel: String(row?.tier_label || `Top ${Number(row?.tier)}`),
+        rankMidpoint: Number(row?.rank_midpoint),
         bucketRating: Number.isFinite(Number(row?.bucket_rating)) ? Number(row.bucket_rating) : null,
         bucketDelta: Number.isFinite(Number(row?.bucket_delta)) ? Number(row.bucket_delta) : null,
+        rawBucketDelta: Number.isFinite(Number(row?.raw_bucket_delta)) ? Number(row.raw_bucket_delta) : null,
+        shrinkageWeight: Number.isFinite(Number(row?.shrinkage_weight)) ? Number(row.shrinkage_weight) : null,
         maps: Number(row?.maps || 0),
       }))
       .filter((row) => Number.isFinite(row.tier) && row.tier > 0 && row.tier < 100)
       .sort((a, b) => a.tier - b.tier);
   }, [playerCurve]);
+  const playerTopxRows = useMemo(() => {
+    const rows = Array.isArray(playerCurve?.graph_rows) ? playerCurve.graph_rows : [];
+    if (rows.length === 0) {
+      return playerTopxBucketRows
+        .map((row) => ({
+          rank: row.tier,
+          rankLabel: String(row.tier),
+          bucketRating: row.bucketRating,
+        }))
+        .filter((row) => Number.isFinite(row.rank) && row.rank > 0 && row.bucketRating !== null);
+    }
+    return rows
+      .map((row) => ({
+        rank: Number(row?.rank),
+        rankLabel: String(row?.rank_label || row?.rank || ""),
+        bucketRating: Number.isFinite(Number(row?.bucket_rating)) ? Number(row.bucket_rating) : null,
+      }))
+      .filter((row) => Number.isFinite(row.rank) && row.rank > 0 && row.bucketRating !== null)
+      .sort((a, b) => a.rank - b.rank);
+  }, [playerCurve, playerTopxBucketRows]);
   const playerTopxRatingAxis = useMemo(() => {
     return buildNiceStepAxis(
       playerTopxRows.map((row) => row.bucketRating),
@@ -3801,10 +5109,18 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
           return toNum(a.hltv_rank, 9999) - toNum(b.hltv_rank, 9999);
         case "hltv_desc":
           return toNum(b.hltv_rank, 9999) - toNum(a.hltv_rank, 9999);
+        case "hltv_points_asc":
+          return toNum(a.hltv_points) - toNum(b.hltv_points);
+        case "hltv_points_desc":
+          return toNum(b.hltv_points) - toNum(a.hltv_points);
         case "vrs_asc":
           return toNum(a.vrs_rank, 9999) - toNum(b.vrs_rank, 9999);
         case "vrs_desc":
           return toNum(b.vrs_rank, 9999) - toNum(a.vrs_rank, 9999);
+        case "vrs_points_asc":
+          return toNum(a.vrs_points) - toNum(b.vrs_points);
+        case "vrs_points_desc":
+          return toNum(b.vrs_points) - toNum(a.vrs_points);
         case "name_asc":
         default:
           return String(a.name || "").localeCompare(String(b.name || ""));
@@ -3859,6 +5175,11 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                     {batchTopRatingsStatus === "pausing" ? "Pausing..." : "Pause"}
                   </button>
                 )}
+                {batchTopRatingsActive && batchTopRatingsJobId && (
+                  <button className="danger" onClick={cancelBatchTopRatingsJob} disabled={batchTopRatingsStatus === "canceling"}>
+                    {batchTopRatingsStatus === "canceling" ? "Canceling..." : "Cancel"}
+                  </button>
+                )}
                 {batchTopRatingsResumable && batchTopRatingsJobId && (
                   <button className="secondary" onClick={resumeBatchTopRatingsJob} disabled={batchTopRatingsBusy}>
                     Resume
@@ -3871,7 +5192,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                 <p className="muted">
                   Top-X progress: {batchTopRatingsProcessed.toLocaleString()} / {batchTopRatingsTotal.toLocaleString()} | ok{" "}
                   {batchTopRatingsOk} | failed {batchTopRatingsFailed}
-                  {["queued", "running", "pausing"].includes(batchTopRatingsStatus) && batchTopRatingsTotal > batchTopRatingsProcessed
+                  {["queued", "running", "pausing", "canceling"].includes(batchTopRatingsStatus) && batchTopRatingsTotal > batchTopRatingsProcessed
                     ? ` | ETA: ${formatBatchEta(batchTopRatingsEtaSeconds)}`
                     : ""}
                 </p>
@@ -3895,31 +5216,20 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
               </colgroup>
               <thead>
                 <tr>
-                  <th>
-                    <button className="table-sort-button" onClick={() => setPlayerSortByColumn("name")}>
-                      Name <span>{playerSortArrow("name")}</span>
-                    </button>
-                  </th>
-                  <th>
-                    <button className="table-sort-button" onClick={() => setPlayerSortByColumn("id")}>
-                      ID <span>{playerSortArrow("id")}</span>
-                    </button>
-                  </th>
-                  <th>
-                    <button className="table-sort-button" onClick={() => setPlayerSortByColumn("team")}>
-                      Team <span>{playerSortArrow("team")}</span>
-                    </button>
-                  </th>
-                  <th>
-                    <button className="table-sort-button" onClick={() => setPlayerSortByColumn("rating")}>
-                      Rating <span>{playerSortArrow("rating")}</span>
-                    </button>
-                  </th>
-                  <th title="Boosters and Roles imported">
-                    <button className="table-sort-button" onClick={() => setPlayerSortByColumn("boost")}>
-                      Boost/Role <span>{playerSortArrow("boost")}</span>
-                    </button>
-                  </th>
+                  <SortHeader sortValue={playerSort} asc="name_asc" desc="name_desc" onChange={setPlayerSort}>Name</SortHeader>
+                  <SortHeader sortValue={playerSort} asc="id_asc" desc="id_desc" onChange={setPlayerSort}>ID</SortHeader>
+                  <SortHeader sortValue={playerSort} asc="team_asc" desc="team_desc" onChange={setPlayerSort}>Team</SortHeader>
+                  <SortHeader sortValue={playerSort} asc="rating_asc" desc="rating_desc" defaultDirection="desc" onChange={setPlayerSort}>Rating</SortHeader>
+                  <SortHeader
+                    sortValue={playerSort}
+                    asc="boost_asc"
+                    desc="boost_desc"
+                    defaultDirection="desc"
+                    onChange={setPlayerSort}
+                    title="Boosters and Roles imported"
+                  >
+                    Boost/Role
+                  </SortHeader>
                 </tr>
               </thead>
               <tbody>
@@ -4049,24 +5359,31 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                 <div className="stack">
                   {playerCurveLoading && <p className="muted">Loading Top-X graph...</p>}
                   {playerCurveError && <p className="error">{playerCurveError}</p>}
-                  {!playerCurveLoading && !playerCurveError && playerTopxRows.length === 0 && (
+                  {!playerCurveLoading && !playerCurveError && playerTopxBucketRows.length === 0 && (
                     <p className="muted">No adjusted Top-X bucket data available yet.</p>
                   )}
-                  {playerTopxRows.length > 0 && (
+                  {playerTopxBucketRows.length > 0 && (
                     <>
                       <p className="muted">
                         Overall rating: {Number(playerCurve?.base_rating || playerForm.rating || 0).toFixed(3)} | Sample maps:{" "}
-                        {Math.round(Number(playerCurve?.sample_maps || 0))}
+                        {Math.round(Number(playerCurve?.sample_maps || 0))} | Weight base:{" "}
+                        {Math.round(Number(playerCurve?.total_maps_proxy || 0))}
                       </p>
                       <div className="value-chart-wrap">
                         <ResponsiveContainer width="100%" height={320}>
                           <ComposedChart data={playerTopxRows} margin={{ top: 12, right: 18, left: 6, bottom: 12 }}>
                             <CartesianGrid stroke="#284061" strokeDasharray="3 3" />
                             <XAxis
-                              dataKey="tierLabel"
+                              type="number"
+                              dataKey="rank"
+                              domain={[1, 50]}
+                              ticks={[1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50]}
+                              interval={0}
+                              minTickGap={0}
                               tick={{ fill: "#9fc5ff", fontSize: 12 }}
                               axisLine={{ stroke: "#365a89" }}
                               tickLine={{ stroke: "#365a89" }}
+                              tickFormatter={(v) => String(v)}
                             />
                             <YAxis
                               tick={{ fill: "#9fc5ff", fontSize: 12 }}
@@ -4074,6 +5391,8 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                               tickLine={{ stroke: "#365a89" }}
                               domain={playerTopxRatingAxis.domain}
                               ticks={playerTopxRatingAxis.ticks}
+                              interval={0}
+                              minTickGap={0}
                               tickFormatter={(v) => Number(v).toFixed(2)}
                             />
                             <Tooltip
@@ -4084,9 +5403,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                               }}
                               labelFormatter={(_, payload) => {
                                 const row = payload?.[0]?.payload || {};
-                                const delta = Number(row.bucketDelta);
-                                const deltaText = Number.isFinite(delta) ? `${delta >= 0 ? "+" : ""}${delta.toFixed(3)}` : "N/A";
-                                return `${row.tierLabel || "-"} | Delta ${deltaText} | Maps ${Math.round(Number(row.maps || 0))}`;
+                                return `Rank ${row.rankLabel || row.rank || "-"}`;
                               }}
                             />
                             <Legend wrapperStyle={{ color: "#9fc5ff" }} />
@@ -4109,11 +5426,12 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                             <th>Bucket</th>
                             <th>Adjusted Rating</th>
                             <th>Delta vs Overall</th>
+                            <th>Sample Weight</th>
                             <th>Maps</th>
                           </tr>
                         </thead>
                         <tbody>
-                          {playerTopxRows.map((row) => (
+                          {playerTopxBucketRows.map((row) => (
                             <tr key={`topx-row-${row.tier}`}>
                               <td>{row.tierLabel}</td>
                               <td>{Number.isFinite(row.bucketRating) ? row.bucketRating.toFixed(3) : "-"}</td>
@@ -4122,6 +5440,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                                   ? `${row.bucketDelta >= 0 ? "+" : ""}${row.bucketDelta.toFixed(3)}`
                                   : "-"}
                               </td>
+                              <td>{Number.isFinite(row.shrinkageWeight) ? `${Math.round(row.shrinkageWeight * 100)}%` : "-"}</td>
                               <td>{Math.round(Number(row.maps || 0))}</td>
                             </tr>
                           ))}
@@ -4258,6 +5577,14 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
 
               <section className="team-detail-block">
                 <h4 className="team-detail-heading">Rankings</h4>
+                <div className="grid two">
+                  <Input
+                    label="HLTV Team ID"
+                    value={teamForm.hltv_team_id}
+                    onChange={(v) => setTeamForm({ ...teamForm, hltv_team_id: v })}
+                    placeholder="e.g. 12468"
+                  />
+                </div>
                 <div className="team-stats-grid">
                   <div className="team-stat-card">
                     <div className="team-stat-label">HLTV Rank</div>
@@ -4277,8 +5604,55 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                   </div>
                 </div>
               </section>
+
+              <section className="team-detail-block">
+                <div className="team-detail-heading-row">
+                  <div>
+                    <h4 className="team-detail-heading">Map Stats</h4>
+                    {teamMapStatsRows.length > 0 && (
+                      <p className="muted">Last 3 months: {teamMapStatsTotalPlayed.toLocaleString()} maps played</p>
+                    )}
+                  </div>
+                  <button className="secondary" onClick={refreshSelectedTeamMapStats} disabled={!selectedTeam || mapStatsJobActive}>
+                    {mapStatsJobActive ? "Importing..." : "Import Map Stats"}
+                  </button>
+                </div>
+                {showMapStatsJobProgress && (
+                  <div className="team-map-stats-progress">
+                    <p className="muted">
+                      {mapStatsJobProcessed.toLocaleString()} / {mapStatsJobTotal.toLocaleString()} | ok {mapStatsJobOk} | failed{" "}
+                      {mapStatsJobFailed}
+                      {mapStatsJobActive && mapStatsJobTotal > mapStatsJobProcessed ? ` | ETA: ${formatBatchEta(mapStatsJobEtaSeconds)}` : ""}
+                    </p>
+                    <div className="progress">
+                      <div className="progress-bar determinate" style={{ width: `${mapStatsJobProgressPct}%` }} />
+                    </div>
+                    <p className="muted">Status: {mapStatsJobStatusLabel}</p>
+                  </div>
+                )}
+                <div className="team-map-stats-grid">
+                  {teamMapStatsRows.length > 0 ? (
+                    teamMapStatsRows.map((row) => (
+                      <div className="team-map-stat-card" key={`team-map-${row.map}`}>
+                        <div className="team-map-stat-title">{row.map}</div>
+                        <div className="team-map-stat-main">{formatTeamPct(row.winRate, 1)}</div>
+                        <div className="team-map-stat-split">
+                          <span>Pick {formatTeamPct(row.pickRate, 1)}</span>
+                          <span>Ban {formatTeamPct(row.banRate, 1)}</span>
+                          <span>{Number(row.played || 0)} maps</span>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="team-map-stat-empty">No current-pool map stats imported</div>
+                  )}
+                </div>
+              </section>
             </div>
             <div className="actions">
+              <button className="primary" onClick={saveTeam} disabled={!teamForm.name}>
+                Save Team
+              </button>
               <button className="danger" onClick={deleteTeam} disabled={!selectedTeam}>
                 Delete Team
               </button>
@@ -4302,36 +5676,57 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                 <button className="primary" onClick={refreshAllRankingsToday} disabled={rankingsRefreshBusy || teams.length === 0}>
                   {rankingsRefreshBusy ? "Refreshing Rankings..." : "Refresh Rankings (HLTV + VRS)"}
                 </button>
+                <button
+                  className="secondary"
+                  onClick={() => startMapStatsImportJob(false)}
+                  disabled={mapStatsJobActive || rankingsRefreshBusy || teams.length === 0}
+                >
+                  {mapStatsJobActive ? `Importing Map Stats ${mapStatsJobProcessed}/${mapStatsJobTotal}` : "Import All Map Stats"}
+                </button>
+                {mapStatsJobActive && mapStatsJobId && (
+                  <button className="secondary" onClick={pauseMapStatsJob} disabled={mapStatsJobStatus === "pausing"}>
+                    {mapStatsJobStatus === "pausing" ? "Pausing..." : "Pause"}
+                  </button>
+                )}
+                {mapStatsJobActive && mapStatsJobId && (
+                  <button className="danger" onClick={cancelMapStatsJob} disabled={mapStatsJobStatus === "canceling"}>
+                    {mapStatsJobStatus === "canceling" ? "Canceling..." : "Cancel"}
+                  </button>
+                )}
+                {mapStatsJobResumable && mapStatsJobId && (
+                  <button className="secondary" onClick={resumeMapStatsJob}>
+                    Resume
+                  </button>
+                )}
                 <span className="teams-meta">{filteredSortedTeams.length} teams shown</span>
               </div>
               <div className="grid two teams-filters">
                 <Input label="Search Teams" value={teamSearch} onChange={setTeamSearch} placeholder="Name, ID, or player" />
-                <Select
-                  label="Sort Teams"
-                  value={teamSort}
-                  onChange={setTeamSort}
-                  options={[
-                    { value: "name_asc", label: "Name A-Z" },
-                    { value: "name_desc", label: "Name Z-A" },
-                    { value: "id_asc", label: "ID low-high" },
-                    { value: "id_desc", label: "ID high-low" },
-                    { value: "hltv_asc", label: "HLTV rank low-high" },
-                    { value: "hltv_desc", label: "HLTV rank high-low" },
-                    { value: "vrs_asc", label: "VRS rank low-high" },
-                    { value: "vrs_desc", label: "VRS rank high-low" },
-                  ]}
-                />
               </div>
             </div>
+            {showMapStatsJobProgress && (
+              <div className="card sub">
+                <p className="muted">
+                  Map stats progress: {mapStatsJobProcessed.toLocaleString()} / {mapStatsJobTotal.toLocaleString()} | ok {mapStatsJobOk} |
+                  failed {mapStatsJobFailed}
+                  {mapStatsJobActive && mapStatsJobTotal > mapStatsJobProcessed ? ` | ETA: ${formatBatchEta(mapStatsJobEtaSeconds)}` : ""}
+                </p>
+                <div className="progress">
+                  <div className="progress-bar determinate" style={{ width: `${mapStatsJobProgressPct}%` }} />
+                </div>
+                <p className="muted">Status: {mapStatsJobStatusLabel}</p>
+                {mapStatsJobLastError && <p className="muted">Last error: {mapStatsJobLastError}</p>}
+              </div>
+            )}
             <table>
               <thead>
                 <tr>
-                  <th>Name</th>
-                  <th>ID</th>
-                  <th>HLTV Rank</th>
-                  <th>HLTV Points</th>
-                  <th>VRS Rank</th>
-                  <th>VRS Points</th>
+                  <SortHeader sortValue={teamSort} asc="name_asc" desc="name_desc" onChange={setTeamSort}>Name</SortHeader>
+                  <SortHeader sortValue={teamSort} asc="id_asc" desc="id_desc" onChange={setTeamSort}>ID</SortHeader>
+                  <SortHeader sortValue={teamSort} asc="hltv_asc" desc="hltv_desc" onChange={setTeamSort}>HLTV Rank</SortHeader>
+                  <SortHeader sortValue={teamSort} asc="hltv_points_asc" desc="hltv_points_desc" defaultDirection="desc" onChange={setTeamSort}>HLTV Points</SortHeader>
+                  <SortHeader sortValue={teamSort} asc="vrs_asc" desc="vrs_desc" onChange={setTeamSort}>VRS Rank</SortHeader>
+                  <SortHeader sortValue={teamSort} asc="vrs_points_asc" desc="vrs_points_desc" defaultDirection="desc" onChange={setTeamSort}>VRS Points</SortHeader>
                   <th>Players</th>
                 </tr>
               </thead>
@@ -4583,6 +5978,441 @@ function AdminTab({ refresh, notify }) {
   );
 }
 
+function ModelLabTab() {
+  const [trainLimit, setTrainLimit] = useState("0");
+  const [testLimit, setTestLimit] = useState("0");
+  const [randomSplit, setRandomSplit] = useState(false);
+  const [fetchMissingMapStats, setFetchMissingMapStats] = useState(false);
+  const [dbMatchCount, setDbMatchCount] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [result, setResult] = useState(null);
+  const [selectedBreakdownRow, setSelectedBreakdownRow] = useState(null);
+
+  const pct = (value, digits = 1) => {
+    const n = Number(value);
+    return Number.isFinite(n) ? `${(n * 100).toFixed(digits)}%` : "-";
+  };
+  const num = (value, digits = 3) => {
+    const n = Number(value);
+    return Number.isFinite(n) ? n.toFixed(digits) : "-";
+  };
+  const featureLabel = (feature) =>
+    ({
+      hltv_gap: "HLTV rank gap",
+      hltv_level: "HLTV matchup level",
+      hltv_gap_level: "HLTV gap x level",
+      vrs_gap: "VRS rank gap",
+      vrs_level: "VRS matchup level",
+      vrs_gap_level: "VRS gap x level",
+      map_win_gap: "Map win gap",
+      pick_gap: "Pick gap",
+      ban_gap: "Ban gap",
+      played_pct_gap: "Played share gap",
+      map_stats_available: "Map stats available",
+    }[feature] || feature);
+  const toPositiveInt = (value, fallback = 0) => {
+    const parsed = Number.parseInt(String(value ?? ""), 10);
+    return Number.isFinite(parsed) ? Math.max(0, parsed) : fallback;
+  };
+
+  useEffect(() => {
+    let live = true;
+    api
+      .get("/events/hltv-results?limit=1&offset=0")
+      .then((data) => {
+        if (!live) return;
+        setDbMatchCount(Number(data?.total || data?.count || 0));
+      })
+      .catch(() => {
+        if (live) setDbMatchCount(0);
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  const effectiveSlice = (startValue, limitValue) => {
+    const rawStart = toPositiveInt(startValue, 0);
+    const rawLimit = toPositiveInt(limitValue, 0);
+    const dbTotal = Math.max(0, Number(result?.db_matches || dbMatchCount || 0));
+    if (dbTotal <= 0) {
+      return { start: rawStart, length: rawLimit, end: rawStart + rawLimit };
+    }
+    const start = Math.min(rawStart, dbTotal);
+    const length = Math.min(rawLimit, Math.max(0, dbTotal - start));
+    return { start, length, end: start + length };
+  };
+
+  const sliceRangeLabel = (start, end) => {
+    if (end <= start) return "none";
+    return `${start.toLocaleString()}-${(end - 1).toLocaleString()}`;
+  };
+
+  const timeline = useMemo(() => {
+    const dbTotal = Math.max(0, Number(result?.db_matches || dbMatchCount || 0));
+    const test = effectiveSlice(0, testLimit);
+    const train = effectiveSlice(test.length, trainLimit);
+    const total = Math.max(dbTotal, train.end, test.end, 1);
+    const overlap = Math.max(0, Math.min(train.end, test.end) - Math.max(train.start, test.start));
+    const segmentStyle = (start, length) => ({
+      left: `${(start / total) * 100}%`,
+      width: `${length > 0 ? Math.max(1.5, (length / total) * 100) : 0}%`,
+    });
+    return {
+      total,
+      overlap,
+      dbTotal,
+      trainStart: train.start,
+      trainEnd: train.end,
+      testStart: test.start,
+      testEnd: test.end,
+      dbStyle: segmentStyle(0, dbTotal),
+      trainStyle: segmentStyle(train.start, train.length),
+      testStyle: segmentStyle(test.start, test.length),
+    };
+  }, [trainLimit, testLimit, dbMatchCount, result?.db_matches]);
+
+  const rankEffectLevelBands = useMemo(
+    () => (result?.rank_effect_curve?.level_bands || []).filter((band) => Array.isArray(band.rows) && band.rows.length > 0),
+    [result?.rank_effect_curve?.level_bands]
+  );
+
+  const RankEffectTooltip = ({ active, payload }) => {
+    if (!active || !payload?.length) return null;
+    const row = payload[0]?.payload || {};
+    return (
+      <div className="chart-tooltip">
+        <strong>Gap {num(row.gap_min, 0)} to {num(row.gap_max, 0)}</strong>
+        <span>Matches {Number(row.n || 0).toLocaleString()}</span>
+        <span>Avg gap {num(row.avg_gap, 2)} | Avg level {num(row.avg_level, 2)}</span>
+        <span>Predicted {pct(row.predicted_winrate, 2)}</span>
+        <span>Actual {pct(row.actual_winrate, 2)}</span>
+      </div>
+    );
+  };
+
+  const run = async () => {
+    setBusy(true);
+    setError("");
+    setResult(null);
+    setSelectedBreakdownRow(null);
+    try {
+      const params = new URLSearchParams({
+        train_limit: String(toPositiveInt(trainLimit, 0)),
+        test_limit: String(toPositiveInt(testLimit, 0)),
+        random_split: randomSplit ? "true" : "false",
+        fetch_missing_map_stats: fetchMissingMapStats ? "true" : "false",
+      });
+      const data = await api.get(`/events/hltv-results/map-model-lab?${params.toString()}`);
+      if (data?.detail) {
+        setError(String(data.detail));
+        return;
+      }
+      setResult(data);
+    } catch (e) {
+      setError(e?.message || "Failed to run model lab.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Section title="Map Model Lab">
+      <div className="stack">
+        <div className="grid two">
+          <Input label="Train Limit" value={trainLimit} onChange={setTrainLimit} />
+          <Input label="Test Limit" value={testLimit} onChange={setTestLimit} />
+        </div>
+        <div className="actions" style={{ marginTop: 0 }}>
+          <label className="checkbox-inline">
+            <input type="checkbox" checked={randomSplit} onChange={(e) => setRandomSplit(e.target.checked)} disabled={busy} />
+            <span>Random train/test split</span>
+          </label>
+          <label className="checkbox-inline">
+            <input
+              type="checkbox"
+              checked={fetchMissingMapStats}
+              onChange={(e) => setFetchMissingMapStats(e.target.checked)}
+              disabled={busy}
+            />
+            <span>Fetch missing historical map stats</span>
+          </label>
+          <button className="primary" onClick={run} disabled={busy}>
+            {busy ? "Running..." : "Train & Evaluate"}
+          </button>
+        </div>
+        <div className="model-slice-card">
+          <div className="model-slice-head">
+            <div>
+              <h3>Stored Match Timeline</h3>
+              <p className="muted">Left is newest. Ordered mode tests on newest matches and trains on the next older matches.</p>
+            </div>
+            <span className="pill">DB only</span>
+          </div>
+          <div className="model-slice-track" aria-label="Training and testing slices across stored matches">
+            <div className="model-slice-zero">Newest</div>
+            <div className="model-slice-end">Older</div>
+            <div className="model-slice-segment db" style={timeline.dbStyle}>
+              DB {timeline.dbTotal.toLocaleString()}
+            </div>
+            <div className="model-slice-segment test" style={timeline.testStyle}>
+              Test
+            </div>
+            <div className="model-slice-segment train" style={timeline.trainStyle}>
+              Train
+            </div>
+          </div>
+          <div className="model-slice-meta">
+            <span>DB matches {timeline.dbTotal.toLocaleString()}</span>
+            <span>Test rows {sliceRangeLabel(timeline.testStart, timeline.testEnd)}</span>
+            <span>Train rows {sliceRangeLabel(timeline.trainStart, timeline.trainEnd)}</span>
+            {randomSplit && <span className="warning-text">Random split ignores timeline order</span>}
+            {timeline.overlap > 0 && <span className="warning-text">Overlap: {timeline.overlap.toLocaleString()} matches</span>}
+          </div>
+        </div>
+        {error && <p className="error">{error}</p>}
+        {result && (
+          <div className="stack">
+            <div className="grid four">
+              <div className="card sub">
+                <h3>Train</h3>
+                <p className="muted">Matches {Number(result.train?.matches_loaded || 0).toLocaleString()}</p>
+                <p className="muted">Maps {Number(result.train?.map_samples || 0).toLocaleString()}</p>
+                <p className="muted">{result.split?.random ? "Random sample" : "Older holdout-safe rows"}</p>
+              </div>
+              <div className="card sub">
+                <h3>Test</h3>
+                <p className="muted">Matches {Number(result.test?.matches_loaded || 0).toLocaleString()}</p>
+                <p className="muted">Maps {Number(result.test?.map_samples || 0).toLocaleString()}</p>
+                <p className="muted">
+                  {result.split?.random ? `Random seed ${Number(result.split?.random_seed || 0).toLocaleString()}` : "Newest rows"}
+                </p>
+              </div>
+              <div className="card sub">
+                <h3>With Map Data</h3>
+                <p className="muted">Winner {pct(result.metrics?.winner_accuracy, 1)}</p>
+                <p className="muted">Score MAE {Number(result.metrics?.score_mae || 0).toFixed(2)}</p>
+                <p className="muted">Brier {Number(result.metrics?.brier || 0).toFixed(3)}</p>
+                <p className="muted">
+                  Historical maps kept {pct(result.input_summary?.train?.map_stats_coverage, 1)} (
+                  {Number(result.input_summary?.train?.maps || 0).toLocaleString()} /{" "}
+                  {Number(result.input_summary?.train?.candidate_maps || 0).toLocaleString()})
+                </p>
+              </div>
+              <div className="card sub">
+                <h3>Rank Only</h3>
+                <p className="muted">Winner {pct(result.rank_only_metrics?.winner_accuracy, 1)}</p>
+                <p className="muted">Score MAE {Number(result.rank_only_metrics?.score_mae || 0).toFixed(2)}</p>
+                <p className="muted">Brier {Number(result.rank_only_metrics?.brier || 0).toFixed(3)}</p>
+              </div>
+            </div>
+            {rankEffectLevelBands.length > 0 && (
+              <div className="card sub">
+                <h3>Rank Gap Effect</h3>
+                <p className="muted">{result.rank_effect_curve.description}</p>
+                <div className="rank-level-chart-grid">
+                  {rankEffectLevelBands.map((band) => (
+                    <div key={band.key} className="rank-level-chart">
+                      <div className="rank-level-chart-head">
+                        <h4>{band.label}</h4>
+                        <span>{Number(band.n || 0).toLocaleString()} maps</span>
+                      </div>
+                      <ResponsiveContainer width="100%" height={220}>
+                        <ComposedChart data={band.rows} margin={{ top: 8, right: 12, left: 0, bottom: 12 }}>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#233458" />
+                          <XAxis
+                            dataKey="gap"
+                            type="number"
+                            tick={{ fill: "#9eb6dd", fontSize: 11 }}
+                            label={{ value: "Rank gap", position: "insideBottom", offset: -4, fill: "#9eb6dd" }}
+                          />
+                          <YAxis
+                            domain={[0, 1]}
+                            tick={{ fill: "#9eb6dd", fontSize: 11 }}
+                            tickFormatter={(v) => `${(Number(v) * 100).toFixed(0)}%`}
+                          />
+                          <Tooltip content={<RankEffectTooltip />} />
+                          <Legend />
+                          <Line
+                            type="monotone"
+                            dataKey="predicted_winrate"
+                            name="Predicted"
+                            stroke="#38bdf8"
+                            strokeWidth={2}
+                            dot={{ r: 3 }}
+                            connectNulls={false}
+                          />
+                          <Line
+                            type="monotone"
+                            dataKey="actual_winrate"
+                            name="Actual"
+                            stroke="#fbbf24"
+                            strokeWidth={2}
+                            dot={{ r: 3 }}
+                            connectNulls={false}
+                          />
+                        </ComposedChart>
+                      </ResponsiveContainer>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            <table>
+              <thead>
+                <tr>
+                  <th>Map</th>
+                  <th>Test Maps</th>
+                  <th>Score MAE</th>
+                  <th>Winner</th>
+                  <th>Model</th>
+                  <th>Train Samples</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(result.maps || []).map((row) => (
+                  <tr key={row.map}>
+                    <td>{row.map}</td>
+                    <td>{Number(row.n || 0).toLocaleString()}</td>
+                    <td>{Number(row.score_mae || 0).toFixed(2)}</td>
+                    <td>{pct(row.winner_accuracy, 1)}</td>
+                    <td>{row.model_scope}</td>
+                    <td>{Number(row.training_samples || 0).toLocaleString()}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <table>
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Match</th>
+                  <th>Map</th>
+                  <th>Pred</th>
+                  <th>Actual</th>
+                  <th>Round %</th>
+                  <th>Map Win %</th>
+                  <th>Error</th>
+                  <th>Details</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(result.rows || []).map((row, idx) => (
+                  <tr key={`${row.match_url || idx}-${row.map}`} onClick={() => setSelectedBreakdownRow(row)}>
+                    <td>{row.match_date || "-"}</td>
+                    <td>{row.team1} vs {row.team2}</td>
+                    <td>{row.map}</td>
+                    <td>
+                      {row.predicted_score}
+                      {row.predicted_winner ? ` (${row.predicted_winner})` : ""}
+                    </td>
+                    <td>{row.actual_score}</td>
+                    <td>{pct(row.team1_round_win_probability, 1)}</td>
+                    <td>{pct(row.team1_map_win_probability, 1)}</td>
+                    <td>{Number(row.score_error || 0).toFixed(0)}</td>
+                    <td>Open</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div className="card sub">
+              <p className="muted">{result.method}</p>
+            </div>
+          </div>
+        )}
+        {selectedBreakdownRow && (
+          <div className="modal-backdrop" onClick={() => setSelectedBreakdownRow(null)}>
+            <div className="modal team-modal" onClick={(e) => e.stopPropagation()}>
+              <header className="modal-header">
+                <h3 className="player-modal-title">
+                  {selectedBreakdownRow.team1} vs {selectedBreakdownRow.team2} | {selectedBreakdownRow.map}
+                </h3>
+                <button className="close" onClick={() => setSelectedBreakdownRow(null)}>
+                  x
+                </button>
+              </header>
+              <div className="modal-body">
+                <div className="grid four">
+                  <div className="card sub">
+                    <h3>Prediction</h3>
+                    <p className="muted">Score {selectedBreakdownRow.predicted_score}</p>
+                    <p className="muted">Winner {selectedBreakdownRow.predicted_winner || "-"}</p>
+                  </div>
+                  <div className="card sub">
+                    <h3>Actual</h3>
+                    <p className="muted">Score {selectedBreakdownRow.actual_score}</p>
+                    <p className="muted">Winner {selectedBreakdownRow.actual_winner || "-"}</p>
+                  </div>
+                  <div className="card sub">
+                    <h3>Round Win</h3>
+                    <p className="muted">{pct(selectedBreakdownRow.team1_round_win_probability, 2)}</p>
+                    <p className="muted">Logit {num(selectedBreakdownRow.feature_breakdown?.logit, 3)}</p>
+                  </div>
+                  <div className="card sub">
+                    <h3>Map Win</h3>
+                    <p className="muted">{pct(selectedBreakdownRow.team1_map_win_probability, 2)}</p>
+                    <p className="muted">Model {selectedBreakdownRow.model_scope || "-"}</p>
+                  </div>
+                </div>
+
+                <div className="card sub">
+                  <h3>Scoreline Probabilities</h3>
+                  <ResponsiveContainer width="100%" height={300}>
+                    <BarChart data={selectedBreakdownRow.score_distribution || []}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#233458" />
+                      <XAxis dataKey="score" tick={{ fill: "#9eb6dd", fontSize: 11 }} interval={0} angle={-45} textAnchor="end" height={70} />
+                      <YAxis tick={{ fill: "#9eb6dd", fontSize: 12 }} tickFormatter={(v) => `${(Number(v) * 100).toFixed(0)}%`} />
+                      <Tooltip formatter={(value) => pct(value, 2)} labelStyle={{ color: "#0f172a" }} />
+                      <Bar dataKey="probability" fill="#38bdf8" />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Factor</th>
+                      <th>Value</th>
+                      <th>Baseline</th>
+                      <th>Std</th>
+                      <th>Coef</th>
+                      <th>Contribution</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>Intercept</td>
+                      <td>-</td>
+                      <td>-</td>
+                      <td>-</td>
+                      <td>-</td>
+                      <td>{num(selectedBreakdownRow.feature_breakdown?.intercept, 4)}</td>
+                    </tr>
+                    {(selectedBreakdownRow.feature_breakdown?.features || []).map((feature) => (
+                      <tr key={feature.feature}>
+                        <td>{featureLabel(feature.feature)}</td>
+                        <td>{num(feature.value, 4)}</td>
+                        <td>{num(feature.mean, 4)}</td>
+                        <td>{num(feature.standardized, 4)}</td>
+                        <td>{num(feature.coefficient, 4)}</td>
+                        <td>{num(feature.contribution, 4)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <button className="secondary" onClick={() => setSelectedBreakdownRow(null)}>
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </Section>
+  );
+}
+
 function BoosterCalculatorTab() {
   const [playerId, setPlayerId] = useState("");
   const [majorPct, setMajorPct] = useState("0.30");
@@ -4757,7 +6587,7 @@ function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
     if (!data?.exists) return;
     const payload = data.payload || {};
     setSelectedTeamIds(Array.isArray(payload.team_ids) ? payload.team_ids.map((x) => Number(x)) : []);
-    setBoMode(payload.bo3_mode || "elim_qual");
+    setBoMode("elim_qual");
     setSimCount(String(payload.n_sims || 200));
     setSimResults(data.results || null);
     setSimUpdatedAt(data.updated_at || "");
@@ -4874,7 +6704,7 @@ function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
           teamLookup={teamLookup}
           selected={selectedTeamIds}
           setSelected={setSelectedTeamIds}
-          bo={boMode}
+          bo="elim_qual"
           setBo={setBoMode}
           sims={simCount}
           setSims={setSimCount}
@@ -4892,7 +6722,7 @@ function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
         <TopTeamsTab
           teamLookup={teamLookup}
           selected={selectedTeamIds}
-          bo={boMode}
+          bo="elim_qual"
           sims={simCount}
           results={simResults}
           onOpenPlayer={onOpenPlayer}
@@ -4969,6 +6799,9 @@ export default function App() {
       case "cpp_desc":
         arr.sort((a, b) => b.total_ev / (b.cost || 1) - a.total_ev / (a.cost || 1));
         break;
+      case "cpp_asc":
+        arr.sort((a, b) => a.total_ev / (a.cost || 1) - b.total_ev / (b.cost || 1));
+        break;
       case "ev_desc":
       default:
         arr.sort((a, b) => b.total_ev - a.total_ev);
@@ -5008,6 +6841,7 @@ export default function App() {
       />
     ),
     events: <EventsTab refreshData={load} notify={notify} players={players} />,
+    modelLab: <ModelLabTab />,
     sim: <SwissTab teams={teams} teamLookup={teamLookup} players={players} onOpenPlayer={handleOpenPlayerFromAnywhere} />,
     playoff: (
       <PlayoffTab
