@@ -1,14 +1,17 @@
 from dataclasses import dataclass, field
-from typing import Dict, Set, List
+from typing import Any, Dict, Set, List
 
 
 @dataclass
 class PlayerState:
     player_id: int
     rating: float
-    major_pct: float        # role major trigger (0–1)
-    minor_pct: float        # role minor trigger (0–1)
+    major_pct: float        # role major trigger (0-1)
+    minor_pct: float        # role minor trigger (0-1)
     boosters: List[float]   # e.g. top 5 booster trigger values
+    role_id: int | None = None
+    booster_ids: List[int] = field(default_factory=list)
+    booster_rates: Dict[int, float] = field(default_factory=dict)
 
     # Aggregated fantasy points over the whole Swiss sim:
     total_points: float = 0.0
@@ -18,6 +21,7 @@ class PlayerState:
     win_points_total: float = 0.0
     role_points_total: float = 0.0
     booster_points_total: float = 0.0
+    point_breakdown: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass

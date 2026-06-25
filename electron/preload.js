@@ -11,8 +11,20 @@ const parseJsonSafe = async (res) => {
   }
 };
 
-const requestJson = async (path, init) => {
-  const res = await fetch(`${API_BASE}${path}`, init);
+const requestJson = async (path, init = {}, timeoutMs = 30000) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let res;
+  try {
+    res = await fetch(`${API_BASE}${path}`, { ...init, signal: controller.signal });
+  } catch (e) {
+    if (e?.name === "AbortError") {
+      throw new Error("Backend did not respond in time. Restart FastAPI and try again.");
+    }
+    throw e;
+  } finally {
+    clearTimeout(timeout);
+  }
   const data = await parseJsonSafe(res);
   if (!res.ok) {
     const detail = data?.detail || `HTTP ${res.status}`;
@@ -22,7 +34,7 @@ const requestJson = async (path, init) => {
 };
 
 contextBridge.exposeInMainWorld("api", {
-  get: (path) => requestJson(path),
+  get: (path, timeoutMs) => requestJson(path, {}, timeoutMs),
   post: (path, body) =>
     requestJson(path, {
       method: "POST",

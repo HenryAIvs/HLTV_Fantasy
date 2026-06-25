@@ -32,8 +32,20 @@ const parseJsonSafe = async (res) => {
   }
 };
 
-const requestJson = async (path, init) => {
-  const res = await fetch(`http://127.0.0.1:8000${path}`, init);
+const requestJson = async (path, init = {}, timeoutMs = 30000) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let res;
+  try {
+    res = await fetch(`http://127.0.0.1:8000${path}`, { ...init, signal: controller.signal });
+  } catch (e) {
+    if (e?.name === "AbortError") {
+      throw new Error("Backend did not respond in time. Restart FastAPI and try again.");
+    }
+    throw e;
+  } finally {
+    clearTimeout(timeout);
+  }
   const data = await parseJsonSafe(res);
   if (!res.ok) {
     const detail = data?.detail || `HTTP ${res.status}`;
@@ -43,7 +55,7 @@ const requestJson = async (path, init) => {
 };
 
 const api = window.api || {
-  get: (path) => requestJson(path),
+  get: (path, timeoutMs) => requestJson(path, {}, timeoutMs),
   post: (path, body) =>
     requestJson(path, {
       method: "POST",
@@ -270,6 +282,8 @@ const buildPlayerValueRowsFromSimulation = (simResults, players) => {
       if (!Number.isFinite(pid) || pid <= 0) return;
       const player = playerById.get(pid) || {};
       const pointsCandidates = [
+        Number(comps?.total_points_without_booster),
+        Number(comps?.rating_points_total) + Number(comps?.win_points_total) + Number(comps?.role_points_total),
         Number(comps?.total_points),
         Number(comps?.total),
         Number(comps?.expected_total_points),
@@ -284,6 +298,7 @@ const buildPlayerValueRowsFromSimulation = (simResults, players) => {
         team_id: Number(player?.team_id || tid || 0),
         price: Number.isFinite(price) ? price : 0,
         points,
+        raw_booster: Number(comps?.booster_points_total || comps?.booster || 0),
       });
     });
   });
@@ -311,6 +326,199 @@ const buildPlayerValueRowsFromSimulation = (simResults, players) => {
   });
 
   return { rows: withDistance, slope, intercept };
+};
+
+const boosterOptionsForBreakdownRow = (row) => {
+  const options = Array.isArray(row?.booster_options) && row.booster_options.length > 0
+    ? row.booster_options
+    : [
+        {
+          booster_id: row?.booster_id,
+          booster_name: row?.booster_name,
+          booster_trigger_rate: row?.booster_trigger_rate,
+          booster_points: row?.booster_points,
+        },
+      ];
+  return options
+    .map((option) => {
+      const boosterId = Number(option?.booster_id);
+      const points = Number(option?.booster_points || 0);
+      if (!Number.isFinite(boosterId) || boosterId < 0 || boosterId > 30 || points <= 0) return null;
+      return {
+        boosterId,
+        boosterName: option.booster_name || `Booster ${boosterId}`,
+        triggerRate: Number(option.booster_trigger_rate || 0),
+        points,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.points - a.points);
+};
+
+const assignRosterBoostersFromBreakdowns = (rosterBreakdowns) => {
+  const slots = [];
+  Object.entries(rosterBreakdowns || {}).forEach(([pidRaw, rows]) => {
+    const playerId = Number(pidRaw);
+    if (!Number.isFinite(playerId)) return;
+    (rows || []).forEach((row, rowIdx) => {
+      const options = boosterOptionsForBreakdownRow(row);
+      if (options.length === 0) return;
+      slots.push({
+        key: `${playerId}:${rowIdx}`,
+        playerId,
+        rowIdx,
+        matchNumber: Number(row?.match_number || 0),
+        options,
+      });
+    });
+  });
+
+  let states = new Map([[0, { score: 0, choices: [] }]]);
+  slots.forEach((slot) => {
+    const nextStates = new Map(states);
+    states.forEach((state, mask) => {
+      slot.options.forEach((option) => {
+        const bit = 1 << option.boosterId;
+        if (mask & bit) return;
+        const nextMask = mask | bit;
+        const nextScore = state.score + option.points;
+        const existing = nextStates.get(nextMask);
+        if (!existing || nextScore > existing.score + 1e-9) {
+          nextStates.set(nextMask, {
+            score: nextScore,
+            choices: [
+              ...state.choices,
+              {
+                key: slot.key,
+                playerId: slot.playerId,
+                rowIdx: slot.rowIdx,
+                matchNumber: slot.matchNumber,
+                boosterId: option.boosterId,
+                boosterName: option.boosterName,
+                triggerRate: option.triggerRate,
+                points: option.points,
+              },
+            ],
+          });
+        }
+      });
+    });
+    states = nextStates;
+  });
+
+  let best = { score: 0, choices: [] };
+  states.forEach((state) => {
+    if (state.score > best.score + 1e-9) best = state;
+  });
+  return best.choices;
+};
+
+const rosterAssignedBoosterPlayer = (player, rosterPlayers) => {
+  const pid = Number(player?.player_id);
+  const roster = Array.isArray(rosterPlayers) ? rosterPlayers : [];
+  if (!Number.isFinite(pid) || !Array.isArray(player?.point_breakdown) || player.point_breakdown.length === 0) {
+    return player;
+  }
+
+  const rosterBreakdowns = {};
+  roster.forEach((rosterPlayer) => {
+    const rosterPid = Number(rosterPlayer?.player_id);
+    if (Number.isFinite(rosterPid)) rosterBreakdowns[rosterPid] = rosterPlayer?.point_breakdown || [];
+  });
+  const assignedRows = new Map(assignRosterBoostersFromBreakdowns(rosterBreakdowns).map((assignment) => [assignment.key, assignment]));
+
+  let assignedBoosterTotal = 0;
+  const pointBreakdown = player.point_breakdown.map((row, rowIdx) => {
+    const key = `${pid}:${rowIdx}`;
+    const assigned = assignedRows.get(key);
+    const rating = Number(row.rating_points || 0);
+    const win = Number(row.win_points || 0);
+    const role = Number(row.role_points || 0);
+    const assignedBooster = assigned ? Number(assigned.points || 0) : 0;
+    assignedBoosterTotal += assignedBooster;
+    return {
+      ...row,
+      raw_booster_points: Number(row.booster_points || 0),
+      raw_booster_name: row.booster_name,
+      raw_booster_trigger_rate: Number(row.booster_trigger_rate || 0),
+      booster_points: assignedBooster,
+      booster_id: assigned ? assigned.boosterId : row.booster_id,
+      booster_name: assigned ? assigned.boosterName : "Unassigned",
+      booster_trigger_rate: assigned ? Number(assigned.triggerRate || 0) : 0,
+      booster_assigned: Boolean(assigned),
+      total_points: rating + win + role,
+    };
+  });
+
+  return {
+    ...player,
+    booster: assignedBoosterTotal,
+    booster_ev: assignedBoosterTotal,
+    point_breakdown: pointBreakdown,
+    roster_boosters_assigned: true,
+  };
+};
+
+const aggregatePlayoffBoosterUsage = (player, rosterPlayers, outcomes) => {
+  const pid = Number(player?.player_id);
+  const rosterIds = (rosterPlayers || []).map((p) => Number(p?.player_id)).filter((id) => Number.isFinite(id));
+  const rows = [];
+  if (!Number.isFinite(pid) || rosterIds.length === 0 || !Array.isArray(outcomes) || outcomes.length === 0) return rows;
+
+  const slotBuckets = new Map();
+  outcomes.forEach((outcome) => {
+    const probability = Number(outcome?.probability || 0);
+    if (!Number.isFinite(probability) || probability <= 0) return;
+    const allBreakdowns = outcome?.player_breakdown || {};
+    const rosterBreakdowns = {};
+    rosterIds.forEach((rosterPid) => {
+      rosterBreakdowns[rosterPid] = allBreakdowns[String(rosterPid)] || [];
+    });
+    assignRosterBoostersFromBreakdowns(rosterBreakdowns)
+      .filter((assignment) => assignment.playerId === pid)
+      .forEach((assignment) => {
+        if (!assignment.matchNumber) return;
+        const slotKey = String(assignment.matchNumber);
+        const slot = slotBuckets.get(slotKey) || {
+          match_number: assignment.matchNumber,
+          probability: 0,
+          expected_points: 0,
+          boosters: new Map(),
+        };
+        slot.probability += probability;
+        slot.expected_points += probability * Number(assignment.points || 0);
+        const booster = slot.boosters.get(assignment.boosterId) || {
+          booster_id: assignment.boosterId,
+          booster: assignment.boosterName,
+          probability: 0,
+          expected_points: 0,
+        };
+        booster.probability += probability;
+        booster.expected_points += probability * Number(assignment.points || 0);
+        slot.boosters.set(assignment.boosterId, booster);
+        slotBuckets.set(slotKey, slot);
+      });
+  });
+
+  Array.from(slotBuckets.values())
+    .sort((a, b) => Number(a.match_number) - Number(b.match_number))
+    .forEach((slot) => {
+      const boosters = Array.from(slot.boosters.values())
+        .sort((a, b) => Number(b.probability) - Number(a.probability))
+        .map((booster) => ({
+          ...booster,
+          usage_probability: booster.probability,
+          average_points: slot.probability > 0 ? booster.expected_points / slot.probability : 0,
+        }));
+      rows.push({
+        match_number: slot.match_number,
+        slot_probability: slot.probability,
+        expected_points: slot.expected_points,
+        average_points: slot.probability > 0 ? slot.expected_points / slot.probability : 0,
+        boosters,
+      });
+    });
+  return rows;
 };
 
 function PriceVsPointsPanel({ title, rows, slope, intercept, showTable = true, onPointClick = null }) {
@@ -496,6 +704,182 @@ function PriceVsPointsPanel({ title, rows, slope, intercept, showTable = true, o
   );
 }
 
+function PointSourcesModal({ player, teamLookup, onClose }) {
+  if (!player) return null;
+  const hasConcreteBreakdown = Array.isArray(player.point_breakdown) && player.point_breakdown.length > 0;
+  const sourceValue = (row, key) => {
+    if (key === "total") {
+      const total = ["rating", "win", "role"].reduce((sum, part) => sum + sourceValue(row, part), 0);
+      if (row?.components_available === false && Number.isFinite(Number(row?.points))) return Number(row.points);
+      return total;
+    }
+    const candidates = {
+      rating: [row?.rating, row?.rating_ev, row?.rating_points_total],
+      win: [row?.win, row?.win_ev, row?.win_points_total],
+      role: [row?.role, row?.role_ev, row?.role_points_total],
+      booster: [row?.booster, row?.booster_ev, row?.booster_points_total],
+    }[key] || [];
+    const value = candidates.map((v) => Number(v)).find((v) => Number.isFinite(v));
+    return Number.isFinite(value) ? value : 0;
+  };
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <header className="modal-header">
+          <h3>{player.name || `Player ${player.player_id}`} Point Sources</h3>
+          <button className="close" onClick={onClose}>
+            &times;
+          </button>
+        </header>
+        <div className="modal-body">
+          <table>
+            <thead>
+              <tr>
+                <th>Source</th>
+                <th>Points</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td>Rating</td><td>{sourceValue(player, "rating").toFixed(2)}</td></tr>
+              <tr><td>Win</td><td>{sourceValue(player, "win").toFixed(2)}</td></tr>
+              <tr><td>Role</td><td>{sourceValue(player, "role").toFixed(2)}</td></tr>
+              <tr><td>Booster</td><td>{hasConcreteBreakdown ? sourceValue(player, "booster").toFixed(2) : "Unknown"}</td></tr>
+              <tr>
+                <td><strong>Total</strong></td>
+                <td><strong>{sourceValue(player, "total").toFixed(2)}</strong></td>
+              </tr>
+            </tbody>
+          </table>
+          {hasConcreteBreakdown && (
+            <div className="stack">
+              <h4>Match Sources</h4>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Match</th>
+                    <th>Opponent</th>
+                    <th>Rating</th>
+                    <th>Win</th>
+                    <th>Role</th>
+                    <th>Booster</th>
+                    <th>Total</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {player.point_breakdown.map((row, idx) => {
+                    const opponentId = Number(row.opponent_team_id || 0);
+                    const matchLabel = row.match_number ? `M${row.match_number} ${row.match_type || ""}` : row.match_type || "Adjustment";
+                    const opponentLabel = opponentId > 0 ? `${teamLookup[opponentId] || opponentId} (#${row.opponent_rank ?? "-"})` : row.note || "-";
+                    const roleName = row.role_id == null ? "Stored role" : roleLabel(row.role_id);
+                    const boosterName = row.booster_name || (row.booster_slot ? `Booster slot ${row.booster_slot}` : "None");
+                    return (
+                      <tr key={`${row.match_number || "adj"}-${idx}`}>
+                        <td>{matchLabel}</td>
+                        <td>{opponentLabel}</td>
+                        <td>
+                          {Number(row.rating_points || 0).toFixed(2)}
+                          {row.rating_used != null && <div className="muted">rating {Number(row.rating_used || 0).toFixed(2)}</div>}
+                        </td>
+                        <td>
+                          {Number(row.win_points || 0).toFixed(2)}
+                          <div className="muted">{row.did_win ? "Win" : "Loss"} {Number((row.win_probability || 0) * 100).toFixed(1)}%</div>
+                        </td>
+                        <td>
+                          {Number(row.role_points || 0).toFixed(2)}
+                          <div className="muted">
+                            {roleName} major {Number((row.role_major_pct || 0) * 100).toFixed(1)}%, minor {Number((row.role_minor_pct || 0) * 100).toFixed(1)}%
+                          </div>
+                        </td>
+                        <td>
+                          {Number(row.booster_points || 0).toFixed(2)}
+                          <div className="muted">
+                            {boosterName} {Number((row.booster_trigger_rate || 0) * 100).toFixed(1)}%
+                          </div>
+                        </td>
+                        <td>{Number(row.total_points || 0).toFixed(2)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {!hasConcreteBreakdown && Array.isArray(player.booster_odds) && player.booster_odds.length > 0 && (
+            <div className="stack">
+              <h4>Booster Odds By Match Slot</h4>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Booster</th>
+                    <th>Match</th>
+                    <th>Record</th>
+                    <th>Format</th>
+                    <th>Slot %</th>
+                    <th>Trigger %</th>
+                    <th>EV</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {player.booster_odds.map((assignment, idx) => (
+                    <tr key={`${assignment.booster_id || "booster"}-${assignment.match_number || idx}-${idx}`}>
+                      <td>{assignment.booster || `Booster ${assignment.booster_id}`}</td>
+                      <td>{assignment.match_number || "-"}</td>
+                      <td>{assignment.record || "-"}</td>
+                      <td>{assignment.match_format || "-"}</td>
+                      <td>{(Number(assignment.slot_probability || 0) * 100).toFixed(1)}%</td>
+                      <td>{(Number(assignment.adjusted_trigger_probability || 0) * 100).toFixed(1)}%</td>
+                      <td>{Number(assignment.expected_points || 0).toFixed(3)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {Array.isArray(player.playoff_booster_usage) && player.playoff_booster_usage.length > 0 && (
+            <div className="stack">
+              <h4>Projected Booster Usage</h4>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Match</th>
+                    <th>Reach %</th>
+                    <th>Boosters</th>
+                    <th>Avg Points If Reached</th>
+                    <th>EV</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {player.playoff_booster_usage.map((slot) => (
+                    <tr key={`playoff-booster-${slot.match_number}`}>
+                      <td>M{slot.match_number}</td>
+                      <td>{(Number(slot.slot_probability || 0) * 100).toFixed(1)}%</td>
+                      <td>
+                        {(slot.boosters || []).map((booster, idx) => (
+                          <div key={`${slot.match_number}-${booster.booster_id}-${idx}`}>
+                            {booster.booster} {(Number(booster.usage_probability || 0) * 100).toFixed(1)}%
+                          </div>
+                        ))}
+                      </td>
+                      <td>{Number(slot.average_points || 0).toFixed(2)}</td>
+                      <td>{Number(slot.expected_points || 0).toFixed(2)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {player.components_available === false && (
+            <p className="muted">
+              This row was generated before source components were saved. Re-run the relevant simulation to see the full source split.
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function GroupStageTab({
   teams,
   teamLookup,
@@ -517,6 +901,7 @@ function GroupStageTab({
   const [etaSeconds, setEtaSeconds] = useState(null);
   const [runMessage, setRunMessage] = useState("");
   const [playerLookup, setPlayerLookup] = useState({});
+  const [sourcePlayerBreakdown, setSourcePlayerBreakdown] = useState(null);
   const simPollingRef = useRef(false);
   const SIM_JOB_ID_KEY = "swiss_sim_job_id";
   const SIM_JOB_STARTED_AT_KEY = "swiss_sim_job_started_at";
@@ -547,6 +932,18 @@ function GroupStageTab({
     if (h > 0) return `${h}h ${m}m ${r}s`;
     if (m > 0) return `${m}m ${r}s`;
     return `${r}s`;
+  };
+  const openSourceBreakdown = (row) => {
+    if (!row) return;
+    setSourcePlayerBreakdown({
+      ...row,
+      points: Number(row.points ?? row.total ?? row.total_points ?? 0),
+      rating: Number(row.rating ?? row.rating_points_total ?? 0),
+      win: Number(row.win ?? row.win_points_total ?? 0),
+      role: Number(row.role ?? row.role_points_total ?? 0),
+      booster: Number(row.booster ?? row.booster_points_total ?? 0),
+      components_available: true,
+    });
   };
 
   const run = async () => {
@@ -769,7 +1166,17 @@ function GroupStageTab({
                     {Object.entries(data.players || {}).map(([pid, comps]) => (
                       <tr key={pid}>
                         <td className="player-col" title={String(playerLookup[Number(pid)] || pid)}>
-                          <button className="inline-link-btn" onClick={() => onOpenPlayer && onOpenPlayer(Number(pid))}>
+                          <button
+                            className="inline-link-btn"
+                            onClick={() =>
+                              openSourceBreakdown({
+                                player_id: Number(pid),
+                                name: playerLookup[Number(pid)] || pid,
+                                team_id: Number(tid),
+                                ...comps,
+                              })
+                            }
+                          >
                             {playerLookup[Number(pid)] || pid}
                           </button>
                         </td>
@@ -787,6 +1194,13 @@ function GroupStageTab({
           </div>
         )}
       </div>
+      {sourcePlayerBreakdown && (
+        <PointSourcesModal
+          player={sourcePlayerBreakdown}
+          teamLookup={teamLookup}
+          onClose={() => setSourcePlayerBreakdown(null)}
+        />
+      )}
     </Section>
   );
 }
@@ -818,6 +1232,7 @@ function TopTeamsTab({ teamLookup, selected, bo, sims, results, onOpenPlayer }) 
   const [filterModalOpen, setFilterModalOpen] = useState(false);
   const [filterSearch, setFilterSearch] = useState("");
   const [allPlayers, setAllPlayers] = useState([]);
+  const [sourcePlayerBreakdown, setSourcePlayerBreakdown] = useState(null);
   const topTeamsPollingRef = useRef(false);
   const TOP5_JOB_ID_KEY = "swiss_top5_job_id";
   const TOP5_JOB_STARTED_AT_KEY = "swiss_top5_job_started_at";
@@ -854,6 +1269,18 @@ function TopTeamsTab({ teamLookup, selected, bo, sims, results, onOpenPlayer }) 
     if (h > 0) return `${h}h ${m}m ${r}s`;
     if (m > 0) return `${m}m ${r}s`;
     return `${r}s`;
+  };
+  const openSourceBreakdown = (row) => {
+    if (!row) return;
+    setSourcePlayerBreakdown({
+      ...row,
+      points: Number(row.points ?? row.total_ev ?? row.mode_score ?? 0),
+      rating: Number(row.rating ?? row.rating_ev ?? 0),
+      win: Number(row.win ?? row.win_ev ?? 0),
+      role: Number(row.role ?? row.role_ev ?? 0),
+      booster: Number(row.booster ?? row.booster_ev ?? 0),
+      components_available: true,
+    });
   };
 
   const parsePlayerIdSet = (text) => {
@@ -1304,7 +1731,17 @@ function TopTeamsTab({ teamLookup, selected, bo, sims, results, onOpenPlayer }) 
                     {team.players.map((p) => (
                       <tr key={p.player_id}>
                         <td>
-                          <button className="inline-link-btn" onClick={() => onOpenPlayer && onOpenPlayer(Number(p.player_id))}>
+                          <button
+                            className="inline-link-btn"
+                            onClick={() =>
+                              openSourceBreakdown({
+                                ...p,
+                                booster_odds: (team.booster_assignments || []).filter(
+                                  (assignment) => Number(assignment.player_id) === Number(p.player_id)
+                                ),
+                              })
+                            }
+                          >
                             {p.name}
                           </button>
                         </td>
@@ -1399,7 +1836,27 @@ function TopTeamsTab({ teamLookup, selected, bo, sims, results, onOpenPlayer }) 
                     <td>{team.total_ev.toFixed(2)}</td>
                     <td>{team.cost}</td>
                     <td>{(team.total_ev / (team.cost || 1)).toFixed(4)}</td>
-                    <td>{team.players.map((p) => `${p.name} (${teamLookup[p.team_id] || p.team_id}, ${roleLabel(p.role_name)})`).join(", ")}</td>
+                    <td>
+                      {(team.players || []).map((p, playerIdx) => (
+                        <span key={`${idx}-${p.player_id}`}>
+                          {playerIdx > 0 && ", "}
+                          <button
+                            className="inline-link-btn"
+                            onClick={() =>
+                              openSourceBreakdown({
+                                ...p,
+                                booster_odds: (team.booster_assignments || []).filter(
+                                  (assignment) => Number(assignment.player_id) === Number(p.player_id)
+                                ),
+                              })
+                            }
+                          >
+                            {p.name}
+                          </button>
+                          {` (${teamLookup[p.team_id] || p.team_id}, ${roleLabel(p.role_name)})`}
+                        </span>
+                      ))}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -1473,6 +1930,13 @@ function TopTeamsTab({ teamLookup, selected, bo, sims, results, onOpenPlayer }) 
               </div>
             </div>
           </div>
+        )}
+        {sourcePlayerBreakdown && (
+          <PointSourcesModal
+            player={sourcePlayerBreakdown}
+            teamLookup={teamLookup}
+            onClose={() => setSourcePlayerBreakdown(null)}
+          />
         )}
       </div>
     </Section>
@@ -1687,6 +2151,8 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   const [topTeams, setTopTeams] = useState(null);
   const [allTeams, setAllTeams] = useState(null);
   const [baseTeams, setBaseTeams] = useState(null);
+  const [sharedComboCount, setSharedComboCount] = useState(0);
+  const [sharedCombosUpdatedAt, setSharedCombosUpdatedAt] = useState("");
   const [filteredCount, setFilteredCount] = useState(0);
   const [page, setPage] = useState(0);
   const [topMessage, setTopMessage] = useState("");
@@ -1702,6 +2168,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   const [showFilterModal, setShowFilterModal] = useState(false);
   const [filterSearch, setFilterSearch] = useState("");
   const [sortKey, setSortKey] = useState("ev_desc");
+  const [playoffTopSubtab, setPlayoffTopSubtab] = useState("average");
   const [playoffBestMode, setPlayoffBestMode] = useState("average");
   const [completedBracket, setCompletedBracket] = useState({
     qf: ["", "", "", ""],
@@ -1711,6 +2178,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   });
   const [completedBracketResult, setCompletedBracketResult] = useState(null);
   const [completedBracketMessage, setCompletedBracketMessage] = useState("");
+  const [completedBracketUpdatedAt, setCompletedBracketUpdatedAt] = useState("");
   const [showCompletedBracketGraph, setShowCompletedBracketGraph] = useState(false);
   const [completedPlayerBreakdown, setCompletedPlayerBreakdown] = useState(null);
   const [processedSims, setProcessedSims] = useState(0);
@@ -1718,6 +2186,8 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   const [processedCombos, setProcessedCombos] = useState(0);
   const [totalCombos, setTotalCombos] = useState(0);
   const [topEtaSeconds, setTopEtaSeconds] = useState(null);
+  const [comboPhase, setComboPhase] = useState("");
+  const [completedEtaSeconds, setCompletedEtaSeconds] = useState(null);
   const [etaSeconds, setEtaSeconds] = useState(null);
   const [runMessage, setRunMessage] = useState("");
   const playoffPollingRef = useRef(false);
@@ -1727,6 +2197,23 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     players.forEach((p) => (m[p.player_id] = p.name));
     return m;
   }, [players]);
+  const playerById = useMemo(() => {
+    const m = {};
+    players.forEach((p) => {
+      m[Number(p.player_id)] = p;
+    });
+    return m;
+  }, [players]);
+  const playerTeamById = useMemo(() => {
+    const m = {};
+    teams.forEach((team) => {
+      [team.player1_id, team.player2_id, team.player3_id, team.player4_id, team.player5_id].forEach((pid) => {
+        const id = Number(pid);
+        if (Number.isFinite(id) && id > 0) m[id] = Number(team.team_id);
+      });
+    });
+    return m;
+  }, [teams]);
   const teamByName = useMemo(() => {
     const m = {};
     teams.forEach((t) => {
@@ -1873,6 +2360,42 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     setCompletedBracketResult(null);
     setCompletedBracketMessage("");
   };
+  const hydrateCompletedBracketFromBracket = (bracket) => {
+    if (!bracket) return;
+    const quarters = bracket.quarters || [];
+    const semis = bracket.semis || [];
+    const finals = bracket.final || [];
+    const thirdPlace = bracket.third_place || [];
+    const qf = quarters.slice(0, 4).map((row) => (row?.winner ? String(row.winner) : ""));
+    const sf = semis.slice(0, 2).map((row) => (row?.winner ? String(row.winner) : ""));
+    const finalWinner = finals[0]?.winner ? String(finals[0].winner) : "";
+    const thirdWinner = thirdPlace[0]?.winner ? String(thirdPlace[0].winner) : "";
+    if (qf.some(Boolean) || sf.some(Boolean) || finalWinner || thirdWinner) {
+      setCompletedBracket({
+        qf: [...qf, "", "", "", ""].slice(0, 4),
+        sf: [...sf, ""].slice(0, 2),
+        final: finalWinner,
+        third: thirdWinner,
+      });
+    }
+  };
+  const openScoringBreakdown = (row) => {
+    if (!row) return;
+    const pid = Number(row.player_id);
+    setCompletedPlayerBreakdown({
+      ...row,
+      player_id: Number.isFinite(pid) ? pid : row.player_id,
+      name: row.name || playerLookup[pid] || `Player ${row.player_id || ""}`,
+      team_id: Number(row.team_id || playerTeamById[pid] || 0),
+      points: Number(row.points ?? row.total_ev ?? row.mode_score ?? 0),
+    });
+  };
+  const openProjectedRosterBreakdown = (player, rosterPlayers) => {
+    openScoringBreakdown({
+      ...player,
+      playoff_booster_usage: aggregatePlayoffBoosterUsage(player, rosterPlayers || [], results?.outcomes || []),
+    });
+  };
   const completedBracketDerived = useMemo(() => {
     const isPickedFrom = (value, ids) => Boolean(value) && ids.some((id) => String(id) === String(value));
     const qfPairs = [
@@ -1901,8 +2424,12 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     setBusy(true);
     setCompletedBracketMessage("");
     setCompletedBracketResult(null);
+    setCompletedBracketUpdatedAt("");
+    setProcessedCombos(0);
+    setTotalCombos(0);
+    setCompletedEtaSeconds(null);
     try {
-      const data = await api.post("/playoff/best-team/bracket-from-latest", {
+      const start = await api.post("/playoff/best-team/bracket-from-latest/start", {
         qf_winners: completedBracket.qf.map((id) => Number(id)),
         sf_winners: completedBracket.sf.map((id) => Number(id)),
         final_winner: Number(completedBracket.final),
@@ -1910,6 +2437,49 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
         include_player_ids: Array.from(effectiveAppliedFilters.include),
         exclude_player_ids: Array.from(effectiveAppliedFilters.exclude),
       });
+      if (start?.detail || start?.error) {
+        setCompletedBracketMessage(String(start.detail || start.error));
+        return;
+      }
+      const jobId = start?.job_id;
+      if (!jobId) {
+        setCompletedBracketMessage("Failed to start completed bracket job.");
+        return;
+      }
+      if (start?.reused) {
+        setCompletedBracketMessage("A completed bracket optimizer is already running. Reusing that job.");
+      }
+      let data = null;
+      let done = false;
+      const startedAtMs = Date.now();
+      while (!done) {
+        const status = await api.get(`/playoff/best-team/bracket-from-latest/job/${jobId}`);
+        if (status?.detail || status?.error) {
+          setCompletedBracketMessage(String(status.detail || status.error));
+          return;
+        }
+        const processed = Number(status.processed_combinations || 0);
+        const total = Number(status.total_combinations || 0);
+        setProcessedCombos(processed);
+        setTotalCombos(total);
+        if (processed > 0 && total > processed) {
+          const elapsedSec = Math.max(0.001, (Date.now() - startedAtMs) / 1000);
+          const rate = processed / elapsedSec;
+          if (rate > 0) setCompletedEtaSeconds((total - processed) / rate);
+        } else if (total > 0 && processed >= total) {
+          setCompletedEtaSeconds(0);
+        }
+        if (status.status === "failed") {
+          setCompletedBracketMessage(status.error || "Completed bracket evaluation failed.");
+          return;
+        }
+        if (status.status === "completed") {
+          data = status.result || {};
+          done = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
       if (data?.detail || data?.error) {
         setCompletedBracketMessage(String(data.detail || data.error));
         return;
@@ -1923,10 +2493,12 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
         return;
       }
       setCompletedBracketResult(data);
+      setCompletedBracketUpdatedAt(new Date().toISOString());
     } catch (e) {
       setCompletedBracketMessage(e?.message || "Failed to evaluate completed bracket.");
     } finally {
       setBusy(false);
+      setComboPhase("");
     }
   };
   const playoffBestModeLabel = {
@@ -1934,10 +2506,27 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     single_outcome: "Highest Single-Outcome Ceiling",
     most_outcomes: "Best In Most Outcomes",
   }[playoffBestMode] || "Best Average Value";
+  const playoffTopSubtabs = [
+    { key: "average", label: "Average Player Value" },
+    { key: "single_outcome", label: "Best Single Outcome" },
+    { key: "most_outcomes", label: "Most Winning Outcomes" },
+    { key: "completed", label: "Completed Bracket" },
+  ];
+  const setPlayoffTopMode = (key) => {
+    setPlayoffTopSubtab(key);
+    if (key !== "completed") {
+      setPlayoffBestMode(key);
+      setTopMessage("");
+    }
+  };
   const playoffTeamMetric = (team) => {
     if (playoffBestMode === "single_outcome") return Number(team?.ceiling_points || 0);
     if (playoffBestMode === "most_outcomes") return Number(team?.outcome_wins || 0);
-    return Number(team?.total_ev || 0);
+    return Number(team?.average_ev ?? team?.total_ev ?? 0);
+  };
+  const playoffPlayerModeScore = (player) => {
+    if (playoffBestMode === "single_outcome") return Number(player?.ceiling_score ?? player?.mode_score ?? player?.total_ev ?? 0);
+    return Number(player?.mode_score ?? player?.total_ev ?? 0);
   };
   const playoffOutcomeCount = Number(results?.outcomes_count || (hasThirdPlaceDecider ? 256 : 128));
   const formatOutcomeWins = (value) => {
@@ -1993,12 +2582,38 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     setSlots((payload.team_slots || []).map((x) => String(x)));
     setHasThirdPlaceDecider(Boolean(payload.has_third_place_decider));
     setResults(data.results || null);
+    hydrateCompletedBracketFromBracket(data.results?.bracket);
     setUpdatedAt(data.updated_at ? new Date(Number(data.updated_at) * 1000).toISOString() : "");
+  };
+
+  const loadLatestCompletedBracket = async () => {
+    const data = await api.get("/playoff/best-team/bracket-from-latest/latest");
+    if (!data?.exists) return;
+    const payload = data.payload || {};
+    const savedQf = (payload.qf_winners || []).slice(0, 4).map((id) => String(id || ""));
+    const savedSf = (payload.sf_winners || []).slice(0, 2).map((id) => String(id || ""));
+    setCompletedBracket({
+      qf: [...savedQf, "", "", "", ""].slice(0, 4),
+      sf: [...savedSf, ""].slice(0, 2),
+      final: payload.final_winner ? String(payload.final_winner) : "",
+      third: payload.third_place_winner ? String(payload.third_place_winner) : "",
+    });
+    setCompletedBracketUpdatedAt(data.updated_at ? new Date(Number(data.updated_at) * 1000).toISOString() : "");
+  };
+
+  const loadLatestSharedCombinations = async () => {
+    const data = await api.get("/playoff/best-team/from-latest/latest");
+    if (!data?.exists) return;
+    setBaseTeams([]);
+    setSharedComboCount(Number(data.total_teams || 0));
+    setSharedCombosUpdatedAt(data.updated_at ? new Date(Number(data.updated_at) * 1000).toISOString() : "");
   };
 
   useEffect(() => {
     loadEventsForPlayoff();
     loadLatestPlayoff();
+    loadLatestCompletedBracket();
+    loadLatestSharedCombinations();
   }, []);
 
   useEffect(() => {
@@ -2086,20 +2701,22 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     }
   };
 
-  const findTopTeams = async () => {
+  const runSharedCombinations = async () => {
     setBusy(true);
     setTopMessage("");
     setAllTeams(null);
     setBaseTeams(null);
+    setSharedComboCount(0);
     setPage(0);
     setProcessedCombos(0);
     setTotalCombos(0);
     setTopEtaSeconds(null);
+    setComboPhase("queued");
     try {
       const start = await api.post("/playoff/best-team/from-latest/start", {
         include_player_ids: Array.from(effectiveAppliedFilters.include),
         exclude_player_ids: Array.from(effectiveAppliedFilters.exclude),
-        mode: playoffBestMode,
+        mode: "most_outcomes",
       });
       if (start?.detail) {
         setTopMessage(String(start.detail));
@@ -2111,8 +2728,11 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       }
       const jobId = start?.job_id;
       if (!jobId) {
-        setTopMessage("Failed to start Top 5 generation job.");
+        setTopMessage("Failed to start combination generation job.");
         return;
+      }
+      if (start?.reused) {
+        setTopMessage("A combination job is already running. Reusing that job.");
       }
 
       let done = false;
@@ -2125,6 +2745,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
         }
         const processed = Number(status.processed_combinations || 0);
         const total = Number(status.total_combinations || 0);
+        setComboPhase(String(status.phase || status.status || ""));
         setProcessedCombos(processed);
         setTotalCombos(total);
         if (processed > 0 && total > processed) {
@@ -2144,25 +2765,12 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
           return;
         }
         if (status.status === "completed") {
-          const data = status.result || {};
-          if (data.error) {
-            setTopMessage(data.error);
-            setTopTeams([]);
-            setAllTeams([]);
-            setBaseTeams([]);
-            setFilteredCount(0);
-          } else if (data.top_teams && data.top_teams.length > 0) {
-            const all = data.all_teams || [];
-            setBaseTeams(all);
-            applyTop5ViewFilters(all);
-            setTopMessage("");
-          } else {
-            setTopTeams([]);
-            setAllTeams([]);
-            setBaseTeams([]);
-            setFilteredCount(0);
-            setTopMessage("No valid teams found from stored playoff valuations.");
-          }
+          const latest = await api.get("/playoff/best-team/from-latest/latest");
+          setBaseTeams([]);
+          setSharedComboCount(Number(latest?.total_teams || 0));
+          setSharedCombosUpdatedAt(latest?.updated_at ? new Date(Number(latest.updated_at) * 1000).toISOString() : new Date().toISOString());
+          await querySharedCombinations(0);
+          setTopMessage("");
           done = true;
           break;
         }
@@ -2181,7 +2789,18 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     setTopTeams(null);
     setAllTeams(null);
     setBaseTeams(null);
+    setSharedCombosUpdatedAt("");
+    setSharedComboCount(0);
+    setCompletedBracketResult(null);
+    setCompletedBracketMessage("");
+    setCompletedBracketUpdatedAt("");
+    setShowCompletedBracketGraph(false);
+    setCompletedPlayerBreakdown(null);
     setFilteredCount(0);
+    setProcessedCombos(0);
+    setTotalCombos(0);
+    setTopEtaSeconds(null);
+    setComboPhase("");
     setTopMessage("");
   };
 
@@ -2195,8 +2814,53 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
 
   useEffect(() => {
     if (!baseTeams) return;
-    applyTop5ViewFilters(baseTeams);
+    querySharedCombinations(page);
   }, [baseTeams, effectiveAppliedFilters, comboSearch, sortKey, playoffBestMode]);
+
+  useEffect(() => {
+    if (!baseTeams) return;
+    if (playoffTopSubtab === "completed" && !completedBracketDerived.complete) {
+      setCompletedBracketResult(null);
+      return;
+    }
+    querySharedCombinations(0);
+  }, [playoffTopSubtab, completedBracket, completedBracketDerived.complete, hasThirdPlaceDecider]);
+
+  const querySharedCombinations = async (nextPage = 0) => {
+    if (!baseTeams) return;
+    try {
+      const endpoint = playoffTopSubtab === "completed"
+        ? "/playoff/best-team/from-latest/completed-query"
+        : "/playoff/best-team/from-latest/query";
+      const body = {
+        mode: playoffBestMode,
+        include_player_ids: Array.from(effectiveAppliedFilters.include),
+        exclude_player_ids: Array.from(effectiveAppliedFilters.exclude),
+        search: comboSearch,
+        sort: sortKey,
+        page: nextPage,
+        page_size: 200,
+      };
+      if (playoffTopSubtab === "completed") {
+        if (!completedBracketDerived.complete) return;
+        body.qf_winners = completedBracket.qf.map((id) => Number(id));
+        body.sf_winners = completedBracket.sf.map((id) => Number(id));
+        body.final_winner = Number(completedBracket.final);
+        body.third_place_winner = hasThirdPlaceDecider ? Number(completedBracket.third) : 0;
+      }
+      const data = await api.post(endpoint, body);
+      setTopTeams(data.top_teams || []);
+      setAllTeams(data.page_teams || []);
+      setFilteredCount(Number(data.filtered_count || 0));
+      setSharedComboCount(Number(data.total_teams || sharedComboCount || 0));
+      setPage(Number(data.page || nextPage || 0));
+      if (playoffTopSubtab === "completed") {
+        setCompletedBracketResult(data);
+      }
+    } catch (e) {
+      setTopMessage(e?.message || "Failed to load saved combinations.");
+    }
+  };
 
   const applyTop5ViewFilters = (teamsIn) => {
     const base = Array.isArray(teamsIn) ? teamsIn : [];
@@ -2234,8 +2898,102 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     () => buildPlayerValueRowsFromSimulation(results, players),
     [results, players]
   );
+  const completedBracketSharedResult = useMemo(() => {
+    if (!results || !baseTeams || !completedBracketDerived.complete) return null;
+    const qf = completedBracket.qf.map((id) => Number(id));
+    const sf = completedBracket.sf.map((id) => Number(id));
+    const finalWinner = Number(completedBracket.final);
+    const thirdWinner = Number(completedBracket.third || 0);
+    const selectedOutcome = (results.outcomes || []).find((outcome) => {
+      const bracket = outcome?.bracket || {};
+      const quarters = bracket.quarters || [];
+      const semis = bracket.semis || [];
+      const finals = bracket.final || [];
+      const third = bracket.third_place || [];
+      if (quarters.length < 4 || semis.length < 2 || finals.length < 1) return false;
+      if (quarters.slice(0, 4).some((row, idx) => Number(row?.winner || 0) !== qf[idx])) return false;
+      if (semis.slice(0, 2).some((row, idx) => Number(row?.winner || 0) !== sf[idx])) return false;
+      if (Number(finals[0]?.winner || 0) !== finalWinner) return false;
+      if (third.length > 0) return thirdWinner > 0 && Number(third[0]?.winner || 0) === thirdWinner;
+      return thirdWinner <= 0;
+    });
+    if (!selectedOutcome) return null;
+
+    const scoresByPid = {};
+    Object.entries(selectedOutcome.players || {}).forEach(([pid, score]) => {
+      scoresByPid[Number(pid)] = Number(score || 0);
+    });
+    const componentsByPid = {};
+    Object.entries(selectedOutcome.player_components || {}).forEach(([pid, comps]) => {
+      componentsByPid[Number(pid)] = comps || {};
+    });
+    const playerValues = Object.entries(scoresByPid)
+      .map(([pidRaw, score]) => {
+        const pid = Number(pidRaw);
+        const p = playerById[pid] || {};
+        const comps = componentsByPid[pid] || {};
+        return {
+          player_id: pid,
+          name: p.name || playerLookup[pid] || `Player ${pid}`,
+          team_id: Number(playerTeamById[pid] || 0),
+          price: Number(p.price || 0),
+          points: Number(score || 0),
+          rating: Number(comps.rating || 0),
+          win: Number(comps.win || 0),
+          role: Number(comps.role || 0),
+          booster: Number(comps.booster || 0),
+          components_available: Boolean(componentsByPid[pid]),
+        };
+      })
+      .sort((a, b) => b.points - a.points);
+
+    let teamsForBracket = applyFilters(baseTeams || [], effectiveAppliedFilters.include, effectiveAppliedFilters.exclude);
+    const q = comboSearch.trim().toLowerCase();
+    if (q) {
+      teamsForBracket = teamsForBracket.filter((team) =>
+        (team.players || []).some((p) => {
+          const name = String(p.name || "").toLowerCase();
+          const teamName = String(teamLookup[p.team_id] || "").toLowerCase();
+          return name.includes(q) || teamName.includes(q) || String(p.player_id).includes(q) || String(p.team_id).includes(q);
+        })
+      );
+    }
+    const scoredTeams = teamsForBracket
+      .map((team) => {
+        const playersForBracket = (team.players || []).map((p) => {
+          const score = Number(scoresByPid[Number(p.player_id)] || 0);
+          return { ...p, mode_score: score, total_ev: score };
+        });
+        const bracketScore = playersForBracket.reduce((sum, p) => sum + Number(p.mode_score || 0), 0);
+        return { ...team, players: playersForBracket, total_ev: bracketScore, bracket_score: bracketScore };
+      })
+      .sort((a, b) => Number(b.bracket_score || 0) - Number(a.bracket_score || 0));
+
+    return {
+      bracket_probability: Number(selectedOutcome.probability || 0),
+      bracket: selectedOutcome.bracket || {},
+      outcomes_count: Number(results.outcomes_count || (results.outcomes || []).length || 0),
+      player_values: playerValues,
+      top_teams: scoredTeams.slice(0, 10),
+      all_teams: scoredTeams,
+      mode: "completed_bracket",
+    };
+  }, [
+    results,
+    baseTeams,
+    completedBracket,
+    completedBracketDerived.complete,
+    effectiveAppliedFilters,
+    comboSearch,
+    playerById,
+    playerLookup,
+    playerTeamById,
+    teamLookup,
+    applyFilters,
+  ]);
+  const activeCompletedBracketResult = completedBracketResult;
   const completedBracketValueData = useMemo(() => {
-    const rows = (completedBracketResult?.player_values || [])
+    const rows = (activeCompletedBracketResult?.player_values || [])
       .map((row) => ({
         player_id: Number(row.player_id),
         name: row.name || `Player ${row.player_id}`,
@@ -2264,10 +3022,14 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       slope,
       intercept,
     };
-  }, [completedBracketResult?.player_values]);
+  }, [activeCompletedBracketResult?.player_values]);
   const completedBreakdownValue = (row, key) => {
+    if (key === "total") {
+      const total = ["rating", "win", "role"].reduce((sum, part) => sum + completedBreakdownValue(row, part), 0);
+      if (row?.components_available === false && Number.isFinite(Number(row?.points))) return Number(row.points);
+      return total;
+    }
     const candidates = {
-      total: [row?.points, row?.total_ev, row?.mode_score],
       rating: [row?.rating, row?.rating_ev],
       win: [row?.win, row?.win_ev],
       role: [row?.role, row?.role_ev],
@@ -2318,9 +3080,6 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
           </button>
           <button className={playoffTab === "top5" ? "tab active" : "tab"} onClick={() => setPlayoffTab("top5")}>
             Top 5 Teams
-          </button>
-          <button className={playoffTab === "completed" ? "tab active" : "tab"} onClick={() => setPlayoffTab("completed")}>
-            Completed Bracket
           </button>
           <button className={playoffTab === "value" ? "tab active" : "tab"} onClick={() => setPlayoffTab("value")}>
             Player Value
@@ -2415,22 +3174,51 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
             {results && (
               <>
                 <div className="actions">
-                  <Select
-                    label="Evaluation Mode"
-                    value={playoffBestMode}
-                    onChange={setPlayoffBestMode}
-                    options={[
-                      { value: "average", label: "Average player value" },
-                      { value: "single_outcome", label: "Most possible points in one outcome" },
-                      { value: "most_outcomes", label: "Best in most outcomes" },
-                    ]}
-                  />
-                  <button className="primary" onClick={findTopTeams} disabled={busy || !results}>
-                    {busy ? "Working..." : "Generate & Store Team Combos"}
+                  <button className="primary" onClick={runSharedCombinations} disabled={busy || !results}>
+                    {busy ? "Running Combinations..." : "Run Combinations"}
                   </button>
+                  {sharedCombosUpdatedAt && <p className="muted">Combinations stored: {new Date(sharedCombosUpdatedAt).toLocaleString()}</p>}
+                </div>
+                {busy && (
+                  <div className="card sub">
+                    {comboPhase === "saving" ? (
+                      <>
+                        <p className="muted">
+                          Saving combinations: {processedCombos.toLocaleString()} / {totalCombos.toLocaleString()}
+                        </p>
+                        <p className="muted">This stores the generated roster universe for the tabs below.</p>
+                      </>
+                    ) : totalCombos > 0 ? (
+                      <>
+                        <p className="muted">
+                          Processing combinations: {processedCombos.toLocaleString()} / {totalCombos.toLocaleString()}
+                        </p>
+                        <p className="muted">ETA: {formatEta(topEtaSeconds)}</p>
+                      </>
+                    ) : (
+                      <p className="muted">Starting combination generator...</p>
+                    )}
+                    <div className="progress">
+                      <div
+                        className={`progress-bar ${totalCombos > 0 ? "determinate" : ""}`}
+                        style={totalCombos > 0 ? { width: `${Math.min(100, (processedCombos / totalCombos) * 100)}%` } : undefined}
+                      />
+                    </div>
+                  </div>
+                )}
+                <div className="tab-bar small">
+                  {playoffTopSubtabs.map((tab) => (
+                    <button
+                      key={tab.key}
+                      className={playoffTopSubtab === tab.key ? "tab active" : "tab"}
+                      onClick={() => setPlayoffTopMode(tab.key)}
+                    >
+                      {tab.label}
+                    </button>
+                  ))}
                 </div>
                 <div className="card sub">
-                  <h3>Top Teams (Filtered) - {playoffBestModeLabel}</h3>
+                  <h3>{playoffTopSubtab === "completed" ? "Completed Bracket Filters" : `Top Teams (Filtered) - ${playoffBestModeLabel}`}</h3>
                   <div className="top5-filters">
                     <div className="grid two">
                       <div className="field">
@@ -2607,7 +3395,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                       <Input label="Search Combos" value={comboSearch} onChange={setComboSearch} placeholder="Player/team name or id" />
                       <div className="field top5-counter">
                         <span>Filtered / Stored</span>
-                        <p className="muted">{filteredCount} / {(baseTeams || []).length}</p>
+                        <p className="muted">{filteredCount} / {sharedComboCount}</p>
                       </div>
                     </div>
                   </div>
@@ -2617,7 +3405,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
           </>
         )}
 
-        {playoffTab === "completed" && (
+        {playoffTab === "top5" && playoffTopSubtab === "completed" && (
           <div className="stack">
             {!results && (
               <div className="card sub">
@@ -2717,23 +3505,22 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                   </div>
                 </div>
                 <div className="actions">
-                  <button className="primary" onClick={runCompletedBracket} disabled={busy || !completedBracketDerived.complete}>
-                    {busy ? "Evaluating..." : "Find Best Teams For Bracket"}
-                  </button>
+                  {!baseTeams && <p className="muted">Run Combinations once above to score this bracket.</p>}
+                  {baseTeams && !completedBracketDerived.complete && <p className="muted">Complete the bracket to score the saved combinations.</p>}
                 </div>
                 {completedBracketMessage && (
                   <div className="card sub">
                     <p className="muted">{completedBracketMessage}</p>
                   </div>
                 )}
-                {completedBracketResult && (
+                {activeCompletedBracketResult && (
                   <div className="stack">
                     <div className="card sub">
                     <h3>
-                      Bracket probability {(Number(completedBracketResult.bracket_probability || 0) * 100).toFixed(2)}%
+                      Bracket probability {(Number(activeCompletedBracketResult.bracket_probability || 0) * 100).toFixed(2)}%
                     </h3>
                     <p className="muted">
-                      Matched 1 of {Number(completedBracketResult.outcomes_count || 0).toLocaleString()} stored outcomes.
+                      Matched 1 of {Number(activeCompletedBracketResult.outcomes_count || 0).toLocaleString()} stored outcomes.
                     </p>
                     <div className="actions">
                       <button className="secondary" onClick={() => setShowCompletedBracketGraph((prev) => !prev)}>
@@ -2751,11 +3538,11 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                         onPointClick={setCompletedPlayerBreakdown}
                       />
                     )}
-                    {(completedBracketResult.top_teams || [])[0] && (
+                    {(activeCompletedBracketResult.top_teams || [])[0] && (
                       <div className="card sub">
                         <h3>Best Team</h3>
                         {(() => {
-                          const team = (completedBracketResult.top_teams || [])[0];
+                          const team = (activeCompletedBracketResult.top_teams || [])[0];
                           return (
                             <>
                               <h4>
@@ -2775,7 +3562,10 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                                   {(team.players || []).map((p) => (
                                     <tr key={p.player_id}>
                                       <td>
-                                        <button className="inline-link-btn" onClick={() => setCompletedPlayerBreakdown(p)}>
+                                        <button
+                                          className="inline-link-btn"
+                                          onClick={() => setCompletedPlayerBreakdown(rosterAssignedBoosterPlayer(p, team.players || []))}
+                                        >
                                           {p.name}
                                         </button>
                                       </td>
@@ -2823,10 +3613,10 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                     </div>
                     <div className="card sub">
                       <h3>Top Teams</h3>
-                      {(completedBracketResult.top_teams || []).length === 0 && (
+                      {(activeCompletedBracketResult.top_teams || []).length === 0 && (
                         <p className="muted">No valid fantasy team matched the budget, per-team, and role constraints.</p>
                       )}
-                      {(completedBracketResult.top_teams || []).map((team, idx) => (
+                      {(activeCompletedBracketResult.top_teams || []).map((team, idx) => (
                       <div key={`completed-team-${idx}`} className="card sub">
                         <h4>
                           #{idx + 1} Bracket score {Number(team.total_ev || 0).toFixed(2)} | Cost {team.cost}
@@ -2845,7 +3635,10 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                             {(team.players || []).map((p) => (
                               <tr key={p.player_id}>
                                 <td>
-                                  <button className="inline-link-btn" onClick={() => setCompletedPlayerBreakdown(p)}>
+                                  <button
+                                    className="inline-link-btn"
+                                    onClick={() => setCompletedPlayerBreakdown(rosterAssignedBoosterPlayer(p, team.players || []))}
+                                  >
                                     {p.name}
                                   </button>
                                 </td>
@@ -2910,11 +3703,27 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                     {Object.entries(data.players || {}).map(([pid, comps]) => (
                       <tr key={pid}>
                         <td>
-                          <button className="inline-link-btn" onClick={() => onOpenPlayer && onOpenPlayer(Number(pid))}>
+                          <button
+                            className="inline-link-btn"
+                            onClick={() =>
+                              openScoringBreakdown({
+                                player_id: Number(pid),
+                                name: playerLookup[Number(pid)] || pid,
+                                team_id: Number(tid),
+                                points: Number(comps.total_points_without_booster ?? comps.total_points ?? 0),
+                                rating: Number(comps.rating_points_total || 0),
+                                win: Number(comps.win_points_total || 0),
+                                role: Number(comps.role_points_total || 0),
+                                booster: Number(comps.booster_points_total || 0),
+                                components_available: true,
+                                point_breakdown: comps.point_breakdown || [],
+                              })
+                            }
+                          >
                             {playerLookup[Number(pid)] || pid}
                           </button>
                         </td>
-                        <td>{comps.total_points.toFixed(2)}</td>
+                        <td>{Number(comps.total_points_without_booster ?? comps.total_points ?? 0).toFixed(2)}</td>
                         <td>{comps.rating_points_total.toFixed(2)}</td>
                         <td>{comps.win_points_total.toFixed(2)}</td>
                         <td>{comps.role_points_total.toFixed(2)}</td>
@@ -2928,7 +3737,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
           </div>
         </div>
       )}
-      {playoffTab === "top5" && topTeams && topTeams.length > 0 && (
+      {playoffTab === "top5" && playoffTopSubtab !== "completed" && topTeams && topTeams.length > 0 && (
         <div className="card sub">
           <h3>Top Teams</h3>
           {topTeams.map((team, idx) => (
@@ -2955,7 +3764,10 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                   {team.players.map((p) => (
                     <tr key={p.player_id}>
                       <td>
-                        <button className="inline-link-btn" onClick={() => onOpenPlayer && onOpenPlayer(Number(p.player_id))}>
+                        <button
+                          className="inline-link-btn"
+                          onClick={() => openProjectedRosterBreakdown(p, team.players || [])}
+                        >
                           {p.name}
                         </button>
                       </td>
@@ -2963,7 +3775,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                       <td>{roleLabel(p.role_name)}</td>
                       <td>{p.price}</td>
                       <td>{p.total_ev.toFixed(2)}</td>
-                      <td>{Number(p.mode_score ?? p.total_ev ?? 0).toFixed(2)}</td>
+                      <td>{playoffPlayerModeScore(p).toFixed(2)}</td>
                       <td>{p.rating_ev.toFixed(2)}</td>
                       <td>{p.win_ev.toFixed(2)}</td>
                       <td>{p.role_ev.toFixed(2)}</td>
@@ -2976,17 +3788,17 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
           ))}
         </div>
       )}
-      {playoffTab === "top5" && allTeams && allTeams.length > 0 && (
+      {playoffTab === "top5" && playoffTopSubtab !== "completed" && allTeams && allTeams.length > 0 && (
         <div className="card sub">
           <h3>All Filtered Teams ({filteredCount})</h3>
           <div className="actions">
-            <button className="secondary" onClick={() => setPage((p) => Math.max(0, p - 1))} disabled={page === 0}>
+            <button className="secondary" onClick={() => querySharedCombinations(Math.max(0, page - 1))} disabled={page === 0}>
               Prev 200
             </button>
             <button
               className="secondary"
-              onClick={() => setPage((p) => ((p + 1) * 200 < allTeams.length ? p + 1 : p))}
-              disabled={(page + 1) * 200 >= allTeams.length}
+              onClick={() => querySharedCombinations((page + 1) * 200 < filteredCount ? page + 1 : page)}
+              disabled={(page + 1) * 200 >= filteredCount}
             >
               Next 200
             </button>
@@ -3005,34 +3817,33 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
               </tr>
             </thead>
             <tbody>
-              {allTeams.slice(page * 200, page * 200 + 200).map((team, idx) => (
+              {allTeams.map((team, idx) => (
                 <tr key={idx + page * 200}>
                   <td>{idx + 1 + page * 200}</td>
                   <td>{playoffTeamMetric(team).toFixed(2)}</td>
                   <td>{team.cost}</td>
                   <td>{(playoffTeamMetric(team) / (team.cost || 1)).toFixed(4)}</td>
-                  <td>{team.players.map((p) => `${p.name} (${teamLookup[p.team_id] || p.team_id}, ${roleLabel(p.role_name)})`).join(", ")}</td>
+                  <td>
+                    {(team.players || []).map((p, playerIdx) => (
+                      <span key={`${idx}-${p.player_id}`}>
+                        {playerIdx > 0 && ", "}
+                        <button
+                          className="inline-link-btn"
+                          onClick={() => openProjectedRosterBreakdown(p, team.players || [])}
+                        >
+                          {p.name}
+                        </button>
+                        {` (${teamLookup[p.team_id] || p.team_id}, ${roleLabel(p.role_name)})`}
+                      </span>
+                    ))}
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
       )}
-      {playoffTab === "top5" && busy && totalCombos > 0 && (
-        <div className="card sub">
-          <p className="muted">
-            Processing combinations: {processedCombos.toLocaleString()} / {totalCombos.toLocaleString()}
-          </p>
-          <p className="muted">ETA: {formatEta(topEtaSeconds)}</p>
-          <div className="progress">
-            <div
-              className="progress-bar determinate"
-              style={{ width: `${totalCombos > 0 ? Math.min(100, (processedCombos / totalCombos) * 100) : 0}%` }}
-            />
-          </div>
-        </div>
-      )}
-      {playoffTab === "top5" && baseTeams && filteredCount === 0 && (
+      {playoffTab === "top5" && playoffTopSubtab !== "completed" && baseTeams && filteredCount === 0 && (
         <div className="card sub">
           <p className="muted">No team combinations match current include/exclude/search filters.</p>
         </div>
@@ -3050,7 +3861,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
           <p className="muted">Run Playoff Bracket first.</p>
         </div>
       )}
-      {playoffTab === "top5" && topMessage && (
+      {playoffTab === "top5" && playoffTopSubtab !== "completed" && topMessage && (
         <div className="card sub">
           <p className="muted">{topMessage}</p>
         </div>
@@ -3188,6 +3999,63 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                   </tr>
                 </tbody>
               </table>
+              {Array.isArray(completedPlayerBreakdown.point_breakdown) && completedPlayerBreakdown.point_breakdown.length > 0 && (
+                <div className="stack">
+                  <h4>Match Sources</h4>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Match</th>
+                        <th>Opponent</th>
+                        <th>Rating</th>
+                        <th>Win</th>
+                        <th>Role</th>
+                        <th>Booster</th>
+                        <th>Total</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {completedPlayerBreakdown.point_breakdown.map((row, idx) => {
+                        const opponentId = Number(row.opponent_team_id || 0);
+                        const matchLabel = row.match_number ? `M${row.match_number} ${row.match_type || ""}` : row.match_type || "Adjustment";
+                        const opponentLabel = opponentId > 0 ? `${teamLookup[opponentId] || opponentId} (#${row.opponent_rank ?? "-"})` : row.note || "-";
+                        const roleName = row.role_id == null ? "Stored role" : roleLabel(row.role_id);
+                        const boosterName = row.booster_name || (row.booster_slot ? `Booster slot ${row.booster_slot}` : "None");
+                        return (
+                          <tr key={`${row.match_number || "adj"}-${idx}`}>
+                            <td>{matchLabel}</td>
+                            <td>{opponentLabel}</td>
+                            <td>
+                              {Number(row.rating_points || 0).toFixed(2)}
+                              {row.rating_used != null && <div className="muted">rating {Number(row.rating_used || 0).toFixed(2)}</div>}
+                            </td>
+                            <td>
+                              {Number(row.win_points || 0).toFixed(2)}
+                              <div className="muted">{row.did_win ? "Win" : "Loss"} {Number((row.win_probability || 0) * 100).toFixed(1)}%</div>
+                            </td>
+                            <td>
+                              {Number(row.role_points || 0).toFixed(2)}
+                              <div className="muted">
+                                {roleName} major {Number((row.role_major_pct || 0) * 100).toFixed(1)}%, minor {Number((row.role_minor_pct || 0) * 100).toFixed(1)}%
+                              </div>
+                            </td>
+                            <td>
+                              {Number(row.booster_points || 0).toFixed(2)}
+                              <div className="muted">
+                                {boosterName} {Number((row.booster_trigger_rate || 0) * 100).toFixed(1)}%
+                                {row.booster_assigned === false && row.raw_booster_name && (
+                                  <div>raw: {row.raw_booster_name} {(Number(row.raw_booster_trigger_rate || 0) * 100).toFixed(1)}%</div>
+                                )}
+                              </div>
+                            </td>
+                            <td>{Number(row.total_points || 0).toFixed(2)}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
               {completedPlayerBreakdown.components_available === false && (
                   <p className="muted">
                     This stored bracket was generated before source components were saved. Re-run the playoff bracket to see rating, win, role, and booster split accurately.

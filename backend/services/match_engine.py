@@ -22,6 +22,28 @@ from swiss_stage.swiss_models import TeamState
 from backend.services.team_strength import _get_hltv_rank, get_team_winrate
 
 
+BOOSTER_NAMES = {
+    0: "Best Pistol Round",
+    1: "Bottom of scoreboard",
+    2: "Clutch",
+    3: "Top of scoreboard",
+    4: "Avenger",
+    5: "Bait",
+    6: "Rambo",
+    7: "Flash",
+    8: "Mister consistent",
+    9: "Kobe",
+    10: "Saver",
+    11: "Assist",
+    12: "Aim bot",
+    13: "Quad",
+    14: "Carry",
+    15: "Cannon fodder",
+    16: "Farmer",
+    17: "Hellcase",
+}
+
+
 @dataclass(frozen=True)
 class MatchResult:
     """Outcome of a single simulated match."""
@@ -120,6 +142,27 @@ def apply_fantasy_points_for_team(
         role_pts = compute_role_points(player)
         win_pts = compute_win_points(win_probability, did_win)
         booster_pts = compute_booster_points(player, match_number)
+        booster_idx = match_number - 1
+        booster_id = None
+        if 0 <= booster_idx < len(player.booster_ids):
+            booster_id = player.booster_ids[booster_idx]
+            if booster_id < 0:
+                booster_id = None
+        booster_rate = float(player.boosters[booster_idx]) if 0 <= booster_idx < len(player.boosters) else 0.0
+        booster_options = [
+            {
+                "booster_id": int(option_id),
+                "booster_name": BOOSTER_NAMES.get(int(option_id), f"Booster {int(option_id)}"),
+                "booster_trigger_rate": float(option_rate),
+                "booster_points": 5.0 * float(option_rate),
+            }
+            for option_id, option_rate in sorted(
+                (player.booster_rates or {}).items(),
+                key=lambda item: float(item[1]),
+                reverse=True,
+            )
+            if float(option_rate) > 0
+        ]
 
         total = rating_pts + role_pts + win_pts + booster_pts
 
@@ -128,5 +171,29 @@ def apply_fantasy_points_for_team(
         player.win_points_total += win_pts
         player.booster_points_total += booster_pts
         player.total_points += total
+        player.point_breakdown.append(
+            {
+                "match_number": int(match_number),
+                "match_type": str(match_type).upper(),
+                "opponent_team_id": int(opponent_team_id),
+                "opponent_rank": int(opponent_rank),
+                "did_win": bool(did_win),
+                "win_probability": float(win_probability),
+                "rating_used": float(match_rating),
+                "rating_points": float(rating_pts),
+                "win_points": float(win_pts),
+                "role_id": player.role_id,
+                "role_major_pct": float(player.major_pct),
+                "role_minor_pct": float(player.minor_pct),
+                "role_points": float(role_pts),
+                "booster_slot": int(match_number),
+                "booster_id": booster_id,
+                "booster_name": BOOSTER_NAMES.get(booster_id, f"Booster {booster_id}") if booster_id is not None else f"Booster slot {match_number}",
+                "booster_trigger_rate": booster_rate,
+                "booster_points": float(booster_pts),
+                "booster_options": booster_options,
+                "total_points": float(total),
+            }
+        )
 
         player.rating = original_rating
