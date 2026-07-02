@@ -6644,8 +6644,9 @@ function AdminTab({ refresh, notify }) {
   const [importResult, setImportResult] = useState("");
   const [importBusy, setImportBusy] = useState(false);
   const [wipeBusy, setWipeBusy] = useState(false);
-  const [fitBusy, setFitBusy] = useState(false);
-  const [fitRows, setFitRows] = useState([{ rankA: "", oddsA: "", rankB: "", oddsB: "" }]);
+  const [simulatorUrl, setSimulatorUrl] = useState("https://www.hltv.org/events/8914/xse-pro-league-2026#simulator");
+  const [simulatorBusy, setSimulatorBusy] = useState(false);
+  const [simulatorResult, setSimulatorResult] = useState(null);
 
   const importTriggers = async () => {
     if (!triggerJson.trim()) {
@@ -6676,35 +6677,36 @@ function AdminTab({ refresh, notify }) {
     refresh();
   };
 
-  const fitWinrate = async () => {
-    const samples = fitRows
-      .map((r) => ({
-        rank_a: Number(r.rankA),
-        rank_b: Number(r.rankB),
-        odds_a: Number(r.oddsA),
-      }))
-      .filter(
-        (s) =>
-          Number.isFinite(s.rank_a) &&
-          s.rank_a > 0 &&
-          Number.isFinite(s.rank_b) &&
-          s.rank_b > 0 &&
-          Number.isFinite(s.odds_a) &&
-          s.odds_a > 0
-      );
-    if (samples.length < 2) {
-      setImportResult("Need at least 2 valid rows (rankA, oddsA, rankB, oddsB). Using oddsA to imply P(A).");
+  const inferHltvSimulatorPairing = async () => {
+    if (!simulatorUrl.trim()) {
+      setImportResult("Paste an HLTV event simulator URL first.");
       return;
     }
-    setFitBusy(true);
+    setSimulatorBusy(true);
     setImportResult("");
+    setSimulatorResult(null);
     try {
-      const res = await api.post("/admin/fit-winrate", { samples });
-      setImportResult(`Fit saved. a_offset=${res.a_offset?.toFixed?.(4)} b_slope=${res.b_slope?.toFixed?.(4)} (n=${res.n_samples})`);
-      notify("Winrate parameters updated");
-      refresh();
+      const res = await requestJson(
+        "/admin/infer-hltv-simulator-pairing",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: simulatorUrl.trim() }),
+        },
+        90000
+      );
+      setSimulatorResult(res);
+      const best = res.inference?.best;
+      setImportResult(
+        best
+          ? `Pairing probe complete: best candidate ${best.label} (${Math.round((best.score || 0) * 100)}%).`
+          : "Pairing probe complete, but no matching candidate could be scored."
+      );
+      notify("HLTV simulator pairing probed");
+    } catch (e) {
+      setImportResult(e?.message || "Failed to infer HLTV simulator pairing.");
     } finally {
-      setFitBusy(false);
+      setSimulatorBusy(false);
     }
   };
 
@@ -6715,8 +6717,8 @@ function AdminTab({ refresh, notify }) {
           <button className={dataTab === "trigger" ? "tab active" : "tab"} onClick={() => setDataTab("trigger")}>
             Trigger Rates
           </button>
-          <button className={dataTab === "fit" ? "tab active" : "tab"} onClick={() => setDataTab("fit")}>
-            Winrate Fit
+          <button className={dataTab === "simulator" ? "tab active" : "tab"} onClick={() => setDataTab("simulator")}>
+            HLTV Simulator
           </button>
           <button className={dataTab === "maintenance" ? "tab active" : "tab"} onClick={() => setDataTab("maintenance")}>
             Maintenance
@@ -6754,80 +6756,109 @@ function AdminTab({ refresh, notify }) {
           </div>
         )}
 
-        {dataTab === "fit" && (
+        {dataTab === "simulator" && (
           <div className="stack">
-            <div className="card sub">
-              <h4>Winrate Fit Samples</h4>
-              <table>
-                <thead>
-                  <tr>
-                    <th>Rank A</th>
-                    <th>Odds A</th>
-                    <th>Rank B</th>
-                    <th>Odds B</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {fitRows.map((row, idx) => (
-                    <tr key={idx}>
-                      <td>
-                        <input
-                          value={row.rankA}
-                          onChange={(e) =>
-                            setFitRows((prev) =>
-                              prev.map((r, i) => (i === idx ? { ...r, rankA: e.target.value } : r))
-                            )
-                          }
-                        />
-                      </td>
-                      <td>
-                        <input
-                          value={row.oddsA}
-                          onChange={(e) =>
-                            setFitRows((prev) =>
-                              prev.map((r, i) => (i === idx ? { ...r, oddsA: e.target.value } : r))
-                            )
-                          }
-                        />
-                      </td>
-                      <td>
-                        <input
-                          value={row.rankB}
-                          onChange={(e) =>
-                            setFitRows((prev) =>
-                              prev.map((r, i) => (i === idx ? { ...r, rankB: e.target.value } : r))
-                            )
-                          }
-                        />
-                      </td>
-                      <td>
-                        <input
-                          value={row.oddsB}
-                          onChange={(e) =>
-                            setFitRows((prev) =>
-                              prev.map((r, i) => (i === idx ? { ...r, oddsB: e.target.value } : r))
-                            )
-                          }
-                        />
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-              <div className="actions">
-                <button
-                  className="secondary"
-                  onClick={() => setFitRows((prev) => [...prev, { rankA: "", oddsA: "", rankB: "", oddsB: "" }])}
-                >
-                  Add Row
-                </button>
-              </div>
-            </div>
+            <label className="field">
+              <span>HLTV Event Simulator URL</span>
+              <input
+                value={simulatorUrl}
+                onChange={(e) => setSimulatorUrl(e.target.value)}
+                placeholder="https://www.hltv.org/events/8914/xse-pro-league-2026#simulator"
+              />
+            </label>
             <div className="actions">
-              <button className="primary" onClick={fitWinrate} disabled={fitBusy}>
-                {fitBusy ? "Fitting..." : "Fit Winrate Params"}
+              <button className="primary" onClick={inferHltvSimulatorPairing} disabled={simulatorBusy}>
+                {simulatorBusy ? "Running Probe..." : "Infer Pairing Algorithm"}
+              </button>
+              <button className="secondary" onClick={() => api.openExternal(simulatorUrl)} disabled={!simulatorUrl.trim()}>
+                Open In Browser
               </button>
             </div>
+            <p className="muted">
+              Opens HLTV in the existing browser profile, clicks several first-round outcome patterns, captures the generated next-round pairings, and scores candidate pairing rules.
+            </p>
+            {simulatorResult && (
+              <>
+                <div className="card sub">
+                  <h4>Pairing Probe Summary</h4>
+                  <p className="muted">Status: {simulatorResult.ok === false ? "Failed" : "Complete"}</p>
+                  <p className="muted">URL: {simulatorResult.url}</p>
+                  {Number.isFinite(Number(simulatorResult.extracted_team_count)) && (
+                    <p className="muted">
+                      Teams detected: {simulatorResult.extracted_team_count} | Rank source: {simulatorResult.rank_source || "unknown"}
+                    </p>
+                  )}
+                  {Array.isArray(simulatorResult.extracted_team_names) && simulatorResult.extracted_team_names.length > 0 && (
+                    <p className="muted">Extracted names: {simulatorResult.extracted_team_names.slice(0, 24).join(", ")}</p>
+                  )}
+                  {simulatorResult.error && <p className="danger-text">{simulatorResult.error}</p>}
+                  {simulatorResult.inference?.best && (
+                    <>
+                      <p className="muted">
+                        Best candidate: {simulatorResult.inference.best.label} (
+                        {Math.round((simulatorResult.inference.best.score || 0) * 100)}%,{" "}
+                        {simulatorResult.inference.best.matched || 0}/{simulatorResult.inference.best.total || 0} pairs)
+                      </p>
+                    </>
+                  )}
+                </div>
+                {(simulatorResult.inference?.candidates || []).length > 0 && (
+                  <div className="card sub">
+                    <h4>Candidate Scores</h4>
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Rule</th>
+                          <th>Score</th>
+                          <th>Matched</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {simulatorResult.inference.candidates.map((candidate) => (
+                          <tr key={candidate.mode}>
+                            <td>{candidate.label}</td>
+                            <td>{Math.round((candidate.score || 0) * 100)}%</td>
+                            <td>
+                              {candidate.matched || 0}/{candidate.total || 0}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+                {(simulatorResult.scenarios || []).length > 0 && (
+                  <div className="card sub">
+                    <h4>Observed Scenarios</h4>
+                    {(simulatorResult.scenarios || []).map((scenario) => (
+                      <div key={scenario.name} className="stack compact">
+                        <h5>{scenario.name}</h5>
+                        {scenario.error && <p className="danger-text">{scenario.error}</p>}
+                        <p className="muted">
+                          Winners: {(scenario.winners || []).join(", ") || "None captured"}
+                        </p>
+                        <p className="muted">
+                          Winner clicks: {scenario.clicks_succeeded ?? 0}/{(scenario.clicks || []).length} | Advance clicks:{" "}
+                          {(scenario.advance_result?.clicked || []).join(", ") || "None"}
+                        </p>
+                        <p className="muted">
+                          1-0: {(scenario.after?.["1:0"] || []).map((p) => `${p.team_a} vs ${p.team_b}`).join(" | ") || "None captured"}
+                        </p>
+                        <p className="muted">
+                          0-1: {(scenario.after?.["0:1"] || []).map((p) => `${p.team_a} vs ${p.team_b}`).join(" | ") || "None captured"}
+                        </p>
+                        {scenario.after_snapshot?.buckets && (
+                          <p className="muted">
+                            Bucket teams: 1-0 [{(scenario.after_snapshot.buckets["1:0"]?.teams || []).join(", ") || "-"}] | 0-1 [
+                            {(scenario.after_snapshot.buckets["0:1"]?.teams || []).join(", ") || "-"}]
+                          </p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
           </div>
         )}
 

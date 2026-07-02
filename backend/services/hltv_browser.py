@@ -232,6 +232,45 @@ def fetch_hltv_html(
         raise HLTVBrowserError(f"Failed to fetch HLTV page with SeleniumBase UC: {last_error}")
 
 
+def run_hltv_browser_session(
+    url: str,
+    callback,
+    *,
+    timeout_ms: int = 45000,
+    wait_text: str | None = None,
+    reconnect_time: float | None = None,
+):
+    with _FETCH_LOCK:
+        _wait_for_rate_limit()
+        last_error: Exception | None = None
+        for attempt in range(2):
+            driver = None
+            profile_dir = None
+            try:
+                driver, profile_dir, _ = _make_driver()
+                _open_hltv_url(driver, url, reconnect_time=reconnect_time)
+                _accept_cookies(driver)
+                if wait_text:
+                    _wait_for_text(driver, wait_text, min(12.0, max(1.0, timeout_ms / 1000.0)))
+                _wait_after_load()
+                result = callback(driver)
+                _mark_fetch_complete()
+                return result
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0 and _is_dead_webdriver_error(exc):
+                    logger.warning("HLTV UC driver died while running session for %s; retrying: %s", url, exc)
+                    if profile_dir is not None:
+                        _cleanup_profile_locks(profile_dir)
+                    time.sleep(1.0)
+                    continue
+                raise HLTVBrowserError(f"Failed to run HLTV browser session with SeleniumBase UC: {exc}") from exc
+            finally:
+                if driver is not None:
+                    _quit_driver(driver)
+        raise HLTVBrowserError(f"Failed to run HLTV browser session with SeleniumBase UC: {last_error}")
+
+
 def fetch_hltv_json(url: str, *, timeout_ms: int = 45000) -> dict[str, Any]:
     with _FETCH_LOCK:
         _wait_for_rate_limit()
