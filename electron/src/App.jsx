@@ -2236,11 +2236,6 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     ];
   }, [players]);
   const playerNameById = playerLookup;
-  const filteredTeams = useMemo(() => {
-    if (!selectedEventId) return [];
-    if (!eventTeamNames || eventTeamNames.size === 0) return [];
-    return teams.filter((t) => eventTeamNames.has(normalizeTeamName(t.name)));
-  }, [teams, selectedEventId, eventTeamNames]);
   const playoffTeamsForFilters = useMemo(() => {
     const selectedIds = Array.from(new Set(slots.map((s) => Number(s)).filter((id) => Number.isFinite(id) && id > 0)));
     const byId = new Map(teams.map((t) => [Number(t.team_id), t]));
@@ -3060,7 +3055,10 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
             onChange={setSelectedEventId}
             options={
               events.length > 0
-                ? events.map((e) => ({ value: String(e.event_id), label: `Event ${e.event_id}` }))
+                ? events.map((e) => ({
+                    value: String(e.event_id),
+                    label: e.hltv_event_id ? `Fantasy ${e.event_id} -> HLTV ${e.hltv_event_id}` : `Fantasy ${e.event_id}`,
+                  }))
                 : [{ value: "", label: "No events imported" }]
             }
           />
@@ -4157,7 +4155,10 @@ function EventsTab({ refreshData, notify, players }) {
       setActiveEventId(res.active_event_id ?? Number(eventId.trim()));
       setSelectedEventId(Number(res.event_id));
       setEventId("");
-      setMessage(`Imported event ${res.event_id}: players ${res.imported_players ?? 0}, teams ${res.imported_teams ?? 0}.`);
+      setMessage(
+        `Imported fantasy event ${res.event_id}: players ${res.imported_players ?? 0}, teams ${res.imported_teams ?? 0}.` +
+          (res.hltv_event_id ? ` Linked HLTV event ${res.hltv_event_id}.` : "")
+      );
       notify("Event imported");
       await loadEvents();
       await loadEventDetail(Number(res.event_id));
@@ -4214,7 +4215,7 @@ function EventsTab({ refreshData, notify, players }) {
       <Section title="Events">
         <div className="stack">
           <div className="grid three">
-            <Input label="Event ID" value={eventId} onChange={setEventId} placeholder="e.g. 12345" />
+            <Input label="Fantasy Event ID" value={eventId} onChange={setEventId} placeholder="e.g. 12345" />
             <div className="field">
               <span>Import</span>
               <button className="primary" onClick={importEvent} disabled={busy}>
@@ -4238,7 +4239,8 @@ function EventsTab({ refreshData, notify, players }) {
               <table>
                 <thead>
                   <tr>
-                    <th>Event</th>
+                    <th>Fantasy Event</th>
+                    <th>HLTV Event</th>
                     <th>Imported</th>
                     <th>Teams</th>
                     <th>Players</th>
@@ -4250,6 +4252,7 @@ function EventsTab({ refreshData, notify, players }) {
                   {events.map((ev) => (
                     <tr key={ev.event_id} className={selectedEventId === ev.event_id ? "row-active" : ""}>
                       <td>{ev.event_id}</td>
+                      <td>{ev.hltv_event_id ?? "-"}</td>
                       <td>{ev.imported_at ? new Date(ev.imported_at).toLocaleString() : "-"}</td>
                       <td>{ev.team_count ?? 0}</td>
                       <td>{ev.player_count ?? 0}</td>
@@ -6637,6 +6640,407 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
   );
 }
 
+const matchWinnerKey = (roundIndex, matchIndex) => `${roundIndex}:${matchIndex}`;
+
+const roundFromWinnerKey = (key) => Number(String(key).split(":")[0]);
+
+const swissBuchholz = (teamName, states) =>
+  (states[teamName]?.opponents || []).reduce((total, opponent) => total + Number(states[opponent]?.wins || 0), 0);
+
+const pairSwissPool = (teamNames, states, ranks) => {
+  const ordered = [...teamNames].sort((a, b) => {
+    const buchholzGap = swissBuchholz(b, states) - swissBuchholz(a, states);
+    if (buchholzGap) return buchholzGap;
+    const rankGap = Number(ranks[a] || 9999) - Number(ranks[b] || 9999);
+    if (rankGap) return rankGap;
+    return a.localeCompare(b);
+  });
+
+  const backtrack = (remaining, acc) => {
+    if (!remaining.length) return acc;
+    const first = remaining[0];
+    const rest = remaining.slice(1);
+    for (let idx = rest.length - 1; idx >= 0; idx -= 1) {
+      const candidate = rest[idx];
+      if ((states[first]?.opponents || []).includes(candidate)) continue;
+      const result = backtrack([...rest.slice(0, idx), ...rest.slice(idx + 1)], [...acc, { team_a: first, team_b: candidate }]);
+      if (result) return result;
+    }
+    return null;
+  };
+
+  const noRematchPairs = backtrack(ordered, []);
+  if (noRematchPairs) return noRematchPairs;
+
+  const fallback = [];
+  for (let idx = 0; idx < Math.floor(ordered.length / 2); idx += 1) {
+    fallback.push({ team_a: ordered[idx], team_b: ordered[ordered.length - 1 - idx] });
+  }
+  return fallback;
+};
+
+const buildReplicaSwiss = (simulatorResult, winnerSelections) => {
+  const seedRanks = simulatorResult?.ranks || {};
+  const seedNames =
+    Array.isArray(simulatorResult?.extracted_team_names) && simulatorResult.extracted_team_names.length
+      ? simulatorResult.extracted_team_names
+      : Object.keys(seedRanks).sort((a, b) => Number(seedRanks[a] || 9999) - Number(seedRanks[b] || 9999));
+  const initialPairs = simulatorResult?.scenarios?.[0]?.initial || [];
+  const states = Object.fromEntries(
+    seedNames.map((name) => [
+      name,
+      {
+        name,
+        wins: 0,
+        losses: 0,
+        opponents: [],
+      },
+    ])
+  );
+
+  const rounds = [];
+  for (let roundIndex = 0; roundIndex < 5; roundIndex += 1) {
+    let pairings = [];
+    if (roundIndex === 0) {
+      pairings = initialPairs;
+    } else {
+      const buckets = {};
+      Object.values(states)
+        .filter((team) => team.wins < 3 && team.losses < 3)
+        .forEach((team) => {
+          const bucket = `${team.wins}:${team.losses}`;
+          buckets[bucket] = [...(buckets[bucket] || []), team.name];
+        });
+      Object.keys(buckets)
+        .sort((a, b) => {
+          const [aw, al] = a.split(":").map(Number);
+          const [bw, bl] = b.split(":").map(Number);
+          return bw - aw || al - bl;
+        })
+        .forEach((bucket) => {
+          pairings.push(...pairSwissPool(buckets[bucket], states, seedRanks).map((pair) => ({ ...pair, bucket })));
+        });
+    }
+
+    if (!pairings.length) break;
+
+    const displayPairings = pairings.map((pair, matchIndex) => {
+      const key = matchWinnerKey(roundIndex, matchIndex);
+      return {
+        ...pair,
+        key,
+        bucket: pair.bucket || `${states[pair.team_a]?.wins || 0}:${states[pair.team_a]?.losses || 0}`,
+        team_a_record: `${states[pair.team_a]?.wins || 0}-${states[pair.team_a]?.losses || 0}`,
+        team_b_record: `${states[pair.team_b]?.wins || 0}-${states[pair.team_b]?.losses || 0}`,
+        team_a_buchholz: swissBuchholz(pair.team_a, states),
+        team_b_buchholz: swissBuchholz(pair.team_b, states),
+        selectedWinner: winnerSelections[key] || "",
+      };
+    });
+    rounds.push({ round: roundIndex + 1, pairings: displayPairings });
+
+    if (!displayPairings.every((pair) => pair.selectedWinner)) break;
+
+    displayPairings.forEach((pair) => {
+      const winner = pair.selectedWinner;
+      const loser = winner === pair.team_a ? pair.team_b : pair.team_a;
+      states[winner].wins += 1;
+      states[loser].losses += 1;
+      states[winner].opponents.push(loser);
+      states[loser].opponents.push(winner);
+    });
+  }
+
+  const standings = Object.values(states).sort((a, b) => {
+    const statusGap = Number(b.wins >= 3) - Number(a.wins >= 3) || Number(a.losses >= 3) - Number(b.losses >= 3);
+    if (statusGap) return statusGap;
+    return (
+      b.wins - a.wins ||
+      a.losses - b.losses ||
+      swissBuchholz(b.name, states) - swissBuchholz(a.name, states) ||
+      Number(seedRanks[a.name] || 9999) - Number(seedRanks[b.name] || 9999)
+    );
+  });
+
+  return { rounds, standings, ranks: seedRanks };
+};
+
+const teamInitials = (name) =>
+  String(name || "?")
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0])
+    .join("")
+    .toUpperCase();
+
+function TeamBubble({ name, logos, selected, onClick, disabled = false }) {
+  const logo = logos?.[name];
+  return (
+    <button className={`swiss-team-bubble${selected ? " selected" : ""}`} onClick={onClick} disabled={disabled} title={name}>
+      {logo ? <img src={logo} alt={name} /> : <span>{teamInitials(name)}</span>}
+    </button>
+  );
+}
+
+function PlaceholderBubble() {
+  return (
+    <button className="swiss-team-bubble placeholder" disabled>
+      <span>?</span>
+    </button>
+  );
+}
+
+const SWISS_BOARD_COLUMNS = [
+  { roundIndex: 0, buckets: [{ key: "0:0", rows: 8 }] },
+  { roundIndex: 1, buckets: [{ key: "1:0", rows: 4 }, { key: "0:1", rows: 4 }] },
+  { roundIndex: 2, buckets: [{ key: "2:0", rows: 2 }, { key: "1:1", rows: 4 }, { key: "0:2", rows: 2 }] },
+  {
+    roundIndex: 3,
+    buckets: [
+      { key: "3:0", rows: 1, outcome: "advanced-perfect" },
+      { key: "2:1", rows: 3 },
+      { key: "1:2", rows: 3 },
+      { key: "0:3", rows: 1, outcome: "eliminated-perfect" },
+    ],
+  },
+  {
+    roundIndex: 4,
+    buckets: [
+      { key: "3:1 / 3:2", rows: 2, outcome: "advanced" },
+      { key: "2:2", rows: 3 },
+      { key: "1:3 / 2:3", rows: 2, outcome: "eliminated" },
+    ],
+  },
+];
+
+function HltvReplicaSimulatorPanel({ eventId, hltvEventId, hltvEventUrl }) {
+  const [simulatorBusy, setSimulatorBusy] = useState(false);
+  const [simulatorResult, setSimulatorResult] = useState(null);
+  const [simulatorWinners, setSimulatorWinners] = useState({});
+  const [simulatorMessage, setSimulatorMessage] = useState("");
+  const replicaSwiss = useMemo(() => buildReplicaSwiss(simulatorResult, simulatorWinners), [simulatorResult, simulatorWinners]);
+
+  const loadHltvReplicaSimulator = async () => {
+    if (!eventId) {
+      setSimulatorMessage("Select or import a fantasy event first.");
+      return;
+    }
+    setSimulatorBusy(true);
+    setSimulatorMessage("");
+    setSimulatorResult(null);
+    setSimulatorWinners({});
+    try {
+      const res = await requestJson(
+        "/admin/infer-hltv-simulator-pairing",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            fantasy_event_id: String(eventId),
+            hltv_event_id: hltvEventId ? String(hltvEventId) : undefined,
+            hltv_event_url: hltvEventUrl || undefined,
+          }),
+        },
+        90000
+      );
+      setSimulatorResult(res);
+      const best = res.inference?.best;
+      setSimulatorMessage(
+        best
+          ? `Loaded from HLTV event ${res.hltv_event_id || hltvEventId || "resolved"}: ${best.label} (${best.matched || 0}/${best.total || 0} observed round-two pairs).`
+          : `Loaded from HLTV event ${res.hltv_event_id || hltvEventId || "resolved"}.`
+      );
+    } catch (e) {
+      setSimulatorMessage(e?.message || "Failed to load HLTV simulator data.");
+    } finally {
+      setSimulatorBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    setSimulatorResult(null);
+    setSimulatorWinners({});
+    setSimulatorMessage("");
+  }, [eventId, hltvEventId, hltvEventUrl]);
+
+  useEffect(() => {
+    if (eventId) {
+      loadHltvReplicaSimulator();
+    }
+  }, [eventId, hltvEventId, hltvEventUrl]);
+
+  const selectReplicaWinner = (matchKey, winner) => {
+    const roundIndex = roundFromWinnerKey(matchKey);
+    setSimulatorWinners((prev) => {
+      const next = Object.fromEntries(Object.entries(prev).filter(([key]) => roundFromWinnerKey(key) <= roundIndex));
+      next[matchKey] = winner;
+      return next;
+    });
+  };
+
+  const resetReplicaRound = (roundIndex) => {
+    setSimulatorWinners((prev) => Object.fromEntries(Object.entries(prev).filter(([key]) => roundFromWinnerKey(key) < roundIndex)));
+  };
+
+  const resetReplicaSimulator = () => setSimulatorWinners({});
+
+  const autoPickReplicaRound = (round, mode) => {
+    setSimulatorWinners((prev) => {
+      const next = Object.fromEntries(Object.entries(prev).filter(([key]) => roundFromWinnerKey(key) <= round.round - 1));
+      round.pairings.forEach((pair) => {
+        next[pair.key] =
+          mode === "higher"
+            ? Number(replicaSwiss.ranks[pair.team_a] || 9999) <= Number(replicaSwiss.ranks[pair.team_b] || 9999)
+              ? pair.team_a
+              : pair.team_b
+            : Math.random() < 0.5
+              ? pair.team_a
+              : pair.team_b;
+      });
+      return next;
+    });
+  };
+
+  return (
+    <Section title="HLTV Swiss Replica">
+      <div className="stack">
+        <div className="actions">
+          <button className="primary" onClick={loadHltvReplicaSimulator} disabled={simulatorBusy || !eventId}>
+            {simulatorBusy ? "Loading..." : eventId ? `Load Fantasy ${eventId}` : "No Event Selected"}
+          </button>
+          <button className="secondary" onClick={resetReplicaSimulator} disabled={!simulatorResult || simulatorBusy}>
+            Reset Picks
+          </button>
+        </div>
+        <p className="muted">
+          Uses the selected fantasy event and its linked HLTV event page to parse the embedded Swiss simulator data.
+        </p>
+        {simulatorMessage && <p className="muted">{simulatorMessage}</p>}
+
+        {simulatorResult && (
+          <>
+            <div className="card sub">
+              <h4>Replica Simulator</h4>
+              {Number.isFinite(Number(simulatorResult.extracted_team_count)) && (
+                <p className="muted">
+                  Teams detected: {simulatorResult.extracted_team_count} | First round: {simulatorResult.first_round_rule || "unknown"} |
+                  Successor rounds: {simulatorResult.successor_round_rule || "unknown"}
+                </p>
+              )}
+              {simulatorResult.inference?.best && (
+                <p className="muted">
+                  Inferred pairing: {simulatorResult.inference.best.label}
+                  {Number(simulatorResult.inference.best.total || 0) > 0 &&
+                    ` (${simulatorResult.inference.best.matched || 0}/${simulatorResult.inference.best.total || 0} observed pairs)`}
+                </p>
+              )}
+            </div>
+
+            {replicaSwiss.rounds.length > 0 && (
+              <div className="swiss-replica-board">
+                <div className="swiss-replica-title">Swiss simulator for {simulatorResult.event_name || `Event ${eventId}`}</div>
+                <div className="swiss-round-grid">
+                  {SWISS_BOARD_COLUMNS.map((column) => {
+                    const round = replicaSwiss.rounds.find((item) => item.round === column.roundIndex + 1);
+                    const buckets = (round?.pairings || []).reduce((acc, pair) => {
+                      acc[pair.bucket] = [...(acc[pair.bucket] || []), pair];
+                      return acc;
+                    }, {});
+                    const outcomeTeams = (kind) => {
+                      if (kind === "advanced-perfect") return replicaSwiss.standings.filter((team) => team.wins >= 3 && team.losses === 0);
+                      if (kind === "advanced") return replicaSwiss.standings.filter((team) => team.wins >= 3 && team.losses > 0);
+                      if (kind === "eliminated-perfect") return replicaSwiss.standings.filter((team) => team.losses >= 3 && team.wins === 0);
+                      if (kind === "eliminated") return replicaSwiss.standings.filter((team) => team.losses >= 3 && team.wins > 0);
+                      return [];
+                    };
+                    return (
+                      <div key={column.roundIndex} className="swiss-round-column">
+                        <div className="swiss-round-controls">
+                          <button onClick={() => resetReplicaRound(column.roundIndex)} disabled={!round}>
+                            Reset
+                          </button>
+                          <button onClick={() => round && autoPickReplicaRound(round, "random")} disabled={!round}>
+                            Shuffle
+                          </button>
+                          <button onClick={() => round && autoPickReplicaRound(round, "higher")} disabled={!round}>
+                            Higher seed
+                          </button>
+                        </div>
+                        {column.buckets.map((bucketConfig) => {
+                          const pairs = buckets[bucketConfig.key] || [];
+                          if (bucketConfig.outcome) {
+                            const teams = outcomeTeams(bucketConfig.outcome);
+                            return (
+                              <div
+                                key={bucketConfig.key}
+                                className={`swiss-outcome-panel ${bucketConfig.outcome.startsWith("advanced") ? "advanced" : "eliminated"}`}
+                              >
+                                <div className="swiss-bucket-label">{bucketConfig.key}</div>
+                                <div className="swiss-outcome-teams">
+                                  {teams.length
+                                    ? teams.map((team) => <TeamBubble key={team.name} name={team.name} logos={simulatorResult.team_logos} disabled />)
+                                    : Array.from({ length: bucketConfig.rows * 2 }).map((_, idx) => <PlaceholderBubble key={idx} />)}
+                                </div>
+                              </div>
+                            );
+                          }
+                          return (
+                            <div key={bucketConfig.key} className="swiss-bucket-panel">
+                              <div className="swiss-bucket-label">{bucketConfig.key.replace(":", "-")}</div>
+                              <div className="swiss-match-list">
+                                {pairs.length
+                                  ? pairs.map((pair) => (
+                                      <div key={pair.key} className="swiss-match-card">
+                                        <div className="swiss-team-wrap">
+                                          <TeamBubble
+                                            name={pair.team_a}
+                                            logos={simulatorResult.team_logos}
+                                            selected={pair.selectedWinner === pair.team_a}
+                                            onClick={() => selectReplicaWinner(pair.key, pair.team_a)}
+                                          />
+                                          <span>{pair.team_a}</span>
+                                        </div>
+                                        <div className="swiss-vs">vs</div>
+                                        <div className="swiss-team-wrap">
+                                          <TeamBubble
+                                            name={pair.team_b}
+                                            logos={simulatorResult.team_logos}
+                                            selected={pair.selectedWinner === pair.team_b}
+                                            onClick={() => selectReplicaWinner(pair.key, pair.team_b)}
+                                          />
+                                          <span>{pair.team_b}</span>
+                                        </div>
+                                      </div>
+                                    ))
+                                  : Array.from({ length: bucketConfig.rows }).map((_, idx) => (
+                                      <div key={idx} className="swiss-match-card placeholder">
+                                        <div className="swiss-team-wrap">
+                                          <PlaceholderBubble />
+                                        </div>
+                                        <div className="swiss-vs">vs</div>
+                                        <div className="swiss-team-wrap">
+                                          <PlaceholderBubble />
+                                        </div>
+                                      </div>
+                                    ))}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </Section>
+  );
+}
+
 function AdminTab({ refresh, notify }) {
   const [dataTab, setDataTab] = useState("trigger");
   const [triggerJson, setTriggerJson] = useState("");
@@ -6644,9 +7048,6 @@ function AdminTab({ refresh, notify }) {
   const [importResult, setImportResult] = useState("");
   const [importBusy, setImportBusy] = useState(false);
   const [wipeBusy, setWipeBusy] = useState(false);
-  const [simulatorUrl, setSimulatorUrl] = useState("https://www.hltv.org/events/8914/xse-pro-league-2026#simulator");
-  const [simulatorBusy, setSimulatorBusy] = useState(false);
-  const [simulatorResult, setSimulatorResult] = useState(null);
 
   const importTriggers = async () => {
     if (!triggerJson.trim()) {
@@ -6677,48 +7078,12 @@ function AdminTab({ refresh, notify }) {
     refresh();
   };
 
-  const inferHltvSimulatorPairing = async () => {
-    if (!simulatorUrl.trim()) {
-      setImportResult("Paste an HLTV event simulator URL first.");
-      return;
-    }
-    setSimulatorBusy(true);
-    setImportResult("");
-    setSimulatorResult(null);
-    try {
-      const res = await requestJson(
-        "/admin/infer-hltv-simulator-pairing",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: simulatorUrl.trim() }),
-        },
-        90000
-      );
-      setSimulatorResult(res);
-      const best = res.inference?.best;
-      setImportResult(
-        best
-          ? `Pairing probe complete: best candidate ${best.label} (${Math.round((best.score || 0) * 100)}%).`
-          : "Pairing probe complete, but no matching candidate could be scored."
-      );
-      notify("HLTV simulator pairing probed");
-    } catch (e) {
-      setImportResult(e?.message || "Failed to infer HLTV simulator pairing.");
-    } finally {
-      setSimulatorBusy(false);
-    }
-  };
-
   return (
     <div className="stack">
       <Section title="Data Management Tools">
         <div className="tab-bar small">
           <button className={dataTab === "trigger" ? "tab active" : "tab"} onClick={() => setDataTab("trigger")}>
             Trigger Rates
-          </button>
-          <button className={dataTab === "simulator" ? "tab active" : "tab"} onClick={() => setDataTab("simulator")}>
-            HLTV Simulator
           </button>
           <button className={dataTab === "maintenance" ? "tab active" : "tab"} onClick={() => setDataTab("maintenance")}>
             Maintenance
@@ -6752,112 +7117,6 @@ function AdminTab({ refresh, notify }) {
                   ))}
                 </ul>
               </div>
-            )}
-          </div>
-        )}
-
-        {dataTab === "simulator" && (
-          <div className="stack">
-            <label className="field">
-              <span>HLTV Event Simulator URL</span>
-              <input
-                value={simulatorUrl}
-                onChange={(e) => setSimulatorUrl(e.target.value)}
-                placeholder="https://www.hltv.org/events/8914/xse-pro-league-2026#simulator"
-              />
-            </label>
-            <div className="actions">
-              <button className="primary" onClick={inferHltvSimulatorPairing} disabled={simulatorBusy}>
-                {simulatorBusy ? "Running Probe..." : "Infer Pairing Algorithm"}
-              </button>
-              <button className="secondary" onClick={() => api.openExternal(simulatorUrl)} disabled={!simulatorUrl.trim()}>
-                Open In Browser
-              </button>
-            </div>
-            <p className="muted">
-              Opens HLTV in the existing browser profile, clicks several first-round outcome patterns, captures the generated next-round pairings, and scores candidate pairing rules.
-            </p>
-            {simulatorResult && (
-              <>
-                <div className="card sub">
-                  <h4>Pairing Probe Summary</h4>
-                  <p className="muted">Status: {simulatorResult.ok === false ? "Failed" : "Complete"}</p>
-                  <p className="muted">URL: {simulatorResult.url}</p>
-                  {Number.isFinite(Number(simulatorResult.extracted_team_count)) && (
-                    <p className="muted">
-                      Teams detected: {simulatorResult.extracted_team_count} | Rank source: {simulatorResult.rank_source || "unknown"}
-                    </p>
-                  )}
-                  {Array.isArray(simulatorResult.extracted_team_names) && simulatorResult.extracted_team_names.length > 0 && (
-                    <p className="muted">Extracted names: {simulatorResult.extracted_team_names.slice(0, 24).join(", ")}</p>
-                  )}
-                  {simulatorResult.error && <p className="danger-text">{simulatorResult.error}</p>}
-                  {simulatorResult.inference?.best && (
-                    <>
-                      <p className="muted">
-                        Best candidate: {simulatorResult.inference.best.label} (
-                        {Math.round((simulatorResult.inference.best.score || 0) * 100)}%,{" "}
-                        {simulatorResult.inference.best.matched || 0}/{simulatorResult.inference.best.total || 0} pairs)
-                      </p>
-                    </>
-                  )}
-                </div>
-                {(simulatorResult.inference?.candidates || []).length > 0 && (
-                  <div className="card sub">
-                    <h4>Candidate Scores</h4>
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>Rule</th>
-                          <th>Score</th>
-                          <th>Matched</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {simulatorResult.inference.candidates.map((candidate) => (
-                          <tr key={candidate.mode}>
-                            <td>{candidate.label}</td>
-                            <td>{Math.round((candidate.score || 0) * 100)}%</td>
-                            <td>
-                              {candidate.matched || 0}/{candidate.total || 0}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-                {(simulatorResult.scenarios || []).length > 0 && (
-                  <div className="card sub">
-                    <h4>Observed Scenarios</h4>
-                    {(simulatorResult.scenarios || []).map((scenario) => (
-                      <div key={scenario.name} className="stack compact">
-                        <h5>{scenario.name}</h5>
-                        {scenario.error && <p className="danger-text">{scenario.error}</p>}
-                        <p className="muted">
-                          Winners: {(scenario.winners || []).join(", ") || "None captured"}
-                        </p>
-                        <p className="muted">
-                          Winner clicks: {scenario.clicks_succeeded ?? 0}/{(scenario.clicks || []).length} | Advance clicks:{" "}
-                          {(scenario.advance_result?.clicked || []).join(", ") || "None"}
-                        </p>
-                        <p className="muted">
-                          1-0: {(scenario.after?.["1:0"] || []).map((p) => `${p.team_a} vs ${p.team_b}`).join(" | ") || "None captured"}
-                        </p>
-                        <p className="muted">
-                          0-1: {(scenario.after?.["0:1"] || []).map((p) => `${p.team_a} vs ${p.team_b}`).join(" | ") || "None captured"}
-                        </p>
-                        {scenario.after_snapshot?.buckets && (
-                          <p className="muted">
-                            Bucket teams: 1-0 [{(scenario.after_snapshot.buckets["1:0"]?.teams || []).join(", ") || "-"}] | 0-1 [
-                            {(scenario.after_snapshot.buckets["0:1"]?.teams || []).join(", ") || "-"}]
-                          </p>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </>
             )}
           </div>
         )}
@@ -7534,6 +7793,11 @@ function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
     return teams.filter((t) => eventTeamNames.has(normalizeTeamName(t.name)));
   }, [teams, selectedEventId, eventTeamNames]);
 
+  const selectedEventMeta = useMemo(
+    () => events.find((event) => String(event.event_id) === String(selectedEventId)) || null,
+    [events, selectedEventId]
+  );
+
   useEffect(() => {
     const allowed = new Set(filteredTeams.map((t) => t.team_id));
     setSelectedTeamIds((prev) => prev.filter((id) => allowed.has(id)));
@@ -7565,7 +7829,10 @@ function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
             onChange={setSelectedEventId}
             options={
               events.length > 0
-                ? events.map((e) => ({ value: String(e.event_id), label: `Event ${e.event_id}` }))
+                ? events.map((e) => ({
+                    value: String(e.event_id),
+                    label: e.hltv_event_id ? `Fantasy ${e.event_id} -> HLTV ${e.hltv_event_id}` : `Fantasy ${e.event_id}`,
+                  }))
                 : [{ value: "", label: "No events imported" }]
             }
           />
@@ -7595,6 +7862,9 @@ function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
         </button>
         <button className={swissTab === "single" ? "tab active" : "tab"} onClick={() => setSwissTab("single")}>
           Bracket Simulator
+        </button>
+        <button className={swissTab === "hltv" ? "tab active" : "tab"} onClick={() => setSwissTab("hltv")}>
+          HLTV Replica
         </button>
       </div>
       {swissTab === "group" && (
@@ -7629,6 +7899,13 @@ function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
       )}
       {swissTab === "value" && <SwissPlayerValueTab results={simResults} players={players} />}
       {swissTab === "single" && <BracketTab teams={filteredTeams} teamLookup={teamLookup} />}
+      {swissTab === "hltv" && (
+        <HltvReplicaSimulatorPanel
+          eventId={selectedEventId}
+          hltvEventId={selectedEventMeta?.hltv_event_id}
+          hltvEventUrl={selectedEventMeta?.hltv_event_url}
+        />
+      )}
     </div>
   );
 }

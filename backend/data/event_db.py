@@ -22,10 +22,18 @@ def ensure_event_schema() -> None:
             """
             CREATE TABLE IF NOT EXISTS events (
                 event_id    INTEGER PRIMARY KEY,
+                hltv_event_id INTEGER,
+                hltv_event_url TEXT,
                 imported_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             """
         )
+        event_cols = conn.execute("PRAGMA table_info(events)").fetchall()
+        event_col_names = {row["name"] for row in event_cols}
+        if "hltv_event_id" not in event_col_names:
+            conn.execute("ALTER TABLE events ADD COLUMN hltv_event_id INTEGER")
+        if "hltv_event_url" not in event_col_names:
+            conn.execute("ALTER TABLE events ADD COLUMN hltv_event_url TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS event_teams (
@@ -259,19 +267,29 @@ def upsert_historical_team_map_stats(
         conn.close()
 
 
-def upsert_event_snapshot(event_id: int, teams: List[Dict[str, Any]]) -> None:
+def upsert_event_snapshot(
+    event_id: int,
+    teams: List[Dict[str, Any]],
+    hltv_event_id: Optional[int] = None,
+    hltv_event_url: Optional[str] = None,
+) -> None:
     eid = int(event_id)
     normalized_teams = [_normalize_team_snapshot(t) for t in (teams or [])]
+    real_event_id = int(hltv_event_id) if hltv_event_id is not None else None
+    real_event_url = str(hltv_event_url or "").strip() or None
 
     conn = connect()
     try:
         conn.execute(
             """
-            INSERT INTO events (event_id, imported_at)
-            VALUES (?, datetime('now'))
-            ON CONFLICT(event_id) DO UPDATE SET imported_at = excluded.imported_at
+            INSERT INTO events (event_id, hltv_event_id, hltv_event_url, imported_at)
+            VALUES (?, ?, ?, datetime('now'))
+            ON CONFLICT(event_id) DO UPDATE SET
+                hltv_event_id = COALESCE(excluded.hltv_event_id, events.hltv_event_id),
+                hltv_event_url = COALESCE(excluded.hltv_event_url, events.hltv_event_url),
+                imported_at = excluded.imported_at
             """,
-            (eid,),
+            (eid, real_event_id, real_event_url),
         )
         conn.execute("DELETE FROM event_teams WHERE event_id = ?", (eid,))
         conn.execute("DELETE FROM event_player_prices WHERE event_id = ?", (eid,))
@@ -299,6 +317,27 @@ def upsert_event_snapshot(event_id: int, teams: List[Dict[str, Any]]) -> None:
                     """,
                     (eid, int(pid), team["team_name"], int(price)),
                 )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_event_hltv_ref(event_id: int, hltv_event_id: Optional[int], hltv_event_url: Optional[str] = None) -> None:
+    conn = connect()
+    try:
+        conn.execute(
+            """
+            UPDATE events
+            SET hltv_event_id = COALESCE(?, hltv_event_id),
+                hltv_event_url = COALESCE(?, hltv_event_url)
+            WHERE event_id = ?
+            """,
+            (
+                int(hltv_event_id) if hltv_event_id is not None else None,
+                str(hltv_event_url or "").strip() or None,
+                int(event_id),
+            ),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -340,6 +379,8 @@ def list_events() -> List[Dict[str, Any]]:
             """
             SELECT
                 e.event_id,
+                e.hltv_event_id,
+                e.hltv_event_url,
                 e.imported_at,
                 (SELECT COUNT(*) FROM event_teams et WHERE et.event_id = e.event_id) AS team_count,
                 (SELECT COUNT(*) FROM event_player_prices ep WHERE ep.event_id = e.event_id) AS player_count,
@@ -399,7 +440,7 @@ def get_event_detail(event_id: int) -> Optional[Dict[str, Any]]:
     conn = connect()
     try:
         event_row = conn.execute(
-            "SELECT event_id, imported_at FROM events WHERE event_id = ?",
+            "SELECT event_id, hltv_event_id, hltv_event_url, imported_at FROM events WHERE event_id = ?",
             (eid,),
         ).fetchone()
         if not event_row:
@@ -438,6 +479,8 @@ def get_event_detail(event_id: int) -> Optional[Dict[str, Any]]:
         out_players = [dict(r) for r in player_rows]
         return {
             "event_id": int(event_row["event_id"]),
+            "hltv_event_id": int(event_row["hltv_event_id"]) if event_row["hltv_event_id"] is not None else None,
+            "hltv_event_url": event_row["hltv_event_url"],
             "imported_at": event_row["imported_at"],
             "teams": out_teams,
             "players": out_players,

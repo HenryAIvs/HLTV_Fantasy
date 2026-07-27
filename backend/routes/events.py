@@ -11,7 +11,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 from dateutil.relativedelta import relativedelta
 
-from backend.routes.admin import _import_money_draft_data
+from backend.routes.admin import _extract_hltv_event_ref_from_fantasy, _import_money_draft_data
 from backend.hltv_rankings import (
     get_recent_hltv_results,
     get_hltv_match_details,
@@ -2585,5 +2585,11 @@ def import_hltv_event(payload: Dict[str, Any]):
     if not money:
         raise HTTPException(status_code=400, detail="moneyDraftData missing in response")
 
-    counts = _import_money_draft_data(money, event_id=int(event_id))
-    return {"status": "ok", **counts, "event_id": int(event_id), "active_event_id": int(event_id)}
+    ref = _extract_hltv_event_ref_from_fantasy(int(event_id), data)
+    counts = _import_money_draft_data(
+        money,
+        event_id=int(event_id),
+        hltv_event_id=ref.get("hltv_event_id"),
+        hltv_event_url=ref.get("hltv_event_url"),
+    )
+    return {"status": "ok", **counts, "event_id": int(event_id), "active_event_id": int(event_id), **ref}

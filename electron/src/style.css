@@ -1353,3 +1353,226 @@ tbody tr { cursor: pointer; }
     transform: rotate(360deg);
   }
 }
+
+.swiss-replica-board {
+  background: #f8fafc;
+  border: 1px solid #d7dee8;
+  border-radius: 8px;
+  color: #334155;
+  margin-top: 12px;
+  padding: 18px 18px 22px;
+}
+
+.swiss-replica-title {
+  color: #333;
+  font-size: 26px;
+  font-weight: 500;
+  margin-bottom: 64px;
+}
+
+.swiss-replica-scroll {
+  overflow-x: visible;
+  padding: 0 10px 8px;
+}
+
+.swiss-round-grid {
+  align-items: center;
+  display: grid;
+  gap: 22px;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  min-width: 0;
+  width: 100%;
+}
+
+.swiss-round-column {
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+  justify-content: center;
+}
+
+.swiss-round-controls {
+  display: inline-flex;
+  justify-content: center;
+  margin: 0 auto 4px;
+}
+
+.swiss-round-controls button {
+  background: #f3f4f8;
+  border: 1px solid #c9ced8;
+  color: #444;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  min-height: 34px;
+  padding: 0 8px;
+}
+
+.swiss-round-controls button:first-child {
+  border-radius: 6px 0 0 6px;
+}
+
+.swiss-round-controls button:last-child {
+  border-radius: 0 6px 6px 0;
+}
+
+.swiss-round-controls button + button {
+  border-left: 0;
+}
+
+.swiss-bucket-panel {
+  position: relative;
+}
+
+.swiss-bucket-label {
+  color: #64748b;
+  font-size: 17px;
+  font-weight: 800;
+  margin: 0 0 6px;
+}
+
+.swiss-match-list {
+  background: #f0f2f7;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.swiss-match-card {
+  align-items: center;
+  background: #f3f5fa;
+  border-bottom: 5px solid #f8fafc;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px minmax(0, 1fr);
+  min-height: 54px;
+  padding: 6px 7px;
+}
+
+.swiss-match-card:last-child {
+  border-bottom: 0;
+}
+
+.swiss-team-wrap {
+  align-items: center;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.swiss-team-wrap span {
+  color: #475569;
+  font-size: 10px;
+  line-height: 1.1;
+  max-width: 74px;
+  min-height: 12px;
+  overflow: hidden;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.swiss-vs {
+  color: #3f3f46;
+  font-size: 15px;
+  text-align: center;
+}
+
+.swiss-team-bubble {
+  align-items: center;
+  background: #e9ebf1;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  cursor: pointer;
+  display: inline-flex;
+  height: 38px;
+  justify-content: center;
+  padding: 0;
+  width: 38px;
+}
+
+.swiss-team-bubble img {
+  display: block;
+  max-height: 26px;
+  max-width: 26px;
+  object-fit: contain;
+}
+
+.swiss-team-bubble span {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.swiss-team-bubble.selected {
+  background: #bfe8c8;
+  border-color: #70bd7c;
+}
+
+.swiss-team-bubble.placeholder {
+  background: #d7d9df;
+  border-color: #c8cbd3;
+}
+
+.swiss-team-bubble.placeholder span {
+  color: #fff;
+  font-size: 18px;
+}
+
+.swiss-team-bubble:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
+.swiss-outcome-column {
+  gap: 18px;
+}
+
+.swiss-outcome-panel {
+  border-radius: 6px;
+  min-height: 92px;
+  padding: 10px;
+}
+
+.swiss-outcome-panel .swiss-bucket-label {
+  color: #fff;
+  font-size: 20px;
+  text-align: center;
+}
+
+.swiss-outcome-panel.advanced {
+  background: #087b10;
+}
+
+.swiss-outcome-panel.eliminated {
+  background: #7f0505;
+}
+
+.swiss-outcome-teams {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  justify-content: center;
+  min-height: 38px;
+}
+
+.swiss-outcome-panel .swiss-team-bubble {
+  background: #1f3843;
+  border-color: #16303a;
+}
+
+.swiss-outcome-panel .swiss-team-bubble span {
+  color: #dbeafe;
+}
+
+@media (max-width: 900px) {
+  .swiss-replica-title {
+    font-size: 22px;
+    margin-bottom: 28px;
+  }
+
+  .swiss-round-grid {
+    gap: 14px;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
+}
