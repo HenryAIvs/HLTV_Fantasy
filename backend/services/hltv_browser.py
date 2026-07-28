@@ -40,6 +40,41 @@ def _resolve_profile_dir() -> Path:
     return (Path(__file__).resolve().parents[2] / "hltv_profile_seleniumbase").resolve()
 
 
+_STALE_UC_MAX_AGE = float(os.getenv("HLTV_STALE_UC_MAX_AGE", "600"))
+
+
+def _kill_stale_uc_processes(profile_dir: Path) -> None:
+    """Kill uc_driver/UC-Chrome leftovers from sessions that died mid-fetch.
+
+    They keep the profile poisoned so every new launch fails with
+    'session not created: cannot connect to chrome'. _FETCH_LOCK serializes
+    fetches, so nothing of ours should be alive when a driver is created; the
+    age guard only protects a second app instance scraping in parallel.
+    """
+    try:
+        import psutil
+    except Exception:
+        return
+    now = time.time()
+    profile_marker = str(profile_dir).lower()
+    for proc in psutil.process_iter(["name", "create_time", "cmdline"]):
+        try:
+            name = (proc.info.get("name") or "").lower()
+            age = now - float(proc.info.get("create_time") or now)
+            if age < _STALE_UC_MAX_AGE:
+                continue
+            if name == "uc_driver.exe":
+                logger.warning("Killing stale uc_driver.exe (pid %s, age %.0fs)", proc.pid, age)
+                proc.kill()
+            elif name in ("chrome.exe", "chrome"):
+                cmdline = " ".join(proc.info.get("cmdline") or []).lower()
+                if profile_marker and profile_marker in cmdline:
+                    logger.warning("Killing stale UC Chrome (pid %s, age %.0fs)", proc.pid, age)
+                    proc.kill()
+        except Exception:
+            continue
+
+
 def _cleanup_profile_locks(profile_dir: Path) -> None:
     for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
         lock_path = profile_dir / name
@@ -64,6 +99,7 @@ def _make_driver():
     Driver = _import_seleniumbase_driver()
     profile_dir = _resolve_profile_dir()
     profile_dir.mkdir(parents=True, exist_ok=True)
+    _kill_stale_uc_processes(profile_dir)
     _cleanup_profile_locks(profile_dir)
 
     headless = os.getenv("HLTV_HEADLESS", "0") == "1"

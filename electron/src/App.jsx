@@ -3040,12 +3040,12 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   const playoffBestModeLabel = {
     average: "Best Average Value",
     single_outcome: "Highest Single-Outcome Ceiling",
-    most_outcomes: "Best In Most Outcomes",
+    most_outcomes: "Most Likely Winner",
   }[playoffBestMode] || "Best Average Value";
   const playoffTopSubtabs = [
     { key: "average", label: "Average Player Value" },
     { key: "single_outcome", label: "Best Single Outcome" },
-    { key: "most_outcomes", label: "Most Winning Outcomes" },
+    { key: "most_outcomes", label: "Most Likely Winner" },
     { key: "completed", label: "Completed Bracket" },
   ];
   const setPlayoffTopMode = (key) => {
@@ -3057,7 +3057,13 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   };
   const playoffTeamMetric = (team) => {
     if (playoffBestMode === "single_outcome") return Number(team?.ceiling_points || 0);
-    if (playoffBestMode === "most_outcomes") return Number(team?.outcome_wins || 0);
+    if (playoffBestMode === "most_outcomes") {
+      // Percent chance this roster is the winning pick; older stored runs only
+      // have the raw outcome-win count.
+      const prob = team?.outcome_win_probability;
+      if (prob !== undefined && prob !== null) return Number(prob) * 100;
+      return Number(team?.outcome_wins || 0);
+    }
     return Number(team?.average_ev ?? team?.total_ev ?? 0);
   };
   const playoffPlayerModeScore = (player) => {
@@ -3077,11 +3083,26 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       ).toFixed(1)}%`;
     }
     if (playoffBestMode === "most_outcomes") {
-      return `Outcome wins ${formatOutcomeWins(team?.outcome_wins)} / ${playoffOutcomeCount.toLocaleString()} | Win prob ${(
-        Number(team?.outcome_win_probability || 0) * 100
-      ).toFixed(1)}%`;
+      return `Win chance ${(Number(team?.outcome_win_probability || 0) * 100).toFixed(1)}% | Wins ${formatOutcomeWins(
+        team?.outcome_wins
+      )} of ${playoffOutcomeCount.toLocaleString()} outcomes`;
     }
     return `EV ${Number(team?.total_ev || 0).toFixed(2)}`;
+  };
+  const playoffOutcomeDescriptor = (outcomeIdx) => {
+    const outcome = (results?.outcomes || [])[outcomeIdx];
+    if (!outcome) return null;
+    const bracket = outcome.bracket || {};
+    const finalRow = (bracket.final || [])[0] || {};
+    const name = (id) => teamLookup[id] || String(id);
+    return {
+      probability: Number(outcome.probability || 0),
+      champion: name(finalRow.winner),
+      runnerUp: name(finalRow.loser),
+      sfWinners: (bracket.semis || []).map((m) => name(m.winner)).join(", "),
+      qfWinners: (bracket.quarters || []).map((m) => name(m.winner)).join(", "),
+      third: (bracket.third_place || [])[0] ? name(bracket.third_place[0].winner) : "",
+    };
   };
 
   const loadEventsForPlayoff = async () => {
@@ -4330,6 +4351,32 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
               <h4>
                 #{idx + 1} {playoffTeamMetricLabel(team)} | Cost {team.cost}
               </h4>
+              {playoffBestMode === "most_outcomes" &&
+                (Array.isArray(team.winning_outcome_indexes) &&
+                team.winning_outcome_indexes.length > 0 &&
+                (results?.outcomes || []).length > 0 ? (
+                  <div>
+                    <p className="muted">Bracket outcomes this roster wins ({team.winning_outcome_indexes.length}):</p>
+                    <ul className="muted">
+                      {team.winning_outcome_indexes
+                        .map((outcomeIdx) => playoffOutcomeDescriptor(outcomeIdx))
+                        .filter(Boolean)
+                        .sort((a, b) => b.probability - a.probability)
+                        .slice(0, 12)
+                        .map((o, i) => (
+                          <li key={i}>
+                            {(o.probability * 100).toFixed(2)}% — {o.champion} beats {o.runnerUp} in the final
+                            {o.third ? ` | 3rd: ${o.third}` : ""} | SF winners: {o.sfWinners} | QF winners: {o.qfWinners}
+                          </li>
+                        ))}
+                    </ul>
+                    {team.winning_outcome_indexes.length > 12 && (
+                      <p className="muted">+{team.winning_outcome_indexes.length - 12} more lower-probability outcomes</p>
+                    )}
+                  </div>
+                ) : (
+                  <p className="muted">Re-run Combinations to see which bracket outcomes this roster wins.</p>
+                ))}
               <table>
                 <thead>
                   <tr>

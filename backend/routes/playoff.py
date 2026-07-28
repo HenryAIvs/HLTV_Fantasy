@@ -79,6 +79,11 @@ def _saved_combo_metric(team: dict, mode: str) -> float:
     if mode == "single_outcome":
         return float(team.get("ceiling_points") or 0.0)
     if mode == "most_outcomes":
+        # Rank by chance this roster ends up the winner; blobs saved before the
+        # probability field existed fall back to the raw outcome-win count.
+        prob = team.get("outcome_win_probability")
+        if prob is not None:
+            return float(prob or 0.0)
         return float(team.get("outcome_wins") or 0.0)
     return float(team.get("average_ev", team.get("total_ev", 0.0)) or 0.0)
 
@@ -886,14 +891,15 @@ def _optimize_playoff_teams_by_outcomes(
         for roster_idx in winners:
             valid_teams[roster_idx]["outcome_wins"] += share
             valid_teams[roster_idx]["outcome_win_probability"] += probability_share
+            valid_teams[roster_idx].setdefault("winning_outcome_indexes", []).append(outcome_idx)
 
     if mode == "single_outcome":
         valid_teams.sort(key=lambda team: (float(team.get("ceiling_points", 0.0)), float(team.get("average_ev", 0.0))), reverse=True)
     elif mode == "most_outcomes":
         valid_teams.sort(
             key=lambda team: (
-                float(team.get("outcome_wins", 0.0)),
                 float(team.get("outcome_win_probability", 0.0)),
+                float(team.get("outcome_wins", 0.0)),
                 float(team.get("average_ev", 0.0)),
             ),
             reverse=True,
