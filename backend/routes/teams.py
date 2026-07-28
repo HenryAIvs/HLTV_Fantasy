@@ -7,7 +7,8 @@ import time
 
 from fastapi import APIRouter, HTTPException
 
-from backend.hltv_rankings import (
+from backend.routes.players import _INTERRUPTION_BOILERPLATE
+from backend.services.hltv_rankings import (
     HLTVRankingError,
     RankingPageParseError,
     TeamNotRankedError,
@@ -78,7 +79,6 @@ def _map_stats_job_from_row(row: sqlite3.Row) -> dict:
 
 
 def _get_stored_map_stats_job(job_id: str) -> dict | None:
-    ensure_map_stats_import_schema()
     conn = connect_team_db()
     try:
         row = conn.execute("SELECT * FROM team_map_stats_import_jobs WHERE job_id = ?", (job_id,)).fetchone()
@@ -88,7 +88,6 @@ def _get_stored_map_stats_job(job_id: str) -> dict | None:
 
 
 def _save_map_stats_job(job: dict) -> None:
-    ensure_map_stats_import_schema()
     now = time.time()
     job["updated_at"] = now
     conn = connect_team_db()
@@ -177,7 +176,13 @@ def _map_stats_job_response(job: dict) -> dict:
 
 
 def _get_map_stats_job_for_response(job_id: str) -> dict:
-    job = _get_stored_map_stats_job(job_id)
+    # Memory first: while the worker is alive it publishes every update here,
+    # so polls avoid touching SQLite alongside the job's own writes.
+    with MAP_STATS_IMPORT_JOBS_LOCK:
+        cached = MAP_STATS_IMPORT_JOBS.get(job_id)
+        job = dict(cached) if cached else None
+    if not job:
+        job = _get_stored_map_stats_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job_id not found")
     if job.get("status") in {"queued", "running", "pausing", "canceling"} and not _map_stats_worker_is_active(job_id):
@@ -235,11 +240,15 @@ def _run_map_stats_import_job(job_id: str) -> None:
     job["pause_requested"] = False
     job["cancel_requested"] = False
     job["error"] = ""
+    if job.get("last_error") in _INTERRUPTION_BOILERPLATE:
+        job["last_error"] = ""
     job["started_at"] = job.get("started_at") or time.time()
     job["finished_at"] = None
     _publish_map_stats_job(job)
     try:
-        items = job.get("items") or []
+        items = _resolve_missing_hltv_ids(job.get("items") or [])
+        job["items"] = items
+        _publish_map_stats_job(job)
         results = list(job.get("results") or [])
         processed_ids = {int(row.get("team_id") or 0) for row in results if int(row.get("team_id") or 0) > 0}
         ok = len([r for r in results if r.get("status") == "ok"])
@@ -312,7 +321,6 @@ def _start_map_stats_worker(job_id: str) -> None:
 
 
 def _get_latest_map_stats_job(*, include_completed: bool = True) -> dict | None:
-    ensure_map_stats_import_schema()
     statuses = "" if include_completed else "WHERE status IN ('queued', 'running', 'pausing', 'canceling', 'paused', 'failed')"
     conn = connect_team_db()
     try:
@@ -335,26 +343,42 @@ def _build_map_stats_import_items(payload: dict | None = None) -> list[dict]:
     missing_only = bool(body.get("missing_only"))
     teams = get_all_teams()
     selected = [t for t in teams if not requested_ids or int(t.get("team_id") or 0) in requested_ids]
-    if any(int(t.get("team_id") or 0) > 0 and not (int(t.get("hltv_team_id") or 0) > 0) for t in selected):
-        refresh_hltv_for_all_teams_today()
-        teams = get_all_teams()
-        selected = [t for t in teams if not requested_ids or int(t.get("team_id") or 0) in requested_ids]
     items = []
     for team in selected:
         if missing_only and team.get("map_stats_json"):
             continue
         team_id = int(team.get("team_id") or 0)
-        hltv_team_id = int(team.get("hltv_team_id") or 0)
-        if team_id <= 0 or hltv_team_id <= 0:
+        if team_id <= 0:
             continue
+        # hltv_team_id may be 0 here; the worker resolves missing ids via a
+        # rankings refresh so this builder (called from the start endpoint)
+        # never blocks on the global HLTV fetch lock.
         items.append(
             {
                 "team_id": team_id,
                 "team_name": str(team.get("name") or ""),
-                "hltv_team_id": hltv_team_id,
+                "hltv_team_id": int(team.get("hltv_team_id") or 0),
             }
         )
     return items
+
+
+def _resolve_missing_hltv_ids(items: list[dict]) -> list[dict]:
+    """Fill in hltv_team_id for items that lack one, scraping today's rankings once if needed."""
+    if not any(int(item.get("hltv_team_id") or 0) <= 0 for item in items):
+        return items
+    try:
+        refresh_hltv_for_all_teams_today()
+    except Exception as exc:
+        logger.warning("HLTV rankings refresh for map-stats id resolution failed: %s", exc)
+    by_id = {int(t.get("team_id") or 0): t for t in get_all_teams()}
+    resolved = []
+    for item in items:
+        if int(item.get("hltv_team_id") or 0) <= 0:
+            team = by_id.get(int(item.get("team_id") or 0)) or {}
+            item = {**item, "hltv_team_id": int(team.get("hltv_team_id") or 0)}
+        resolved.append(item)
+    return resolved
 
 
 @router.get("/")
@@ -648,6 +672,345 @@ def refresh_all_rankings_for_all_teams_today():
     }
 
 
+# --- Rankings refresh as a pausable/resumable background job -----------------
+# Two phases (HLTV ranking page, VRS ranking page); each phase is one scrape
+# plus a fast DB apply, so pause/cancel take effect between phases.
+
+RANKINGS_REFRESH_JOBS: dict[str, dict] = {}
+RANKINGS_REFRESH_WORKERS: dict[str, threading.Thread] = {}
+RANKINGS_REFRESH_JOBS_LOCK = threading.Lock()
+_RANKINGS_PHASES = ("hltv", "vrs")
+
+
+def ensure_rankings_refresh_schema() -> None:
+    conn = connect_team_db()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rankings_refresh_jobs (
+                job_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                results_json TEXT NOT NULL,
+                error TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                progress REAL NOT NULL DEFAULT 0,
+                processed_phases INTEGER NOT NULL DEFAULT 0,
+                total_phases INTEGER NOT NULL DEFAULT 2,
+                pause_requested INTEGER NOT NULL DEFAULT 0,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                started_at REAL,
+                finished_at REAL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rankings_refresh_jobs_updated ON rankings_refresh_jobs(updated_at DESC)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _rankings_job_from_row(row: sqlite3.Row) -> dict:
+    out = dict(row)
+    out["results"] = json.loads(out.pop("results_json") or "[]")
+    out["pause_requested"] = bool(out.get("pause_requested"))
+    out["cancel_requested"] = bool(out.get("cancel_requested"))
+    out["progress"] = float(out.get("progress") or 0.0)
+    return out
+
+
+def _get_stored_rankings_job(job_id: str) -> dict | None:
+    conn = connect_team_db()
+    try:
+        row = conn.execute("SELECT * FROM rankings_refresh_jobs WHERE job_id = ?", (job_id,)).fetchone()
+        return _rankings_job_from_row(row) if row else None
+    finally:
+        conn.close()
+
+
+def _save_rankings_job(job: dict) -> None:
+    now = time.time()
+    job["updated_at"] = now
+    conn = connect_team_db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO rankings_refresh_jobs (
+                job_id, status, results_json, error, last_error, progress,
+                processed_phases, total_phases, pause_requested, cancel_requested,
+                created_at, updated_at, started_at, finished_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                status = excluded.status,
+                results_json = excluded.results_json,
+                error = excluded.error,
+                last_error = excluded.last_error,
+                progress = excluded.progress,
+                processed_phases = excluded.processed_phases,
+                total_phases = excluded.total_phases,
+                pause_requested = excluded.pause_requested,
+                cancel_requested = excluded.cancel_requested,
+                updated_at = excluded.updated_at,
+                started_at = COALESCE(excluded.started_at, rankings_refresh_jobs.started_at),
+                finished_at = excluded.finished_at
+            """,
+            (
+                str(job["job_id"]),
+                str(job.get("status") or "queued"),
+                json.dumps(job.get("results") or []),
+                str(job.get("error") or ""),
+                str(job.get("last_error") or ""),
+                float(job.get("progress") or 0.0),
+                int(job.get("processed_phases") or 0),
+                int(job.get("total_phases") or len(_RANKINGS_PHASES)),
+                1 if job.get("pause_requested") else 0,
+                1 if job.get("cancel_requested") else 0,
+                float(job.get("created_at") or now),
+                now,
+                job.get("started_at"),
+                job.get("finished_at"),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _publish_rankings_job(job: dict) -> None:
+    with RANKINGS_REFRESH_JOBS_LOCK:
+        RANKINGS_REFRESH_JOBS[str(job["job_id"])] = dict(job)
+    _save_rankings_job(job)
+
+
+def _rankings_worker_is_active(job_id: str) -> bool:
+    with RANKINGS_REFRESH_JOBS_LOCK:
+        worker = RANKINGS_REFRESH_WORKERS.get(job_id)
+        return bool(worker and worker.is_alive())
+
+
+def _rankings_job_response(job: dict) -> dict:
+    return {
+        "job_id": str(job["job_id"]),
+        "status": job.get("status", "queued"),
+        "error": job.get("error", ""),
+        "last_error": job.get("last_error", ""),
+        "progress": job.get("progress", 0.0),
+        "processed_phases": job.get("processed_phases", 0),
+        "total_phases": job.get("total_phases", len(_RANKINGS_PHASES)),
+        "pause_requested": bool(job.get("pause_requested")),
+        "cancel_requested": bool(job.get("cancel_requested")),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+        "results": job.get("results", []),
+    }
+
+
+def _get_rankings_job_for_response(job_id: str) -> dict:
+    # Memory first: while the worker is alive it publishes every update here,
+    # so polls avoid touching SQLite alongside the job's own writes.
+    with RANKINGS_REFRESH_JOBS_LOCK:
+        cached = RANKINGS_REFRESH_JOBS.get(job_id)
+        job = dict(cached) if cached else None
+    if not job:
+        job = _get_stored_rankings_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job_id not found")
+    if job.get("status") in {"queued", "running", "pausing", "canceling"} and not _rankings_worker_is_active(job_id):
+        job["status"] = "canceled" if job.get("cancel_requested") else "paused"
+        job["last_error"] = job.get("last_error") or "Job was interrupted before completion. Resume to continue."
+        job["error"] = ""
+        job["pause_requested"] = False
+        job["cancel_requested"] = False
+        _publish_rankings_job(job)
+    return job
+
+
+def _run_rankings_refresh_job(job_id: str) -> None:
+    job = _get_stored_rankings_job(job_id)
+    if not job:
+        return
+    if job.get("cancel_requested") or job.get("pause_requested"):
+        job["status"] = "canceled" if job.get("cancel_requested") else "paused"
+        job["pause_requested"] = False
+        job["cancel_requested"] = False
+        job["error"] = ""
+        job["finished_at"] = time.time()
+        _publish_rankings_job(job)
+        with RANKINGS_REFRESH_JOBS_LOCK:
+            RANKINGS_REFRESH_WORKERS.pop(job_id, None)
+        return
+
+    job["status"] = "running"
+    job["pause_requested"] = False
+    job["cancel_requested"] = False
+    job["error"] = ""
+    if job.get("last_error") in _INTERRUPTION_BOILERPLATE:
+        job["last_error"] = ""
+    job["started_at"] = job.get("started_at") or time.time()
+    job["finished_at"] = None
+    _publish_rankings_job(job)
+
+    phase_runners = {
+        "hltv": refresh_hltv_for_all_teams_today,
+        "vrs": refresh_vrs_for_all_teams_today,
+    }
+    try:
+        results = list(job.get("results") or [])
+        done_phases = {str(row.get("phase")) for row in results}
+        for phase in _RANKINGS_PHASES:
+            if phase in done_phases:
+                continue
+            latest = _get_stored_rankings_job(job_id) or job
+            if latest.get("cancel_requested") or latest.get("pause_requested"):
+                job.update(latest)
+                job["status"] = "canceled" if latest.get("cancel_requested") else "paused"
+                job["pause_requested"] = False
+                job["cancel_requested"] = False
+                job["error"] = ""
+                job["last_error"] = "Canceled" if job["status"] == "canceled" else "Paused"
+                job["finished_at"] = time.time()
+                _publish_rankings_job(job)
+                return
+            try:
+                summary = phase_runners[phase]()
+                results.append(
+                    {
+                        "phase": phase,
+                        "status": "ok",
+                        "updated": int(summary.get("updated") or 0),
+                        "inserted": int(summary.get("inserted") or 0),
+                        "failed": int(summary.get("failed") or 0),
+                    }
+                )
+            except Exception as exc:
+                results.append({"phase": phase, "status": "error", "detail": str(exc)})
+                job["last_error"] = f"{phase.upper()} refresh failed: {exc}"
+            job["results"] = results
+            job["processed_phases"] = len(results)
+            job["total_phases"] = len(_RANKINGS_PHASES)
+            job["progress"] = len(results) / float(len(_RANKINGS_PHASES))
+            _publish_rankings_job(job)
+
+        job["status"] = "completed"
+        job["finished_at"] = time.time()
+        _publish_rankings_job(job)
+    except Exception as exc:
+        job["status"] = "failed"
+        job["error"] = str(exc)
+        job["finished_at"] = time.time()
+        _publish_rankings_job(job)
+    finally:
+        with RANKINGS_REFRESH_JOBS_LOCK:
+            RANKINGS_REFRESH_WORKERS.pop(job_id, None)
+
+
+def _start_rankings_worker(job_id: str) -> None:
+    with RANKINGS_REFRESH_JOBS_LOCK:
+        worker = RANKINGS_REFRESH_WORKERS.get(job_id)
+        if worker and worker.is_alive():
+            return
+        worker = threading.Thread(target=_run_rankings_refresh_job, args=(job_id,), daemon=True)
+        RANKINGS_REFRESH_WORKERS[job_id] = worker
+        worker.start()
+
+
+def _get_latest_rankings_job() -> dict | None:
+    conn = connect_team_db()
+    try:
+        row = conn.execute("SELECT job_id FROM rankings_refresh_jobs ORDER BY updated_at DESC LIMIT 1").fetchone()
+    finally:
+        conn.close()
+    return _get_rankings_job_for_response(str(row["job_id"])) if row else None
+
+
+@router.post("/rankings-refresh/start")
+def start_rankings_refresh_job():
+    latest = _get_latest_rankings_job()
+    if latest and latest.get("status") in {"queued", "running", "pausing", "canceling"}:
+        return {"job_id": latest["job_id"], "status": latest.get("status"), "reused": True}
+    now = time.time()
+    job_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "error": "",
+        "last_error": "",
+        "progress": 0.0,
+        "processed_phases": 0,
+        "total_phases": len(_RANKINGS_PHASES),
+        "pause_requested": False,
+        "cancel_requested": False,
+        "results": [],
+        "created_at": now,
+        "updated_at": now,
+        "started_at": None,
+        "finished_at": None,
+    }
+    _publish_rankings_job(job)
+    _start_rankings_worker(job_id)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@router.get("/rankings-refresh/latest")
+def get_latest_rankings_refresh_job():
+    job = _get_latest_rankings_job()
+    if not job:
+        return {"exists": False}
+    return {"exists": True, **_rankings_job_response(job)}
+
+
+@router.get("/rankings-refresh/job/{job_id}")
+def get_rankings_refresh_job(job_id: str):
+    return _rankings_job_response(_get_rankings_job_for_response(job_id))
+
+
+@router.post("/rankings-refresh/job/{job_id}/pause")
+def pause_rankings_refresh_job(job_id: str):
+    job = _get_rankings_job_for_response(job_id)
+    if job.get("status") in {"completed", "canceled", "failed", "paused"}:
+        return _rankings_job_response(job)
+    job["pause_requested"] = True
+    job["status"] = "pausing" if _rankings_worker_is_active(job_id) else "paused"
+    _publish_rankings_job(job)
+    return _rankings_job_response(job)
+
+
+@router.post("/rankings-refresh/job/{job_id}/cancel")
+def cancel_rankings_refresh_job(job_id: str):
+    job = _get_rankings_job_for_response(job_id)
+    if job.get("status") in {"completed", "canceled", "failed"}:
+        return _rankings_job_response(job)
+    job["cancel_requested"] = True
+    job["status"] = "canceling" if _rankings_worker_is_active(job_id) else "canceled"
+    _publish_rankings_job(job)
+    return _rankings_job_response(job)
+
+
+@router.post("/rankings-refresh/job/{job_id}/resume")
+def resume_rankings_refresh_job(job_id: str):
+    job = _get_rankings_job_for_response(job_id)
+    if job.get("status") in {"completed", "canceled"}:
+        return _rankings_job_response(job)
+    if job.get("status") == "running" and _rankings_worker_is_active(job_id):
+        return _rankings_job_response(job)
+    job["status"] = "queued"
+    job["pause_requested"] = False
+    job["cancel_requested"] = False
+    job["error"] = ""
+    if job.get("last_error") in _INTERRUPTION_BOILERPLATE:
+        job["last_error"] = ""
+    job["finished_at"] = None
+    _publish_rankings_job(job)
+    _start_rankings_worker(job_id)
+    return _rankings_job_response(_get_rankings_job_for_response(job_id))
+
+
 @router.post("/map-stats-import/start")
 def start_map_stats_import_job(payload: dict | None = None):
     latest = _get_latest_map_stats_job(include_completed=False)
@@ -655,7 +1018,7 @@ def start_map_stats_import_job(payload: dict | None = None):
         return {"job_id": latest["job_id"], "status": latest.get("status"), "reused": True}
     items = _build_map_stats_import_items(payload)
     if not items:
-        raise HTTPException(status_code=400, detail="No teams with HLTV team ids were found for map-stats import.")
+        raise HTTPException(status_code=400, detail="No teams were found for map-stats import.")
     now = time.time()
     job_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
     job = {
@@ -735,6 +1098,8 @@ def resume_map_stats_import_job(job_id: str):
     job["pause_requested"] = False
     job["cancel_requested"] = False
     job["error"] = ""
+    if job.get("last_error") in _INTERRUPTION_BOILERPLATE:
+        job["last_error"] = ""
     job["finished_at"] = None
     _publish_map_stats_job(job)
     _start_map_stats_worker(job_id)

@@ -1,13 +1,13 @@
-import json
-import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
-from swiss_stage.fantasy_montecarlo import simulate_swiss_fantasy
+from backend.swiss_stage.fantasy_montecarlo import simulate_swiss_fantasy
+from backend.data.db import connect as _connect
+from backend.data.singleton_state import SingletonState
 from backend.data.team_db import get_all_teams
-from backend.data.player_db import DB_PATH
+
 
 
 router = APIRouter()
@@ -15,72 +15,21 @@ SIM_JOBS = {}
 SIM_JOBS_LOCK = threading.Lock()
 
 
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+_SIM_STATE = SingletonState(
+    "swiss_simulation_state", result_column="results_json", result_key="results", iso_timestamps=True
+)
 
 
 def ensure_simulation_schema() -> None:
-    conn = _connect()
-    try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS swiss_simulation_state (
-                singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
-                payload_json TEXT NOT NULL,
-                results_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            """
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    _SIM_STATE.ensure_table()
 
 
 def save_latest_simulation(payload: dict, results: dict) -> None:
-    conn = _connect()
-    try:
-        conn.execute(
-            """
-            INSERT INTO swiss_simulation_state (singleton_id, payload_json, results_json, updated_at)
-            VALUES (1, ?, ?, ?)
-            ON CONFLICT(singleton_id) DO UPDATE SET
-                payload_json = excluded.payload_json,
-                results_json = excluded.results_json,
-                updated_at = excluded.updated_at
-            """,
-            (
-                json.dumps(payload),
-                json.dumps(results),
-                datetime.now(timezone.utc).isoformat(),
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    _SIM_STATE.save(payload, results)
 
 
 def load_latest_simulation() -> dict | None:
-    conn = _connect()
-    try:
-        row = conn.execute(
-            """
-            SELECT payload_json, results_json, updated_at
-            FROM swiss_simulation_state
-            WHERE singleton_id = 1
-            """
-        ).fetchone()
-        if not row:
-            return None
-        return {
-            "payload": json.loads(row["payload_json"]),
-            "results": json.loads(row["results_json"]),
-            "updated_at": row["updated_at"],
-        }
-    finally:
-        conn.close()
+    return _SIM_STATE.load()
 
 
 def _normalize_sim_payload(payload: dict) -> dict:
@@ -236,4 +185,5 @@ def reset_latest_simulation():
         conn.commit()
     finally:
         conn.close()
+    _SIM_STATE.invalidate()
     return {"status": "ok"}

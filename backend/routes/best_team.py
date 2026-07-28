@@ -8,26 +8,21 @@ import uuid
 from fastapi import APIRouter, HTTPException
 
 from backend.routes.simulation import load_latest_simulation
-from backend.data.player_db import DB_PATH, get_player
+from backend.data.db import connect as _connect
+from backend.data.player_db import get_player
 from backend.services.team_optimizer import (
     iter_valid_rosters,
     parse_optimizer_payload,
     serialize_roster,
 )
 from backend.services.swiss_booster_assignment import optimize_swiss_boosters_for_roster
-from swiss_stage.fantasy_montecarlo import simulate_swiss_fantasy
+from backend.swiss_stage.fantasy_montecarlo import simulate_swiss_fantasy
 from backend.data.team_db import get_all_teams
 
 router = APIRouter()
 
 BEST_TEAM_JOBS = {}
 BEST_TEAM_JOBS_LOCK = threading.Lock()
-
-
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
 
 
 def ensure_best_team_schema() -> None:

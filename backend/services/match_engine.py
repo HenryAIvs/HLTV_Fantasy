@@ -12,13 +12,13 @@ import random
 
 from backend.data.player_db import get_player
 from backend.services.rating_picker import pick_match_rating
-from swiss_stage.fantasy_scoring import (
+from backend.swiss_stage.fantasy_scoring import (
     compute_booster_points,
     compute_rating_points,
     compute_role_points,
     compute_win_points,
 )
-from swiss_stage.swiss_models import TeamState
+from backend.swiss_stage.swiss_models import TeamState
 from backend.services.team_strength import _get_hltv_rank, get_team_winrate
 
 

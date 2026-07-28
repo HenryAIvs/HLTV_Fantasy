@@ -1,10 +1,10 @@
 from typing import Dict, List, Tuple
 
 from fastapi import APIRouter, HTTPException
-from swiss_stage.team_initialization import initialize_teams
-from swiss_stage.pairing import buchholz_score, generate_pairings
-from swiss_stage.swiss_bracket import simulate_single_swiss_run
-from swiss_stage.swiss_models import TeamState
+from backend.swiss_stage.team_initialization import initialize_teams
+from backend.swiss_stage.pairing import buchholz_score, generate_pairings
+from backend.swiss_stage.swiss_bracket import simulate_single_swiss_run
+from backend.swiss_stage.swiss_models import TeamState
 
 
 router = APIRouter()

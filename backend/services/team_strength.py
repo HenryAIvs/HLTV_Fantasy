@@ -1,22 +1,14 @@
 # team_strength.py
 
 import math
-import sqlite3
 import json
 import os
 from functools import lru_cache
-from pathlib import Path
-from typing import Dict, Tuple
+from typing import Tuple
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
-DB_PATH = str(ROOT_DIR / "fantasy_players.db")
+from backend.data.db import ROOT_DIR, connect as _connect
+
 PARAMS_PATH = str(ROOT_DIR / "winrate_params.json")
-
-
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
 
 
 @lru_cache(maxsize=2048)

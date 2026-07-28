@@ -11,15 +11,15 @@ from backend.data.db_admin import wipe_database
 from backend.data.event_db import get_event_detail, set_active_event, set_event_hltv_ref, upsert_event_snapshot
 from backend.data.player_db import add_or_update_player, get_player
 from backend.data.team_db import add_or_update_team, get_team_by_name
-from backend.services.hltv_browser import HLTVBrowserError, fetch_hltv_html, fetch_hltv_json, run_hltv_browser_session
+from backend.services.hltv_browser import HLTVBrowserError, fetch_hltv_html, run_hltv_browser_session
 from backend.services.rating_picker import pick_match_rating
-from swiss_stage.fantasy_scoring import (
+from backend.swiss_stage.fantasy_scoring import (
     compute_rating_points,
     compute_role_points,
     compute_win_points,
     compute_booster_points,
 )
-from swiss_stage.swiss_models import PlayerState
+from backend.swiss_stage.swiss_models import PlayerState
 
 router = APIRouter()
 
@@ -45,15 +45,6 @@ HLTV_SCRIPT_SRC_RE = re.compile(r"<script[^>]+src=[\"'](?P<src>[^\"']+\.js[^\"']
 HLTV_TEAM_RANK_RE = re.compile(r"^\s*(?P<team>.+?)\s+#\d+\s+#(?P<rank>\d+)\s*$")
 HLTV_TEAM_LINK_RE = re.compile(r"<a\b[^>]*href=[\"']/team/\d+/[^\"']+[\"'][^>]*>(?P<body>.*?)</a>", re.IGNORECASE | re.DOTALL)
 HLTV_IMAGE_NAME_RE = re.compile(r"<img\b[^>]*(?:alt|title)=[\"'](?P<name>[^\"']+)[\"'][^>]*>", re.IGNORECASE)
-
-TIER_FIELD_MAP = {
-    5: ("rating_top5", "maps_top5"),
-    10: ("rating_top10", "maps_top10"),
-    20: ("rating_top20", "maps_top20"),
-    30: ("rating_top30", "maps_top30"),
-    50: ("rating_top50", "maps_top50"),
-}
-
 
 def _html_to_lines(html: str) -> List[str]:
     text = re.sub(r"(?is)<script\b.*?</script>", " ", html or "")
@@ -1093,59 +1084,6 @@ def wipe():
     return {"status": "ok"}
 
 
-@router.post("/import-hltv")
-def import_hltv(payload: Dict[str, Any]):
-    """
-    Import players/teams from a pasted HLTV fantasy JSON (moneyDraftData).
-    This avoids scraping and works offline with a provided JSON blob.
-    """
-    raw_json = payload.get("fantasy_json")
-    if not raw_json:
-        raise HTTPException(status_code=400, detail="fantasy_json is required")
-
-    try:
-        data = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    money = data.get("moneyDraftData", {})
-    teams = money.get("teams") or []
-    if not teams:
-        raise HTTPException(status_code=400, detail="moneyDraftData.teams missing or empty")
-
-    counts = _import_money_draft_data(money)
-    return {"status": "ok", **counts}
-
-
-@router.post("/import-hltv-event")
-def import_hltv_event(payload: Dict[str, Any]):
-    """
-    Fetch HLTV fantasy JSON for a given event id and import teams/players.
-    """
-    event_id = str(payload.get("event_id", "")).strip()
-    if not event_id.isdigit():
-        raise HTTPException(status_code=400, detail="event_id must be numeric")
-
-    url = f"https://www.hltv.org/fantasy/{event_id}/leagues/create/json"
-    try:
-        data = fetch_hltv_json(url)
-    except HLTVBrowserError as e:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch HLTV data with SeleniumBase UC: {e}")
-
-    money = data.get("moneyDraftData", {})
-    if not money:
-        raise HTTPException(status_code=400, detail="moneyDraftData missing in response")
-
-    ref = _extract_hltv_event_ref_from_fantasy(int(event_id), data)
-    counts = _import_money_draft_data(
-        money,
-        event_id=int(event_id),
-        hltv_event_id=ref.get("hltv_event_id"),
-        hltv_event_url=ref.get("hltv_event_url"),
-    )
-    return {"status": "ok", **counts, "event_id": event_id, **ref}
-
-
 @router.post("/import-trigger-rates")
 def import_trigger_rates(payload: Dict[str, Any]):
     """
@@ -1253,102 +1191,6 @@ def import_trigger_rates(payload: Dict[str, Any]):
         "updated_players_info": updated_players_info,
         "updated_player_names": updated_player_names,
     }
-
-
-@router.post("/import-top-ratings")
-def import_top_ratings(payload: Dict[str, Any]):
-    """
-    Parse pasted "vs top X opponents" text and update rating_topX/maps_topX for a player.
-    Payload: { player_id: int, text: str }
-    """
-    player_id = payload.get("player_id")
-    text = payload.get("text") or ""
-    if not player_id:
-        raise HTTPException(status_code=400, detail="player_id is required")
-    if not str(player_id).isdigit():
-        raise HTTPException(status_code=400, detail="player_id must be numeric")
-    if not text.strip():
-        raise HTTPException(status_code=400, detail="text is required")
-
-    # Find all rating/tier/maps tuples
-    pattern = re.compile(r"(?P<rating>\d+\.\d+)\s*vs top\s*(?P<tier>\d+)\s*opponents.*?\(\s*(?P<maps>\d+)\s*maps", re.IGNORECASE | re.DOTALL)
-    matches = pattern.findall(text)
-    if not matches:
-        raise HTTPException(status_code=400, detail="No 'vs top X opponents' entries found")
-
-    # Collect parsed values per tier
-    tier_data = {}
-    for rating_str, tier_str, maps_str in matches:
-        try:
-            tier = int(tier_str)
-        except Exception:
-            continue
-        if tier not in TIER_FIELD_MAP:
-            continue
-        try:
-            rating_val = float(rating_str)
-            maps_val = int(maps_str)
-        except Exception:
-            continue
-        tier_data[tier] = (rating_val, maps_val)
-
-    # For each target tier, if maps < 5, fall forward to the next available tier with >=5 maps
-    tiers_sorted = sorted(TIER_FIELD_MAP.keys())
-
-    def pick_for(target_tier):
-        # prefer current tier if maps >=5
-        if target_tier in tier_data and tier_data[target_tier][1] >= 5:
-            return tier_data[target_tier]
-        # otherwise look ahead
-        for t in tiers_sorted:
-            if t < target_tier:
-                continue
-            if t in tier_data and tier_data[t][1] >= 5:
-                return tier_data[t]
-        # fallback: if current tier exists but <5 maps, still return it
-        if target_tier in tier_data:
-            return tier_data[target_tier]
-        return None
-
-    updates = {}
-    for t in tiers_sorted:
-        val = pick_for(t)
-        if not val:
-            continue
-        rating_val, maps_val = val
-        r_field, m_field = TIER_FIELD_MAP[t]
-        updates[r_field] = rating_val
-        updates[m_field] = maps_val
-
-    if not updates:
-        raise HTTPException(status_code=400, detail="No supported tiers found (expect top 5/10/20/30/50)")
-
-    # Ensure NOT NULL fields are present by pulling existing row
-    from backend.data.player_db import get_player  # local import to avoid circular
-
-    existing = get_player(int(player_id)) or {}
-    name = existing.get("name") or f"Player {player_id}"
-    rating = existing.get("rating", 0.0)
-    price = existing.get("price", 0)
-    best_role = existing.get("best_role", "")
-    major_win_pct = existing.get("major_win_pct", 0.0)
-    minor_win_pct = existing.get("minor_win_pct", 0.0)
-    boosters_json = existing.get("boosters_json")
-    roles_json = existing.get("roles_json")
-
-    add_or_update_player(
-        player_id=int(player_id),
-        name=name,
-        rating=rating,
-        price=price,
-        best_role=best_role,
-        major_win_pct=major_win_pct,
-        minor_win_pct=minor_win_pct,
-        boosters_json=boosters_json,
-        roles_json=roles_json,
-        **updates,
-    )
-    return {"status": "ok", "updated_fields": list(updates.keys())}
 
 
 @router.post("/inspect-hltv-simulator")

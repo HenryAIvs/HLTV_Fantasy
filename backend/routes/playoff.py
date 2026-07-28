@@ -1,7 +1,6 @@
 import json
 import math
 import random
-import sqlite3
 import threading
 import time
 import uuid
@@ -9,11 +8,14 @@ from typing import List, Dict
 
 from fastapi import APIRouter, HTTPException
 
-from backend.data.player_db import DB_PATH, get_player
+from backend.data.db import connect as _connect
+from backend.data.player_db import get_player
+from backend.data.singleton_state import SingletonState
 from backend.data.team_db import get_team_by_id
 from backend.services.team_optimizer import iter_valid_rosters, optimize_rosters, parse_optimizer_payload, serialize_roster
-from swiss_stage.team_initialization import initialize_teams
-from swiss_stage.swiss_models import TeamState, PlayerState
+from backend.swiss_stage.fantasy_scoring import compute_elimination_penalty_components
+from backend.swiss_stage.team_initialization import initialize_teams
+from backend.swiss_stage.swiss_models import TeamState, PlayerState
 from backend.services.match_engine import simulate_match_outcome, apply_fantasy_points_for_team, calculate_win_probability
 
 router = APIRouter()
@@ -25,168 +27,52 @@ PLAYOFF_COMPLETED_BRACKET_JOBS = {}
 PLAYOFF_COMPLETED_BRACKET_JOBS_LOCK = threading.Lock()
 
 
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+_PLAYOFF_STATE = SingletonState("playoff_simulation_state", result_column="results_json", result_key="results")
+_COMPLETED_BRACKET_STATE = SingletonState("playoff_completed_bracket_state")
+_BEST_TEAM_STATE = SingletonState("playoff_best_team_state")
+# Small summary saved alongside the combos blob so metadata endpoints never
+# have to materialize the (multi-hundred-MB) result_json.
+_BEST_TEAM_META = SingletonState("playoff_best_team_meta")
 
 
 def ensure_playoff_schema() -> None:
-    conn = _connect()
-    try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS playoff_simulation_state (
-                singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
-                payload_json TEXT NOT NULL,
-                results_json TEXT NOT NULL,
-                updated_at REAL NOT NULL
-            );
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS playoff_completed_bracket_state (
-                singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
-                payload_json TEXT NOT NULL,
-                result_json TEXT NOT NULL,
-                updated_at REAL NOT NULL
-            );
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS playoff_best_team_state (
-                singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
-                payload_json TEXT NOT NULL,
-                result_json TEXT NOT NULL,
-                updated_at REAL NOT NULL
-            );
-            """
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    for state in (_PLAYOFF_STATE, _COMPLETED_BRACKET_STATE, _BEST_TEAM_STATE, _BEST_TEAM_META):
+        state.ensure_table()
 
 
 def save_latest_playoff(payload: dict, results: dict) -> None:
-    conn = _connect()
-    try:
-        conn.execute(
-            """
-            INSERT INTO playoff_simulation_state (singleton_id, payload_json, results_json, updated_at)
-            VALUES (1, ?, ?, ?)
-            ON CONFLICT(singleton_id) DO UPDATE SET
-                payload_json = excluded.payload_json,
-                results_json = excluded.results_json,
-                updated_at = excluded.updated_at
-            """,
-            (json.dumps(payload), json.dumps(results), float(time.time())),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    _PLAYOFF_STATE.save(payload, results)
 
 
 def load_latest_playoff() -> dict | None:
-    conn = _connect()
-    try:
-        row = conn.execute(
-            """
-            SELECT payload_json, results_json, updated_at
-            FROM playoff_simulation_state
-            WHERE singleton_id = 1
-            """
-        ).fetchone()
-        if not row:
-            return None
-        return {
-            "payload": json.loads(row["payload_json"]),
-            "results": json.loads(row["results_json"]),
-            "updated_at": float(row["updated_at"]),
-        }
-    finally:
-        conn.close()
+    return _PLAYOFF_STATE.load()
 
 
 def save_latest_completed_bracket(payload: dict, result: dict) -> None:
-    conn = _connect()
-    try:
-        conn.execute(
-            """
-            INSERT INTO playoff_completed_bracket_state (singleton_id, payload_json, result_json, updated_at)
-            VALUES (1, ?, ?, ?)
-            ON CONFLICT(singleton_id) DO UPDATE SET
-                payload_json = excluded.payload_json,
-                result_json = excluded.result_json,
-                updated_at = excluded.updated_at
-            """,
-            (json.dumps(payload), json.dumps(result), float(time.time())),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    _COMPLETED_BRACKET_STATE.save(payload, result)
 
 
 def load_latest_completed_bracket() -> dict | None:
-    conn = _connect()
-    try:
-        row = conn.execute(
-            """
-            SELECT payload_json, result_json, updated_at
-            FROM playoff_completed_bracket_state
-            WHERE singleton_id = 1
-            """
-        ).fetchone()
-        if not row:
-            return None
-        return {
-            "payload": json.loads(row["payload_json"]),
-            "result": json.loads(row["result_json"]),
-            "updated_at": float(row["updated_at"]),
-        }
-    finally:
-        conn.close()
+    return _COMPLETED_BRACKET_STATE.load()
+
+
+def _best_team_meta_summary(result: dict) -> dict:
+    return {
+        "mode": result.get("mode"),
+        "player_count": result.get("player_count"),
+        "total_teams": len(result.get("all_teams") or []),
+        "processed_combinations": result.get("processed_combinations"),
+        "total_combinations": result.get("total_combinations"),
+    }
 
 
 def save_latest_playoff_best_team(payload: dict, result: dict) -> None:
-    conn = _connect()
-    try:
-        conn.execute(
-            """
-            INSERT INTO playoff_best_team_state (singleton_id, payload_json, result_json, updated_at)
-            VALUES (1, ?, ?, ?)
-            ON CONFLICT(singleton_id) DO UPDATE SET
-                payload_json = excluded.payload_json,
-                result_json = excluded.result_json,
-                updated_at = excluded.updated_at
-            """,
-            (json.dumps(payload), json.dumps(result), float(time.time())),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    _BEST_TEAM_STATE.save(payload, result)
+    _BEST_TEAM_META.save(payload, _best_team_meta_summary(result))
 
 
 def load_latest_playoff_best_team() -> dict | None:
-    conn = _connect()
-    try:
-        row = conn.execute(
-            """
-            SELECT payload_json, result_json, updated_at
-            FROM playoff_best_team_state
-            WHERE singleton_id = 1
-            """
-        ).fetchone()
-        if not row:
-            return None
-        return {
-            "payload": json.loads(row["payload_json"]),
-            "result": json.loads(row["result_json"]),
-            "updated_at": float(row["updated_at"]),
-        }
-    finally:
-        conn.close()
+    return _BEST_TEAM_STATE.load()
 
 
 def _saved_combo_metric(team: dict, mode: str) -> float:
@@ -258,7 +144,7 @@ def _apply_elimination_penalty(team: TeamState, remaining_rounds: int) -> None:
     """
     if remaining_rounds <= 0:
         return
-    penalty = -3.0 * remaining_rounds
+    penalty = compute_elimination_penalty_components(remaining_rounds)["win"]
     for p in team.players.values():
         p.win_points_total += penalty
         p.total_points += penalty
@@ -286,25 +172,6 @@ def _apply_elimination_penalty(team: TeamState, remaining_rounds: int) -> None:
                 "note": f"Elimination penalty for {remaining_rounds} unplayed round(s)",
             }
         )
-
-
-def _serialize_team(ts: TeamState) -> dict:
-    return {
-        "team_id": ts.team_id,
-        "wins": ts.wins,
-        "losses": ts.losses,
-        "players": {
-            pid: {
-                "total_points": p.total_points,
-                "rating_points_total": p.rating_points_total,
-                "win_points_total": p.win_points_total,
-                "role_points_total": p.role_points_total,
-                "booster_points_total": p.booster_points_total,
-                "point_breakdown": list(p.point_breakdown),
-            }
-            for pid, p in ts.players.items()
-        },
-    }
 
 
 def _build_playoff_lookup_context(team_slots: List[int]) -> tuple[Dict[int, dict], Dict[int, int]]:
@@ -740,50 +607,6 @@ def _exact_weighted_player_totals(
         }
 
     return results, best_bracket, total_outcomes, outcomes
-
-
-def _average_player_totals(
-    team_slots: List[int], vrs_ranks: Dict[int, int], n_sims: int, progress_callback=None
-) -> Dict[int, Dict]:
-    """
-    Monte Carlo over the playoff bracket, returning expected fantasy components per player.
-    """
-    player_sums: Dict[int, Dict[int, Dict[str, float]]] = {tid: {} for tid in team_slots}
-    for i in range(n_sims):
-        team_states, _ = _simulate_bracket(team_slots, vrs_ranks)
-        for tid, ts in team_states.items():
-            for pid, p in ts.players.items():
-                bucket = player_sums[tid].setdefault(
-                    pid,
-                    {"total": 0.0, "rating": 0.0, "win": 0.0, "role": 0.0, "booster": 0.0},
-                )
-                bucket["total"] += p.total_points
-                bucket["rating"] += p.rating_points_total
-                bucket["win"] += p.win_points_total
-                bucket["role"] += p.role_points_total
-                bucket["booster"] += p.booster_points_total
-        if progress_callback and ((i + 1) % 10 == 0 or (i + 1) == n_sims):
-            progress_callback(i + 1, n_sims)
-
-    results: Dict[int, Dict] = {}
-    for tid in team_slots:
-        players_out: Dict[int, Dict[str, float]] = {}
-        for pid, sums in player_sums[tid].items():
-            players_out[pid] = {
-                "total_points": sums["total"] / float(n_sims),
-                "rating_points_total": sums["rating"] / float(n_sims),
-                "win_points_total": sums["win"] / float(n_sims),
-                "role_points_total": sums["role"] / float(n_sims),
-                "booster_points_total": sums["booster"] / float(n_sims),
-                "total_points_without_booster": (sums["rating"] + sums["win"] + sums["role"]) / float(n_sims),
-            }
-        results[tid] = {
-            "team_id": tid,
-            "wins": 0,
-            "losses": 0,
-            "players": players_out,
-        }
-    return results
 
 
 def _normalize_playoff_payload(payload: dict) -> dict:
@@ -1385,9 +1208,12 @@ def _compute_completed_bracket_from_latest(payload: dict | None = None, progress
         progress_callback=progress_callback,
         include_error_suffix="in selected bracket outcome",
     )
-    for team in (result.get("top_teams") or []) + (result.get("all_teams") or []):
+    for team in result.get("all_teams") or result.get("top_teams") or []:
         for player in team.get("players") or []:
             player["mode_score"] = float(player.get("total_ev") or 0.0)
+    # The completed-bracket UI only consumes top_teams/player_values; keeping
+    # every roster would persist and return a second multi-hundred-MB blob.
+    result.pop("all_teams", None)
     result["bracket_probability"] = float(selected.get("probability") or 0.0)
     result["bracket"] = selected.get("bracket") or {}
     result["outcomes_count"] = int(latest_results.get("outcomes_count") or len(outcomes))
@@ -1495,6 +1321,7 @@ def get_completed_bracket_job(job_id: str):
         "processed_combinations": out.get("processed_combinations", 0),
         "total_combinations": out.get("total_combinations", 0),
         "result_ready": out.get("result") is not None,
+        "result": out.get("result"),
     }
 
 
@@ -1503,10 +1330,14 @@ def get_latest_completed_bracket():
     latest = load_latest_completed_bracket()
     if not latest:
         return {"exists": False}
+    # Rows saved before all_teams was dropped carry every roster; serializing
+    # that here breaks the response, and no caller uses it.
+    result = dict(latest["result"] or {})
+    result.pop("all_teams", None)
     return {
         "exists": True,
         "payload": latest["payload"],
-        "result": latest["result"],
+        "result": result,
         "updated_at": latest["updated_at"],
     }
 
@@ -1562,19 +1393,66 @@ def get_best_team_playoff_job(job_id: str):
 
 @router.get("/best-team/from-latest/latest")
 def get_latest_best_team_playoff_from_latest():
-    latest = load_latest_playoff_best_team()
-    if not latest:
-        return {"exists": False}
-    result = latest["result"] or {}
+    meta = _BEST_TEAM_META.load()
+    if meta:
+        summary = meta["result"] or {}
+        return {
+            "exists": True,
+            "payload": meta["payload"],
+            "mode": summary.get("mode"),
+            "player_count": summary.get("player_count"),
+            "total_teams": summary.get("total_teams"),
+            "processed_combinations": summary.get("processed_combinations"),
+            "total_combinations": summary.get("total_combinations"),
+            "updated_at": meta["updated_at"],
+        }
+
+    # Legacy row saved before the meta table existed. Summarize it with
+    # SQLite's JSON functions (C-side parse, no giant Python objects) and
+    # persist the summary so this path only ever runs once.
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT payload_json, updated_at FROM playoff_best_team_state WHERE singleton_id = 1"
+        ).fetchone()
+        if not row:
+            return {"exists": False}
+        payload = json.loads(row["payload_json"])
+        updated_at = float(row["updated_at"])
+        summary = {
+            "mode": None,
+            "player_count": None,
+            "total_teams": None,
+            "processed_combinations": None,
+            "total_combinations": None,
+        }
+        try:
+            extracted = conn.execute(
+                """
+                SELECT json_extract(result_json, '$.mode') AS mode,
+                       json_extract(result_json, '$.player_count') AS player_count,
+                       json_array_length(result_json, '$.all_teams') AS total_teams,
+                       json_extract(result_json, '$.processed_combinations') AS processed_combinations,
+                       json_extract(result_json, '$.total_combinations') AS total_combinations
+                FROM playoff_best_team_state WHERE singleton_id = 1
+                """
+            ).fetchone()
+            if extracted:
+                summary = {key: extracted[key] for key in summary}
+        except Exception:
+            pass  # blob too large to summarize here; exists/payload still useful
+    finally:
+        conn.close()
+    _BEST_TEAM_META.save(payload, summary)
     return {
         "exists": True,
-        "payload": latest["payload"],
-        "mode": result.get("mode"),
-        "player_count": result.get("player_count"),
-        "total_teams": len(result.get("all_teams") or []),
-        "processed_combinations": result.get("processed_combinations"),
-        "total_combinations": result.get("total_combinations"),
-        "updated_at": latest["updated_at"],
+        "payload": payload,
+        "mode": summary.get("mode"),
+        "player_count": summary.get("player_count"),
+        "total_teams": summary.get("total_teams"),
+        "processed_combinations": summary.get("processed_combinations"),
+        "total_combinations": summary.get("total_combinations"),
+        "updated_at": updated_at,
     }
 
 
@@ -1736,8 +1614,11 @@ def reset_latest_playoff():
     try:
         conn.execute("DELETE FROM playoff_simulation_state WHERE singleton_id = 1")
         conn.execute("DELETE FROM playoff_best_team_state WHERE singleton_id = 1")
+        conn.execute("DELETE FROM playoff_best_team_meta WHERE singleton_id = 1")
         conn.execute("DELETE FROM playoff_completed_bracket_state WHERE singleton_id = 1")
         conn.commit()
     finally:
         conn.close()
+    for state in (_PLAYOFF_STATE, _BEST_TEAM_STATE, _BEST_TEAM_META, _COMPLETED_BRACKET_STATE):
+        state.invalidate()
     return {"status": "ok"}

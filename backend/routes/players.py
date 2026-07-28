@@ -7,13 +7,21 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
 
-from backend.data.player_db import DB_PATH, add_or_update_player, delete_player, get_all_players, get_player
+from backend.data.db import connect as _connect
+from backend.data.player_db import add_or_update_player, delete_player, get_all_players, get_player
 from backend.services.hltv_featured_ratings import HLTVFeaturedRatingsError, get_featured_ratings
 from backend.services.rating_curve import build_player_topx_graph
 
 
 router = APIRouter()
 DEFAULT_TOPX_BATCH_CONCURRENCY = 1
+# Status boilerplate that should disappear once a job is resumed; real fetch
+# errors are kept so the user still sees what last went wrong.
+_INTERRUPTION_BOILERPLATE = {
+    "Job was interrupted before completion. Resume to continue.",
+    "Paused",
+    "Canceled",
+}
 MAX_TOPX_BATCH_CONCURRENCY = 8
 TOPX_BATCH_JOBS = {}
 TOPX_BATCH_JOBS_LOCK = threading.Lock()
@@ -29,12 +37,6 @@ TOP_RATING_TEXT_RE = re.compile(
     r"(?P<rating>\d+\.\d+)\s*vs\s*top\s*(?P<tier>\d+)\s*opponents.*?\(\s*(?P<maps>\d+)\s*maps",
     re.IGNORECASE | re.DOTALL,
 )
-
-
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
 
 
 def ensure_topx_batch_schema() -> None:
@@ -85,7 +87,6 @@ def _status_from_row(row: sqlite3.Row) -> dict:
 
 
 def _get_stored_topx_job(job_id: str) -> dict | None:
-    ensure_topx_batch_schema()
     conn = _connect()
     try:
         row = conn.execute("SELECT * FROM topx_batch_jobs WHERE job_id = ?", (job_id,)).fetchone()
@@ -95,7 +96,6 @@ def _get_stored_topx_job(job_id: str) -> dict | None:
 
 
 def _save_topx_job(job: dict) -> None:
-    ensure_topx_batch_schema()
     now = time.time()
     job["updated_at"] = now
     conn = _connect()
@@ -454,7 +454,13 @@ def _stored_running_job_is_active(job_id: str) -> bool:
 
 
 def _get_topx_job_for_response(job_id: str) -> dict:
-    job = _get_stored_topx_job(job_id)
+    # Memory first: while the worker is alive it publishes every update here,
+    # so polls avoid touching SQLite alongside the job's own writes.
+    with TOPX_BATCH_JOBS_LOCK:
+        cached = TOPX_BATCH_JOBS.get(job_id)
+        job = dict(cached) if cached else None
+    if not job:
+        job = _get_stored_topx_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job_id not found")
     if job.get("status") in {"queued", "running", "pausing", "canceling"} and not _stored_running_job_is_active(job_id):
@@ -488,6 +494,8 @@ def _run_top_ratings_batch_job(job_id: str) -> None:
     job["pause_requested"] = False
     job["cancel_requested"] = False
     job["error"] = ""
+    if job.get("last_error") in _INTERRUPTION_BOILERPLATE:
+        job["last_error"] = ""
     job["started_at"] = job.get("started_at") or time.time()
     job["finished_at"] = None
     _publish_topx_job(job)
@@ -724,6 +732,8 @@ def resume_fetch_top_ratings_batch_job(job_id: str):
     job["pause_requested"] = False
     job["cancel_requested"] = False
     job["error"] = ""
+    if job.get("last_error") in _INTERRUPTION_BOILERPLATE:
+        job["last_error"] = ""
     _publish_topx_job(job)
     _start_topx_worker(job_id)
     return _topx_job_response(_get_topx_job_for_response(job_id))

@@ -1,19 +1,9 @@
 # role_assignment.py
 
 import json
-import math
 from typing import Dict, List, Tuple, Optional
 
-
-def _safe_float(v):
-    try:
-        if v is None:
-            return None
-        if isinstance(v, float) and math.isnan(v):
-            return None
-        return float(v)
-    except (TypeError, ValueError):
-        return None
+from backend.services.rating_curve import _safe_float
 
 
 def _compute_role_score(major: float, minor: float) -> float:

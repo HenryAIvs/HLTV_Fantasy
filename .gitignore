@@ -28,6 +28,10 @@ Thumbs.db
 coverage/
 downloaded_files/
 
+# Local runtime state
+.runtime/
+.agents/
+
 # Local environment
 .env
 *.env

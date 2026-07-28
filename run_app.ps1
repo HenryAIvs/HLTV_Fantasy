@@ -29,9 +29,8 @@ if (-not (Test-Path $venvPath)) {
 }
 $venvPy = Join-Path $venvPath "Scripts\python.exe"
 
-# HLTV scraping defaults: headed browser and persistent profile for Cloudflare cookie reuse.
+# HLTV scraping default: headed browser so Cloudflare cookies persist in the profile.
 $env:HLTV_HEADLESS = "0"
-$env:HLTV_PROFILE_DIR = Join-Path $root "hltv_profile_playwright"
 
 & $venvPy -m pip install --upgrade pip
 & $venvPy -m pip install -r requirements.txt

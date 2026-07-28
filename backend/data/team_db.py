@@ -1,15 +1,6 @@
-import sqlite3
-from pathlib import Path
 from typing import List, Dict, Optional
 
-DB_PATH = str(Path(__file__).resolve().parents[2] / "fantasy_players.db")
-
-
-def connect() -> sqlite3.Connection:
-    """Returns a database connection with dict-like row access."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+from backend.data.db import connect
 
 
 def ensure_team_schema() -> None:

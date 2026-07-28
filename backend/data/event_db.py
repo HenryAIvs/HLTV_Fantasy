@@ -1,18 +1,10 @@
-import sqlite3
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 from datetime import date
 import re
 import json
 from urllib.parse import urlsplit, urlunsplit
 
-DB_PATH = str(Path(__file__).resolve().parents[2] / "fantasy_players.db")
-
-
-def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+from backend.data.db import connect
 
 
 def ensure_event_schema() -> None:
@@ -131,6 +123,10 @@ def ensure_event_schema() -> None:
             conn.execute("ALTER TABLE hltv_results ADD COLUMN vrs_effective_date TEXT")
         if "points_enriched_at" not in hltv_col_names:
             conn.execute("ALTER TABLE hltv_results ADD COLUMN points_enriched_at TEXT")
+        if "veto_json" not in hltv_col_names:
+            conn.execute("ALTER TABLE hltv_results ADD COLUMN veto_json TEXT")
+        if "player_stats_json" not in hltv_col_names:
+            conn.execute("ALTER TABLE hltv_results ADD COLUMN player_stats_json TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hltv_results_match_id ON hltv_results(match_id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hltv_results_imported ON hltv_results(imported_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hltv_results_match_date ON hltv_results(match_date DESC)")
@@ -207,6 +203,18 @@ def _normalize_team_snapshot(team: Dict[str, Any]) -> Dict[str, Any]:
         "player_ids": player_ids,
         "prices_by_player": prices_by_player,
     }
+
+
+def get_historical_team_map_stats_keys() -> set[tuple[str, str, str]]:
+    """All (normalized_name, start_date, end_date) windows already stored."""
+    conn = connect()
+    try:
+        rows = conn.execute(
+            "SELECT normalized_name, start_date, end_date FROM historical_team_map_stats"
+        ).fetchall()
+        return {(str(r["normalized_name"]), str(r["start_date"]), str(r["end_date"])) for r in rows}
+    finally:
+        conn.close()
 
 
 def get_historical_team_map_stats(normalized_name: str, start_date: str, end_date: str) -> Optional[Dict[str, Any]]:
@@ -555,8 +563,9 @@ def upsert_hltv_results(rows: List[Dict[str, Any]]) -> Dict[str, int]:
             conn.execute(
                 """
                 INSERT INTO hltv_results (
-                    match_url, match_id, match_date, team1, team2, score1, score2, winner, event_name, source_offset, maps_json, imported_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+                    match_url, match_id, match_date, team1, team2, score1, score2, winner, event_name, source_offset,
+                    maps_json, veto_json, player_stats_json, imported_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
                 ON CONFLICT(match_url) DO UPDATE SET
                     match_id = excluded.match_id,
                     match_date = COALESCE(excluded.match_date, hltv_results.match_date),
@@ -568,6 +577,8 @@ def upsert_hltv_results(rows: List[Dict[str, Any]]) -> Dict[str, int]:
                     event_name = excluded.event_name,
                     source_offset = excluded.source_offset,
                     maps_json = COALESCE(excluded.maps_json, hltv_results.maps_json),
+                    veto_json = COALESCE(excluded.veto_json, hltv_results.veto_json),
+                    player_stats_json = COALESCE(excluded.player_stats_json, hltv_results.player_stats_json),
                     last_seen_at = datetime('now')
                 """,
                 (
@@ -582,6 +593,8 @@ def upsert_hltv_results(rows: List[Dict[str, Any]]) -> Dict[str, int]:
                     str(r.get("event")) if r.get("event") is not None else None,
                     _to_int(r.get("source_offset")) or 0,
                     str(r.get("maps_json")) if r.get("maps_json") is not None else None,
+                    str(r.get("veto_json")) if r.get("veto_json") is not None else None,
+                    str(r.get("player_stats_json")) if r.get("player_stats_json") is not None else None,
                 ),
             )
             if existing:
@@ -629,6 +642,21 @@ def dedupe_hltv_results_by_match_id() -> int:
                 removed += 1
         conn.commit()
         return removed
+    finally:
+        conn.close()
+
+
+def get_imported_match_ids() -> set[int]:
+    """Match ids already stored with map details — used to skip re-importing them."""
+    conn = connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT match_id FROM hltv_results
+            WHERE match_id IS NOT NULL AND maps_json IS NOT NULL AND maps_json != '' AND maps_json != '[]'
+            """
+        ).fetchall()
+        return {int(row["match_id"]) for row in rows}
     finally:
         conn.close()
 
@@ -709,6 +737,8 @@ def list_hltv_results(limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]
                 vrs_rank_1,
                 vrs_rank_2,
                 maps_json,
+                veto_json,
+                player_stats_json,
                 hltv_effective_date,
                 vrs_effective_date,
                 points_enriched_at,
@@ -761,6 +791,8 @@ def get_hltv_result_by_url(match_url: str) -> Optional[Dict[str, Any]]:
                 vrs_rank_1,
                 vrs_rank_2,
                 maps_json,
+                veto_json,
+                player_stats_json,
                 hltv_effective_date,
                 vrs_effective_date,
                 points_enriched_at,

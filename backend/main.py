@@ -4,6 +4,7 @@ Run with: `python backend/main.py`
 """
 
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,10 +13,30 @@ from backend.routes import players, teams, simulation, bracket, best_team, playo
 from backend.data.event_db import ensure_event_schema
 from backend.data.player_db import ensure_schema
 from backend.data.team_db import ensure_team_schema
-from backend.routes.simulation import ensure_simulation_schema
-from backend.routes.best_team import ensure_best_team_schema
-from backend.routes.playoff import ensure_playoff_schema
-from backend.routes.players import ensure_topx_batch_schema
+
+SCHEMA_INITIALIZERS = (
+    ensure_schema,
+    ensure_team_schema,
+    ensure_event_schema,
+    simulation.ensure_simulation_schema,
+    best_team.ensure_best_team_schema,
+    playoff.ensure_playoff_schema,
+    players.ensure_topx_batch_schema,
+    teams.ensure_map_stats_import_schema,
+    teams.ensure_rankings_refresh_schema,
+    events.ensure_historical_stats_job_schema,
+)
+
+ROUTERS = (
+    (players.router, "/players", "players"),
+    (teams.router, "/teams", "teams"),
+    (simulation.router, "/simulate", "simulation"),
+    (bracket.router, "/bracket", "bracket"),
+    (best_team.router, "/best-team", "best-team"),
+    (playoff.router, "/playoff", "playoff"),
+    (admin.router, "/admin", "admin"),
+    (events.router, "/events", "events"),
+)
 
 
 def configure_logging() -> None:
@@ -25,35 +46,24 @@ def configure_logging() -> None:
     )
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    for ensure in SCHEMA_INITIALIZERS:
+        ensure()
+    yield
+
+
 def create_app() -> FastAPI:
     configure_logging()
-    app = FastAPI(title="CS Fantasy API", version="0.1.0")
+    app = FastAPI(title="CS Fantasy API", version="0.1.0", lifespan=_lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-    app.include_router(players.router, prefix="/players", tags=["players"])
-    app.include_router(teams.router, prefix="/teams", tags=["teams"])
-    app.include_router(simulation.router, prefix="/simulate", tags=["simulation"])
-    app.include_router(bracket.router, prefix="/bracket", tags=["bracket"])
-    app.include_router(best_team.router, prefix="/best-team", tags=["best-team"])
-    app.include_router(playoff.router, prefix="/playoff", tags=["playoff"])
-    app.include_router(admin.router, prefix="/admin", tags=["admin"])
-    app.include_router(events.router, prefix="/events", tags=["events"])
-
-    @app.on_event("startup")
-    def _init_database() -> None:
-        ensure_schema()
-        ensure_team_schema()
-        ensure_event_schema()
-        ensure_simulation_schema()
-        ensure_best_team_schema()
-        ensure_playoff_schema()
-        ensure_topx_batch_schema()
-
+    for router, prefix, tag in ROUTERS:
+        app.include_router(router, prefix=prefix, tags=[tag])
     return app
 
 

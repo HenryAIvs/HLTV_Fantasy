@@ -1,16 +1,8 @@
 # player_db.py
-import sqlite3
 import json
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-DB_PATH = str(Path(__file__).resolve().parents[2] / "fantasy_players.db")
-
-
-def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+from backend.data.db import DB_PATH, connect  # noqa: F401  (DB_PATH re-exported for routes)
 
 
 def ensure_schema() -> None:
@@ -197,38 +189,10 @@ def get_player(player_id: int) -> Optional[Dict[str, Any]]:
             return None
         out = dict(row)
         try:
-            from event_db import get_active_event_id, get_event_price
+            from backend.data.event_db import get_active_event_id, get_event_price
 
             active_event_id = get_active_event_id()
             event_price = get_event_price(player_id, active_event_id)
-            out["active_event_id"] = active_event_id
-            if event_price is not None:
-                out["price"] = int(event_price)
-        except Exception:
-            pass
-        return out
-    finally:
-        conn.close()
-
-
-def get_player_by_name(name: str) -> Optional[Dict[str, Any]]:
-    """
-    Case-insensitive lookup by player name.
-    """
-    conn = connect()
-    try:
-        row = conn.execute(
-            "SELECT * FROM players WHERE lower(name) = lower(?)",
-            (name,),
-        ).fetchone()
-        if not row:
-            return None
-        out = dict(row)
-        try:
-            from event_db import get_active_event_id, get_event_price
-
-            active_event_id = get_active_event_id()
-            event_price = get_event_price(int(out["player_id"]), active_event_id)
             out["active_event_id"] = active_event_id
             if event_price is not None:
                 out["price"] = int(event_price)
@@ -247,7 +211,7 @@ def get_all_players() -> List[Dict[str, Any]]:
         ).fetchall()
         players = [dict(r) for r in rows]
         try:
-            from event_db import get_active_event_id, get_event_price_map
+            from backend.data.event_db import get_active_event_id, get_event_price_map
 
             active_event_id = get_active_event_id()
             price_map = get_event_price_map(active_event_id)
@@ -261,34 +225,6 @@ def get_all_players() -> List[Dict[str, Any]]:
         return players
     finally:
         conn.close()
-
-
-def get_player_with_parsed_json(player_id: int) -> Optional[Dict[str, Any]]:
-    """
-    Return a player row plus parsed boosters/roles JSON as 'boosters' and 'roles'.
-    """
-    row = get_player(player_id)
-    if not row:
-        return None
-
-    boosters = None
-    roles = None
-
-    if row.get("boosters_json"):
-        try:
-            boosters = json.loads(row["boosters_json"])
-        except Exception:
-            boosters = None
-
-    if row.get("roles_json"):
-        try:
-            roles = json.loads(row["roles_json"])
-        except Exception:
-            roles = None
-
-    row["boosters"] = boosters
-    row["roles"] = roles
-    return row
 
 
 def delete_player(player_id: int) -> None:

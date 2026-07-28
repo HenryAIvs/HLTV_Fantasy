@@ -35,12 +35,16 @@ const requestJson = async (path, init = {}, timeoutMs = 30000) => {
 
 contextBridge.exposeInMainWorld("api", {
   get: (path, timeoutMs) => requestJson(path, {}, timeoutMs),
-  post: (path, body) =>
-    requestJson(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
+  post: (path, body, timeoutMs) =>
+    requestJson(
+      path,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+      timeoutMs
+    ),
   delete: (path) =>
     requestJson(path, {
       method: "DELETE",

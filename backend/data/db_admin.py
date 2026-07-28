@@ -1,20 +1,18 @@
 # db_admin.py
-import sqlite3
-from pathlib import Path
+from backend.data.db import connect
 
-DB_PATH = str(Path(__file__).resolve().parents[2] / "fantasy_players.db")
 
 def wipe_database():
     # Ensure tables exist before delete to avoid OperationalError on first run.
-    from player_db import ensure_schema
-    from team_db import ensure_team_schema
-    from event_db import ensure_event_schema
+    from backend.data.player_db import ensure_schema
+    from backend.data.team_db import ensure_team_schema
+    from backend.data.event_db import ensure_event_schema
 
     ensure_schema()
     ensure_team_schema()
     ensure_event_schema()
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect()
     cur = conn.cursor()
 
     # Delete all rows but keep schema

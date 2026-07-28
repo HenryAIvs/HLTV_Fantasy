@@ -3,6 +3,7 @@ import random
 import re
 import json
 import threading
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
@@ -11,8 +12,9 @@ import logging
 from fastapi import APIRouter, HTTPException
 from dateutil.relativedelta import relativedelta
 
+from backend.routes.players import _INTERRUPTION_BOILERPLATE
 from backend.routes.admin import _extract_hltv_event_ref_from_fantasy, _import_money_draft_data
-from backend.hltv_rankings import (
+from backend.services.hltv_rankings import (
     get_recent_hltv_results,
     get_hltv_match_details,
     get_hltv_team_map_stats_for_range,
@@ -20,7 +22,9 @@ from backend.hltv_rankings import (
     get_all_vrs_rankings_on_or_before_date,
     HLTVRankingError,
 )
+from backend.data.db import connect as event_db_connect
 from backend.data.event_db import (
+    get_historical_team_map_stats_keys,
     clear_hltv_results,
     count_hltv_results,
     dedupe_hltv_results_by_match_id,
@@ -29,6 +33,7 @@ from backend.data.event_db import (
     get_active_event_id,
     get_event_detail,
     get_hltv_result_by_url,
+    get_imported_match_ids,
     get_historical_team_map_stats,
     list_hltv_results,
     set_hltv_result_maps,
@@ -557,6 +562,23 @@ def _import_hltv_results_work(
             job = HLTV_RESULTS_IMPORT_JOBS.get(job_id) or {}
             return bool(job.get("pause_requested"))
 
+    def cancel_requested() -> bool:
+        if not job_id:
+            return False
+        with HLTV_RESULTS_IMPORT_JOBS_LOCK:
+            job = HLTV_RESULTS_IMPORT_JOBS.get(job_id) or {}
+            return bool(job.get("cancel_requested"))
+
+    def stop_if_requested(where: str):
+        """Return a terminal status dict when cancel/pause was requested, else None."""
+        if cancel_requested():
+            checkpoint(status="canceled", phase="canceled", current=f"Canceled {where}")
+            return {"status": "canceled"}
+        if pause_requested():
+            checkpoint(status="paused", phase="paused", current=f"Paused {where}")
+            return {"status": "paused"}
+        return None
+
     def checkpoint(**updates: Any) -> None:
         if not job_id:
             return
@@ -592,16 +614,16 @@ def _import_hltv_results_work(
             }
         )
 
-    if pause_requested():
-        checkpoint(status="paused", phase="paused", current="Paused")
-        return {"status": "paused"}
+    stopped = stop_if_requested("before starting")
+    if stopped:
+        return stopped
 
     if not fetch_complete:
         report(phase="fetching_results")
     while not fetch_complete:
-        if pause_requested():
-            checkpoint(status="paused", phase="paused", current=f"Paused before page {page_index + 1}")
-            return {"status": "paused"}
+        stopped = stop_if_requested(f"before page {page_index + 1}")
+        if stopped:
+            return stopped
         page_index += 1
         try:
             snapshot = get_recent_hltv_results(limit=per_page_limit, offsets=[offset])
@@ -651,10 +673,29 @@ def _import_hltv_results_work(
         date_filtered_out = max(0, before_date_filter - len(rows))
         checkpoint(date_filter_applied=True)
 
+    if not detail_complete and detail_index <= 0 and rows and not (job_state or {}).get("existing_filter_applied"):
+        # Skip matches that were already fully imported (map details stored).
+        imported_ids = get_imported_match_ids()
+        before_existing_filter = len(rows)
+        rows = [
+            r
+            for r in rows
+            if not (r.get("match_id") is not None and int(r.get("match_id") or 0) in imported_ids)
+        ]
+        skipped_existing = max(0, before_existing_filter - len(rows))
+        checkpoint(existing_filter_applied=True, skipped_existing=skipped_existing)
+        report(
+            phase="fetching_results",
+            current=f"Skipped {skipped_existing} already-imported matches",
+            skipped_existing=skipped_existing,
+        )
+    else:
+        skipped_existing = int((job_state or {}).get("skipped_existing") or 0)
+
     if not detail_complete and detail_index <= 0 and max_hltv_rank > 0 and rows and not (job_state or {}).get("rank_filter_applied"):
-        if pause_requested():
-            checkpoint(status="paused", phase="paused", current="Paused before rank filtering")
-            return {"status": "paused"}
+        stopped = stop_if_requested("before rank filtering")
+        if stopped:
+            return stopped
         rank_filter_dates_total = len({str(r.get("match_date")) for r in rows if r.get("match_date")})
         total_units = max(
             1,
@@ -700,9 +741,9 @@ def _import_hltv_results_work(
     checkpoint(total_units=total_units, phase="fetching_match_details")
     report(phase="fetching_match_details", detail_total=len(rows), detail_done=detail_index)
     for idx in range(detail_index, len(rows)):
-        if pause_requested():
-            checkpoint(status="paused", phase="paused", current=f"Paused at match {idx + 1} / {len(rows)}")
-            return {"status": "paused"}
+        stopped = stop_if_requested(f"at match {idx + 1} / {len(rows)}")
+        if stopped:
+            return stopped
         r = rows[idx]
         url = str(r.get("match_url") or "").strip()
         if url:
@@ -710,11 +751,21 @@ def _import_hltv_results_work(
                 stored = get_hltv_result_by_url(url)
                 if stored and stored.get("maps_json"):
                     r["maps_json"] = str(stored.get("maps_json") or "[]")
+                    if stored.get("veto_json"):
+                        r["veto_json"] = str(stored.get("veto_json"))
+                    if stored.get("player_stats_json"):
+                        r["player_stats_json"] = str(stored.get("player_stats_json"))
                 else:
                     md = get_hltv_match_details(url)
                     maps = md.get("maps") or []
                     if maps:
                         r["maps_json"] = json.dumps(maps)
+                    veto = md.get("veto") or []
+                    if veto:
+                        r["veto_json"] = json.dumps(veto)
+                    player_stats = md.get("player_stats") or []
+                    if player_stats:
+                        r["player_stats_json"] = json.dumps(player_stats)
             except Exception:
                 pass
         processed_units += 1
@@ -797,6 +848,7 @@ def _import_hltv_results_work(
         "kept": len(rows),
         "rank_filtered_out": int(rank_filtered_out),
         "date_filtered_out": int(date_filtered_out),
+        "skipped_existing": int(skipped_existing),
         "max_hltv_rank": max_hltv_rank,
         "rank_filter_mode": rank_filter_mode,
         "import_mode": import_mode,
@@ -829,6 +881,17 @@ def _run_hltv_results_import_job(job_id: str, payload: Dict[str, Any] | None) ->
         result = _import_hltv_results_work(payload, lambda updates: _update_hltv_results_import_job(job_id, **updates), job_id=job_id)
         if (result or {}).get("status") == "paused":
             _update_hltv_results_import_job(job_id, status="paused", phase="paused", current="Paused", pause_requested=False)
+            return
+        if (result or {}).get("status") == "canceled":
+            _update_hltv_results_import_job(
+                job_id,
+                status="canceled",
+                phase="canceled",
+                current="Canceled",
+                pause_requested=False,
+                cancel_requested=False,
+                finished_at=_utc_now_iso(),
+            )
             return
         with HLTV_RESULTS_IMPORT_JOBS_LOCK:
             total_units = int((HLTV_RESULTS_IMPORT_JOBS.get(job_id) or {}).get("total_units") or 1)
@@ -880,7 +943,7 @@ def import_hltv_results(payload: Dict[str, Any] | None = None):
 def start_hltv_results_import(payload: Dict[str, Any] | None = None):
     with HLTV_RESULTS_IMPORT_JOBS_LOCK:
         for existing_id, existing_job in HLTV_RESULTS_IMPORT_JOBS.items():
-            if existing_job.get("status") in {"queued", "running", "pausing"}:
+            if existing_job.get("status") in {"queued", "running", "pausing", "canceling"}:
                 return {"job_id": existing_id, "status": existing_job.get("status"), "reused": True}
         job_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
         normalized = _normalize_hltv_results_import_payload(payload)
@@ -900,6 +963,7 @@ def start_hltv_results_import(payload: Dict[str, Any] | None = None):
             "detail_index": 0,
             "detail_complete": False,
             "pause_requested": False,
+            "cancel_requested": False,
             "created_at": _utc_now_iso(),
             "updated_at": _utc_now_iso(),
             "payload": normalized,
@@ -969,12 +1033,36 @@ def resume_hltv_results_import_job(job_id: str):
     if not data:
         raise HTTPException(status_code=404, detail="job_id not found")
     status = str(data.get("status") or "")
-    if status == "completed":
+    if status in {"completed", "canceled", "running"}:
         return get_hltv_results_import_job(job_id)
-    if status == "running":
-        return get_hltv_results_import_job(job_id)
-    _update_hltv_results_import_job(job_id, status="queued", pause_requested=False, current="Resuming")
+    _update_hltv_results_import_job(job_id, status="queued", pause_requested=False, cancel_requested=False, current="Resuming")
     _start_hltv_results_import_thread(job_id)
+    return get_hltv_results_import_job(job_id)
+
+
+@router.post("/hltv-results/import/job/{job_id}/cancel")
+def cancel_hltv_results_import_job(job_id: str):
+    data = _hydrate_hltv_results_import_job(job_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="job_id not found")
+    status = str(data.get("status") or "")
+    if status in {"completed", "failed", "canceled"}:
+        return get_hltv_results_import_job(job_id)
+    if status in {"queued", "paused"}:
+        # No worker is mid-request; cancel immediately.
+        _update_hltv_results_import_job(
+            job_id,
+            status="canceled",
+            phase="canceled",
+            current="Canceled",
+            pause_requested=False,
+            cancel_requested=False,
+            finished_at=_utc_now_iso(),
+        )
+        return get_hltv_results_import_job(job_id)
+    _update_hltv_results_import_job(
+        job_id, status="canceling", cancel_requested=True, current="Canceling after current request"
+    )
     return get_hltv_results_import_job(job_id)
 
 
@@ -1464,7 +1552,7 @@ def get_winrate_model_current_points(limit: int = 1000, fallback_current: int = 
     }
 
 
-MAP_POOL = ["Mirage", "Inferno", "Nuke", "Ancient", "Anubis", "Dust2", "Overpass"]
+MAP_POOL = ["Mirage", "Inferno", "Nuke", "Ancient", "Anubis", "Dust2", "Cache"]
 
 
 def _canonical_map_name(value: Any) -> str:
@@ -1561,11 +1649,10 @@ def _historical_map_stats_window(match_date: Any) -> tuple[str, str] | None:
     return start_date.isoformat(), end_date.isoformat()
 
 
-def _build_historical_team_map_stats_by_window(
+def _required_historical_windows(
     rows: List[Dict[str, Any]],
-    *,
-    fetch_missing: bool = False,
-) -> tuple[Dict[tuple[str, str, str], Dict[str, Dict[str, float]]], Dict[str, Any]]:
+) -> tuple[Dict[tuple[str, str, str], Dict[str, Any]], set[str]]:
+    """All (team, six-month window) pairs the given matches need pre-match map stats for."""
     teams_by_key = {_norm_team_name(team.get("name") or ""): team for team in get_all_teams()}
     required: Dict[tuple[str, str, str], Dict[str, Any]] = {}
     missing_team_keys: set[str] = set()
@@ -1589,6 +1676,15 @@ def _build_historical_team_map_stats_by_window(
                 "start_date": start_date,
                 "end_date": end_date,
             }
+    return required, missing_team_keys
+
+
+def _build_historical_team_map_stats_by_window(
+    rows: List[Dict[str, Any]],
+    *,
+    fetch_missing: bool = False,
+) -> tuple[Dict[tuple[str, str, str], Dict[str, Dict[str, float]]], Dict[str, Any]]:
+    required, missing_team_keys = _required_historical_windows(rows)
 
     out: Dict[tuple[str, str, str], Dict[str, Dict[str, float]]] = {}
     fetched = 0
@@ -1643,6 +1739,407 @@ def _build_historical_team_map_stats_by_window(
         "unmapped_team_examples": sorted(missing_team_keys)[:20],
         "fetch_missing": bool(fetch_missing),
     }
+
+
+# --- Historical map-stats backfill as a pausable/cancelable background job ----
+# Fills the permanent historical_team_map_stats table (one HLTV scrape per
+# missing team/six-month-window pair) so the Model Lab can train on full data.
+
+HISTORICAL_STATS_JOBS: Dict[str, Dict[str, Any]] = {}
+HISTORICAL_STATS_WORKERS: Dict[str, threading.Thread] = {}
+HISTORICAL_STATS_JOBS_LOCK = threading.Lock()
+
+
+def ensure_historical_stats_job_schema() -> None:
+    conn = event_db_connect()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS historical_map_stats_jobs (
+                job_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                error TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                progress REAL NOT NULL DEFAULT 0,
+                processed_items INTEGER NOT NULL DEFAULT 0,
+                total_items INTEGER NOT NULL DEFAULT 0,
+                ok INTEGER NOT NULL DEFAULT 0,
+                failed INTEGER NOT NULL DEFAULT 0,
+                current_item TEXT NOT NULL DEFAULT '',
+                pause_requested INTEGER NOT NULL DEFAULT 0,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                started_at REAL,
+                finished_at REAL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_historical_stats_jobs_updated ON historical_map_stats_jobs(updated_at DESC)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _historical_job_from_row(row: Any) -> Dict[str, Any]:
+    out = dict(row)
+    out["pause_requested"] = bool(out.get("pause_requested"))
+    out["cancel_requested"] = bool(out.get("cancel_requested"))
+    out["progress"] = float(out.get("progress") or 0.0)
+    return out
+
+
+def _get_stored_historical_job(job_id: str) -> Dict[str, Any] | None:
+    conn = event_db_connect()
+    try:
+        row = conn.execute("SELECT * FROM historical_map_stats_jobs WHERE job_id = ?", (job_id,)).fetchone()
+        return _historical_job_from_row(row) if row else None
+    finally:
+        conn.close()
+
+
+def _save_historical_job(job: Dict[str, Any]) -> None:
+    now = time.time()
+    job["updated_at"] = now
+    conn = event_db_connect()
+    try:
+        conn.execute(
+            """
+            INSERT INTO historical_map_stats_jobs (
+                job_id, status, error, last_error, progress, processed_items, total_items,
+                ok, failed, current_item, pause_requested, cancel_requested,
+                created_at, updated_at, started_at, finished_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                status = excluded.status,
+                error = excluded.error,
+                last_error = excluded.last_error,
+                progress = excluded.progress,
+                processed_items = excluded.processed_items,
+                total_items = excluded.total_items,
+                ok = excluded.ok,
+                failed = excluded.failed,
+                current_item = excluded.current_item,
+                pause_requested = excluded.pause_requested,
+                cancel_requested = excluded.cancel_requested,
+                updated_at = excluded.updated_at,
+                started_at = COALESCE(excluded.started_at, historical_map_stats_jobs.started_at),
+                finished_at = excluded.finished_at
+            """,
+            (
+                str(job["job_id"]),
+                str(job.get("status") or "queued"),
+                str(job.get("error") or ""),
+                str(job.get("last_error") or ""),
+                float(job.get("progress") or 0.0),
+                int(job.get("processed_items") or 0),
+                int(job.get("total_items") or 0),
+                int(job.get("ok") or 0),
+                int(job.get("failed") or 0),
+                str(job.get("current_item") or ""),
+                1 if job.get("pause_requested") else 0,
+                1 if job.get("cancel_requested") else 0,
+                float(job.get("created_at") or now),
+                now,
+                job.get("started_at"),
+                job.get("finished_at"),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _publish_historical_job(job: Dict[str, Any]) -> None:
+    with HISTORICAL_STATS_JOBS_LOCK:
+        HISTORICAL_STATS_JOBS[str(job["job_id"])] = dict(job)
+    _save_historical_job(job)
+
+
+def _historical_worker_is_active(job_id: str) -> bool:
+    with HISTORICAL_STATS_JOBS_LOCK:
+        worker = HISTORICAL_STATS_WORKERS.get(job_id)
+        return bool(worker and worker.is_alive())
+
+
+def _historical_job_response(job: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "job_id": str(job["job_id"]),
+        "status": job.get("status", "queued"),
+        "error": job.get("error", ""),
+        "last_error": job.get("last_error", ""),
+        "progress": job.get("progress", 0.0),
+        "processed_items": job.get("processed_items", 0),
+        "total_items": job.get("total_items", 0),
+        "ok": job.get("ok", 0),
+        "failed": job.get("failed", 0),
+        "current_item": job.get("current_item", ""),
+        "pause_requested": bool(job.get("pause_requested")),
+        "cancel_requested": bool(job.get("cancel_requested")),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+    }
+
+
+def _get_historical_job_for_response(job_id: str) -> Dict[str, Any]:
+    with HISTORICAL_STATS_JOBS_LOCK:
+        cached = HISTORICAL_STATS_JOBS.get(job_id)
+        job = dict(cached) if cached else None
+    if not job:
+        job = _get_stored_historical_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job_id not found")
+    if job.get("status") in {"queued", "running", "pausing", "canceling"} and not _historical_worker_is_active(job_id):
+        job["status"] = "canceled" if job.get("cancel_requested") else "paused"
+        job["last_error"] = job.get("last_error") or "Job was interrupted before completion. Resume to continue."
+        job["error"] = ""
+        job["pause_requested"] = False
+        job["cancel_requested"] = False
+        _publish_historical_job(job)
+    return job
+
+
+def _historical_missing_items() -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Current missing (team, window) pairs plus coverage counts, straight from the DB."""
+    rows = list_hltv_results(limit=max(1, count_hltv_results()), offset=0)
+    required, unmapped = _required_historical_windows(rows)
+    stored_keys = get_historical_team_map_stats_keys()
+    missing: List[Dict[str, Any]] = []
+    cached = 0
+    for cache_key, item in required.items():
+        if cache_key in stored_keys:
+            cached += 1
+        else:
+            missing.append(item)
+    missing.sort(key=lambda it: (it["end_date"], it["key"]), reverse=True)
+    coverage = {
+        "required_windows": len(required),
+        "cached_windows": cached,
+        "missing_windows": len(missing),
+        "unmapped_team_keys": len(unmapped),
+        "unmapped_team_examples": sorted(unmapped)[:20],
+    }
+    return missing, coverage
+
+
+def _run_historical_stats_job(job_id: str) -> None:
+    job = _get_stored_historical_job(job_id)
+    if not job:
+        return
+
+    def stop_requested() -> str:
+        with HISTORICAL_STATS_JOBS_LOCK:
+            live = HISTORICAL_STATS_JOBS.get(job_id) or {}
+        if live.get("cancel_requested"):
+            return "canceled"
+        if live.get("pause_requested"):
+            return "paused"
+        return ""
+
+    job["status"] = "running"
+    job["pause_requested"] = False
+    job["cancel_requested"] = False
+    job["error"] = ""
+    if job.get("last_error") in _INTERRUPTION_BOILERPLATE:
+        job["last_error"] = ""
+    job["started_at"] = job.get("started_at") or time.time()
+    job["finished_at"] = None
+    job["current_item"] = "Scanning stored matches for missing windows"
+    _publish_historical_job(job)
+
+    try:
+        # Recomputed fresh on every (re)start, so already-fetched windows are
+        # skipped automatically and resume always continues where it left off.
+        missing, _coverage = _historical_missing_items()
+        total = len(missing)
+        processed = 0
+        ok = int(job.get("ok") or 0)
+        failed = int(job.get("failed") or 0)
+        job["total_items"] = total
+        job["processed_items"] = 0
+        job["progress"] = 0.0 if total else 1.0
+        _publish_historical_job(job)
+
+        for item in missing:
+            stopped = stop_requested()
+            if stopped:
+                job["status"] = stopped
+                job["pause_requested"] = False
+                job["cancel_requested"] = False
+                job["last_error"] = "Canceled" if stopped == "canceled" else "Paused"
+                job["finished_at"] = time.time()
+                _publish_historical_job(job)
+                return
+            label = f"{item['team_name']} ({item['start_date']} to {item['end_date']})"
+            job["current_item"] = label
+            try:
+                stats = get_hltv_team_map_stats_for_range(
+                    int(item["hltv_team_id"]),
+                    str(item["team_name"]),
+                    start_date=str(item["start_date"]),
+                    end_date=str(item["end_date"]),
+                )
+                upsert_historical_team_map_stats(
+                    normalized_name=str(item["key"]),
+                    team_name=str(item["team_name"]),
+                    hltv_team_id=int(item["hltv_team_id"]),
+                    start_date=str(item["start_date"]),
+                    end_date=str(item["end_date"]),
+                    maps_json=json.dumps(stats.get("maps") or []),
+                    source_url=str(stats.get("url") or ""),
+                )
+                ok += 1
+            except Exception as exc:
+                failed += 1
+                job["last_error"] = f"{label}: {exc}"
+            processed += 1
+            job["processed_items"] = processed
+            job["ok"] = ok
+            job["failed"] = failed
+            job["progress"] = processed / float(total) if total else 1.0
+            # Merge live pause/cancel requests before publishing, so this
+            # snapshot does not erase a request made while we were fetching.
+            with HISTORICAL_STATS_JOBS_LOCK:
+                live = HISTORICAL_STATS_JOBS.get(job_id) or {}
+            job["pause_requested"] = bool(live.get("pause_requested"))
+            job["cancel_requested"] = bool(live.get("cancel_requested"))
+            if job["cancel_requested"]:
+                job["status"] = "canceling"
+            elif job["pause_requested"]:
+                job["status"] = "pausing"
+            else:
+                job["status"] = "running"
+            _publish_historical_job(job)
+
+        job["status"] = "completed"
+        job["current_item"] = ""
+        job["finished_at"] = time.time()
+        _publish_historical_job(job)
+    except Exception as exc:
+        job["status"] = "failed"
+        job["error"] = str(exc)
+        job["finished_at"] = time.time()
+        _publish_historical_job(job)
+    finally:
+        with HISTORICAL_STATS_JOBS_LOCK:
+            HISTORICAL_STATS_WORKERS.pop(job_id, None)
+
+
+def _start_historical_stats_worker(job_id: str) -> None:
+    with HISTORICAL_STATS_JOBS_LOCK:
+        worker = HISTORICAL_STATS_WORKERS.get(job_id)
+        if worker and worker.is_alive():
+            return
+        worker = threading.Thread(target=_run_historical_stats_job, args=(job_id,), daemon=True)
+        HISTORICAL_STATS_WORKERS[job_id] = worker
+        worker.start()
+
+
+def _get_latest_historical_job() -> Dict[str, Any] | None:
+    conn = event_db_connect()
+    try:
+        row = conn.execute("SELECT job_id FROM historical_map_stats_jobs ORDER BY updated_at DESC LIMIT 1").fetchone()
+    finally:
+        conn.close()
+    return _get_historical_job_for_response(str(row["job_id"])) if row else None
+
+
+@router.get("/hltv-results/historical-map-stats/coverage")
+def get_historical_map_stats_coverage():
+    _missing, coverage = _historical_missing_items()
+    return {"status": "ok", **coverage}
+
+
+@router.post("/hltv-results/historical-map-stats/start")
+def start_historical_map_stats_job():
+    latest = _get_latest_historical_job()
+    if latest and latest.get("status") in {"queued", "running", "pausing", "canceling"}:
+        return {"job_id": latest["job_id"], "status": latest.get("status"), "reused": True}
+    now = time.time()
+    job_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "error": "",
+        "last_error": "",
+        "progress": 0.0,
+        "processed_items": 0,
+        "total_items": 0,
+        "ok": 0,
+        "failed": 0,
+        "current_item": "",
+        "pause_requested": False,
+        "cancel_requested": False,
+        "created_at": now,
+        "updated_at": now,
+        "started_at": None,
+        "finished_at": None,
+    }
+    _publish_historical_job(job)
+    _start_historical_stats_worker(job_id)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@router.get("/hltv-results/historical-map-stats/latest")
+def get_latest_historical_map_stats_job():
+    job = _get_latest_historical_job()
+    if not job:
+        return {"exists": False}
+    return {"exists": True, **_historical_job_response(job)}
+
+
+@router.get("/hltv-results/historical-map-stats/job/{job_id}")
+def get_historical_map_stats_job(job_id: str):
+    return _historical_job_response(_get_historical_job_for_response(job_id))
+
+
+@router.post("/hltv-results/historical-map-stats/job/{job_id}/pause")
+def pause_historical_map_stats_job(job_id: str):
+    job = _get_historical_job_for_response(job_id)
+    if job.get("status") in {"completed", "canceled", "failed", "paused"}:
+        return _historical_job_response(job)
+    job["pause_requested"] = True
+    job["status"] = "pausing" if _historical_worker_is_active(job_id) else "paused"
+    _publish_historical_job(job)
+    return _historical_job_response(job)
+
+
+@router.post("/hltv-results/historical-map-stats/job/{job_id}/cancel")
+def cancel_historical_map_stats_job(job_id: str):
+    job = _get_historical_job_for_response(job_id)
+    if job.get("status") in {"completed", "canceled", "failed"}:
+        return _historical_job_response(job)
+    job["cancel_requested"] = True
+    job["status"] = "canceling" if _historical_worker_is_active(job_id) else "canceled"
+    if job["status"] == "canceled":
+        job["cancel_requested"] = False
+        job["finished_at"] = time.time()
+    _publish_historical_job(job)
+    return _historical_job_response(job)
+
+
+@router.post("/hltv-results/historical-map-stats/job/{job_id}/resume")
+def resume_historical_map_stats_job(job_id: str):
+    job = _get_historical_job_for_response(job_id)
+    if job.get("status") in {"completed", "canceled"}:
+        return _historical_job_response(job)
+    if job.get("status") == "running" and _historical_worker_is_active(job_id):
+        return _historical_job_response(job)
+    job["status"] = "queued"
+    job["pause_requested"] = False
+    job["cancel_requested"] = False
+    job["error"] = ""
+    if job.get("last_error") in _INTERRUPTION_BOILERPLATE:
+        job["last_error"] = ""
+    job["finished_at"] = None
+    _publish_historical_job(job)
+    _start_historical_stats_worker(job_id)
+    return _historical_job_response(_get_historical_job_for_response(job_id))
 
 
 def _map_stat_features(

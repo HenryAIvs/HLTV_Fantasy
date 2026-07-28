@@ -3,9 +3,11 @@ import {
   Bar,
   BarChart,
   CartesianGrid,
+  Cell,
   ComposedChart,
   Legend,
   Line,
+  Rectangle,
   ResponsiveContainer,
   Scatter,
   Tooltip,
@@ -21,6 +23,22 @@ const tabs = [
   { key: "playoff", label: "Playoff Bracket" },
   { key: "admin", label: "Data Management" },
 ];
+
+const ACTIVE_MAP_POOL = ["Mirage", "Inferno", "Nuke", "Ancient", "Anubis", "Dust2", "Cache"];
+
+// Map-themed bar colors, validated for the dark surface (lightness band, chroma,
+// contrast). With 7 thematic hues some pairs sit below CVD separation targets;
+// identity never relies on color alone because every bar is labeled with its map.
+const MAP_BAR_COLORS = {
+  Dust2: "#b38a1f", // sand gold
+  Inferno: "#d64545", // red
+  Nuke: "#6b9c10", // hazard green
+  Ancient: "#159f78", // jungle green
+  Anubis: "#0aa2c0", // canal teal
+  Mirage: "#4d8fd6", // desert sky
+  Cache: "#8b5cf6", // industrial violet
+};
+const MAP_BAR_FALLBACK_COLOR = "#64748b";
 
 const parseJsonSafe = async (res) => {
   const text = await res.text();
@@ -2137,6 +2155,523 @@ function SwissPlayerValueTab({ results, players }) {
   );
 }
 
+const parseMapStatsRows = (raw) => {
+  if (!raw) return [];
+  try {
+    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+};
+
+const formatBatchEta = (seconds) => {
+  if (!Number.isFinite(seconds) || seconds == null || seconds < 0) return "Calculating...";
+  if (seconds <= 1) return "<1s";
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rem = Math.round(seconds % 60);
+  return `${minutes}m ${rem}s`;
+};
+
+const getBatchStartedAtMs = (status, fallback = Date.now()) => {
+  const startedAt = Number(status?.started_at || status?.created_at || 0);
+  return Number.isFinite(startedAt) && startedAt > 0 ? startedAt * 1000 : fallback;
+};
+
+const jobStatusLabel = (status) =>
+  ({
+    completed: "Completed",
+    failed: "Failed",
+    canceled: "Canceled",
+    canceling: "Canceling",
+    paused: "Paused",
+    pausing: "Pausing",
+    running: "Running",
+    queued: "Queued",
+  }[status] || "Queued");
+
+// Shared map-stats import job state. Owned by App so both the Maps tab (bulk
+// import) and the Database team modal (single-team import) drive the same job.
+function useMapStatsJob({ refresh, notify, modalRefreshRef }) {
+  const [status, setStatus] = useState("idle");
+  const [jobId, setJobId] = useState("");
+  const [processed, setProcessed] = useState(0);
+  const [total, setTotal] = useState(0);
+  const [ok, setOk] = useState(0);
+  const [failed, setFailed] = useState(0);
+  const [lastError, setLastError] = useState("");
+  const [etaSeconds, setEtaSeconds] = useState(null);
+  const pollingRef = useRef(false);
+
+  const applyStatus = (statusPayload, jobIdOverride = "") => {
+    const nextJobId = String(jobIdOverride || statusPayload?.job_id || "");
+    const nextProcessed = Number(statusPayload?.processed_teams || 0);
+    const nextTotal = Number(statusPayload?.total_teams || 0);
+    const nextOk = Number(statusPayload?.ok || 0);
+    const nextFailed = Number(statusPayload?.failed || 0);
+    const nextStatus = String(statusPayload?.status || "queued");
+    const nextLastError = String(statusPayload?.last_error || statusPayload?.error || "");
+
+    setStatus(nextStatus);
+    setJobId(nextJobId);
+    setProcessed(nextProcessed);
+    setTotal(nextTotal);
+    setOk(nextOk);
+    setFailed(nextFailed);
+    setLastError(nextLastError);
+
+    const startedAtMs = getBatchStartedAtMs(statusPayload);
+    if (nextProcessed > 0 && nextTotal > nextProcessed && ["queued", "running", "pausing", "canceling"].includes(nextStatus)) {
+      const elapsedSeconds = Math.max(1, (Date.now() - startedAtMs) / 1000);
+      const rate = nextProcessed / elapsedSeconds;
+      setEtaSeconds(rate > 0 ? (nextTotal - nextProcessed) / rate : null);
+    } else if (nextTotal > 0 && nextProcessed >= nextTotal) {
+      setEtaSeconds(0);
+    } else {
+      setEtaSeconds(null);
+    }
+
+    return { jobId: nextJobId, ok: nextOk, failed: nextFailed, nextStatus, lastError: nextLastError };
+  };
+
+  const poll = async (pollJobId) => {
+    if (!pollJobId || pollingRef.current) return;
+    pollingRef.current = true;
+    try {
+      let done = false;
+      let pollFailures = 0;
+      while (!done) {
+        let statusPayload;
+        try {
+          statusPayload = await api.get(`/teams/map-stats-import/job/${pollJobId}`, 60000);
+          pollFailures = 0;
+        } catch (pollError) {
+          // The job keeps running server-side; only give up after repeated failures.
+          pollFailures += 1;
+          if (pollFailures >= 5) throw pollError;
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+          continue;
+        }
+        const applied = applyStatus(statusPayload, pollJobId);
+
+        if (applied.nextStatus === "completed") {
+          notify(`Map stats imported: ${applied.ok} ok, ${applied.failed} failed`);
+          await refresh();
+          await modalRefreshRef?.current?.();
+          done = true;
+          break;
+        }
+        if (applied.nextStatus === "failed") {
+          notify(applied.lastError || "Map stats import failed.");
+          done = true;
+          break;
+        }
+        if (["paused", "canceled"].includes(applied.nextStatus)) {
+          await refresh();
+          await modalRefreshRef?.current?.();
+          done = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+      }
+    } catch (e) {
+      setStatus("failed");
+      setLastError(String(e?.message || "Failed to poll map stats job."));
+      notify(`Map stats import failed: ${e?.message || "unknown error"}`);
+    } finally {
+      pollingRef.current = false;
+    }
+  };
+
+  const start = async (missingOnly = false, teamIds = []) => {
+    setStatus("queued");
+    setProcessed(0);
+    setTotal(0);
+    setOk(0);
+    setFailed(0);
+    setLastError("");
+    setEtaSeconds(null);
+    try {
+      const startPayload = await api.post("/teams/map-stats-import/start", {
+        missing_only: missingOnly,
+        team_ids: teamIds,
+      });
+      const startedJobId = String(startPayload?.job_id || "");
+      if (!startedJobId) throw new Error("Failed to start map stats import job.");
+      setJobId(startedJobId);
+      await poll(startedJobId);
+    } catch (e) {
+      setStatus("failed");
+      setLastError(String(e?.message || "Failed to start map stats import job."));
+      notify(`Map stats import failed: ${e?.message || "unknown error"}`);
+    }
+  };
+
+  const pause = async () => {
+    if (!jobId) return;
+    setStatus("pausing");
+    try {
+      const statusPayload = await api.post(`/teams/map-stats-import/job/${jobId}/pause`, {});
+      const applied = applyStatus(statusPayload, jobId);
+      if (["pausing", "running", "queued"].includes(applied.nextStatus)) {
+        poll(jobId);
+      }
+    } catch (e) {
+      setStatus("running");
+      notify(`Failed to pause map stats import: ${e?.message || "unknown error"}`);
+    }
+  };
+
+  const cancel = async () => {
+    if (!jobId) return;
+    setStatus("canceling");
+    try {
+      const statusPayload = await api.post(`/teams/map-stats-import/job/${jobId}/cancel`, {});
+      const applied = applyStatus(statusPayload, jobId);
+      if (["canceling", "running", "queued", "pausing"].includes(applied.nextStatus)) {
+        poll(jobId);
+      }
+    } catch (e) {
+      notify(`Failed to cancel map stats import: ${e?.message || "unknown error"}`);
+    }
+  };
+
+  const resume = async () => {
+    if (!jobId) return;
+    try {
+      const statusPayload = await api.post(`/teams/map-stats-import/job/${jobId}/resume`, {});
+      const applied = applyStatus(statusPayload, jobId);
+      if (["queued", "running", "pausing"].includes(applied.nextStatus)) {
+        poll(jobId);
+      }
+    } catch (e) {
+      notify(`Failed to resume map stats import: ${e?.message || "unknown error"}`);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    const hydrateLatest = async () => {
+      try {
+        const latest = await api.get("/teams/map-stats-import/latest");
+        if (cancelled || !latest?.exists) return;
+        if (latest?.status === "completed") return;
+        const applied = applyStatus(latest);
+        if (["queued", "running", "pausing", "canceling"].includes(applied.nextStatus)) {
+          poll(applied.jobId);
+        }
+      } catch {
+        // The map-stats progress panel is optional on startup.
+      }
+    };
+    hydrateLatest();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const active = ["queued", "running", "pausing", "canceling"].includes(status);
+  return {
+    status,
+    jobId,
+    processed,
+    total,
+    ok,
+    failed,
+    lastError,
+    etaSeconds,
+    start,
+    pause,
+    cancel,
+    resume,
+    active,
+    resumable: ["paused", "failed"].includes(status),
+    show: status !== "idle" && status !== "completed",
+    progressPct: total > 0 ? Math.min(100, Math.max(0, (processed / total) * 100)) : 0,
+    statusLabel: jobStatusLabel(status),
+  };
+}
+
+const MapStatsJobControls = ({ job, teamsAvailable }) => (
+  <div className="teams-toolbar">
+    <button className="secondary" onClick={() => job.start(false)} disabled={job.active || !teamsAvailable}>
+      {job.active ? `Importing Map Stats ${job.processed}/${job.total}` : "Import All Map Stats"}
+    </button>
+    {job.active && job.jobId && (
+      <button className="secondary" onClick={job.pause} disabled={job.status === "pausing"}>
+        {job.status === "pausing" ? "Pausing..." : "Pause"}
+      </button>
+    )}
+    {job.active && job.jobId && (
+      <button className="danger" onClick={job.cancel} disabled={job.status === "canceling"}>
+        {job.status === "canceling" ? "Canceling..." : "Cancel"}
+      </button>
+    )}
+    {job.resumable && job.jobId && (
+      <button className="secondary" onClick={job.resume}>
+        Resume
+      </button>
+    )}
+  </div>
+);
+
+const MapStatsJobProgress = ({ job }) =>
+  !job.show ? null : (
+    <div className="card sub">
+      <p className="muted">
+        Map stats progress: {job.processed.toLocaleString()} / {job.total.toLocaleString()} | ok {job.ok} | failed {job.failed}
+        {job.active && job.total > job.processed ? ` | ETA: ${formatBatchEta(job.etaSeconds)}` : ""}
+      </p>
+      <div className="progress">
+        <div className="progress-bar determinate" style={{ width: `${job.progressPct}%` }} />
+      </div>
+      <p className="muted">Status: {job.statusLabel}</p>
+      {job.lastError && <p className="muted">Last error: {job.lastError}</p>}
+    </div>
+  );
+
+const MapsBarTooltip = ({ active, payload, label }) => {
+  if (!active || !payload || !payload.length) return null;
+  const row = payload[0]?.payload || {};
+  return (
+    <div className="card sub" style={{ padding: "8px 12px", border: "1px solid #284061" }}>
+      <p style={{ margin: 0, fontWeight: 600 }}>{label}</p>
+      {Number(row.played || 0) === 0 ? (
+        <p className="muted" style={{ margin: 0 }}>Not played in the last 3 months</p>
+      ) : (
+        <p className="muted" style={{ margin: 0 }}>Maps played: {Number(row.played || 0).toLocaleString()}</p>
+      )}
+      {row.teams !== undefined && Number(row.played || 0) > 0 && (
+        <p className="muted" style={{ margin: 0 }}>Teams with data: {row.teams}</p>
+      )}
+      {row.win_rate !== undefined && row.win_rate !== null && (
+        <p className="muted" style={{ margin: 0 }}>Win rate: {(Number(row.win_rate) * 100).toFixed(1)}%</p>
+      )}
+    </div>
+  );
+};
+
+// Bar with a white tick marking the team's win rate on that map: the tick sits
+// at win_rate percent of the bar's own height (top of bar = 100% win rate).
+const MapBarWithWinRate = (props) => {
+  const { x, y, width, height, fill, payload } = props;
+  const winRate = payload?.win_rate;
+  const showTick = winRate !== null && winRate !== undefined && Number.isFinite(winRate) && height > 4;
+  const tickY = showTick ? y + height * (1 - Math.min(1, Math.max(0, winRate))) : 0;
+  return (
+    <g>
+      <Rectangle x={x} y={y} width={width} height={height} fill={fill} radius={[4, 4, 0, 0]} />
+      {showTick && (
+        <line x1={x - 3} x2={x + width + 3} y1={tickY} y2={tickY} stroke="#f8fafc" strokeWidth={2.5} strokeLinecap="round" />
+      )}
+    </g>
+  );
+};
+
+function MapsTab({ teams, mapStats }) {
+  const [selectedTeamId, setSelectedTeamId] = useState("");
+
+  const teamsWithStats = useMemo(
+    () => (teams || []).filter((t) => parseMapStatsRows(t.map_stats_json).length > 0),
+    [teams]
+  );
+
+  const overallRows = useMemo(() => {
+    const totals = new Map();
+    teamsWithStats.forEach((team) => {
+      parseMapStatsRows(team.map_stats_json).forEach((row) => {
+        const name = String(row.map || "").trim();
+        if (!name) return;
+        const bucket =
+          totals.get(name) || { map: name, played: 0, teams: 0, inPool: ACTIVE_MAP_POOL.includes(name) };
+        bucket.played += Number(row.played || 0);
+        bucket.teams += 1;
+        totals.set(name, bucket);
+      });
+    });
+    // Out-of-pool maps (e.g. Overpass) stay in the stored data but are hidden from display.
+    // Every active-pool map is always shown, even with zero plays.
+    ACTIVE_MAP_POOL.forEach((name) => {
+      if (!totals.has(name)) totals.set(name, { map: name, played: 0, teams: 0, inPool: true });
+    });
+    return Array.from(totals.values())
+      .filter((row) => row.inPool)
+      .sort((a, b) => b.played - a.played);
+  }, [teamsWithStats]);
+
+  const selectedTeam = useMemo(
+    () => teamsWithStats.find((t) => String(t.team_id) === String(selectedTeamId)) || null,
+    [teamsWithStats, selectedTeamId]
+  );
+
+  const teamRows = useMemo(() => {
+    if (!selectedTeam) return [];
+    const rows = parseMapStatsRows(selectedTeam.map_stats_json)
+      .map((row) => {
+        const name = String(row.map || "").trim();
+        const rate = (value) => (value === null || value === undefined ? null : Number(value));
+        return {
+          map: name,
+          played: Number(row.played || 0),
+          wins: Number(row.wins || 0),
+          draws: Number(row.draws || 0),
+          losses: Number(row.losses || 0),
+          win_rate: rate(row.win_rate),
+          total_rounds: Number(row.total_rounds || 0),
+          pick_rate: rate(row.pick_rate),
+          ban_rate: rate(row.ban_rate),
+          inPool: ACTIVE_MAP_POOL.includes(name),
+        };
+      })
+      .filter((row) => row.map && row.inPool);
+    const present = new Set(rows.map((row) => row.map));
+    ACTIVE_MAP_POOL.forEach((name) => {
+      if (!present.has(name)) {
+        rows.push({
+          map: name,
+          played: 0,
+          wins: 0,
+          draws: 0,
+          losses: 0,
+          win_rate: null,
+          total_rounds: 0,
+          pick_rate: null,
+          ban_rate: null,
+          inPool: true,
+        });
+      }
+    });
+    return rows.sort((a, b) => b.played - a.played);
+  }, [selectedTeam]);
+
+  const teamOptions = useMemo(
+    () => [
+      { value: "", label: "Select team" },
+      ...teamsWithStats
+        .slice()
+        .sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")))
+        .map((t) => ({ value: String(t.team_id), label: t.name || `Team ${t.team_id}` })),
+    ],
+    [teamsWithStats]
+  );
+
+  const formatRate = (value, digits = 1) =>
+    value === null || !Number.isFinite(value) ? "-" : `${(value * 100).toFixed(digits)}%`;
+
+  const renderMapBars = (rows, { withWinRate = false } = {}) => (
+    <ResponsiveContainer width="100%" height={320}>
+      <BarChart
+        data={rows.map((r) => ({ ...r, label: r.inPool ? r.map : `${r.map} (out)` }))}
+        margin={{ top: 12, right: 18, left: 6, bottom: 12 }}
+      >
+        <CartesianGrid stroke="#284061" strokeDasharray="3 3" vertical={false} />
+        <XAxis
+          dataKey="label"
+          interval={0}
+          tick={{ fill: "#9fc5ff", fontSize: 12 }}
+          axisLine={{ stroke: "#365a89" }}
+          tickLine={{ stroke: "#365a89" }}
+        />
+        <YAxis
+          allowDecimals={false}
+          tick={{ fill: "#9fc5ff", fontSize: 12 }}
+          axisLine={{ stroke: "#365a89" }}
+          tickLine={{ stroke: "#365a89" }}
+        />
+        <Tooltip cursor={{ fill: "rgba(59, 130, 246, 0.08)" }} content={<MapsBarTooltip />} />
+        <Bar
+          dataKey="played"
+          isAnimationActive={false}
+          radius={[4, 4, 0, 0]}
+          maxBarSize={48}
+          shape={withWinRate ? <MapBarWithWinRate /> : undefined}
+        >
+          {rows.map((r) => (
+            <Cell key={r.map} fill={r.inPool ? MAP_BAR_COLORS[r.map] || MAP_BAR_FALLBACK_COLOR : MAP_BAR_FALLBACK_COLOR} />
+          ))}
+        </Bar>
+      </BarChart>
+    </ResponsiveContainer>
+  );
+
+  return (
+    <Section title="Maps">
+      <div className="stack">
+        <div className="card sub">
+          <h3>Map Stats Import</h3>
+          <p className="muted">
+            Scrapes each team's HLTV map page (last 3 months). Pausable and resumable; safe to leave running.
+          </p>
+          <MapStatsJobControls job={mapStats} teamsAvailable={(teams || []).length > 0} />
+          <MapStatsJobProgress job={mapStats} />
+        </div>
+        <div className="card sub">
+          <h3>Most Played Maps (All Teams)</h3>
+          <p className="muted">
+            Total maps played across {teamsWithStats.length} teams with imported map stats (HLTV, last 3 months).
+            Only the current active-duty pool is shown; out-of-pool data is kept in the database.
+          </p>
+          {overallRows.length === 0 ? (
+            <p className="muted">No map stats imported yet. Use "Import All Map Stats" in the Database tab.</p>
+          ) : (
+            renderMapBars(overallRows)
+          )}
+        </div>
+        <div className="card sub">
+          <h3>Team Map Stats</h3>
+          <div className="grid two">
+            <Select label="Team" value={selectedTeamId} onChange={setSelectedTeamId} options={teamOptions} />
+            <div className="field">
+              <span>Stats Imported</span>
+              <div className="pill">{selectedTeam?.map_stats_imported_at || "-"}</div>
+            </div>
+          </div>
+          {!selectedTeam ? (
+            <p className="muted">Select a team to see its per-map record.</p>
+          ) : teamRows.length === 0 ? (
+            <p className="muted">No map stats stored for this team yet.</p>
+          ) : (
+            <>
+              <p className="muted">
+                The white tick on each bar marks the team's win rate on that map — top of the bar is 100%, the
+                baseline is 0%. Exact numbers are in the table below.
+              </p>
+              {renderMapBars(teamRows, { withWinRate: true })}
+              <table>
+                <thead>
+                  <tr>
+                    <th>Map</th>
+                    <th>Played</th>
+                    <th>W - D - L</th>
+                    <th>Win Rate</th>
+                    <th>Rounds</th>
+                    <th>Pick Rate</th>
+                    <th>Ban Rate</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {teamRows.map((row) => (
+                    <tr key={row.map}>
+                      <td>{row.map}</td>
+                      <td>{row.played}</td>
+                      <td>{`${row.wins} - ${row.draws} - ${row.losses}`}</td>
+                      <td>{formatRate(row.win_rate)}</td>
+                      <td>{row.total_rounds || "-"}</td>
+                      <td>{formatRate(row.pick_rate)}</td>
+                      <td>{formatRate(row.ban_rate)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </>
+          )}
+        </div>
+      </div>
+    </Section>
+  );
+}
+
 function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpenPlayer }) {
   const [playoffTab, setPlayoffTab] = useState("stage");
   const [events, setEvents] = useState([]);
@@ -2191,6 +2726,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   const [etaSeconds, setEtaSeconds] = useState(null);
   const [runMessage, setRunMessage] = useState("");
   const playoffPollingRef = useRef(false);
+  const comboQuerySeqRef = useRef(0);
   const normalizeTeamName = (name) => String(name || "").trim().toLowerCase();
   const playerLookup = useMemo(() => {
     const m = {};
@@ -2236,6 +2772,11 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     ];
   }, [players]);
   const playerNameById = playerLookup;
+  const filteredTeams = useMemo(() => {
+    if (!selectedEventId) return [];
+    if (!eventTeamNames || eventTeamNames.size === 0) return [];
+    return teams.filter((t) => eventTeamNames.has(normalizeTeamName(t.name)));
+  }, [teams, selectedEventId, eventTeamNames]);
   const playoffTeamsForFilters = useMemo(() => {
     const selectedIds = Array.from(new Set(slots.map((s) => Number(s)).filter((id) => Number.isFinite(id) && id > 0)));
     const byId = new Map(teams.map((t) => [Number(t.team_id), t]));
@@ -2565,7 +3106,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   };
 
   const loadLatestPlayoff = async () => {
-    const data = await api.get("/playoff/latest");
+    const data = await api.get("/playoff/latest", 120000);
     if (!data?.exists) {
       setLatestPayload(null);
       setResults(null);
@@ -2582,7 +3123,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   };
 
   const loadLatestCompletedBracket = async () => {
-    const data = await api.get("/playoff/best-team/bracket-from-latest/latest");
+    const data = await api.get("/playoff/best-team/bracket-from-latest/latest", 120000);
     if (!data?.exists) return;
     const payload = data.payload || {};
     const savedQf = (payload.qf_winners || []).slice(0, 4).map((id) => String(id || ""));
@@ -2597,7 +3138,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   };
 
   const loadLatestSharedCombinations = async () => {
-    const data = await api.get("/playoff/best-team/from-latest/latest");
+    const data = await api.get("/playoff/best-team/from-latest/latest", 120000);
     if (!data?.exists) return;
     setBaseTeams([]);
     setSharedComboCount(Number(data.total_teams || 0));
@@ -2616,6 +3157,9 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   }, [selectedEventId]);
 
   useEffect(() => {
+    // While the event's team list is still loading, filteredTeams is empty —
+    // wiping then would erase slots freshly hydrated from the saved bracket.
+    if (filteredTeams.length === 0) return;
     const allowed = new Set(filteredTeams.map((t) => t.team_id));
     setSlots((prev) => prev.map((v) => (allowed.has(Number(v)) ? v : "")));
   }, [filteredTeams]);
@@ -2807,10 +3351,21 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       .slice(0, 25);
   }, [players, filterSearch]);
 
+  // Content-based signature so background team refreshes (new array/Set identities
+  // with identical contents) do not re-fire the expensive combination query.
+  const effectiveFiltersSignature = useMemo(
+    () =>
+      JSON.stringify({
+        include: Array.from(effectiveAppliedFilters.include).sort((a, b) => a - b),
+        exclude: Array.from(effectiveAppliedFilters.exclude).sort((a, b) => a - b),
+      }),
+    [effectiveAppliedFilters]
+  );
+
   useEffect(() => {
     if (!baseTeams) return;
     querySharedCombinations(page);
-  }, [baseTeams, effectiveAppliedFilters, comboSearch, sortKey, playoffBestMode]);
+  }, [baseTeams, effectiveFiltersSignature, comboSearch, sortKey, playoffBestMode]);
 
   useEffect(() => {
     if (!baseTeams) return;
@@ -2823,6 +3378,9 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
 
   const querySharedCombinations = async (nextPage = 0) => {
     if (!baseTeams) return;
+    // Overlapping queries resolve in arbitrary order; only the newest one may
+    // apply its response, otherwise a slow stale result overwrites fresh data.
+    const seq = ++comboQuerySeqRef.current;
     try {
       const endpoint = playoffTopSubtab === "completed"
         ? "/playoff/best-team/from-latest/completed-query"
@@ -2843,7 +3401,8 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
         body.final_winner = Number(completedBracket.final);
         body.third_place_winner = hasThirdPlaceDecider ? Number(completedBracket.third) : 0;
       }
-      const data = await api.post(endpoint, body);
+      const data = await api.post(endpoint, body, 120000);
+      if (seq !== comboQuerySeqRef.current) return;
       setTopTeams(data.top_teams || []);
       setAllTeams(data.page_teams || []);
       setFilteredCount(Number(data.filtered_count || 0));
@@ -2853,6 +3412,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
         setCompletedBracketResult(data);
       }
     } catch (e) {
+      if (seq !== comboQuerySeqRef.current) return;
       setTopMessage(e?.message || "Failed to load saved combinations.");
     }
   };
@@ -3505,7 +4065,34 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                 <div className="actions">
                   {!baseTeams && <p className="muted">Run Combinations once above to score this bracket.</p>}
                   {baseTeams && !completedBracketDerived.complete && <p className="muted">Complete the bracket to score the saved combinations.</p>}
+                  {baseTeams && completedBracketDerived.complete && (
+                    <>
+                      <button className="primary" onClick={runCompletedBracket} disabled={busy}>
+                        {busy
+                          ? `Computing Boosters... ${processedCombos.toLocaleString()} / ${totalCombos.toLocaleString()}`
+                          : "Compute Exact Booster Ranking"}
+                      </button>
+                      <span className="muted">
+                        The table below updates instantly but ranks without roster booster assignment. This recomputes
+                        booster-exact totals for the picked bracket.
+                      </span>
+                    </>
+                  )}
                 </div>
+                {busy && totalCombos > 0 && (
+                  <div className="card sub">
+                    <p className="muted">
+                      Booster ranking: {processedCombos.toLocaleString()} / {totalCombos.toLocaleString()}
+                      {totalCombos > processedCombos ? ` | ETA: ${formatBatchEta(completedEtaSeconds)}` : ""}
+                    </p>
+                    <div className="progress">
+                      <div
+                        className="progress-bar determinate"
+                        style={{ width: `${Math.min(100, Math.max(0, (processedCombos / totalCombos) * 100))}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
                 {completedBracketMessage && (
                   <div className="card sub">
                     <p className="muted">{completedBracketMessage}</p>
@@ -4337,9 +4924,7 @@ function MatchesDataPanel({ notify }) {
   const [recentResultsError, setRecentResultsError] = useState("");
   const [recentResultsImportMode, setRecentResultsImportMode] = useState("until_date");
   const [recentResultsPages, setRecentResultsPages] = useState("3");
-  const [recentResultsUntilYear, setRecentResultsUntilYear] = useState("");
-  const [recentResultsUntilMonth, setRecentResultsUntilMonth] = useState("");
-  const [recentResultsUntilDay, setRecentResultsUntilDay] = useState("");
+  const [recentResultsUntilDate, setRecentResultsUntilDate] = useState("");
   const [recentResultsMaxHltvRank, setRecentResultsMaxHltvRank] = useState("0");
   const [recentResultsRankFilterMode, setRecentResultsRankFilterMode] = useState("both");
   const [recentResultsOffset, setRecentResultsOffset] = useState(0);
@@ -4372,7 +4957,7 @@ function MatchesDataPanel({ notify }) {
       ? Math.min(100, Math.max(0, (recentResultsImportProcessed / recentResultsImportTotal) * 100))
       : 0;
   const recentResultsImportIndeterminate = recentResultsImporting && recentResultsImportTotal <= 0;
-  const recentResultsImportActive = ["queued", "running", "pausing"].includes(recentResultsImportStatus);
+  const recentResultsImportActive = ["queued", "running", "pausing", "canceling"].includes(recentResultsImportStatus);
   const recentResultsImportResumable = ["paused", "failed"].includes(recentResultsImportStatus);
   const recentResultsBusy = recentResultsLoading || recentResultsImportActive;
 
@@ -4442,20 +5027,10 @@ function MatchesDataPanel({ notify }) {
   };
 
   const buildRecentResultsUntilDate = () => {
-    const year = String(recentResultsUntilYear || "").trim();
-    const month = String(recentResultsUntilMonth || "").trim().padStart(2, "0");
-    const day = String(recentResultsUntilDay || "").trim().padStart(2, "0");
-    if (!/^\d{4}$/.test(year) || !/^\d{2}$/.test(month) || !/^\d{2}$/.test(day)) return "";
-    const date = new Date(`${year}-${month}-${day}T00:00:00Z`);
-    if (
-      Number.isNaN(date.getTime()) ||
-      date.getUTCFullYear() !== Number(year) ||
-      date.getUTCMonth() + 1 !== Number(month) ||
-      date.getUTCDate() !== Number(day)
-    ) {
-      return "";
-    }
-    return `${year}-${month}-${day}`;
+    const value = String(recentResultsUntilDate || "").trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return "";
+    const parsed = new Date(`${value}T00:00:00Z`);
+    return Number.isNaN(parsed.getTime()) ? "" : value;
   };
 
   const clearRecentResultsImportStorage = () => {
@@ -4522,11 +5097,17 @@ function MatchesDataPanel({ notify }) {
           done = true;
           break;
         }
+        if (status.status === "canceled") {
+          if (notify) notify("HLTV results import canceled.");
+          clearRecentResultsImportStorage();
+          done = true;
+          break;
+        }
         if (status.status === "completed") {
           const res = status.result || {};
           if (notify) {
             notify(
-              `Imported HLTV results: ${res.kept ?? res.fetched ?? 0} kept, ${res.rank_filtered_out || 0} rank-filtered, ${res.date_filtered_out || 0} date-filtered, ${res.inserted || 0} inserted, ${res.updated || 0} updated`
+              `Imported HLTV results: ${res.kept ?? res.fetched ?? 0} kept, ${res.skipped_existing || 0} already imported, ${res.rank_filtered_out || 0} rank-filtered, ${res.date_filtered_out || 0} date-filtered, ${res.inserted || 0} inserted, ${res.updated || 0} updated`
             );
           }
           clearRecentResultsImportStorage();
@@ -4619,6 +5200,30 @@ function MatchesDataPanel({ notify }) {
     }
   };
 
+  const cancelRecentResultsImportJob = async () => {
+    const jobId = recentResultsImportJobId || localStorage.getItem(RECENT_RESULTS_IMPORT_JOB_ID_KEY);
+    if (!jobId) return;
+    setRecentResultsImportStatus("canceling");
+    setRecentResultsImportCurrent("Canceling after current request");
+    try {
+      const status = await api.post(`/events/hltv-results/import/job/${jobId}/cancel`, {});
+      if (status?.detail) {
+        setRecentResultsError(String(status.detail));
+        return;
+      }
+      setRecentResultsImportStatus(String(status.status || "canceling"));
+      setRecentResultsImportPhase(String(status.phase || status.status || ""));
+      setRecentResultsImportCurrent(String(status.current || ""));
+      if (String(status.status || "") === "canceled") {
+        setRecentResultsImporting(false);
+        clearRecentResultsImportStorage();
+        if (notify) notify("HLTV results import canceled.");
+      }
+    } catch (e) {
+      setRecentResultsError(e?.message || "Failed to cancel HLTV results import.");
+    }
+  };
+
   const resumeRecentResultsImportJob = async () => {
     const jobId = recentResultsImportJobId || localStorage.getItem(RECENT_RESULTS_IMPORT_JOB_ID_KEY);
     if (!jobId) return;
@@ -4641,28 +5246,6 @@ function MatchesDataPanel({ notify }) {
       setRecentResultsError(e?.message || "Failed to resume HLTV results import.");
     } finally {
       if (!recentResultsImportPollingRef.current) setRecentResultsImporting(false);
-    }
-  };
-
-  const clearStoredResults = async () => {
-    setRecentResultsLoading(true);
-    setRecentResultsError("");
-    try {
-      const res = await api.delete("/events/hltv-results");
-      if (res?.detail) {
-        setRecentResultsError(String(res.detail));
-        return;
-      }
-      setRecentResults([]);
-      setRecentResultsOffset(0);
-      setSelectedMatchUrl("");
-      setSelectedMatchRow(null);
-      setShowMatchModal(false);
-      if (notify) notify(`Deleted ${Number(res?.deleted || 0)} stored matches`);
-    } catch (e) {
-      setRecentResultsError("Failed to delete stored HLTV results.");
-    } finally {
-      setRecentResultsLoading(false);
     }
   };
 
@@ -4737,28 +5320,12 @@ function MatchesDataPanel({ notify }) {
         {recentResultsImportMode === "until_date" ? (
           <label className="field">
             <span>Import Back To Date</span>
-            <div className="date-input-group">
-              <input
-                value={recentResultsUntilYear}
-                onChange={(e) => setRecentResultsUntilYear(e.target.value.replace(/\D/g, "").slice(0, 4))}
-                placeholder="YYYY"
-                inputMode="numeric"
-              />
-              <input
-                value={recentResultsUntilMonth}
-                onChange={(e) => setRecentResultsUntilMonth(e.target.value.replace(/\D/g, "").slice(0, 2))}
-                onBlur={() => setRecentResultsUntilMonth((value) => (value ? String(value).padStart(2, "0") : ""))}
-                placeholder="MM"
-                inputMode="numeric"
-              />
-              <input
-                value={recentResultsUntilDay}
-                onChange={(e) => setRecentResultsUntilDay(e.target.value.replace(/\D/g, "").slice(0, 2))}
-                onBlur={() => setRecentResultsUntilDay((value) => (value ? String(value).padStart(2, "0") : ""))}
-                placeholder="DD"
-                inputMode="numeric"
-              />
-            </div>
+            <input
+              type="date"
+              value={recentResultsUntilDate}
+              onChange={(e) => setRecentResultsUntilDate(e.target.value)}
+              max={new Date().toISOString().slice(0, 10)}
+            />
           </label>
         ) : (
           <Input
@@ -4789,7 +5356,11 @@ function MatchesDataPanel({ notify }) {
           {recentResultsImporting ? "Importing..." : "Import HLTV Results To SQL"}
         </button>
         {recentResultsImportActive && recentResultsImportJobId && (
-          <button className="secondary" onClick={pauseRecentResultsImportJob} disabled={recentResultsImportStatus === "pausing"}>
+          <button
+            className="secondary"
+            onClick={pauseRecentResultsImportJob}
+            disabled={["pausing", "canceling"].includes(recentResultsImportStatus)}
+          >
             {recentResultsImportStatus === "pausing" ? "Pausing..." : "Pause"}
           </button>
         )}
@@ -4798,9 +5369,11 @@ function MatchesDataPanel({ notify }) {
             Resume
           </button>
         )}
-        <button className="danger" onClick={clearStoredResults} disabled={recentResultsBusy}>
-          {recentResultsLoading ? "Deleting..." : "Delete All Stored Matches"}
-        </button>
+        {(recentResultsImportActive || recentResultsImportResumable) && recentResultsImportJobId && (
+          <button className="danger" onClick={cancelRecentResultsImportJob} disabled={recentResultsImportStatus === "canceling"}>
+            {recentResultsImportStatus === "canceling" ? "Canceling..." : "Cancel"}
+          </button>
+        )}
         <button className="secondary" onClick={loadStoredRecentResults} disabled={recentResultsBusy}>
           {recentResultsLoading ? "Loading..." : "Reload Stored Results"}
         </button>
@@ -4987,7 +5560,7 @@ function MatchesDataPanel({ notify }) {
   );
 }
 
-function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlayerId, onOpenPlayerHandled }) {
+function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlayerId, onOpenPlayerHandled, mapStats, mapStatsModalRefreshRef }) {
   const [dbTab, setDbTab] = useState("players");
   const [playerSearch, setPlayerSearch] = useState("");
   const [playerSort, setPlayerSort] = useState("name_asc");
@@ -5030,16 +5603,13 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
 
   const [selectedTeam, setSelectedTeam] = useState(null);
   const [showTeamModal, setShowTeamModal] = useState(false);
-  const [rankingsRefreshBusy, setRankingsRefreshBusy] = useState(false);
-  const [mapStatsJobStatus, setMapStatsJobStatus] = useState("idle");
-  const [mapStatsJobId, setMapStatsJobId] = useState("");
-  const [mapStatsJobProcessed, setMapStatsJobProcessed] = useState(0);
-  const [mapStatsJobTotal, setMapStatsJobTotal] = useState(0);
-  const [mapStatsJobOk, setMapStatsJobOk] = useState(0);
-  const [mapStatsJobFailed, setMapStatsJobFailed] = useState(0);
-  const [mapStatsJobLastError, setMapStatsJobLastError] = useState("");
-  const [mapStatsJobEtaSeconds, setMapStatsJobEtaSeconds] = useState(null);
-  const mapStatsJobPollingRef = useRef(false);
+  const [rankingsJobStatus, setRankingsJobStatus] = useState("idle");
+  const [rankingsJobId, setRankingsJobId] = useState("");
+  const [rankingsJobProcessed, setRankingsJobProcessed] = useState(0);
+  const [rankingsJobTotal, setRankingsJobTotal] = useState(2);
+  const [rankingsJobLastError, setRankingsJobLastError] = useState("");
+  const [rankingsJobResults, setRankingsJobResults] = useState([]);
+  const rankingsJobPollingRef = useRef(false);
   const [teamForm, setTeamForm] = useState({
     team_id: "",
     hltv_team_id: "",
@@ -5352,20 +5922,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     }
   };
 
-  const formatBatchEta = (seconds) => {
-    if (!Number.isFinite(seconds) || seconds == null || seconds < 0) return "Calculating...";
-    if (seconds <= 1) return "<1s";
-    if (seconds < 60) return `${Math.round(seconds)}s`;
-    const minutes = Math.floor(seconds / 60);
-    const rem = Math.round(seconds % 60);
-    return `${minutes}m ${rem}s`;
-  };
-
-  const getBatchStartedAtMs = (status, fallback = Date.now()) => {
-    const startedAt = Number(status?.started_at || status?.created_at || 0);
-    return Number.isFinite(startedAt) && startedAt > 0 ? startedAt * 1000 : fallback;
-  };
-
   const applyBatchTopRatingsStatus = (status, jobIdOverride = "") => {
     const jobId = String(jobIdOverride || status?.job_id || "");
     const processed = Number(status?.processed_players || 0);
@@ -5402,8 +5958,19 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     batchTopRatingsPollingRef.current = true;
     try {
       let done = false;
+      let pollFailures = 0;
       while (!done) {
-        const status = await api.get(`/players/fetch-top-ratings-batch/job/${jobId}`);
+        let status;
+        try {
+          status = await api.get(`/players/fetch-top-ratings-batch/job/${jobId}`, 60000);
+          pollFailures = 0;
+        } catch (pollError) {
+          // The job keeps running server-side; only give up after repeated failures.
+          pollFailures += 1;
+          if (pollFailures >= 5) throw pollError;
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+          continue;
+        }
         const { ok, failed, nextStatus, lastError } = applyBatchTopRatingsStatus(status, jobId);
 
         if (nextStatus === "failed") {
@@ -5567,177 +6134,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     };
   }, []);
 
-  const applyMapStatsJobStatus = (status, jobIdOverride = "") => {
-    const jobId = String(jobIdOverride || status?.job_id || "");
-    const processed = Number(status?.processed_teams || 0);
-    const total = Number(status?.total_teams || 0);
-    const ok = Number(status?.ok || 0);
-    const failed = Number(status?.failed || 0);
-    const nextStatus = String(status?.status || "queued");
-    const lastError = String(status?.last_error || status?.error || "");
-
-    setMapStatsJobStatus(nextStatus);
-    setMapStatsJobId(jobId);
-    setMapStatsJobProcessed(processed);
-    setMapStatsJobTotal(total);
-    setMapStatsJobOk(ok);
-    setMapStatsJobFailed(failed);
-    setMapStatsJobLastError(lastError);
-
-    const startedAtMs = getBatchStartedAtMs(status);
-    if (processed > 0 && total > processed && ["queued", "running", "pausing", "canceling"].includes(nextStatus)) {
-      const elapsedSeconds = Math.max(1, (Date.now() - startedAtMs) / 1000);
-      const rate = processed / elapsedSeconds;
-      setMapStatsJobEtaSeconds(rate > 0 ? (total - processed) / rate : null);
-    } else if (total > 0 && processed >= total) {
-      setMapStatsJobEtaSeconds(0);
-    } else {
-      setMapStatsJobEtaSeconds(null);
-    }
-
-    return { jobId, processed, total, ok, failed, nextStatus, lastError };
-  };
-
-  const pollMapStatsJob = async (jobId) => {
-    if (!jobId || mapStatsJobPollingRef.current) return;
-    mapStatsJobPollingRef.current = true;
-    const refreshOpenTeamMapStats = async () => {
-      if (!selectedTeam) return;
-      try {
-        const refreshedTeam = await api.get(`/teams/${selectedTeam}`);
-        setTeamForm((prev) => ({
-          ...prev,
-          hltv_team_id: refreshedTeam?.hltv_team_id ?? prev.hltv_team_id,
-          map_stats_json: refreshedTeam?.map_stats_json || "",
-          map_stats_imported_at: refreshedTeam?.map_stats_imported_at || "",
-          map_stats_source_url: refreshedTeam?.map_stats_source_url || "",
-        }));
-      } catch {
-        // The main list refresh still covers this; the direct modal refresh is just for immediacy.
-      }
-    };
-    try {
-      let done = false;
-      while (!done) {
-        const status = await api.get(`/teams/map-stats-import/job/${jobId}`);
-        const { ok, failed, nextStatus, lastError } = applyMapStatsJobStatus(status, jobId);
-
-        if (nextStatus === "completed") {
-          notify(`Map stats imported: ${ok} ok, ${failed} failed`);
-          await refresh();
-          await refreshOpenTeamMapStats();
-          done = true;
-          break;
-        }
-        if (nextStatus === "failed") {
-          notify(lastError || "Map stats import failed.");
-          done = true;
-          break;
-        }
-        if (["paused", "canceled"].includes(nextStatus)) {
-          await refresh();
-          await refreshOpenTeamMapStats();
-          done = true;
-          break;
-        }
-
-        await new Promise((resolve) => setTimeout(resolve, 1200));
-      }
-    } catch (e) {
-      setMapStatsJobStatus("failed");
-      setMapStatsJobLastError(String(e?.message || "Failed to poll map stats job."));
-      notify(`Map stats import failed: ${e?.message || "unknown error"}`);
-    } finally {
-      mapStatsJobPollingRef.current = false;
-    }
-  };
-
-  const startMapStatsImportJob = async (missingOnly = false, teamIds = []) => {
-    setMapStatsJobStatus("queued");
-    setMapStatsJobProcessed(0);
-    setMapStatsJobTotal(0);
-    setMapStatsJobOk(0);
-    setMapStatsJobFailed(0);
-    setMapStatsJobLastError("");
-    setMapStatsJobEtaSeconds(null);
-    try {
-      const start = await api.post("/teams/map-stats-import/start", { missing_only: missingOnly, team_ids: teamIds });
-      const jobId = String(start?.job_id || "");
-      if (!jobId) throw new Error("Failed to start map stats import job.");
-      setMapStatsJobId(jobId);
-      await pollMapStatsJob(jobId);
-    } catch (e) {
-      setMapStatsJobStatus("failed");
-      setMapStatsJobLastError(String(e?.message || "Failed to start map stats import job."));
-      notify(`Map stats import failed: ${e?.message || "unknown error"}`);
-    }
-  };
-
-  const pauseMapStatsJob = async () => {
-    if (!mapStatsJobId) return;
-    setMapStatsJobStatus("pausing");
-    try {
-      const status = await api.post(`/teams/map-stats-import/job/${mapStatsJobId}/pause`, {});
-      const applied = applyMapStatsJobStatus(status, mapStatsJobId);
-      if (["pausing", "running", "queued"].includes(applied.nextStatus)) {
-        pollMapStatsJob(mapStatsJobId);
-      }
-    } catch (e) {
-      setMapStatsJobStatus("running");
-      notify(`Failed to pause map stats import: ${e?.message || "unknown error"}`);
-    }
-  };
-
-  const cancelMapStatsJob = async () => {
-    if (!mapStatsJobId) return;
-    setMapStatsJobStatus("canceling");
-    try {
-      const status = await api.post(`/teams/map-stats-import/job/${mapStatsJobId}/cancel`, {});
-      const applied = applyMapStatsJobStatus(status, mapStatsJobId);
-      if (["canceling", "running", "queued", "pausing"].includes(applied.nextStatus)) {
-        pollMapStatsJob(mapStatsJobId);
-      }
-    } catch (e) {
-      notify(`Failed to cancel map stats import: ${e?.message || "unknown error"}`);
-    }
-  };
-
-  const resumeMapStatsJob = async () => {
-    if (!mapStatsJobId) return;
-    try {
-      const status = await api.post(`/teams/map-stats-import/job/${mapStatsJobId}/resume`, {});
-      const applied = applyMapStatsJobStatus(status, mapStatsJobId);
-      if (["queued", "running", "pausing"].includes(applied.nextStatus)) {
-        pollMapStatsJob(mapStatsJobId);
-      }
-    } catch (e) {
-      notify(`Failed to resume map stats import: ${e?.message || "unknown error"}`);
-    }
-  };
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const hydrateLatestMapStatsJob = async () => {
-      try {
-        const latest = await api.get("/teams/map-stats-import/latest");
-        if (cancelled || !latest?.exists) return;
-        if (latest?.status === "completed") return;
-        const applied = applyMapStatsJobStatus(latest);
-        if (["queued", "running", "pausing", "canceling"].includes(applied.nextStatus)) {
-          pollMapStatsJob(applied.jobId);
-        }
-      } catch {
-        // The map-stats progress panel is optional on startup.
-      }
-    };
-
-    hydrateLatestMapStatsJob();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
   const openPlayerDetailsFromTeam = (playerId) => {
     const pid = Number(playerId);
     if (!Number.isFinite(pid) || pid <= 0) return;
@@ -5755,28 +6151,183 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     setShowTeamModal(true);
   };
 
-  const refreshAllRankingsToday = async () => {
-    setRankingsRefreshBusy(true);
+  const applyRankingsJobStatus = (status, jobIdOverride = "") => {
+    const jobId = String(jobIdOverride || status?.job_id || "");
+    const nextStatus = String(status?.status || "queued");
+    const lastError = String(status?.last_error || status?.error || "");
+    setRankingsJobStatus(nextStatus);
+    setRankingsJobId(jobId);
+    setRankingsJobProcessed(Number(status?.processed_phases || 0));
+    setRankingsJobTotal(Number(status?.total_phases || 2));
+    setRankingsJobLastError(lastError);
+    setRankingsJobResults(Array.isArray(status?.results) ? status.results : []);
+    return { jobId, nextStatus, lastError };
+  };
+
+  const summarizeRankingsResults = (results) =>
+    (results || [])
+      .map((row) =>
+        row?.status === "ok"
+          ? `${String(row.phase || "").toUpperCase()} u:${row.updated || 0} i:${row.inserted || 0} f:${row.failed || 0}`
+          : `${String(row.phase || "").toUpperCase()} error`
+      )
+      .join(" | ");
+
+  const pollRankingsJob = async (jobId) => {
+    if (!jobId || rankingsJobPollingRef.current) return;
+    rankingsJobPollingRef.current = true;
     try {
-      const res = await api.post("/teams/refresh-rankings-today", {});
-      await refresh();
-      const hltv = res?.hltv || {};
-      const vrs = res?.vrs || {};
-      notify(
-        `Rankings refreshed: HLTV u:${hltv.updated || 0} i:${hltv.inserted || 0} f:${hltv.failed || 0} | ` +
-          `VRS u:${vrs.updated || 0} i:${vrs.inserted || 0} f:${vrs.failed || 0}`
-      );
+      let done = false;
+      let pollFailures = 0;
+      while (!done) {
+        let status;
+        try {
+          status = await api.get(`/teams/rankings-refresh/job/${jobId}`, 60000);
+          pollFailures = 0;
+        } catch (pollError) {
+          // The job keeps running server-side; only give up after repeated failures.
+          pollFailures += 1;
+          if (pollFailures >= 5) throw pollError;
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+          continue;
+        }
+        const { nextStatus, lastError } = applyRankingsJobStatus(status, jobId);
+        if (nextStatus === "completed") {
+          await refresh();
+          notify(`Rankings refreshed: ${summarizeRankingsResults(status?.results) || "done"}`);
+          done = true;
+          break;
+        }
+        if (nextStatus === "failed") {
+          notify(lastError || "Rankings refresh failed.");
+          done = true;
+          break;
+        }
+        if (["paused", "canceled"].includes(nextStatus)) {
+          await refresh();
+          done = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
     } catch (e) {
+      setRankingsJobStatus("failed");
+      setRankingsJobLastError(String(e?.message || "Failed to poll rankings refresh job."));
       notify(`Rankings refresh failed: ${e?.message || "unknown error"}`);
     } finally {
-      setRankingsRefreshBusy(false);
+      rankingsJobPollingRef.current = false;
     }
   };
 
+  const startRankingsRefreshJob = async () => {
+    setRankingsJobStatus("queued");
+    setRankingsJobProcessed(0);
+    setRankingsJobTotal(2);
+    setRankingsJobLastError("");
+    setRankingsJobResults([]);
+    try {
+      const start = await api.post("/teams/rankings-refresh/start", {});
+      const jobId = String(start?.job_id || "");
+      if (!jobId) throw new Error("Failed to start rankings refresh job.");
+      setRankingsJobId(jobId);
+      if (start?.reused) notify("A rankings refresh is already running. Reusing that job.");
+      await pollRankingsJob(jobId);
+    } catch (e) {
+      setRankingsJobStatus("failed");
+      setRankingsJobLastError(String(e?.message || "Failed to start rankings refresh job."));
+      notify(`Rankings refresh failed: ${e?.message || "unknown error"}`);
+    }
+  };
+
+  const pauseRankingsJob = async () => {
+    if (!rankingsJobId) return;
+    setRankingsJobStatus("pausing");
+    try {
+      const status = await api.post(`/teams/rankings-refresh/job/${rankingsJobId}/pause`, {});
+      const applied = applyRankingsJobStatus(status, rankingsJobId);
+      if (["pausing", "running", "queued"].includes(applied.nextStatus)) {
+        pollRankingsJob(rankingsJobId);
+      }
+    } catch (e) {
+      notify(`Failed to pause rankings refresh: ${e?.message || "unknown error"}`);
+    }
+  };
+
+  const cancelRankingsJob = async () => {
+    if (!rankingsJobId) return;
+    setRankingsJobStatus("canceling");
+    try {
+      const status = await api.post(`/teams/rankings-refresh/job/${rankingsJobId}/cancel`, {});
+      const applied = applyRankingsJobStatus(status, rankingsJobId);
+      if (["canceling", "running", "queued"].includes(applied.nextStatus)) {
+        pollRankingsJob(rankingsJobId);
+      }
+    } catch (e) {
+      notify(`Failed to cancel rankings refresh: ${e?.message || "unknown error"}`);
+    }
+  };
+
+  const resumeRankingsJob = async () => {
+    if (!rankingsJobId) return;
+    try {
+      const status = await api.post(`/teams/rankings-refresh/job/${rankingsJobId}/resume`, {});
+      const applied = applyRankingsJobStatus(status, rankingsJobId);
+      if (["queued", "running", "pausing"].includes(applied.nextStatus)) {
+        pollRankingsJob(rankingsJobId);
+      }
+    } catch (e) {
+      notify(`Failed to resume rankings refresh: ${e?.message || "unknown error"}`);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    const hydrateLatestRankingsJob = async () => {
+      try {
+        const latest = await api.get("/teams/rankings-refresh/latest");
+        if (cancelled || !latest?.exists) return;
+        if (["completed", "canceled"].includes(String(latest?.status || ""))) return;
+        const applied = applyRankingsJobStatus(latest);
+        if (["queued", "running", "pausing", "canceling"].includes(applied.nextStatus)) {
+          pollRankingsJob(applied.jobId);
+        }
+      } catch {
+        // The rankings progress panel is optional on startup.
+      }
+    };
+    hydrateLatestRankingsJob();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const refreshSelectedTeamMapStats = async () => {
     if (!selectedTeam) return;
-    await startMapStatsImportJob(false, [selectedTeam]);
+    await mapStats.start(false, [selectedTeam]);
   };
+
+  // Keep an open team modal's map stats fresh when the shared import job finishes.
+  useEffect(() => {
+    if (!mapStatsModalRefreshRef) return undefined;
+    mapStatsModalRefreshRef.current = async () => {
+      if (!selectedTeam) return;
+      try {
+        const refreshedTeam = await api.get(`/teams/${selectedTeam}`);
+        setTeamForm((prev) => ({
+          ...prev,
+          hltv_team_id: refreshedTeam?.hltv_team_id ?? prev.hltv_team_id,
+          map_stats_json: refreshedTeam?.map_stats_json || "",
+          map_stats_imported_at: refreshedTeam?.map_stats_imported_at || "",
+          map_stats_source_url: refreshedTeam?.map_stats_source_url || "",
+        }));
+      } catch {
+        // The main list refresh still covers this; the direct modal refresh is just for immediacy.
+      }
+    };
+    return () => {
+      mapStatsModalRefreshRef.current = null;
+    };
+  }, [selectedTeam, mapStatsModalRefreshRef]);
 
   const hasJsonEntries = (raw) => {
     if (!raw) return false;
@@ -5791,7 +6342,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
   };
 
   const hasBoostersAndRoles = (player) => hasJsonEntries(player.boosters_json) && hasJsonEntries(player.roles_json);
-  const currentMapPool = ["Mirage", "Inferno", "Nuke", "Ancient", "Anubis", "Dust2", "Overpass"];
+  const currentMapPool = ACTIVE_MAP_POOL;
   const canonicalMapName = (value) => {
     const raw = String(value || "").trim();
     const key = raw.toLowerCase().replace(/_/g, " ");
@@ -5842,11 +6393,16 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
   const showBatchTopRatingsProgress = batchTopRatingsStatus !== "idle";
   const batchTopRatingsActive = ["queued", "running", "pausing", "canceling"].includes(batchTopRatingsStatus);
   const batchTopRatingsResumable = ["paused", "failed"].includes(batchTopRatingsStatus);
-  const mapStatsJobProgressPct =
-    mapStatsJobTotal > 0 ? Math.min(100, Math.max(0, (mapStatsJobProcessed / mapStatsJobTotal) * 100)) : 0;
-  const showMapStatsJobProgress = mapStatsJobStatus !== "idle" && mapStatsJobStatus !== "completed";
-  const mapStatsJobActive = ["queued", "running", "pausing", "canceling"].includes(mapStatsJobStatus);
-  const mapStatsJobResumable = ["paused", "failed"].includes(mapStatsJobStatus);
+  const rankingsJobProgressPct =
+    rankingsJobTotal > 0 ? Math.min(100, Math.max(0, (rankingsJobProcessed / rankingsJobTotal) * 100)) : 0;
+  const showRankingsJobProgress = rankingsJobStatus !== "idle" && rankingsJobStatus !== "completed";
+  const rankingsJobActive = ["queued", "running", "pausing", "canceling"].includes(rankingsJobStatus);
+  const rankingsJobResumable = ["paused", "failed"].includes(rankingsJobStatus);
+  const rankingsJobPhaseLabel = rankingsJobActive
+    ? rankingsJobProcessed === 0
+      ? "HLTV ranking"
+      : "VRS ranking"
+    : "";
   const missingTopRatingsCount = (players || []).filter((player) => !playerHasCompleteTopRatings(player)).length;
   const batchTopRatingsStatusLabel =
     {
@@ -5859,7 +6415,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
       running: "Running",
       queued: "Queued",
     }[batchTopRatingsStatus] || "Queued";
-  const mapStatsJobStatusLabel =
+  const rankingsJobStatusLabel =
     {
       completed: "Completed",
       failed: "Failed",
@@ -5869,7 +6425,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
       pausing: "Pausing",
       running: "Running",
       queued: "Queued",
-    }[mapStatsJobStatus] || "Queued";
+    }[rankingsJobStatus] || "Queued";
   const playerTopxBucketRows = useMemo(() => {
     const rows = Array.isArray(playerCurve?.bucket_rows) ? playerCurve.bucket_rows : [];
     return rows
@@ -6013,7 +6569,12 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
         <button className={dbTab === "matches" ? "tab active" : "tab"} onClick={() => setDbTab("matches")}>
           Matches
         </button>
+        <button className={dbTab === "maps" ? "tab active" : "tab"} onClick={() => setDbTab("maps")}>
+          Maps
+        </button>
       </div>
+
+      {dbTab === "maps" && <MapsTab teams={teams} mapStats={mapStats} />}
 
       {dbTab === "players" && <Section title="Players">
         {loading ? (
@@ -6484,21 +7045,21 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                       <p className="muted">Last 3 months: {teamMapStatsTotalPlayed.toLocaleString()} maps played</p>
                     )}
                   </div>
-                  <button className="secondary" onClick={refreshSelectedTeamMapStats} disabled={!selectedTeam || mapStatsJobActive}>
-                    {mapStatsJobActive ? "Importing..." : "Import Map Stats"}
+                  <button className="secondary" onClick={refreshSelectedTeamMapStats} disabled={!selectedTeam || mapStats.active}>
+                    {mapStats.active ? "Importing..." : "Import Map Stats"}
                   </button>
                 </div>
-                {showMapStatsJobProgress && (
+                {mapStats.show && (
                   <div className="team-map-stats-progress">
                     <p className="muted">
-                      {mapStatsJobProcessed.toLocaleString()} / {mapStatsJobTotal.toLocaleString()} | ok {mapStatsJobOk} | failed{" "}
-                      {mapStatsJobFailed}
-                      {mapStatsJobActive && mapStatsJobTotal > mapStatsJobProcessed ? ` | ETA: ${formatBatchEta(mapStatsJobEtaSeconds)}` : ""}
+                      {mapStats.processed.toLocaleString()} / {mapStats.total.toLocaleString()} | ok {mapStats.ok} | failed{" "}
+                      {mapStats.failed}
+                      {mapStats.active && mapStats.total > mapStats.processed ? ` | ETA: ${formatBatchEta(mapStats.etaSeconds)}` : ""}
                     </p>
                     <div className="progress">
-                      <div className="progress-bar determinate" style={{ width: `${mapStatsJobProgressPct}%` }} />
+                      <div className="progress-bar determinate" style={{ width: `${mapStats.progressPct}%` }} />
                     </div>
-                    <p className="muted">Status: {mapStatsJobStatusLabel}</p>
+                    <p className="muted">Status: {mapStats.statusLabel}</p>
                   </div>
                 )}
                 <div className="team-map-stats-grid">
@@ -6544,28 +7105,21 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
           <>
             <div className="teams-controls">
               <div className="teams-toolbar">
-                <button className="primary" onClick={refreshAllRankingsToday} disabled={rankingsRefreshBusy || teams.length === 0}>
-                  {rankingsRefreshBusy ? "Refreshing Rankings..." : "Refresh Rankings (HLTV + VRS)"}
+                <button className="primary" onClick={startRankingsRefreshJob} disabled={rankingsJobActive || teams.length === 0}>
+                  {rankingsJobActive ? `Refreshing Rankings ${rankingsJobProcessed}/${rankingsJobTotal}` : "Refresh Rankings (HLTV + VRS)"}
                 </button>
-                <button
-                  className="secondary"
-                  onClick={() => startMapStatsImportJob(false)}
-                  disabled={mapStatsJobActive || rankingsRefreshBusy || teams.length === 0}
-                >
-                  {mapStatsJobActive ? `Importing Map Stats ${mapStatsJobProcessed}/${mapStatsJobTotal}` : "Import All Map Stats"}
-                </button>
-                {mapStatsJobActive && mapStatsJobId && (
-                  <button className="secondary" onClick={pauseMapStatsJob} disabled={mapStatsJobStatus === "pausing"}>
-                    {mapStatsJobStatus === "pausing" ? "Pausing..." : "Pause"}
+                {rankingsJobActive && rankingsJobId && (
+                  <button className="secondary" onClick={pauseRankingsJob} disabled={rankingsJobStatus === "pausing"}>
+                    {rankingsJobStatus === "pausing" ? "Pausing..." : "Pause"}
                   </button>
                 )}
-                {mapStatsJobActive && mapStatsJobId && (
-                  <button className="danger" onClick={cancelMapStatsJob} disabled={mapStatsJobStatus === "canceling"}>
-                    {mapStatsJobStatus === "canceling" ? "Canceling..." : "Cancel"}
+                {rankingsJobActive && rankingsJobId && (
+                  <button className="danger" onClick={cancelRankingsJob} disabled={rankingsJobStatus === "canceling"}>
+                    {rankingsJobStatus === "canceling" ? "Canceling..." : "Cancel"}
                   </button>
                 )}
-                {mapStatsJobResumable && mapStatsJobId && (
-                  <button className="secondary" onClick={resumeMapStatsJob}>
+                {rankingsJobResumable && rankingsJobId && (
+                  <button className="secondary" onClick={resumeRankingsJob}>
                     Resume
                   </button>
                 )}
@@ -6575,18 +7129,18 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                 <Input label="Search Teams" value={teamSearch} onChange={setTeamSearch} placeholder="Name, ID, or player" />
               </div>
             </div>
-            {showMapStatsJobProgress && (
+            {showRankingsJobProgress && (
               <div className="card sub">
                 <p className="muted">
-                  Map stats progress: {mapStatsJobProcessed.toLocaleString()} / {mapStatsJobTotal.toLocaleString()} | ok {mapStatsJobOk} |
-                  failed {mapStatsJobFailed}
-                  {mapStatsJobActive && mapStatsJobTotal > mapStatsJobProcessed ? ` | ETA: ${formatBatchEta(mapStatsJobEtaSeconds)}` : ""}
+                  Rankings refresh: {rankingsJobProcessed} / {rankingsJobTotal} phases
+                  {rankingsJobPhaseLabel ? ` | current: ${rankingsJobPhaseLabel}` : ""}
+                  {rankingsJobResults.length > 0 ? ` | ${summarizeRankingsResults(rankingsJobResults)}` : ""}
                 </p>
                 <div className="progress">
-                  <div className="progress-bar determinate" style={{ width: `${mapStatsJobProgressPct}%` }} />
+                  <div className="progress-bar determinate" style={{ width: `${rankingsJobProgressPct}%` }} />
                 </div>
-                <p className="muted">Status: {mapStatsJobStatusLabel}</p>
-                {mapStatsJobLastError && <p className="muted">Last error: {mapStatsJobLastError}</p>}
+                <p className="muted">Status: {rankingsJobStatusLabel}</p>
+                {rankingsJobLastError && <p className="muted">Last error: {rankingsJobLastError}</p>}
               </div>
             )}
             <table>
@@ -7048,6 +7602,7 @@ function AdminTab({ refresh, notify }) {
   const [importResult, setImportResult] = useState("");
   const [importBusy, setImportBusy] = useState(false);
   const [wipeBusy, setWipeBusy] = useState(false);
+  const [deleteMatchesBusy, setDeleteMatchesBusy] = useState(false);
 
   const importTriggers = async () => {
     if (!triggerJson.trim()) {
@@ -7076,6 +7631,18 @@ function AdminTab({ refresh, notify }) {
     notify("Database wiped");
     setWipeBusy(false);
     refresh();
+  };
+
+  const deleteStoredMatches = async () => {
+    setDeleteMatchesBusy(true);
+    try {
+      const res = await api.delete("/events/hltv-results");
+      notify(`Deleted ${Number(res?.deleted || 0)} stored matches`);
+    } catch (e) {
+      notify(`Failed to delete stored matches: ${e?.message || "unknown error"}`);
+    } finally {
+      setDeleteMatchesBusy(false);
+    }
   };
 
   return (
@@ -7127,6 +7694,13 @@ function AdminTab({ refresh, notify }) {
               {wipeBusy ? "Wiping..." : "Wipe Database"}
             </button>
             <p className="muted">Deletes all players and teams (schema is kept).</p>
+            <button className="danger" onClick={deleteStoredMatches} disabled={deleteMatchesBusy}>
+              {deleteMatchesBusy ? "Deleting..." : "Delete All Stored Matches"}
+            </button>
+            <p className="muted">
+              Removes every imported HLTV match result (map scores, vetoes, player stats). The next match import
+              starts from scratch.
+            </p>
           </div>
         )}
 
@@ -7140,8 +7714,167 @@ function ModelLabTab() {
   const [trainLimit, setTrainLimit] = useState("0");
   const [testLimit, setTestLimit] = useState("0");
   const [randomSplit, setRandomSplit] = useState(false);
-  const [fetchMissingMapStats, setFetchMissingMapStats] = useState(false);
   const [dbMatchCount, setDbMatchCount] = useState(0);
+  const [histCoverage, setHistCoverage] = useState(null);
+  const [histJobStatus, setHistJobStatus] = useState("idle");
+  const [histJobId, setHistJobId] = useState("");
+  const [histJobProcessed, setHistJobProcessed] = useState(0);
+  const [histJobTotal, setHistJobTotal] = useState(0);
+  const [histJobOk, setHistJobOk] = useState(0);
+  const [histJobFailed, setHistJobFailed] = useState(0);
+  const [histJobCurrent, setHistJobCurrent] = useState("");
+  const [histJobLastError, setHistJobLastError] = useState("");
+  const [histJobEtaSeconds, setHistJobEtaSeconds] = useState(null);
+  const histJobPollingRef = useRef(false);
+
+  const loadHistCoverage = async () => {
+    try {
+      const cov = await api.get("/events/hltv-results/historical-map-stats/coverage");
+      if (cov && cov.status === "ok") setHistCoverage(cov);
+    } catch {
+      // Coverage is informational; the lab still works without it.
+    }
+  };
+
+  const applyHistJobStatus = (status, jobIdOverride = "") => {
+    const jobId = String(jobIdOverride || status?.job_id || "");
+    const nextStatus = String(status?.status || "queued");
+    const lastError = String(status?.last_error || status?.error || "");
+    const processed = Number(status?.processed_items || 0);
+    const total = Number(status?.total_items || 0);
+    setHistJobStatus(nextStatus);
+    setHistJobId(jobId);
+    setHistJobProcessed(processed);
+    setHistJobTotal(total);
+    setHistJobOk(Number(status?.ok || 0));
+    setHistJobFailed(Number(status?.failed || 0));
+    setHistJobCurrent(String(status?.current_item || ""));
+    setHistJobLastError(lastError);
+    const startedAtMs = getBatchStartedAtMs(status);
+    if (processed > 0 && total > processed && ["queued", "running", "pausing", "canceling"].includes(nextStatus)) {
+      const elapsedSeconds = Math.max(1, (Date.now() - startedAtMs) / 1000);
+      const rate = processed / elapsedSeconds;
+      setHistJobEtaSeconds(rate > 0 ? (total - processed) / rate : null);
+    } else {
+      setHistJobEtaSeconds(null);
+    }
+    return { jobId, nextStatus, lastError };
+  };
+
+  const pollHistJob = async (jobId) => {
+    if (!jobId || histJobPollingRef.current) return;
+    histJobPollingRef.current = true;
+    try {
+      let done = false;
+      let pollFailures = 0;
+      while (!done) {
+        let status;
+        try {
+          status = await api.get(`/events/hltv-results/historical-map-stats/job/${jobId}`, 60000);
+          pollFailures = 0;
+        } catch (pollError) {
+          // The job keeps running server-side; only give up after repeated failures.
+          pollFailures += 1;
+          if (pollFailures >= 5) throw pollError;
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+          continue;
+        }
+        const applied = applyHistJobStatus(status, jobId);
+        if (["completed", "failed", "paused", "canceled"].includes(applied.nextStatus)) {
+          await loadHistCoverage();
+          done = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+    } catch (e) {
+      setHistJobStatus("failed");
+      setHistJobLastError(String(e?.message || "Failed to poll historical map stats job."));
+    } finally {
+      histJobPollingRef.current = false;
+    }
+  };
+
+  const startHistJob = async () => {
+    setHistJobStatus("queued");
+    setHistJobProcessed(0);
+    setHistJobTotal(0);
+    setHistJobOk(0);
+    setHistJobFailed(0);
+    setHistJobLastError("");
+    setHistJobCurrent("");
+    try {
+      const start = await api.post("/events/hltv-results/historical-map-stats/start", {});
+      const jobId = String(start?.job_id || "");
+      if (!jobId) throw new Error("Failed to start historical map stats job.");
+      setHistJobId(jobId);
+      await pollHistJob(jobId);
+    } catch (e) {
+      setHistJobStatus("failed");
+      setHistJobLastError(String(e?.message || "Failed to start historical map stats job."));
+    }
+  };
+
+  const pauseHistJob = async () => {
+    if (!histJobId) return;
+    setHistJobStatus("pausing");
+    try {
+      const status = await api.post(`/events/hltv-results/historical-map-stats/job/${histJobId}/pause`, {});
+      const applied = applyHistJobStatus(status, histJobId);
+      if (["pausing", "running", "queued"].includes(applied.nextStatus)) pollHistJob(histJobId);
+    } catch (e) {
+      setHistJobLastError(String(e?.message || "Failed to pause historical map stats job."));
+    }
+  };
+
+  const cancelHistJob = async () => {
+    if (!histJobId) return;
+    setHistJobStatus("canceling");
+    try {
+      const status = await api.post(`/events/hltv-results/historical-map-stats/job/${histJobId}/cancel`, {});
+      const applied = applyHistJobStatus(status, histJobId);
+      if (["canceling", "running", "queued", "pausing"].includes(applied.nextStatus)) pollHistJob(histJobId);
+    } catch (e) {
+      setHistJobLastError(String(e?.message || "Failed to cancel historical map stats job."));
+    }
+  };
+
+  const resumeHistJob = async () => {
+    if (!histJobId) return;
+    try {
+      const status = await api.post(`/events/hltv-results/historical-map-stats/job/${histJobId}/resume`, {});
+      const applied = applyHistJobStatus(status, histJobId);
+      if (["queued", "running", "pausing"].includes(applied.nextStatus)) pollHistJob(histJobId);
+    } catch (e) {
+      setHistJobLastError(String(e?.message || "Failed to resume historical map stats job."));
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    loadHistCoverage();
+    const hydrateHistJob = async () => {
+      try {
+        const latest = await api.get("/events/hltv-results/historical-map-stats/latest");
+        if (cancelled || !latest?.exists) return;
+        if (["completed", "canceled"].includes(String(latest?.status || ""))) return;
+        const applied = applyHistJobStatus(latest);
+        if (["queued", "running", "pausing", "canceling"].includes(applied.nextStatus)) {
+          pollHistJob(applied.jobId);
+        }
+      } catch {
+        // Optional panel; ignore startup failures.
+      }
+    };
+    hydrateHistJob();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const histJobActive = ["queued", "running", "pausing", "canceling"].includes(histJobStatus);
+  const histJobResumable = ["paused", "failed"].includes(histJobStatus);
+  const histJobPct = histJobTotal > 0 ? Math.min(100, Math.max(0, (histJobProcessed / histJobTotal) * 100)) : 0;
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
@@ -7260,7 +7993,7 @@ function ModelLabTab() {
         train_limit: String(toPositiveInt(trainLimit, 0)),
         test_limit: String(toPositiveInt(testLimit, 0)),
         random_split: randomSplit ? "true" : "false",
-        fetch_missing_map_stats: fetchMissingMapStats ? "true" : "false",
+        fetch_missing_map_stats: "false",
       });
       const data = await api.get(`/events/hltv-results/map-model-lab?${params.toString()}`);
       if (data?.detail) {
@@ -7287,18 +8020,64 @@ function ModelLabTab() {
             <input type="checkbox" checked={randomSplit} onChange={(e) => setRandomSplit(e.target.checked)} disabled={busy} />
             <span>Random train/test split</span>
           </label>
-          <label className="checkbox-inline">
-            <input
-              type="checkbox"
-              checked={fetchMissingMapStats}
-              onChange={(e) => setFetchMissingMapStats(e.target.checked)}
-              disabled={busy}
-            />
-            <span>Fetch missing historical map stats</span>
-          </label>
           <button className="primary" onClick={run} disabled={busy}>
             {busy ? "Running..." : "Train & Evaluate"}
           </button>
+        </div>
+        <div className="card sub">
+          <h3>Historical Map Stats</h3>
+          <p className="muted">
+            The map-data model only uses maps where both teams have pre-match six-month map stats stored in the
+            database. This job scrapes and permanently stores each missing team/date window; it is safe to pause,
+            cancel, and resume across sessions, and already-stored windows are always skipped.
+          </p>
+          {histCoverage && (
+            <p className="muted">
+              Coverage: {Number(histCoverage.cached_windows || 0).toLocaleString()} of{" "}
+              {Number(histCoverage.required_windows || 0).toLocaleString()} team-windows stored |{" "}
+              {Number(histCoverage.missing_windows || 0).toLocaleString()} missing
+              {Number(histCoverage.unmapped_team_keys || 0) > 0
+                ? ` | ${histCoverage.unmapped_team_keys} team names not in the team DB`
+                : ""}
+            </p>
+          )}
+          <div className="actions" style={{ marginTop: 0 }}>
+            <button className="secondary" onClick={startHistJob} disabled={histJobActive}>
+              {histJobActive ? `Fetching ${histJobProcessed}/${histJobTotal}` : "Fetch Missing Historical Stats"}
+            </button>
+            {histJobActive && histJobId && (
+              <button className="secondary" onClick={pauseHistJob} disabled={["pausing", "canceling"].includes(histJobStatus)}>
+                {histJobStatus === "pausing" ? "Pausing..." : "Pause"}
+              </button>
+            )}
+            {histJobResumable && histJobId && (
+              <button className="secondary" onClick={resumeHistJob}>
+                Resume
+              </button>
+            )}
+            {(histJobActive || histJobResumable) && histJobId && (
+              <button className="danger" onClick={cancelHistJob} disabled={histJobStatus === "canceling"}>
+                {histJobStatus === "canceling" ? "Canceling..." : "Cancel"}
+              </button>
+            )}
+          </div>
+          {histJobStatus !== "idle" && histJobStatus !== "completed" && (
+            <>
+              <p className="muted">
+                Progress: {histJobProcessed.toLocaleString()} / {histJobTotal.toLocaleString()} | ok {histJobOk} | failed{" "}
+                {histJobFailed}
+                {histJobActive && histJobTotal > histJobProcessed ? ` | ETA: ${formatBatchEta(histJobEtaSeconds)}` : ""}
+              </p>
+              <div className="progress">
+                <div className="progress-bar determinate" style={{ width: `${histJobPct}%` }} />
+              </div>
+              {histJobCurrent && <p className="muted">Current: {histJobCurrent}</p>}
+              {histJobLastError && <p className="muted">Last error: {histJobLastError}</p>}
+            </>
+          )}
+          {histJobStatus === "completed" && (
+            <p className="muted">Backfill complete: {histJobOk} fetched, {histJobFailed} failed.</p>
+          )}
         </div>
         <div className="model-slice-card">
           <div className="model-slice-head">
@@ -7799,6 +8578,9 @@ function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
   );
 
   useEffect(() => {
+    // While the event's team list is still loading, filteredTeams is empty —
+    // filtering then would wipe selections and stored sim results spuriously.
+    if (filteredTeams.length === 0) return;
     const allowed = new Set(filteredTeams.map((t) => t.team_id));
     setSelectedTeamIds((prev) => prev.filter((id) => allowed.has(id)));
 
@@ -7953,6 +8735,10 @@ export default function App() {
     setToast(msg);
     setTimeout(() => setToast(""), 2000);
   };
+
+  const mapStatsModalRefreshRef = useRef(null);
+  const mapStatsJob = useMapStatsJob({ refresh: load, notify, modalRefreshRef: mapStatsModalRefreshRef });
+
   const handleOpenPlayerFromAnywhere = (playerId) => {
     const pid = Number(playerId);
     if (!Number.isFinite(pid) || pid <= 0) return;
@@ -8014,6 +8800,8 @@ export default function App() {
         notify={notify}
         openPlayerId={openPlayerId}
         onOpenPlayerHandled={() => setOpenPlayerId(null)}
+        mapStats={mapStatsJob}
+        mapStatsModalRefreshRef={mapStatsModalRefreshRef}
       />
     ),
     events: <EventsTab refreshData={load} notify={notify} players={players} />,
