@@ -21,6 +21,7 @@ const tabs = [
   { key: "modelLab", label: "Model Lab" },
   { key: "sim", label: "Swiss Group Stage" },
   { key: "playoff", label: "Playoff Bracket" },
+  { key: "bounty", label: "Bounty Event" },
   { key: "admin", label: "Data Management" },
 ];
 
@@ -2672,7 +2673,8 @@ function MapsTab({ teams, mapStats }) {
   );
 }
 
-function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpenPlayer }) {
+function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpenPlayer, variant = "main" }) {
+  const isBounty = variant === "bounty";
   const [playoffTab, setPlayoffTab] = useState("stage");
   const [events, setEvents] = useState([]);
   const [selectedEventId, setSelectedEventId] = useState("");
@@ -2681,6 +2683,10 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   const [updatedAt, setUpdatedAt] = useState("");
   const [slots, setSlots] = useState(Array(8).fill(""));
   const [hasThirdPlaceDecider, setHasThirdPlaceDecider] = useState(false);
+  // Bounty draft state: seeds 5-7 pick their QF opponent (seed 8 gets the
+  // leftover), and per QF-winner scenario the first SF drafter's pick.
+  const [draftPicks, setDraftPicks] = useState(["", "", ""]);
+  const [sfPicks, setSfPicks] = useState({});
   const [results, setResults] = useState(null);
   const [busy, setBusy] = useState(false);
   const [topTeams, setTopTeams] = useState(null);
@@ -2878,7 +2884,11 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       const next = { ...prev, qf: [...prev.qf], sf: [...prev.sf] };
       if (round === "qf") {
         next.qf[index] = value;
-        if (index < 2) next.sf[0] = "";
+        if (isBounty) {
+          // Bounty semis are re-drafted from the surviving four, so any QF
+          // change invalidates both SF pairings.
+          next.sf = ["", ""];
+        } else if (index < 2) next.sf[0] = "";
         else next.sf[1] = "";
         next.final = "";
         next.third = "";
@@ -2932,18 +2942,76 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       playoff_booster_usage: aggregatePlayoffBoosterUsage(player, rosterPlayers || [], results?.outcomes || []),
     });
   };
+  const seedIndexById = useMemo(() => {
+    const m = {};
+    slots.forEach((s, idx) => {
+      const id = Number(s);
+      if (Number.isFinite(id) && id > 0) m[id] = idx;
+    });
+    return m;
+  }, [slots]);
+  const draftedQfPairs = useMemo(() => {
+    if (!isBounty) return null;
+    const top = slots.slice(0, 4).map((s) => Number(s));
+    const bottom = slots.slice(4, 8).map((s) => Number(s));
+    if (top.some((id) => !id) || bottom.some((id) => !id)) return null;
+    const picks = draftPicks.map((p) => Number(p));
+    if (picks.some((p) => !p)) return null;
+    if (new Set(picks).size !== 3 || picks.some((p) => !top.includes(p))) return null;
+    const leftover = top.find((id) => !picks.includes(id));
+    return bottom.map((drafter, idx) => [drafter, idx < 3 ? picks[idx] : leftover]);
+  }, [isBounty, slots, draftPicks]);
+  // The 16 possible QF-winner scenarios; in each, the two lowest-seeded
+  // survivors re-draft: the higher of them picks first from the top two.
+  const bountySfScenarios = useMemo(() => {
+    if (!isBounty || !draftedQfPairs) return [];
+    const scenarios = [];
+    for (let mask = 0; mask < 16; mask++) {
+      const winners = draftedQfPairs.map((pair, i) => pair[(mask >> i) & 1]);
+      const ordered = [...winners].sort((a, b) => (seedIndexById[a] ?? 99) - (seedIndexById[b] ?? 99));
+      const key = [...winners].sort((a, b) => a - b).join("-");
+      scenarios.push({ key, winners, ordered, drafter: ordered[2], options: [ordered[0], ordered[1]] });
+    }
+    return scenarios;
+  }, [isBounty, draftedQfPairs, seedIndexById]);
+  const bountySfPairsFor = (winners) => {
+    const ordered = [...winners.map(Number)].sort((a, b) => (seedIndexById[a] ?? 99) - (seedIndexById[b] ?? 99));
+    const key = [...winners.map(Number)].sort((a, b) => a - b).join("-");
+    const options = [ordered[0], ordered[1]];
+    let pick = Number(sfPicks[key]);
+    if (!options.includes(pick)) pick = ordered[1];
+    const other = options.find((id) => id !== pick);
+    return [
+      [ordered[2], pick],
+      [ordered[3], other],
+    ];
+  };
+  const bountySfPicksPayload = () => {
+    const out = {};
+    bountySfScenarios.forEach((sc) => {
+      out[sc.key] = bountySfPairsFor(sc.winners);
+    });
+    return out;
+  };
   const completedBracketDerived = useMemo(() => {
     const isPickedFrom = (value, ids) => Boolean(value) && ids.some((id) => String(id) === String(value));
-    const qfPairs = [
-      [slots[0], slots[1]],
-      [slots[2], slots[3]],
-      [slots[4], slots[5]],
-      [slots[6], slots[7]],
-    ];
-    const sfPairs = [
-      [completedBracket.qf[0], completedBracket.qf[1]],
-      [completedBracket.qf[2], completedBracket.qf[3]],
-    ];
+    const qfPairs = isBounty
+      ? (draftedQfPairs || [["", ""], ["", ""], ["", ""], ["", ""]]).map((pair) => pair.map((id) => (id ? String(id) : "")))
+      : [
+          [slots[0], slots[1]],
+          [slots[2], slots[3]],
+          [slots[4], slots[5]],
+          [slots[6], slots[7]],
+        ];
+    const qfWinnersPicked = completedBracket.qf.every((pick) => Boolean(pick));
+    const sfPairs = isBounty
+      ? qfWinnersPicked
+        ? bountySfPairsFor(completedBracket.qf).map((pair) => pair.map((id) => (id ? String(id) : "")))
+        : [["", ""], ["", ""]]
+      : [
+          [completedBracket.qf[0], completedBracket.qf[1]],
+          [completedBracket.qf[2], completedBracket.qf[3]],
+        ];
     const finalPair = [completedBracket.sf[0], completedBracket.sf[1]];
     const thirdPair = [
       sfPairs[0].find((id) => id && String(id) !== String(completedBracket.sf[0])) || "",
@@ -2955,7 +3023,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       isPickedFrom(completedBracket.final, finalPair) &&
       (!hasThirdPlaceDecider || isPickedFrom(completedBracket.third, thirdPair));
     return { qfPairs, sfPairs, finalPair, thirdPair, complete };
-  }, [slots, completedBracket, hasThirdPlaceDecider]);
+  }, [slots, completedBracket, hasThirdPlaceDecider, isBounty, draftedQfPairs, sfPicks, seedIndexById]);
   const runCompletedBracket = async () => {
     setBusy(true);
     setCompletedBracketMessage("");
@@ -2969,9 +3037,10 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
         qf_winners: completedBracket.qf.map((id) => Number(id)),
         sf_winners: completedBracket.sf.map((id) => Number(id)),
         final_winner: Number(completedBracket.final),
-        third_place_winner: hasThirdPlaceDecider ? Number(completedBracket.third) : 0,
+        third_place_winner: !isBounty && hasThirdPlaceDecider ? Number(completedBracket.third) : 0,
         include_player_ids: Array.from(effectiveAppliedFilters.include),
         exclude_player_ids: Array.from(effectiveAppliedFilters.exclude),
+        variant,
       });
       if (start?.detail || start?.error) {
         setCompletedBracketMessage(String(start.detail || start.error));
@@ -3105,8 +3174,17 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     };
   };
 
-  const loadEventsForPlayoff = async () => {
-    const data = await api.get("/events/");
+  const loadEventsForPlayoff = async (retriesLeft = 3) => {
+    // A busy backend (giant combo-blob parses hold the GIL) can stall this
+    // request; retry instead of leaving the event dropdown blank, which reads
+    // as the active event having been unset.
+    let data = null;
+    try {
+      data = await api.get("/events/");
+    } catch (e) {
+      if (retriesLeft > 0) setTimeout(() => loadEventsForPlayoff(retriesLeft - 1), 5000);
+      return;
+    }
     if (data?.detail) return;
     const allEvents = Array.isArray(data.events) ? data.events : [];
     setEvents(allEvents);
@@ -3127,7 +3205,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   };
 
   const loadLatestPlayoff = async () => {
-    const data = await api.get("/playoff/latest", 120000);
+    const data = await api.get(`/playoff/latest?variant=${variant}`, 120000);
     if (!data?.exists) {
       setLatestPayload(null);
       setResults(null);
@@ -3138,13 +3216,25 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     setLatestPayload(payload);
     setSlots((payload.team_slots || []).map((x) => String(x)));
     setHasThirdPlaceDecider(Boolean(payload.has_third_place_decider));
+    if (isBounty) {
+      const savedPairs = payload.qf_pairs || [];
+      if (savedPairs.length === 4) {
+        setDraftPicks(savedPairs.slice(0, 3).map((pair) => String(pair?.[1] || "")));
+      }
+      const restored = {};
+      Object.entries(payload.sf_picks || {}).forEach(([key, pairs]) => {
+        const pick = pairs?.[0]?.[1];
+        if (pick) restored[key] = String(pick);
+      });
+      setSfPicks(restored);
+    }
     setResults(data.results || null);
     hydrateCompletedBracketFromBracket(data.results?.bracket);
     setUpdatedAt(data.updated_at ? new Date(Number(data.updated_at) * 1000).toISOString() : "");
   };
 
   const loadLatestCompletedBracket = async () => {
-    const data = await api.get("/playoff/best-team/bracket-from-latest/latest", 120000);
+    const data = await api.get(`/playoff/best-team/bracket-from-latest/latest?variant=${variant}`, 120000);
     if (!data?.exists) return;
     const payload = data.payload || {};
     const savedQf = (payload.qf_winners || []).slice(0, 4).map((id) => String(id || ""));
@@ -3159,7 +3249,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   };
 
   const loadLatestSharedCombinations = async () => {
-    const data = await api.get("/playoff/best-team/from-latest/latest", 120000);
+    const data = await api.get(`/playoff/best-team/from-latest/latest?variant=${variant}`, 120000);
     if (!data?.exists) return;
     setBaseTeams([]);
     setSharedComboCount(Number(data.total_teams || 0));
@@ -3188,10 +3278,11 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   const run = async () => {
     const ids = slots.map((s) => Number(s));
     if (ids.some((id) => !id)) return;
+    if (isBounty && !draftedQfPairs) return;
     setBusy(true);
     setRunMessage("");
     setProcessedSims(0);
-    setTotalSims(hasThirdPlaceDecider ? 256 : 128);
+    setTotalSims(!isBounty && hasThirdPlaceDecider ? 256 : 128);
     setEtaSeconds(null);
 
     const pollPlayoffJob = async (jobId, startedAtMs) => {
@@ -3244,7 +3335,8 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     try {
       const start = await api.post("/playoff/start", {
         team_slots: ids,
-        has_third_place_decider: hasThirdPlaceDecider,
+        has_third_place_decider: isBounty ? false : hasThirdPlaceDecider,
+        ...(isBounty ? { variant: "bounty", qf_pairs: draftedQfPairs, sf_picks: bountySfPicksPayload() } : {}),
       });
       if (start?.detail) {
         setRunMessage(String(start.detail));
@@ -3277,6 +3369,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
         include_player_ids: Array.from(effectiveAppliedFilters.include),
         exclude_player_ids: Array.from(effectiveAppliedFilters.exclude),
         mode: "most_outcomes",
+        variant,
       });
       if (start?.detail) {
         setTopMessage(String(start.detail));
@@ -3342,7 +3435,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   };
 
   const resetStoredPlayoff = async () => {
-    await api.delete("/playoff/latest");
+    await api.delete(`/playoff/latest?variant=${variant}`);
     setLatestPayload(null);
     setResults(null);
     setUpdatedAt("");
@@ -3414,13 +3507,14 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
         sort: sortKey,
         page: nextPage,
         page_size: 200,
+        variant,
       };
       if (playoffTopSubtab === "completed") {
         if (!completedBracketDerived.complete) return;
         body.qf_winners = completedBracket.qf.map((id) => Number(id));
         body.sf_winners = completedBracket.sf.map((id) => Number(id));
         body.final_winner = Number(completedBracket.final);
-        body.third_place_winner = hasThirdPlaceDecider ? Number(completedBracket.third) : 0;
+        body.third_place_winner = !isBounty && hasThirdPlaceDecider ? Number(completedBracket.third) : 0;
       }
       const data = await api.post(endpoint, body, 120000);
       if (seq !== comboQuerySeqRef.current) return;
@@ -3627,7 +3721,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   };
 
   return (
-    <Section title="Playoff Bracket (BO3)">
+    <Section title={isBounty ? "Bounty Playoffs (BO3)" : "Playoff Bracket (BO3)"}>
       <div className="stack">
         <div className="grid three">
           <Select
@@ -3665,7 +3759,164 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
           </button>
         </div>
 
-        {playoffTab === "stage" && (
+        {playoffTab === "stage" && isBounty && (
+          <>
+            <div className="card sub">
+              <h3>Seeding</h3>
+              <p className="muted">
+                Seeds 1-4 are the top half and get drafted; seeds 5-8 are the bottom half and pick their quarter-final
+                opponent in seed order (highest-rated bottom-half team drafts first).
+              </p>
+              <div className="grid three">
+                {slots.map((slotValue, idx) => (
+                  <div className="field" key={`bounty-seed-${idx}`}>
+                    <span>
+                      Seed {idx + 1} {idx < 4 ? "(top half)" : "(bottom half)"}
+                    </span>
+                    <select value={slotValue} onChange={(e) => setSlot(idx, e.target.value)} disabled={busy}>
+                      {playoffTeamOptions.map((option) => (
+                        <option key={option.value || "empty"} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="card sub">
+              <h3>Quarter-final Draft</h3>
+              {slots.slice(4, 8).some((s) => !s) || slots.slice(0, 4).some((s) => !s) ? (
+                <p className="muted">Fill in all 8 seeds above to run the draft.</p>
+              ) : (
+                <>
+                  {[0, 1, 2].map((pickIdx) => {
+                    const drafter = Number(slots[4 + pickIdx]);
+                    const takenElsewhere = new Set(
+                      draftPicks.filter((p, i) => i !== pickIdx && p).map((p) => String(p))
+                    );
+                    const options = slots
+                      .slice(0, 4)
+                      .map((s) => Number(s))
+                      .filter((id) => id && !takenElsewhere.has(String(id)));
+                    return (
+                      <div className="field" key={`bounty-pick-${pickIdx}`}>
+                        <span>
+                          Pick {pickIdx + 1}: {teamLookup[drafter] || `Seed ${5 + pickIdx}`} plays
+                        </span>
+                        <select
+                          value={draftPicks[pickIdx]}
+                          onChange={(e) =>
+                            setDraftPicks((prev) => {
+                              const next = [...prev];
+                              next[pickIdx] = e.target.value;
+                              return next;
+                            })
+                          }
+                          disabled={busy}
+                        >
+                          <option value="">Select opponent</option>
+                          {options.map((id) => (
+                            <option key={id} value={String(id)}>
+                              {teamLookup[id] || id}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    );
+                  })}
+                  <p className="muted">
+                    {draftedQfPairs
+                      ? `${teamLookup[draftedQfPairs[3][0]] || "Seed 8"} gets the remaining team: ${
+                          teamLookup[draftedQfPairs[3][1]] || draftedQfPairs[3][1]
+                        }`
+                      : "Seed 8 automatically plays the remaining top-half team."}
+                  </p>
+                </>
+              )}
+              {draftedQfPairs && (
+                <div className="playoff-bracket-shell">
+                  <div className="playoff-bracket-column qf">
+                    <h3>Drafted Quarter-finals</h3>
+                    {draftedQfPairs.map((pair, idx) => (
+                      <BracketMatchCard
+                        key={`bounty-qf-${idx}`}
+                        title={`QF ${idx + 1}`}
+                        rows={
+                          <>
+                            {pair.map((teamId, rowIdx) => (
+                              <div className="playoff-team-row" key={`bounty-qf-${idx}-${rowIdx}`}>
+                                <span className="playoff-team-badge">{teamInitials(teamId)}</span>
+                                <span>{teamLookup[teamId] || teamId}</span>
+                              </div>
+                            ))}
+                          </>
+                        }
+                      />
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+            {draftedQfPairs && (
+              <div className="card sub">
+                <h3>Semi-final Drafts (per scenario)</h3>
+                <p className="muted">
+                  After the quarter-finals the two lowest-seeded survivors draft again. For each possible set of QF
+                  winners, choose who the first drafter picks; the other pairing is forced. Unset scenarios default to
+                  the drafter picking the lower-seeded top survivor.
+                </p>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>QF Winners</th>
+                      <th>First Drafter</th>
+                      <th>Picks</th>
+                      <th>Other Semi-final</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {bountySfScenarios.map((sc) => {
+                      const pairs = bountySfPairsFor(sc.winners);
+                      return (
+                        <tr key={sc.key}>
+                          <td>{sc.winners.map((id) => teamLookup[id] || id).join(", ")}</td>
+                          <td>{teamLookup[sc.drafter] || sc.drafter}</td>
+                          <td>
+                            <select
+                              value={String(Number(sfPicks[sc.key]) && sc.options.includes(Number(sfPicks[sc.key])) ? sfPicks[sc.key] : pairs[0][1])}
+                              onChange={(e) => setSfPicks((prev) => ({ ...prev, [sc.key]: e.target.value }))}
+                              disabled={busy}
+                            >
+                              {sc.options.map((id) => (
+                                <option key={id} value={String(id)}>
+                                  {teamLookup[id] || id}
+                                </option>
+                              ))}
+                            </select>
+                          </td>
+                          <td>
+                            {(teamLookup[pairs[1][0]] || pairs[1][0]) + " vs " + (teamLookup[pairs[1][1]] || pairs[1][1])}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            <div className="actions">
+              <button className="primary" onClick={run} disabled={busy || !draftedQfPairs}>
+                {busy ? "Running..." : "Run Bounty Playoffs And Store Valuations"}
+              </button>
+              <button className="danger" onClick={resetStoredPlayoff} disabled={busy || !results}>
+                Reset Stored Valuations
+              </button>
+              {updatedAt && <p className="muted">Stored: {new Date(updatedAt).toLocaleString()}</p>}
+            </div>
+          </>
+        )}
+        {playoffTab === "stage" && !isBounty && (
           <>
             <div className="playoff-bracket-shell">
               <div className="playoff-bracket-column qf">
@@ -7757,6 +8008,141 @@ function AdminTab({ refresh, notify }) {
   );
 }
 
+function useBackfillJob(basePath, jobLabel) {
+  const [status, setStatus] = useState("idle");
+  const [jobId, setJobId] = useState("");
+  const [processed, setProcessed] = useState(0);
+  const [total, setTotal] = useState(0);
+  const [ok, setOk] = useState(0);
+  const [failed, setFailed] = useState(0);
+  const [current, setCurrent] = useState("");
+  const [lastError, setLastError] = useState("");
+  const [etaSeconds, setEtaSeconds] = useState(null);
+  const pollingRef = useRef(false);
+  const onSettledRef = useRef(null);
+
+  const apply = (data, jobIdOverride = "") => {
+    const id = String(jobIdOverride || data?.job_id || "");
+    const nextStatus = String(data?.status || "queued");
+    const nextProcessed = Number(data?.processed_items || 0);
+    const nextTotal = Number(data?.total_items || 0);
+    setStatus(nextStatus);
+    setJobId(id);
+    setProcessed(nextProcessed);
+    setTotal(nextTotal);
+    setOk(Number(data?.ok || 0));
+    setFailed(Number(data?.failed || 0));
+    setCurrent(String(data?.current_item || ""));
+    setLastError(String(data?.last_error || data?.error || ""));
+    const startedAtMs = getBatchStartedAtMs(data);
+    if (nextProcessed > 0 && nextTotal > nextProcessed && ["queued", "running", "pausing", "canceling"].includes(nextStatus)) {
+      const elapsedSeconds = Math.max(1, (Date.now() - startedAtMs) / 1000);
+      const rate = nextProcessed / elapsedSeconds;
+      setEtaSeconds(rate > 0 ? (nextTotal - nextProcessed) / rate : null);
+    } else {
+      setEtaSeconds(null);
+    }
+    return { jobId: id, nextStatus };
+  };
+
+  const poll = async (id) => {
+    if (!id || pollingRef.current) return;
+    pollingRef.current = true;
+    try {
+      let done = false;
+      let pollFailures = 0;
+      while (!done) {
+        let data;
+        try {
+          data = await api.get(`${basePath}/job/${id}`, 60000);
+          pollFailures = 0;
+        } catch (pollError) {
+          pollFailures += 1;
+          if (pollFailures >= 5) throw pollError;
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+          continue;
+        }
+        const applied = apply(data, id);
+        if (["completed", "failed", "paused", "canceled"].includes(applied.nextStatus)) {
+          if (onSettledRef.current) onSettledRef.current();
+          done = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+    } catch (e) {
+      setStatus("failed");
+      setLastError(String(e?.message || `Failed to poll ${jobLabel} job.`));
+    } finally {
+      pollingRef.current = false;
+    }
+  };
+
+  const start = async () => {
+    setStatus("queued");
+    setProcessed(0);
+    setTotal(0);
+    setOk(0);
+    setFailed(0);
+    setLastError("");
+    setCurrent("");
+    try {
+      const res = await api.post(`${basePath}/start`, {});
+      const id = String(res?.job_id || "");
+      if (!id) throw new Error(`Failed to start ${jobLabel} job.`);
+      setJobId(id);
+      await poll(id);
+    } catch (e) {
+      setStatus("failed");
+      setLastError(String(e?.message || `Failed to start ${jobLabel} job.`));
+    }
+  };
+
+  const control = async (action) => {
+    if (!jobId) return;
+    try {
+      const res = await api.post(`${basePath}/job/${jobId}/${action}`, {});
+      const applied = apply(res, jobId);
+      if (["queued", "running", "pausing", "canceling"].includes(applied.nextStatus)) poll(jobId);
+    } catch (e) {
+      setLastError(String(e?.message || `Failed to ${action} ${jobLabel} job.`));
+    }
+  };
+
+  const hydrate = async () => {
+    try {
+      const latest = await api.get(`${basePath}/latest`);
+      if (!latest?.exists) return;
+      if (["completed", "canceled"].includes(String(latest?.status || ""))) return;
+      const applied = apply(latest);
+      if (["queued", "running", "pausing", "canceling"].includes(applied.nextStatus)) poll(applied.jobId);
+    } catch {
+      // Optional panel; ignore startup failures.
+    }
+  };
+
+  return {
+    status,
+    jobId,
+    processed,
+    total,
+    ok,
+    failed,
+    current,
+    lastError,
+    etaSeconds,
+    active: ["queued", "running", "pausing", "canceling"].includes(status),
+    resumable: ["paused", "failed"].includes(status),
+    pctDone: total > 0 ? Math.min(100, Math.max(0, (processed / total) * 100)) : 0,
+    start,
+    pause: () => control("pause"),
+    cancel: () => control("cancel"),
+    resume: () => control("resume"),
+    hydrate,
+    onSettledRef,
+  };
+}
+
 function ModelLabTab() {
   const [trainLimit, setTrainLimit] = useState("0");
   const [testLimit, setTestLimit] = useState("0");
@@ -7782,6 +8168,18 @@ function ModelLabTab() {
       // Coverage is informational; the lab still works without it.
     }
   };
+
+  const [vetoCoverage, setVetoCoverage] = useState(null);
+  const vetoJob = useBackfillJob("/events/hltv-results/veto-backfill", "veto backfill");
+  const loadVetoCoverage = async () => {
+    try {
+      const cov = await api.get("/events/hltv-results/veto-backfill/coverage");
+      if (cov && cov.status === "ok") setVetoCoverage(cov);
+    } catch {
+      // Coverage is informational; the lab still works without it.
+    }
+  };
+  vetoJob.onSettledRef.current = loadVetoCoverage;
 
   const applyHistJobStatus = (status, jobIdOverride = "") => {
     const jobId = String(jobIdOverride || status?.job_id || "");
@@ -7914,6 +8312,8 @@ function ModelLabTab() {
       }
     };
     hydrateHistJob();
+    loadVetoCoverage();
+    vetoJob.hydrate();
     return () => {
       cancelled = true;
     };
@@ -8042,7 +8442,9 @@ function ModelLabTab() {
         random_split: randomSplit ? "true" : "false",
         fetch_missing_map_stats: "false",
       });
-      const data = await api.get(`/events/hltv-results/map-model-lab?${params.toString()}`);
+      // Training scales with dataset size (~40s at 1,600 matches); give it far
+      // more than the 30s default before declaring the backend unresponsive.
+      const data = await api.get(`/events/hltv-results/map-model-lab?${params.toString()}`, 600000);
       if (data?.detail) {
         setError(String(data.detail));
         return;
@@ -8126,6 +8528,58 @@ function ModelLabTab() {
             <p className="muted">Backfill complete: {histJobOk} fetched, {histJobFailed} failed.</p>
           )}
         </div>
+        <div className="card sub">
+          <h3>Match Veto Backfill</h3>
+          <p className="muted">
+            Fetches each stored match page to fill in the map veto (who picked each map) plus any missing per-map
+            scores and player stats. The picked-map feature and veto-simulated series predictions need this data.
+            Safe to pause, cancel, and resume across sessions; matches already checked are always skipped.
+          </p>
+          {vetoCoverage && (
+            <p className="muted">
+              Coverage: {Number(vetoCoverage.with_veto || 0).toLocaleString()} of{" "}
+              {Number(vetoCoverage.total_matches || 0).toLocaleString()} matches have veto data |{" "}
+              {Number(vetoCoverage.missing_veto || 0).toLocaleString()} missing
+            </p>
+          )}
+          <div className="actions" style={{ marginTop: 0 }}>
+            <button className="secondary" onClick={vetoJob.start} disabled={vetoJob.active}>
+              {vetoJob.active ? `Fetching ${vetoJob.processed}/${vetoJob.total}` : "Fetch Missing Vetoes"}
+            </button>
+            {vetoJob.active && vetoJob.jobId && (
+              <button className="secondary" onClick={vetoJob.pause} disabled={["pausing", "canceling"].includes(vetoJob.status)}>
+                {vetoJob.status === "pausing" ? "Pausing..." : "Pause"}
+              </button>
+            )}
+            {vetoJob.resumable && vetoJob.jobId && (
+              <button className="secondary" onClick={vetoJob.resume}>
+                Resume
+              </button>
+            )}
+            {(vetoJob.active || vetoJob.resumable) && vetoJob.jobId && (
+              <button className="danger" onClick={vetoJob.cancel} disabled={vetoJob.status === "canceling"}>
+                {vetoJob.status === "canceling" ? "Canceling..." : "Cancel"}
+              </button>
+            )}
+          </div>
+          {vetoJob.status !== "idle" && vetoJob.status !== "completed" && (
+            <>
+              <p className="muted">
+                Progress: {vetoJob.processed.toLocaleString()} / {vetoJob.total.toLocaleString()} | ok {vetoJob.ok} |{" "}
+                failed {vetoJob.failed}
+                {vetoJob.active && vetoJob.total > vetoJob.processed ? ` | ETA: ${formatBatchEta(vetoJob.etaSeconds)}` : ""}
+              </p>
+              <div className="progress">
+                <div className="progress-bar determinate" style={{ width: `${vetoJob.pctDone}%` }} />
+              </div>
+              {vetoJob.current && <p className="muted">Current: {vetoJob.current}</p>}
+              {vetoJob.lastError && <p className="muted">Last error: {vetoJob.lastError}</p>}
+            </>
+          )}
+          {vetoJob.status === "completed" && (
+            <p className="muted">Backfill complete: {vetoJob.ok} fetched, {vetoJob.failed} failed.</p>
+          )}
+        </div>
         <div className="model-slice-card">
           <div className="model-slice-head">
             <div>
@@ -8175,9 +8629,30 @@ function ModelLabTab() {
               </div>
               <div className="card sub">
                 <h3>With Map Data</h3>
-                <p className="muted">Winner {pct(result.metrics?.winner_accuracy, 1)}</p>
+                <p className="muted">Map winner {pct(result.metrics?.winner_accuracy, 1)}</p>
                 <p className="muted">Score MAE {Number(result.metrics?.score_mae || 0).toFixed(2)}</p>
-                <p className="muted">Brier {Number(result.metrics?.brier || 0).toFixed(3)}</p>
+                <p className="muted">Map Brier {Number(result.metrics?.brier || 0).toFixed(3)}</p>
+                {result.metrics?.series_winner_accuracy != null && (
+                  <>
+                    <p className="muted">
+                      Series (BO3) winner {pct(result.metrics.series_winner_accuracy, 1)} of{" "}
+                      {Number(result.metrics.n_series || 0).toLocaleString()}
+                    </p>
+                    <p className="muted">Series Brier {Number(result.metrics.series_brier || 0).toFixed(3)}</p>
+                  </>
+                )}
+                {result.metrics?.veto_sim?.winner_accuracy != null && (
+                  <>
+                    <p className="muted">
+                      Veto-sim series winner {pct(result.metrics.veto_sim.winner_accuracy, 1)} of{" "}
+                      {Number(result.metrics.veto_sim.n || 0).toLocaleString()}
+                    </p>
+                    <p className="muted">
+                      Veto-sim Brier {Number(result.metrics.veto_sim.brier || 0).toFixed(3)} | maps matched{" "}
+                      {pct(result.metrics.veto_sim.map_match_rate, 1)}
+                    </p>
+                  </>
+                )}
                 <p className="muted">
                   Historical maps kept {pct(result.input_summary?.train?.map_stats_coverage, 1)} (
                   {Number(result.input_summary?.train?.maps || 0).toLocaleString()} /{" "}
@@ -8186,9 +8661,30 @@ function ModelLabTab() {
               </div>
               <div className="card sub">
                 <h3>Rank Only</h3>
-                <p className="muted">Winner {pct(result.rank_only_metrics?.winner_accuracy, 1)}</p>
+                <p className="muted">Map winner {pct(result.rank_only_metrics?.winner_accuracy, 1)}</p>
                 <p className="muted">Score MAE {Number(result.rank_only_metrics?.score_mae || 0).toFixed(2)}</p>
-                <p className="muted">Brier {Number(result.rank_only_metrics?.brier || 0).toFixed(3)}</p>
+                <p className="muted">Map Brier {Number(result.rank_only_metrics?.brier || 0).toFixed(3)}</p>
+                {result.rank_only_metrics?.series_winner_accuracy != null && (
+                  <>
+                    <p className="muted">
+                      Series (BO3) winner {pct(result.rank_only_metrics.series_winner_accuracy, 1)} of{" "}
+                      {Number(result.rank_only_metrics.n_series || 0).toLocaleString()}
+                    </p>
+                    <p className="muted">Series Brier {Number(result.rank_only_metrics.series_brier || 0).toFixed(3)}</p>
+                  </>
+                )}
+                {result.rank_only_metrics?.veto_sim?.winner_accuracy != null && (
+                  <>
+                    <p className="muted">
+                      Veto-sim series winner {pct(result.rank_only_metrics.veto_sim.winner_accuracy, 1)} of{" "}
+                      {Number(result.rank_only_metrics.veto_sim.n || 0).toLocaleString()}
+                    </p>
+                    <p className="muted">
+                      Veto-sim Brier {Number(result.rank_only_metrics.veto_sim.brier || 0).toFixed(3)} | maps matched{" "}
+                      {pct(result.rank_only_metrics.veto_sim.map_match_rate, 1)}
+                    </p>
+                  </>
+                )}
               </div>
             </div>
             {rankEffectLevelBands.length > 0 && (
@@ -8577,8 +9073,14 @@ function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
     setSimUpdatedAt(data.updated_at || "");
   };
 
-  const loadEventsForSwiss = async () => {
-    const data = await api.get("/events/");
+  const loadEventsForSwiss = async (retriesLeft = 3) => {
+    let data = null;
+    try {
+      data = await api.get("/events/");
+    } catch (e) {
+      if (retriesLeft > 0) setTimeout(() => loadEventsForSwiss(retriesLeft - 1), 5000);
+      return;
+    }
     if (data?.detail) return;
 
     const allEvents = Array.isArray(data.events) ? data.events : [];
@@ -8739,6 +9241,23 @@ function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
   );
 }
 
+function BountyTab(props) {
+  const [bountyTab, setBountyTab] = useState("playoffs");
+  return (
+    <div className="stack">
+      <div className="tab-bar small">
+        <button className={bountyTab === "playoffs" ? "tab active" : "tab"} onClick={() => setBountyTab("playoffs")}>
+          Playoffs
+        </button>
+        <button className="tab" disabled title="Online stage (32 teams) coming later">
+          Online Stage
+        </button>
+      </div>
+      {bountyTab === "playoffs" && <PlayoffTab {...props} variant="bounty" />}
+    </div>
+  );
+}
+
 export default function App() {
   const [active, setActive] = useState("view");
   const [openPlayerId, setOpenPlayerId] = useState(null);
@@ -8856,6 +9375,16 @@ export default function App() {
     sim: <SwissTab teams={teams} teamLookup={teamLookup} players={players} onOpenPlayer={handleOpenPlayerFromAnywhere} />,
     playoff: (
       <PlayoffTab
+        teams={teams}
+        teamLookup={teamLookup}
+        players={players}
+        sortTeams={sortTeams}
+        applyFilters={applyFilters}
+        onOpenPlayer={handleOpenPlayerFromAnywhere}
+      />
+    ),
+    bounty: (
+      <BountyTab
         teams={teams}
         teamLookup={teamLookup}
         players={players}

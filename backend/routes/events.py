@@ -34,7 +34,9 @@ from backend.data.event_db import (
     get_event_detail,
     get_hltv_result_by_url,
     get_imported_match_ids,
+    get_all_historical_team_map_stats_json,
     get_historical_team_map_stats,
+    update_hltv_result_details,
     list_hltv_results,
     set_hltv_result_maps,
     list_events,
@@ -69,6 +71,8 @@ def _sigmoid(z: float) -> float:
     return ez / (1.0 + ez)
 
 
+# First 6 entries are the rank-only baseline (see _fit_round_share_logistic_2d's
+# [:6] slice); map-informed features must be appended after them.
 ROUND_SHARE_FEATURES: Tuple[Tuple[str, str], ...] = (
     ("hltv_gap", "hltv_gap"),
     ("hltv_level", "hltv_level"),
@@ -81,6 +85,9 @@ ROUND_SHARE_FEATURES: Tuple[Tuple[str, str], ...] = (
     ("ban_gap", "ban_gap"),
     ("played_pct_gap", "played_pct_gap"),
     ("map_stats_available", "map_stats_available"),
+    ("elo_gap", "elo_gap"),
+    ("map_elo_gap", "map_elo_gap"),
+    ("picked_by_a", "picked_by_a"),
 )
 
 
@@ -203,6 +210,11 @@ def _predict_logistic_2d(
                 for v in (map_win_a, map_win_b, pick_a, pick_b, ban_a, ban_b, played_pct_a, played_pct_b)
             )
             else 0.0,
+            # Callers of this legacy path have no Elo/veto context; zero is the
+            # neutral value under standardization.
+            "elo_gap": 0.0,
+            "map_elo_gap": 0.0,
+            "picked_by_a": 0.0,
         }
         z = float(model["a"])
         for name, _sample_key in ROUND_SHARE_FEATURES:
@@ -1685,6 +1697,7 @@ def _build_historical_team_map_stats_by_window(
     fetch_missing: bool = False,
 ) -> tuple[Dict[tuple[str, str, str], Dict[str, Dict[str, float]]], Dict[str, Any]]:
     required, missing_team_keys = _required_historical_windows(rows)
+    stored_by_window = get_all_historical_team_map_stats_json()
 
     out: Dict[tuple[str, str, str], Dict[str, Dict[str, float]]] = {}
     fetched = 0
@@ -1692,10 +1705,10 @@ def _build_historical_team_map_stats_by_window(
     cache_hits = 0
     cache_misses = 0
     for cache_key, item in required.items():
-        stored = get_historical_team_map_stats(item["key"], item["start_date"], item["end_date"])
-        if stored:
+        stored_json = stored_by_window.get((str(item["key"]), str(item["start_date"]), str(item["end_date"])))
+        if stored_json is not None:
             cache_hits += 1
-            out[cache_key] = _parse_team_map_stats(stored.get("maps_json"))
+            out[cache_key] = _parse_team_map_stats(stored_json)
             continue
         cache_misses += 1
         if not fetch_missing:
@@ -2142,6 +2155,404 @@ def resume_historical_map_stats_job(job_id: str):
     return _historical_job_response(_get_historical_job_for_response(job_id))
 
 
+# --- Veto/match-detail backfill as a pausable/cancelable background job -------
+# Re-fetches stored match pages to fill veto_json (and player stats / maps when
+# missing) for rows imported before those columns were captured. A fetched page
+# without a veto box stores '[]' so it is never refetched.
+
+VETO_BACKFILL_JOBS: Dict[str, Dict[str, Any]] = {}
+VETO_BACKFILL_WORKERS: Dict[str, threading.Thread] = {}
+VETO_BACKFILL_JOBS_LOCK = threading.Lock()
+
+
+def ensure_veto_backfill_job_schema() -> None:
+    conn = event_db_connect()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS veto_backfill_jobs (
+                job_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                error TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                progress REAL NOT NULL DEFAULT 0,
+                processed_items INTEGER NOT NULL DEFAULT 0,
+                total_items INTEGER NOT NULL DEFAULT 0,
+                ok INTEGER NOT NULL DEFAULT 0,
+                failed INTEGER NOT NULL DEFAULT 0,
+                current_item TEXT NOT NULL DEFAULT '',
+                pause_requested INTEGER NOT NULL DEFAULT 0,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                started_at REAL,
+                finished_at REAL
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _veto_job_from_row(row) -> Dict[str, Any]:
+    job = dict(row)
+    job["pause_requested"] = bool(job.get("pause_requested"))
+    job["cancel_requested"] = bool(job.get("cancel_requested"))
+    return job
+
+
+def _get_stored_veto_job(job_id: str) -> Dict[str, Any] | None:
+    conn = event_db_connect()
+    try:
+        row = conn.execute("SELECT * FROM veto_backfill_jobs WHERE job_id = ?", (job_id,)).fetchone()
+        return _veto_job_from_row(row) if row else None
+    finally:
+        conn.close()
+
+
+def _save_veto_job(job: Dict[str, Any]) -> None:
+    now = time.time()
+    job["updated_at"] = now
+    conn = event_db_connect()
+    try:
+        conn.execute(
+            """
+            INSERT INTO veto_backfill_jobs (
+                job_id, status, error, last_error, progress, processed_items, total_items,
+                ok, failed, current_item, pause_requested, cancel_requested,
+                created_at, updated_at, started_at, finished_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                status = excluded.status,
+                error = excluded.error,
+                last_error = excluded.last_error,
+                progress = excluded.progress,
+                processed_items = excluded.processed_items,
+                total_items = excluded.total_items,
+                ok = excluded.ok,
+                failed = excluded.failed,
+                current_item = excluded.current_item,
+                pause_requested = excluded.pause_requested,
+                cancel_requested = excluded.cancel_requested,
+                updated_at = excluded.updated_at,
+                started_at = COALESCE(excluded.started_at, veto_backfill_jobs.started_at),
+                finished_at = excluded.finished_at
+            """,
+            (
+                str(job["job_id"]),
+                str(job.get("status") or "queued"),
+                str(job.get("error") or ""),
+                str(job.get("last_error") or ""),
+                float(job.get("progress") or 0.0),
+                int(job.get("processed_items") or 0),
+                int(job.get("total_items") or 0),
+                int(job.get("ok") or 0),
+                int(job.get("failed") or 0),
+                str(job.get("current_item") or ""),
+                1 if job.get("pause_requested") else 0,
+                1 if job.get("cancel_requested") else 0,
+                float(job.get("created_at") or now),
+                now,
+                job.get("started_at"),
+                job.get("finished_at"),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _publish_veto_job(job: Dict[str, Any]) -> None:
+    with VETO_BACKFILL_JOBS_LOCK:
+        VETO_BACKFILL_JOBS[str(job["job_id"])] = dict(job)
+    _save_veto_job(job)
+
+
+def _veto_worker_is_active(job_id: str) -> bool:
+    with VETO_BACKFILL_JOBS_LOCK:
+        worker = VETO_BACKFILL_WORKERS.get(job_id)
+        return bool(worker and worker.is_alive())
+
+
+def _veto_job_response(job: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "job_id": str(job["job_id"]),
+        "status": job.get("status", "queued"),
+        "error": job.get("error", ""),
+        "last_error": job.get("last_error", ""),
+        "progress": job.get("progress", 0.0),
+        "processed_items": job.get("processed_items", 0),
+        "total_items": job.get("total_items", 0),
+        "ok": job.get("ok", 0),
+        "failed": job.get("failed", 0),
+        "current_item": job.get("current_item", ""),
+        "pause_requested": bool(job.get("pause_requested")),
+        "cancel_requested": bool(job.get("cancel_requested")),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+    }
+
+
+def _get_veto_job_for_response(job_id: str) -> Dict[str, Any]:
+    with VETO_BACKFILL_JOBS_LOCK:
+        cached = VETO_BACKFILL_JOBS.get(job_id)
+        job = dict(cached) if cached else None
+    if not job:
+        job = _get_stored_veto_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job_id not found")
+    if job.get("status") in {"queued", "running", "pausing", "canceling"} and not _veto_worker_is_active(job_id):
+        job["status"] = "canceled" if job.get("cancel_requested") else "paused"
+        job["last_error"] = job.get("last_error") or "Job was interrupted before completion. Resume to continue."
+        job["error"] = ""
+        job["pause_requested"] = False
+        job["cancel_requested"] = False
+        _publish_veto_job(job)
+    return job
+
+
+def _veto_missing_items() -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    rows = list_hltv_results(limit=max(1, count_hltv_results()), offset=0)
+    missing: List[Dict[str, Any]] = []
+    with_veto = 0
+    for r in rows:
+        url = str(r.get("match_url") or "").strip()
+        if not url:
+            continue
+        if r.get("veto_json"):
+            with_veto += 1
+            continue
+        missing.append(
+            {
+                "match_url": url,
+                "match_date": str(r.get("match_date") or ""),
+                "label": f"{r.get('team1')} vs {r.get('team2')} ({r.get('match_date')})",
+                "has_maps": bool(r.get("maps_json")),
+                "has_player_stats": bool(r.get("player_stats_json")),
+            }
+        )
+    missing.sort(key=lambda it: it["match_date"], reverse=True)
+    coverage = {
+        "total_matches": len(rows),
+        "with_veto": with_veto,
+        "missing_veto": len(missing),
+    }
+    return missing, coverage
+
+
+def _run_veto_backfill_job(job_id: str) -> None:
+    job = _get_stored_veto_job(job_id)
+    if not job:
+        return
+
+    def stop_requested() -> str:
+        with VETO_BACKFILL_JOBS_LOCK:
+            live = VETO_BACKFILL_JOBS.get(job_id) or {}
+        if live.get("cancel_requested"):
+            return "canceled"
+        if live.get("pause_requested"):
+            return "paused"
+        return ""
+
+    job["status"] = "running"
+    job["pause_requested"] = False
+    job["cancel_requested"] = False
+    job["error"] = ""
+    if job.get("last_error") in _INTERRUPTION_BOILERPLATE:
+        job["last_error"] = ""
+    job["started_at"] = job.get("started_at") or time.time()
+    job["finished_at"] = None
+    job["current_item"] = "Scanning stored matches for missing vetoes"
+    _publish_veto_job(job)
+
+    try:
+        # Recomputed fresh on every (re)start; rows with veto_json (including
+        # stored '[]' for pages without a veto box) are skipped automatically.
+        missing, _coverage = _veto_missing_items()
+        total = len(missing)
+        processed = 0
+        ok = int(job.get("ok") or 0)
+        failed = int(job.get("failed") or 0)
+        job["total_items"] = total
+        job["processed_items"] = 0
+        job["progress"] = 0.0 if total else 1.0
+        _publish_veto_job(job)
+
+        for item in missing:
+            stopped = stop_requested()
+            if stopped:
+                job["status"] = stopped
+                job["pause_requested"] = False
+                job["cancel_requested"] = False
+                job["last_error"] = "Canceled" if stopped == "canceled" else "Paused"
+                job["finished_at"] = time.time()
+                _publish_veto_job(job)
+                return
+            job["current_item"] = item["label"]
+            try:
+                md = get_hltv_match_details(item["match_url"])
+                veto = md.get("veto") or []
+                player_stats = md.get("player_stats") or []
+                maps = md.get("maps") or []
+                update_hltv_result_details(
+                    item["match_url"],
+                    veto_json=json.dumps(veto),
+                    player_stats_json=json.dumps(player_stats) if player_stats and not item["has_player_stats"] else None,
+                    maps_json=json.dumps(maps) if maps and not item["has_maps"] else None,
+                )
+                ok += 1
+            except Exception as exc:
+                failed += 1
+                job["last_error"] = f"{item['label']}: {exc}"
+            processed += 1
+            job["processed_items"] = processed
+            job["ok"] = ok
+            job["failed"] = failed
+            job["progress"] = processed / float(total) if total else 1.0
+            # Merge live pause/cancel requests before publishing, so this
+            # snapshot does not erase a request made while we were fetching.
+            with VETO_BACKFILL_JOBS_LOCK:
+                live = VETO_BACKFILL_JOBS.get(job_id) or {}
+            job["pause_requested"] = bool(live.get("pause_requested"))
+            job["cancel_requested"] = bool(live.get("cancel_requested"))
+            if job["cancel_requested"]:
+                job["status"] = "canceling"
+            elif job["pause_requested"]:
+                job["status"] = "pausing"
+            else:
+                job["status"] = "running"
+            _publish_veto_job(job)
+
+        job["status"] = "completed"
+        job["current_item"] = ""
+        job["finished_at"] = time.time()
+        _publish_veto_job(job)
+    except Exception as exc:
+        job["status"] = "failed"
+        job["error"] = str(exc)
+        job["finished_at"] = time.time()
+        _publish_veto_job(job)
+    finally:
+        with VETO_BACKFILL_JOBS_LOCK:
+            VETO_BACKFILL_WORKERS.pop(job_id, None)
+
+
+def _start_veto_backfill_worker(job_id: str) -> None:
+    with VETO_BACKFILL_JOBS_LOCK:
+        worker = VETO_BACKFILL_WORKERS.get(job_id)
+        if worker and worker.is_alive():
+            return
+        worker = threading.Thread(target=_run_veto_backfill_job, args=(job_id,), daemon=True)
+        VETO_BACKFILL_WORKERS[job_id] = worker
+        worker.start()
+
+
+def _get_latest_veto_job() -> Dict[str, Any] | None:
+    conn = event_db_connect()
+    try:
+        row = conn.execute("SELECT job_id FROM veto_backfill_jobs ORDER BY updated_at DESC LIMIT 1").fetchone()
+    finally:
+        conn.close()
+    return _get_veto_job_for_response(str(row["job_id"])) if row else None
+
+
+@router.get("/hltv-results/veto-backfill/coverage")
+def get_veto_backfill_coverage():
+    _missing, coverage = _veto_missing_items()
+    return {"status": "ok", **coverage}
+
+
+@router.post("/hltv-results/veto-backfill/start")
+def start_veto_backfill_job():
+    latest = _get_latest_veto_job()
+    if latest and latest.get("status") in {"queued", "running", "pausing", "canceling"}:
+        return {"job_id": latest["job_id"], "status": latest.get("status"), "reused": True}
+    now = time.time()
+    job_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "error": "",
+        "last_error": "",
+        "progress": 0.0,
+        "processed_items": 0,
+        "total_items": 0,
+        "ok": 0,
+        "failed": 0,
+        "current_item": "",
+        "pause_requested": False,
+        "cancel_requested": False,
+        "created_at": now,
+        "updated_at": now,
+        "started_at": None,
+        "finished_at": None,
+    }
+    _publish_veto_job(job)
+    _start_veto_backfill_worker(job_id)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@router.get("/hltv-results/veto-backfill/latest")
+def get_latest_veto_backfill_job():
+    job = _get_latest_veto_job()
+    if not job:
+        return {"exists": False}
+    return {"exists": True, **_veto_job_response(job)}
+
+
+@router.get("/hltv-results/veto-backfill/job/{job_id}")
+def get_veto_backfill_job(job_id: str):
+    return _veto_job_response(_get_veto_job_for_response(job_id))
+
+
+@router.post("/hltv-results/veto-backfill/job/{job_id}/pause")
+def pause_veto_backfill_job(job_id: str):
+    job = _get_veto_job_for_response(job_id)
+    if job.get("status") in {"completed", "canceled", "failed", "paused"}:
+        return _veto_job_response(job)
+    job["pause_requested"] = True
+    job["status"] = "pausing" if _veto_worker_is_active(job_id) else "paused"
+    _publish_veto_job(job)
+    return _veto_job_response(job)
+
+
+@router.post("/hltv-results/veto-backfill/job/{job_id}/cancel")
+def cancel_veto_backfill_job(job_id: str):
+    job = _get_veto_job_for_response(job_id)
+    if job.get("status") in {"completed", "canceled", "failed"}:
+        return _veto_job_response(job)
+    job["cancel_requested"] = True
+    job["status"] = "canceling" if _veto_worker_is_active(job_id) else "canceled"
+    if job["status"] == "canceled":
+        job["cancel_requested"] = False
+        job["finished_at"] = time.time()
+    _publish_veto_job(job)
+    return _veto_job_response(job)
+
+
+@router.post("/hltv-results/veto-backfill/job/{job_id}/resume")
+def resume_veto_backfill_job(job_id: str):
+    job = _get_veto_job_for_response(job_id)
+    if job.get("status") in {"completed", "canceled"}:
+        return _veto_job_response(job)
+    if job.get("status") == "running" and _veto_worker_is_active(job_id):
+        return _veto_job_response(job)
+    job["status"] = "queued"
+    job["pause_requested"] = False
+    job["cancel_requested"] = False
+    job["error"] = ""
+    if job.get("last_error") in _INTERRUPTION_BOILERPLATE:
+        job["last_error"] = ""
+    job["finished_at"] = None
+    _publish_veto_job(job)
+    _start_veto_backfill_worker(job_id)
+    return _veto_job_response(_get_veto_job_for_response(job_id))
+
+
 def _map_stat_features(
     team_a_stats: Dict[str, Dict[str, float]] | None,
     team_b_stats: Dict[str, Dict[str, float]] | None,
@@ -2222,12 +2633,99 @@ def _series_probability_from_map_probability(p_map: float, best_of: int) -> floa
     return min(0.999, max(0.001, total))
 
 
+_ELO_START = 1500.0
+_ELO_K_MAP = 32.0
+_ELO_K_OVERALL = 20.0
+
+
+def _build_prematch_elo_by_match(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Pre-match overall and per-map Elo for each stored match, keyed by match_url.
+
+    Matches are replayed chronologically, so every entry reflects only earlier
+    results (no label leakage). A team's first appearance on a map inherits its
+    overall Elo as the prior, which keeps cold-start gaps sane.
+    """
+    overall: Dict[str, float] = {}
+    per_map: Dict[tuple, float] = {}
+    out: Dict[str, Dict[str, Any]] = {}
+
+    def _expected(e_a: float, e_b: float) -> float:
+        return 1.0 / (1.0 + 10.0 ** ((e_b - e_a) / 400.0))
+
+    ordered = sorted(rows, key=lambda r: (str(r.get("match_date") or ""), str(r.get("match_id") or r.get("match_url") or "")))
+    for r in ordered:
+        url = str(r.get("match_url") or "").strip()
+        k1 = _norm_team_name(str(r.get("team1") or ""))
+        k2 = _norm_team_name(str(r.get("team2") or ""))
+        if not url or not k1 or not k2:
+            continue
+        o1 = overall.get(k1, _ELO_START)
+        o2 = overall.get(k2, _ELO_START)
+        snapshot: Dict[str, Any] = {"overall": (o1, o2), "maps": {}}
+        played = []
+        for m in _parse_stored_maps(r.get("maps_json")):
+            map_name = _canonical_map_name(m.get("map"))
+            if map_name not in MAP_POOL:
+                continue
+            try:
+                s1 = int(m["score1"])
+                s2 = int(m["score2"])
+            except Exception:
+                continue
+            if s1 == s2:
+                continue
+            e1 = per_map.get((k1, map_name), o1)
+            e2 = per_map.get((k2, map_name), o2)
+            snapshot["maps"][map_name] = (e1, e2)
+            played.append((map_name, e1, e2, 1.0 if s1 > s2 else 0.0))
+        out[url] = snapshot
+        # Update ratings only after the whole match is snapshotted.
+        for map_name, e1, e2, result in played:
+            exp_map = _expected(e1, e2)
+            per_map[(k1, map_name)] = e1 + _ELO_K_MAP * (result - exp_map)
+            per_map[(k2, map_name)] = e2 + _ELO_K_MAP * ((1.0 - result) - (1.0 - exp_map))
+            c1 = overall.get(k1, _ELO_START)
+            c2 = overall.get(k2, _ELO_START)
+            exp_overall = _expected(c1, c2)
+            overall[k1] = c1 + _ELO_K_OVERALL * (result - exp_overall)
+            overall[k2] = c2 + _ELO_K_OVERALL * ((1.0 - result) - (1.0 - exp_overall))
+    return out
+
+
+def _map_pickers_from_veto(veto_json: Any, team1: str, team2: str) -> Dict[str, float]:
+    """{canonical map: +1 team1 picked, -1 team2 picked, 0 decider/unknown}."""
+    try:
+        steps = json.loads(veto_json) if veto_json else []
+    except Exception:
+        return {}
+    k1 = _norm_team_name(team1)
+    k2 = _norm_team_name(team2)
+    out: Dict[str, float] = {}
+    for step in steps or []:
+        action = str((step or {}).get("action") or "").lower()
+        map_name = _canonical_map_name((step or {}).get("map"))
+        if not map_name:
+            continue
+        if action in ("picked", "pick"):
+            team_key = _norm_team_name(str(step.get("team") or ""))
+            if not team_key:
+                continue
+            if team_key == k1 or team_key in k1 or k1 in team_key:
+                out[map_name] = 1.0
+            elif team_key == k2 or team_key in k2 or k2 in team_key:
+                out[map_name] = -1.0
+        elif action == "leftover":
+            out.setdefault(map_name, 0.0)
+    return out
+
+
 def _iter_ranked_map_samples(
     rows: List[Dict[str, Any]],
     team_map_stats_by_key: Dict[str, Dict[str, Dict[str, float]]] | None = None,
     *,
     historical_map_stats_by_window: Dict[tuple[str, str, str], Dict[str, Dict[str, float]]] | None = None,
     require_map_stats: bool = False,
+    prematch_elo_by_match: Dict[str, Dict[str, Any]] | None = None,
 ) -> List[Dict[str, Any]]:
     samples: List[Dict[str, Any]] = []
     for r in rows:
@@ -2250,6 +2748,10 @@ def _iter_ranked_map_samples(
         else:
             team1_stats = (team_map_stats_by_key or {}).get(k1)
             team2_stats = (team_map_stats_by_key or {}).get(k2)
+        pickers = _map_pickers_from_veto(r.get("veto_json"), t1, t2)
+        elo_entry = (prematch_elo_by_match or {}).get(str(r.get("match_url") or "").strip())
+        series_score1 = _to_float_or_none(r.get("score1"))
+        series_score2 = _to_float_or_none(r.get("score2"))
         for m in maps:
             map_name = _canonical_map_name(m.get("map"))
             if map_name not in MAP_POOL:
@@ -2270,6 +2772,13 @@ def _iter_ranked_map_samples(
             )
             if require_map_stats and float(map_stat_features.get("map_stats_available") or 0.0) <= 0.0:
                 continue
+            elo_gap = 0.0
+            map_elo_gap = 0.0
+            if elo_entry:
+                overall = elo_entry.get("overall") or (0.0, 0.0)
+                elo_gap = float(overall[0]) - float(overall[1])
+                map_pair = (elo_entry.get("maps") or {}).get(map_name)
+                map_elo_gap = float(map_pair[0]) - float(map_pair[1]) if map_pair else elo_gap
             samples.append(
                 {
                     "match_url": r.get("match_url"),
@@ -2302,6 +2811,11 @@ def _iter_ranked_map_samples(
                     "ban_gap": float(map_stat_features.get("ban_gap") or 0.0),
                     "played_pct_gap": float(map_stat_features.get("played_pct_gap") or 0.0),
                     "map_stats_available": float(map_stat_features.get("map_stats_available") or 0.0),
+                    "elo_gap": elo_gap,
+                    "map_elo_gap": map_elo_gap,
+                    "picked_by_a": float(pickers.get(map_name, 0.0)),
+                    "series_score1": int(series_score1) if series_score1 is not None else None,
+                    "series_score2": int(series_score2) if series_score2 is not None else None,
                 }
             )
     return samples
@@ -2323,6 +2837,9 @@ def _fit_map_model_set(samples: List[Dict[str, Any]], include_map_stats: bool = 
             "ban_gap": float(sample.get("ban_gap") or 0.0),
             "played_pct_gap": float(sample.get("played_pct_gap") or 0.0),
             "map_stats_available": float(sample.get("map_stats_available") or 0.0),
+            "elo_gap": float(sample.get("elo_gap") or 0.0),
+            "map_elo_gap": float(sample.get("map_elo_gap") or 0.0),
+            "picked_by_a": float(sample.get("picked_by_a") or 0.0),
             "round_share": float(sample["round_share"]),
             "weight": float(sample["weight"]),
         }
@@ -2338,6 +2855,9 @@ def _fit_map_model_set(samples: List[Dict[str, Any]], include_map_stats: bool = 
             "ban_gap": -float(sample.get("ban_gap") or 0.0),
             "played_pct_gap": -float(sample.get("played_pct_gap") or 0.0),
             "map_stats_available": float(sample.get("map_stats_available") or 0.0),
+            "elo_gap": -float(sample.get("elo_gap") or 0.0),
+            "map_elo_gap": -float(sample.get("map_elo_gap") or 0.0),
+            "picked_by_a": -float(sample.get("picked_by_a") or 0.0),
             "round_share": 1.0 - float(sample["round_share"]),
             "weight": float(sample["weight"]),
         }
@@ -2539,11 +3059,243 @@ def _build_rank_effect_curve(model: Dict[str, Any], samples: List[Dict[str, Any]
     }
 
 
+def _iter_series_contexts(
+    rows: List[Dict[str, Any]],
+    historical_map_stats_by_window: Dict[tuple[str, str, str], Dict[str, Dict[str, float]]] | None = None,
+    prematch_elo_by_match: Dict[str, Dict[str, Any]] | None = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Per-match pre-match feature bundles covering the WHOLE map pool.
+
+    Unlike map samples (played maps only), these let the evaluator predict a
+    win probability for every candidate map and simulate the veto.
+    """
+    contexts: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        url = str(r.get("match_url") or "").strip()
+        t1 = str(r.get("team1") or "").strip()
+        t2 = str(r.get("team2") or "").strip()
+        h1 = _to_float_or_none(r.get("hltv_rank_1"))
+        h2 = _to_float_or_none(r.get("hltv_rank_2"))
+        v1 = _to_float_or_none(r.get("vrs_rank_1"))
+        v2 = _to_float_or_none(r.get("vrs_rank_2"))
+        if not url or not t1 or not t2 or h1 is None or h2 is None or v1 is None or v2 is None:
+            continue
+        k1 = _norm_team_name(t1)
+        k2 = _norm_team_name(t2)
+        window = _historical_map_stats_window(r.get("match_date")) if historical_map_stats_by_window is not None else None
+        if window:
+            start_date, end_date = window
+            team1_stats = (historical_map_stats_by_window or {}).get((k1, start_date, end_date))
+            team2_stats = (historical_map_stats_by_window or {}).get((k2, start_date, end_date))
+        else:
+            team1_stats = None
+            team2_stats = None
+        elo_entry = (prematch_elo_by_match or {}).get(url)
+        elo_gap = 0.0
+        if elo_entry:
+            overall = elo_entry.get("overall") or (0.0, 0.0)
+            elo_gap = float(overall[0]) - float(overall[1])
+        shared = {
+            "hltv_gap": float(h2 - h1),
+            "hltv_level": float((h1 + h2) / 2.0),
+            "hltv_gap_level": float((h2 - h1) * ((h1 + h2) / 2.0)),
+            "vrs_gap": float(v2 - v1),
+            "vrs_level": float((v1 + v2) / 2.0),
+            "vrs_gap_level": float((v2 - v1) * ((v1 + v2) / 2.0)),
+            "elo_gap": elo_gap,
+        }
+        per_map: Dict[str, Dict[str, float]] = {}
+        for map_name in MAP_POOL:
+            features = _map_stat_features(team1_stats, team2_stats, map_name)
+            map_elo_gap = elo_gap
+            if elo_entry:
+                map_pair = (elo_entry.get("maps") or {}).get(map_name)
+                if map_pair:
+                    map_elo_gap = float(map_pair[0]) - float(map_pair[1])
+            per_map[map_name] = {
+                "map_win_gap": float(features.get("map_win_gap") or 0.0),
+                "pick_gap": float(features.get("pick_gap") or 0.0),
+                "ban_gap": float(features.get("ban_gap") or 0.0),
+                "played_pct_gap": float(features.get("played_pct_gap") or 0.0),
+                "map_stats_available": float(features.get("map_stats_available") or 0.0),
+                "map_elo_gap": map_elo_gap,
+            }
+        series_score1 = _to_float_or_none(r.get("score1"))
+        series_score2 = _to_float_or_none(r.get("score2"))
+        played_maps = []
+        for m in _parse_stored_maps(r.get("maps_json")):
+            map_name = _canonical_map_name(m.get("map"))
+            if map_name in MAP_POOL:
+                played_maps.append(map_name)
+        contexts[url] = {
+            "match_url": url,
+            "shared": shared,
+            "per_map": per_map,
+            "series_score1": int(series_score1) if series_score1 is not None else None,
+            "series_score2": int(series_score2) if series_score2 is not None else None,
+            "played_maps": played_maps,
+        }
+    return contexts
+
+
+def _simulate_veto(p_by_map: Dict[str, float], wins_needed: int) -> List[tuple[str, float]]:
+    """Predict the veto outcome: [(map, picked_by_a)] for the maps to be played.
+
+    Teams act on the same zero-sum map probabilities the model produces: a team
+    bans the opponent's best map (its own worst) and picks its own best.
+    Sequences follow the standard HLTV format for BO1/BO3/BO5.
+    """
+    pool = sorted(p_by_map, key=lambda m: p_by_map[m])  # ascending team-A strength
+    if not pool:
+        return []
+    remaining = list(pool)
+
+    def ban_worst_for_a() -> None:
+        if remaining:
+            remaining.pop(0)
+
+    def ban_best_for_a() -> None:
+        if remaining:
+            remaining.pop(-1)
+
+    def pick_best_for_a() -> str:
+        return remaining.pop(-1) if remaining else ""
+
+    def pick_worst_for_a() -> str:
+        return remaining.pop(0) if remaining else ""
+
+    picked: List[tuple[str, float]] = []
+    wins_needed = max(1, int(wins_needed))
+    if wins_needed == 1:
+        # BO1: alternating bans until one map is left.
+        turn_a = True
+        while len(remaining) > 1:
+            if turn_a:
+                ban_worst_for_a()
+            else:
+                ban_best_for_a()
+            turn_a = not turn_a
+        if remaining:
+            picked.append((remaining[0], 0.0))
+        return picked
+    if wins_needed >= 3:
+        # BO5: ban, ban, then alternating picks, leftover decider.
+        ban_worst_for_a()
+        ban_best_for_a()
+        for i in range(4):
+            if i % 2 == 0:
+                m = pick_best_for_a()
+                if m:
+                    picked.append((m, 1.0))
+            else:
+                m = pick_worst_for_a()
+                if m:
+                    picked.append((m, -1.0))
+        if remaining:
+            picked.append((remaining[len(remaining) // 2], 0.0))
+        return picked
+    # BO3: ban, ban, pick, pick, ban, ban, decider.
+    ban_worst_for_a()
+    ban_best_for_a()
+    m = pick_best_for_a()
+    if m:
+        picked.append((m, 1.0))
+    m = pick_worst_for_a()
+    if m:
+        picked.append((m, -1.0))
+    ban_worst_for_a()
+    ban_best_for_a()
+    if remaining:
+        picked.append((remaining[0], 0.0))
+    return picked
+
+
+def _series_win_probability(map_probs: List[float], wins_needed: int) -> float:
+    """P(team A wins the series) given independent per-map win probabilities."""
+    wins_needed = max(1, int(wins_needed))
+    dist = [1.0]
+    for p in map_probs:
+        p = min(1.0, max(0.0, float(p)))
+        nxt = [0.0] * (len(dist) + 1)
+        for wins, prob in enumerate(dist):
+            nxt[wins + 1] += prob * p
+            nxt[wins] += prob * (1.0 - p)
+        dist = nxt
+    return float(sum(prob for wins, prob in enumerate(dist) if wins >= wins_needed))
+
+
+def _best_of_series_win_probability(p_map: float, wins_needed: int) -> float:
+    """P(team wins a best-of-(2n-1) series) assuming per-map win probability p_map."""
+    wins_needed = max(1, int(wins_needed))
+    total_maps = 2 * wins_needed - 1
+    p = min(1.0, max(0.0, float(p_map)))
+    return float(
+        sum(math.comb(total_maps, k) * p**k * (1.0 - p) ** (total_maps - k) for k in range(wins_needed, total_maps + 1))
+    )
+
+
+def _veto_sim_series_metrics(
+    models: Dict[str, Dict[str, Any]],
+    series_contexts: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """True pre-match series prediction: simulate the veto with model-implied
+    per-map probabilities, then combine each predicted map's probability."""
+    n = 0
+    correct = 0
+    brier_sum = 0.0
+    map_match_sum = 0.0
+    map_match_n = 0
+    for ctx in series_contexts.values():
+        s1 = ctx.get("series_score1")
+        s2 = ctx.get("series_score2")
+        if s1 is None or s2 is None or int(s1) == int(s2):
+            continue
+        wins_needed = max(int(s1), int(s2))
+        shared = ctx.get("shared") or {}
+        per_map = ctx.get("per_map") or {}
+        neutral_p: Dict[str, float] = {}
+        for map_name, map_features in per_map.items():
+            model = models.get(map_name) or models["__global__"]
+            values = {**shared, **map_features, "picked_by_a": 0.0}
+            neutral_p[map_name] = _round_win_to_map_win_probability(
+                _predict_from_round_share_features(model, values)
+            )
+        if not neutral_p:
+            continue
+        predicted_veto = _simulate_veto(neutral_p, wins_needed)
+        if not predicted_veto:
+            continue
+        map_probs = []
+        for map_name, picked_by_a in predicted_veto:
+            model = models.get(map_name) or models["__global__"]
+            values = {**shared, **(per_map.get(map_name) or {}), "picked_by_a": float(picked_by_a)}
+            map_probs.append(
+                _round_win_to_map_win_probability(_predict_from_round_share_features(model, values))
+            )
+        p_series = _series_win_probability(map_probs, wins_needed)
+        actual = 1.0 if int(s1) > int(s2) else 0.0
+        n += 1
+        correct += 1 if (1.0 if p_series >= 0.5 else 0.0) == actual else 0
+        brier_sum += (p_series - actual) ** 2
+        played = ctx.get("played_maps") or []
+        if played:
+            predicted_names = {map_name for map_name, _flag in predicted_veto}
+            map_match_sum += len(predicted_names.intersection(played)) / float(len(set(played)))
+            map_match_n += 1
+    return {
+        "n": n,
+        "winner_accuracy": (correct / n) if n else None,
+        "brier": (brier_sum / n) if n else None,
+        "map_match_rate": (map_match_sum / map_match_n) if map_match_n else None,
+    }
+
+
 def _evaluate_map_model_set(
     models: Dict[str, Dict[str, Any]],
     test_samples: List[Dict[str, Any]],
     *,
     include_rows: bool = False,
+    series_contexts: Dict[str, Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     eval_rows = []
     abs_score_error = 0.0
@@ -2551,6 +3303,7 @@ def _evaluate_map_model_set(
     winner_correct = 0
     brier_sum = 0.0
     by_map: Dict[str, Dict[str, Any]] = {}
+    series_groups: Dict[str, Dict[str, Any]] = {}
     for sample in test_samples:
         map_name = str(sample["map"])
         model = models.get(map_name) or models["__global__"]
@@ -2568,6 +3321,13 @@ def _evaluate_map_model_set(
         abs_round_share_error += round_share_error
         winner_correct += 1 if pred_outcome == actual_outcome else 0
         brier_sum += (p_map - actual_map_target) ** 2
+        series_url = str(sample.get("match_url") or "")
+        if series_url:
+            group = series_groups.setdefault(
+                series_url,
+                {"probs": [], "series_score1": sample.get("series_score1"), "series_score2": sample.get("series_score2")},
+            )
+            group["probs"].append(p_map)
         bucket = by_map.setdefault(
             map_name,
             {"map": map_name, "n": 0, "score_error": 0.0, "winner_correct": 0},
@@ -2596,6 +3356,27 @@ def _evaluate_map_model_set(
                 }
             )
 
+    # Series-level (BO1/BO3/BO5) evaluation: maps of the same match are grouped;
+    # the average predicted map-win probability feeds a best-of-N formula, with
+    # N inferred from the winner's map count in the stored match score.
+    series_n = 0
+    series_correct = 0
+    series_brier_sum = 0.0
+    for group in series_groups.values():
+        s1 = group.get("series_score1")
+        s2 = group.get("series_score2")
+        probs = group.get("probs") or []
+        if s1 is None or s2 is None or int(s1) == int(s2) or not probs:
+            continue
+        wins_needed = max(int(s1), int(s2))
+        p_map_avg = sum(probs) / len(probs)
+        p_series = _best_of_series_win_probability(p_map_avg, wins_needed)
+        actual = 1.0 if int(s1) > int(s2) else 0.0
+        predicted_winner = 1.0 if p_series >= 0.5 else 0.0
+        series_n += 1
+        series_correct += 1 if predicted_winner == actual else 0
+        series_brier_sum += (p_series - actual) ** 2
+
     n = max(1, len(test_samples))
     map_metrics = []
     for row in by_map.values():
@@ -2619,6 +3400,10 @@ def _evaluate_map_model_set(
             "round_share_mae": abs_round_share_error / n,
             "winner_accuracy": winner_correct / n,
             "brier": brier_sum / n,
+            "n_series": series_n,
+            "series_winner_accuracy": (series_correct / series_n) if series_n else None,
+            "series_brier": (series_brier_sum / series_n) if series_n else None,
+            "veto_sim": _veto_sim_series_metrics(models, series_contexts) if series_contexts else None,
         },
         "maps": map_metrics,
         "rows": eval_rows,
@@ -2682,17 +3467,22 @@ def get_map_model_lab(
         [*train_rows, *test_rows],
         fetch_missing=bool(fetch_missing_map_stats),
     )
-    train_candidate_samples = _iter_ranked_map_samples(train_rows)
-    test_candidate_samples = _iter_ranked_map_samples(test_rows)
+    # Elo replays the full stored timeline; each match only sees earlier results.
+    elo_rows = all_rows if random_split else list_hltv_results(limit=db_matches, offset=0)
+    prematch_elo_by_match = _build_prematch_elo_by_match(elo_rows)
+    train_candidate_samples = _iter_ranked_map_samples(train_rows, prematch_elo_by_match=prematch_elo_by_match)
+    test_candidate_samples = _iter_ranked_map_samples(test_rows, prematch_elo_by_match=prematch_elo_by_match)
     train_samples = _iter_ranked_map_samples(
         train_rows,
         historical_map_stats_by_window=historical_map_stats_by_window,
         require_map_stats=True,
+        prematch_elo_by_match=prematch_elo_by_match,
     )
     test_samples = _iter_ranked_map_samples(
         test_rows,
         historical_map_stats_by_window=historical_map_stats_by_window,
         require_map_stats=True,
+        prematch_elo_by_match=prematch_elo_by_match,
     )
     models_with_map_data = _fit_map_model_set(train_samples, include_map_stats=True)
     models_rank_only = _fit_map_model_set(train_samples, include_map_stats=False)
@@ -2702,11 +3492,18 @@ def get_map_model_lab(
             detail="No evaluation maps have historical six-month map stats for both teams. Fetch missing historical map stats, or fix team identity mappings.",
         )
 
-    with_map_data = _evaluate_map_model_set(models_with_map_data, test_samples, include_rows=True)
-    rank_only = _evaluate_map_model_set(models_rank_only, test_samples)
+    test_series_contexts = _iter_series_contexts(
+        test_rows,
+        historical_map_stats_by_window=historical_map_stats_by_window,
+        prematch_elo_by_match=prematch_elo_by_match,
+    )
+    with_map_data = _evaluate_map_model_set(
+        models_with_map_data, test_samples, include_rows=True, series_contexts=test_series_contexts
+    )
+    rank_only = _evaluate_map_model_set(models_rank_only, test_samples, series_contexts=test_series_contexts)
     return {
         "status": "ok",
-        "method": "Trains two round-share logistic formulas on the same historical slice after excluding maps without cached six-month pre-match map stats for both teams. The rank-only baseline uses HLTV/VRS rank gaps, matchup rank level, and gap-by-level interactions. The map-data model also uses directional historical map-stat deltas for Team A minus Team B: win-rate, pick-rate, ban-rate, and map-played share. Both are evaluated on the same covered holdout slice.",
+        "method": "Trains two round-share logistic formulas on the same historical slice after excluding maps without cached six-month pre-match map stats for both teams. The rank-only baseline uses HLTV/VRS rank gaps, matchup rank level, and gap-by-level interactions. The map-data model adds directional Team A minus Team B deltas: six-month map-stat gaps (win/pick/ban/played share), pre-match overall and per-map Elo gaps replayed from the stored match timeline, and who picked the map in the veto (when veto data is stored). Both are evaluated on the same covered holdout slice.",
         "db_matches": db_matches,
         "split": {
             "mode": "random" if random_split else "ordered",

@@ -25,6 +25,7 @@ SCHEMA_INITIALIZERS = (
     teams.ensure_map_stats_import_schema,
     teams.ensure_rankings_refresh_schema,
     events.ensure_historical_stats_job_schema,
+    events.ensure_veto_backfill_job_schema,
 )
 
 ROUTERS = (

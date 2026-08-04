@@ -27,33 +27,55 @@ PLAYOFF_COMPLETED_BRACKET_JOBS = {}
 PLAYOFF_COMPLETED_BRACKET_JOBS_LOCK = threading.Lock()
 
 
-_PLAYOFF_STATE = SingletonState("playoff_simulation_state", result_column="results_json", result_key="results")
-_COMPLETED_BRACKET_STATE = SingletonState("playoff_completed_bracket_state")
-_BEST_TEAM_STATE = SingletonState("playoff_best_team_state")
-# Small summary saved alongside the combos blob so metadata endpoints never
-# have to materialize the (multi-hundred-MB) result_json.
-_BEST_TEAM_META = SingletonState("playoff_best_team_meta")
+# Two independent copies of the playoff pipeline state: the regular playoff
+# bracket and the Bounty Event playoffs share every endpoint, distinguished by
+# a `variant` field ("main"/"bounty") in payloads or query params.
+_STATE_SETS = {
+    "main": {
+        "playoff": SingletonState("playoff_simulation_state", result_column="results_json", result_key="results"),
+        "completed": SingletonState("playoff_completed_bracket_state"),
+        "best": SingletonState("playoff_best_team_state"),
+        # Small summary saved alongside the combos blob so metadata endpoints
+        # never have to materialize the (multi-hundred-MB) result_json.
+        "meta": SingletonState("playoff_best_team_meta"),
+    },
+    "bounty": {
+        "playoff": SingletonState("bounty_playoff_simulation_state", result_column="results_json", result_key="results"),
+        "completed": SingletonState("bounty_completed_bracket_state"),
+        "best": SingletonState("bounty_best_team_state"),
+        "meta": SingletonState("bounty_best_team_meta"),
+    },
+}
+
+
+def _variant(value) -> str:
+    return "bounty" if str(value or "").strip().lower() == "bounty" else "main"
+
+
+def _states(variant) -> dict:
+    return _STATE_SETS[_variant(variant)]
 
 
 def ensure_playoff_schema() -> None:
-    for state in (_PLAYOFF_STATE, _COMPLETED_BRACKET_STATE, _BEST_TEAM_STATE, _BEST_TEAM_META):
-        state.ensure_table()
+    for states in _STATE_SETS.values():
+        for state in states.values():
+            state.ensure_table()
 
 
-def save_latest_playoff(payload: dict, results: dict) -> None:
-    _PLAYOFF_STATE.save(payload, results)
+def save_latest_playoff(payload: dict, results: dict, variant: str = "main") -> None:
+    _states(variant)["playoff"].save(payload, results)
 
 
-def load_latest_playoff() -> dict | None:
-    return _PLAYOFF_STATE.load()
+def load_latest_playoff(variant: str = "main") -> dict | None:
+    return _states(variant)["playoff"].load()
 
 
-def save_latest_completed_bracket(payload: dict, result: dict) -> None:
-    _COMPLETED_BRACKET_STATE.save(payload, result)
+def save_latest_completed_bracket(payload: dict, result: dict, variant: str = "main") -> None:
+    _states(variant)["completed"].save(payload, result)
 
 
-def load_latest_completed_bracket() -> dict | None:
-    return _COMPLETED_BRACKET_STATE.load()
+def load_latest_completed_bracket(variant: str = "main") -> dict | None:
+    return _states(variant)["completed"].load()
 
 
 def _best_team_meta_summary(result: dict) -> dict:
@@ -66,13 +88,13 @@ def _best_team_meta_summary(result: dict) -> dict:
     }
 
 
-def save_latest_playoff_best_team(payload: dict, result: dict) -> None:
-    _BEST_TEAM_STATE.save(payload, result)
-    _BEST_TEAM_META.save(payload, _best_team_meta_summary(result))
+def save_latest_playoff_best_team(payload: dict, result: dict, variant: str = "main") -> None:
+    _states(variant)["best"].save(payload, result)
+    _states(variant)["meta"].save(payload, _best_team_meta_summary(result))
 
 
-def load_latest_playoff_best_team() -> dict | None:
-    return _BEST_TEAM_STATE.load()
+def load_latest_playoff_best_team(variant: str = "main") -> dict | None:
+    return _states(variant)["best"].load()
 
 
 def _saved_combo_metric(team: dict, mode: str) -> float:
@@ -369,6 +391,8 @@ def _exact_weighted_player_totals(
     vrs_ranks: Dict[int, int],
     has_third_place_decider: bool = False,
     progress_callback=None,
+    quarters_override: List[tuple] | None = None,
+    sf_pairs_resolver=None,
 ) -> tuple[Dict[int, Dict], Dict, int, List[Dict]]:
     base_states = initialize_teams(team_slots, vrs_ranks)
     player_rows_by_id, team_rank_by_id = _build_playoff_lookup_context(team_slots)
@@ -379,7 +403,7 @@ def _exact_weighted_player_totals(
     best_bracket = {"quarters": [], "semis": [], "final": []}
     outcomes: List[Dict] = []
 
-    quarters = [
+    quarters = [tuple(pair) for pair in quarters_override] if quarters_override else [
         (team_slots[0], team_slots[1]),
         (team_slots[2], team_slots[3]),
         (team_slots[4], team_slots[5]),
@@ -420,32 +444,37 @@ def _exact_weighted_player_totals(
     def recurse_qf(idx: int, states: Dict[int, TeamState], prob: float, qf_winners: List[int], qf_matches: List[dict]):
         nonlocal total_prob, processed, best_prob, best_bracket
         if idx == 4:
+            if sf_pairs_resolver:
+                (sf1_a, sf1_b), (sf2_a, sf2_b) = sf_pairs_resolver(qf_winners)
+            else:
+                sf1_a, sf1_b = qf_winners[0], qf_winners[1]
+                sf2_a, sf2_b = qf_winners[2], qf_winners[3]
             # Semifinal 1
-            for semi1_winner in (qf_winners[0], qf_winners[1]):
+            for semi1_winner in (sf1_a, sf1_b):
                 s1_states = _clone_team_states(states)
                 s1_winner, s1_loser, s1_p_win_a, s1_branch_p = _play_match_deterministic(
-                    s1_states, qf_winners[0], qf_winners[1], semi1_winner, remaining_rounds_after=1, prob_cache=prob_cache,
+                    s1_states, sf1_a, sf1_b, semi1_winner, remaining_rounds_after=1, prob_cache=prob_cache,
                     player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id
                 )
                 semi1_match = {
                     "winner": s1_winner,
                     "loser": s1_loser,
                     "p_win_a": s1_p_win_a,
-                    "teams": [qf_winners[0], qf_winners[1]],
+                    "teams": [sf1_a, sf1_b],
                 }
 
                 # Semifinal 2
-                for semi2_winner in (qf_winners[2], qf_winners[3]):
+                for semi2_winner in (sf2_a, sf2_b):
                     s2_states = _clone_team_states(s1_states)
                     s2_winner, s2_loser, s2_p_win_a, s2_branch_p = _play_match_deterministic(
-                        s2_states, qf_winners[2], qf_winners[3], semi2_winner, remaining_rounds_after=1, prob_cache=prob_cache,
+                        s2_states, sf2_a, sf2_b, semi2_winner, remaining_rounds_after=1, prob_cache=prob_cache,
                         player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id
                     )
                     semi2_match = {
                         "winner": s2_winner,
                         "loser": s2_loser,
                         "p_win_a": s2_p_win_a,
-                        "teams": [qf_winners[2], qf_winners[3]],
+                        "teams": [sf2_a, sf2_b],
                     }
 
                     # Final (and optional third-place decider)
@@ -619,10 +648,45 @@ def _normalize_playoff_payload(payload: dict) -> dict:
     if len(slots) != 8:
         raise HTTPException(status_code=400, detail="team_slots must contain 8 team IDs")
     has_third_place_decider = bool(payload.get("has_third_place_decider", False))
-    return {
+    normalized = {
         "team_slots": [int(x) for x in slots],
         "has_third_place_decider": has_third_place_decider,
     }
+    if _variant(payload.get("variant")) == "bounty":
+        qf_pairs_raw = payload.get("qf_pairs") or []
+        qf_pairs = [[int(a), int(b)] for a, b in qf_pairs_raw] if len(qf_pairs_raw) == 4 else []
+        used = [tid for pair in qf_pairs for tid in pair]
+        if sorted(used) != sorted(normalized["team_slots"]):
+            raise HTTPException(status_code=400, detail="qf_pairs must pair all 8 teams exactly once (finish the draft first)")
+        normalized["variant"] = "bounty"
+        normalized["qf_pairs"] = qf_pairs
+        normalized["sf_picks"] = dict(payload.get("sf_picks") or {})
+        normalized["has_third_place_decider"] = False
+    return normalized
+
+
+def _bounty_sf_pairs_resolver(team_slots: List[int], sf_picks: dict):
+    """SF pairings for a set of QF winners in the Bounty re-draft format.
+
+    `sf_picks` maps a scenario key (the 4 surviving team ids, sorted ascending,
+    joined with '-') to explicit SF pairs [[a, b], [c, d]]. Scenarios without a
+    stored pick fall back to the default: the highest-seeded bottom-half
+    survivor drafts the weakest (lowest-seeded) top-half survivor.
+    """
+    seed_index = {int(tid): idx for idx, tid in enumerate(team_slots)}
+
+    def resolve(qf_winners: List[int]):
+        winners = [int(t) for t in qf_winners]
+        key = "-".join(str(t) for t in sorted(winners))
+        picked = sf_picks.get(key)
+        if picked and len(picked) == 2:
+            pairs = [[int(a), int(b)] for a, b in picked]
+            if sorted(t for pair in pairs for t in pair) == sorted(winners):
+                return [(pairs[0][0], pairs[0][1]), (pairs[1][0], pairs[1][1])]
+        surv = sorted(winners, key=lambda t: seed_index.get(t, 99))
+        return [(surv[2], surv[1]), (surv[3], surv[0])]
+
+    return resolve
 
 
 def _compute_playoff_result(payload: dict, progress_callback=None) -> dict:
@@ -632,11 +696,19 @@ def _compute_playoff_result(payload: dict, progress_callback=None) -> dict:
     # vrs_ranks not relevant here (use default 999)
     vrs_ranks = {tid: 999 for tid in slots}
 
+    quarters_override = None
+    sf_pairs_resolver = None
+    if _variant(payload.get("variant")) == "bounty":
+        quarters_override = [tuple(pair) for pair in payload.get("qf_pairs") or []]
+        sf_pairs_resolver = _bounty_sf_pairs_resolver(slots, payload.get("sf_picks") or {})
+
     exact_players, best_bracket, outcomes_count, outcomes = _exact_weighted_player_totals(
         slots,
         vrs_ranks,
         has_third_place_decider=has_third_place_decider,
         progress_callback=progress_callback,
+        quarters_override=quarters_override,
+        sf_pairs_resolver=sf_pairs_resolver,
     )
     return {
         "bracket": best_bracket,
@@ -659,7 +731,7 @@ def run_playoff(payload: dict):
     """
     normalized = _normalize_playoff_payload(payload)
     response = _compute_playoff_result(normalized)
-    save_latest_playoff(normalized, response)
+    save_latest_playoff(normalized, response, normalized.get("variant"))
     return response
 
 
@@ -683,7 +755,7 @@ def _run_playoff_job(job_id: str, payload: dict) -> None:
 
     try:
         result = _compute_playoff_result(payload, progress_callback=_update_progress)
-        save_latest_playoff(payload, result)
+        save_latest_playoff(payload, result, payload.get("variant"))
         with PLAYOFF_JOBS_LOCK:
             job = PLAYOFF_JOBS.get(job_id)
             if not job:
@@ -937,11 +1009,11 @@ def _run_playoff_best_team_job(job_id: str, payload: dict | None = None) -> None
         job["updated_at"] = time.time()
 
     try:
-        latest = load_latest_playoff()
+        body = payload or {}
+        latest = load_latest_playoff(body.get("variant"))
         if not latest:
             raise HTTPException(status_code=404, detail="No stored playoff simulation found. Run Playoff Bracket first.")
 
-        body = payload or {}
         options = parse_optimizer_payload(body)
         budget = options["budget"]
         max_per_team = options["max_per_team"]
@@ -968,7 +1040,7 @@ def _run_playoff_best_team_job(job_id: str, payload: dict | None = None) -> None
             if job:
                 job["phase"] = "saving"
                 job["updated_at"] = time.time()
-        save_latest_playoff_best_team(body, result)
+        save_latest_playoff_best_team(body, result, body.get("variant"))
 
         with PLAYOFF_BEST_TEAM_JOBS_LOCK:
             job = PLAYOFF_BEST_TEAM_JOBS.get(job_id)
@@ -1028,11 +1100,10 @@ def best_team_playoff(payload: dict):
 
 @router.post("/best-team/from-latest")
 def best_team_playoff_from_latest(payload: dict | None = None):
-    latest = load_latest_playoff()
+    body = payload or {}
+    latest = load_latest_playoff(body.get("variant"))
     if not latest:
         raise HTTPException(status_code=404, detail="No stored playoff simulation found. Run Playoff Bracket first.")
-
-    body = payload or {}
     options = parse_optimizer_payload(body)
     budget = options["budget"]
     max_per_team = options["max_per_team"]
@@ -1081,7 +1152,7 @@ def _outcome_matches_completed_bracket(outcome: Dict, picks: Dict[str, object]) 
 
 
 def _selected_completed_outcome_from_latest(payload: dict | None = None) -> tuple[dict, dict]:
-    latest = load_latest_playoff()
+    latest = load_latest_playoff((payload or {}).get("variant"))
     if not latest:
         raise HTTPException(status_code=404, detail="No stored playoff simulation found. Run Playoff Bracket first.")
     latest_results = latest.get("results", {}) or {}
@@ -1248,7 +1319,7 @@ def _run_completed_bracket_job(job_id: str, payload: dict | None = None) -> None
 
     try:
         result = _compute_completed_bracket_from_latest(payload or {}, progress_callback=_update_progress)
-        save_latest_completed_bracket(payload or {}, result)
+        save_latest_completed_bracket(payload or {}, result, (payload or {}).get("variant"))
         with PLAYOFF_COMPLETED_BRACKET_JOBS_LOCK:
             job = PLAYOFF_COMPLETED_BRACKET_JOBS.get(job_id)
             if not job:
@@ -1278,19 +1349,21 @@ def _run_completed_bracket_job(job_id: str, payload: dict | None = None) -> None
 @router.post("/best-team/bracket-from-latest")
 def best_team_for_completed_bracket_from_latest(payload: dict | None = None):
     result = _compute_completed_bracket_from_latest(payload or {})
-    save_latest_completed_bracket(payload or {}, result)
+    save_latest_completed_bracket(payload or {}, result, (payload or {}).get("variant"))
     return result
 
 
 @router.post("/best-team/bracket-from-latest/start")
 def start_completed_bracket_from_latest(payload: dict | None = None):
-    latest = load_latest_playoff()
+    body = payload or {}
+    latest = load_latest_playoff(body.get("variant"))
     if not latest:
         raise HTTPException(status_code=404, detail="No stored playoff simulation found. Run Playoff Bracket first.")
 
-    body = payload or {}
     with PLAYOFF_COMPLETED_BRACKET_JOBS_LOCK:
         for existing_id, existing_job in PLAYOFF_COMPLETED_BRACKET_JOBS.items():
+            if _variant((existing_job.get("payload") or {}).get("variant")) != _variant(body.get("variant")):
+                continue
             if existing_job.get("status") in {"queued", "running"}:
                 return {"job_id": existing_id, "reused": True}
 
@@ -1332,8 +1405,8 @@ def get_completed_bracket_job(job_id: str):
 
 
 @router.get("/best-team/bracket-from-latest/latest")
-def get_latest_completed_bracket():
-    latest = load_latest_completed_bracket()
+def get_latest_completed_bracket(variant: str = "main"):
+    latest = load_latest_completed_bracket(variant)
     if not latest:
         return {"exists": False}
     # Rows saved before all_teams was dropped carry every roster; serializing
@@ -1350,13 +1423,15 @@ def get_latest_completed_bracket():
 
 @router.post("/best-team/from-latest/start")
 def start_best_team_playoff_from_latest(payload: dict | None = None):
-    latest = load_latest_playoff()
+    body = payload or {}
+    latest = load_latest_playoff(body.get("variant"))
     if not latest:
         raise HTTPException(status_code=404, detail="No stored playoff simulation found. Run Playoff Bracket first.")
 
-    body = payload or {}
     with PLAYOFF_BEST_TEAM_JOBS_LOCK:
         for existing_id, existing_job in PLAYOFF_BEST_TEAM_JOBS.items():
+            if _variant((existing_job.get("payload") or {}).get("variant")) != _variant(body.get("variant")):
+                continue
             if existing_job.get("status") in {"queued", "running"}:
                 return {"job_id": existing_id, "reused": True}
 
@@ -1398,8 +1473,9 @@ def get_best_team_playoff_job(job_id: str):
 
 
 @router.get("/best-team/from-latest/latest")
-def get_latest_best_team_playoff_from_latest():
-    meta = _BEST_TEAM_META.load()
+def get_latest_best_team_playoff_from_latest(variant: str = "main"):
+    states = _states(variant)
+    meta = states["meta"].load()
     if meta:
         summary = meta["result"] or {}
         return {
@@ -1416,10 +1492,11 @@ def get_latest_best_team_playoff_from_latest():
     # Legacy row saved before the meta table existed. Summarize it with
     # SQLite's JSON functions (C-side parse, no giant Python objects) and
     # persist the summary so this path only ever runs once.
+    best_table = states["best"].table
     conn = _connect()
     try:
         row = conn.execute(
-            "SELECT payload_json, updated_at FROM playoff_best_team_state WHERE singleton_id = 1"
+            f"SELECT payload_json, updated_at FROM {best_table} WHERE singleton_id = 1"
         ).fetchone()
         if not row:
             return {"exists": False}
@@ -1434,13 +1511,13 @@ def get_latest_best_team_playoff_from_latest():
         }
         try:
             extracted = conn.execute(
-                """
+                f"""
                 SELECT json_extract(result_json, '$.mode') AS mode,
                        json_extract(result_json, '$.player_count') AS player_count,
                        json_array_length(result_json, '$.all_teams') AS total_teams,
                        json_extract(result_json, '$.processed_combinations') AS processed_combinations,
                        json_extract(result_json, '$.total_combinations') AS total_combinations
-                FROM playoff_best_team_state WHERE singleton_id = 1
+                FROM {best_table} WHERE singleton_id = 1
                 """
             ).fetchone()
             if extracted:
@@ -1449,7 +1526,7 @@ def get_latest_best_team_playoff_from_latest():
             pass  # blob too large to summarize here; exists/payload still useful
     finally:
         conn.close()
-    _BEST_TEAM_META.save(payload, summary)
+    states["meta"].save(payload, summary)
     return {
         "exists": True,
         "payload": payload,
@@ -1464,10 +1541,10 @@ def get_latest_best_team_playoff_from_latest():
 
 @router.post("/best-team/from-latest/query")
 def query_latest_best_team_playoff(payload: dict | None = None):
-    latest = load_latest_playoff_best_team()
+    body = payload or {}
+    latest = load_latest_playoff_best_team(body.get("variant"))
     if not latest:
         raise HTTPException(status_code=404, detail="No stored team combinations found. Run Combinations first.")
-    body = payload or {}
     options = parse_optimizer_payload(body)
     mode = str(body.get("mode") or "average").strip().lower()
     if mode not in {"average", "single_outcome", "most_outcomes"}:
@@ -1498,10 +1575,10 @@ def query_latest_best_team_playoff(payload: dict | None = None):
 
 @router.post("/best-team/from-latest/completed-query")
 def query_latest_best_team_for_completed_bracket(payload: dict | None = None):
-    latest_combos = load_latest_playoff_best_team()
+    body = payload or {}
+    latest_combos = load_latest_playoff_best_team(body.get("variant"))
     if not latest_combos:
         raise HTTPException(status_code=404, detail="No stored team combinations found. Run Combinations first.")
-    body = payload or {}
     latest_playoff, selected = _selected_completed_outcome_from_latest(body)
     latest_results = latest_playoff.get("results", {}) or {}
     options = parse_optimizer_payload(body)
@@ -1602,8 +1679,8 @@ def query_latest_best_team_for_completed_bracket(payload: dict | None = None):
 
 
 @router.get("/latest")
-def get_latest_playoff():
-    latest = load_latest_playoff()
+def get_latest_playoff(variant: str = "main"):
+    latest = load_latest_playoff(variant)
     if not latest:
         return {"exists": False}
     return {
@@ -1615,16 +1692,15 @@ def get_latest_playoff():
 
 
 @router.delete("/latest")
-def reset_latest_playoff():
+def reset_latest_playoff(variant: str = "main"):
+    states = _states(variant)
     conn = _connect()
     try:
-        conn.execute("DELETE FROM playoff_simulation_state WHERE singleton_id = 1")
-        conn.execute("DELETE FROM playoff_best_team_state WHERE singleton_id = 1")
-        conn.execute("DELETE FROM playoff_best_team_meta WHERE singleton_id = 1")
-        conn.execute("DELETE FROM playoff_completed_bracket_state WHERE singleton_id = 1")
+        for state in states.values():
+            conn.execute(f"DELETE FROM {state.table} WHERE singleton_id = 1")
         conn.commit()
     finally:
         conn.close()
-    for state in (_PLAYOFF_STATE, _BEST_TEAM_STATE, _BEST_TEAM_META, _COMPLETED_BRACKET_STATE):
+    for state in states.values():
         state.invalidate()
     return {"status": "ok"}

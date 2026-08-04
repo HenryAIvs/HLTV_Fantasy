@@ -24,6 +24,10 @@ class SingletonState:
     """
 
     _CACHE_MAX_RAW_BYTES = 100 * 1024 * 1024
+    # Parsing an oversized blob transiently needs several GB; two of them at
+    # once (e.g. the playoff and bounty combo stores) can OOM the process, so
+    # oversized parses are serialized across ALL instances, not just per table.
+    _BIG_PARSE_LOCK = threading.Lock()
 
     def __init__(
         self,
@@ -130,10 +134,17 @@ class SingletonState:
             raw_size = len(payload_text or "") + len(result_text or "")
             updated_at = row["updated_at"] if self.iso_timestamps else float(row["updated_at"])
             del row
-            payload = json.loads(payload_text)
-            del payload_text
-            result = json.loads(result_text)
-            del result_text
+            if raw_size > self._CACHE_MAX_RAW_BYTES:
+                with SingletonState._BIG_PARSE_LOCK:
+                    payload = json.loads(payload_text)
+                    del payload_text
+                    result = json.loads(result_text)
+                    del result_text
+            else:
+                payload = json.loads(payload_text)
+                del payload_text
+                result = json.loads(result_text)
+                del result_text
             value = {
                 "payload": payload,
                 self.result_key: result,

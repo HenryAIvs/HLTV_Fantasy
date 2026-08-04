@@ -234,6 +234,26 @@ def get_historical_team_map_stats(normalized_name: str, start_date: str, end_dat
         conn.close()
 
 
+def get_all_historical_team_map_stats_json() -> Dict[tuple, str]:
+    """All stored windows as {(normalized_name, start_date, end_date): maps_json}.
+
+    One query instead of thousands of per-window lookups when the Model Lab
+    resolves coverage for a large training slice.
+    """
+    ensure_event_schema()
+    conn = connect()
+    try:
+        rows = conn.execute(
+            "SELECT normalized_name, start_date, end_date, maps_json FROM historical_team_map_stats"
+        ).fetchall()
+        return {
+            (str(row["normalized_name"]), str(row["start_date"]), str(row["end_date"])): row["maps_json"]
+            for row in rows
+        }
+    finally:
+        conn.close()
+
+
 def upsert_historical_team_map_stats(
     *,
     normalized_name: str,
@@ -759,6 +779,30 @@ def list_hltv_results(limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]
             d["event"] = d.pop("event_name", None)
             out.append(d)
         return out
+    finally:
+        conn.close()
+
+
+def update_hltv_result_details(
+    match_url: str,
+    *,
+    veto_json: Optional[str] = None,
+    player_stats_json: Optional[str] = None,
+    maps_json: Optional[str] = None,
+) -> None:
+    """Backfill match-page details on an already stored result row."""
+    sets = []
+    params: list = []
+    for col, val in (("veto_json", veto_json), ("player_stats_json", player_stats_json), ("maps_json", maps_json)):
+        if val is not None:
+            sets.append(f"{col} = ?")
+            params.append(val)
+    if not sets:
+        return
+    conn = connect()
+    try:
+        conn.execute(f"UPDATE hltv_results SET {', '.join(sets)} WHERE match_url = ?", (*params, str(match_url)))
+        conn.commit()
     finally:
         conn.close()
 
