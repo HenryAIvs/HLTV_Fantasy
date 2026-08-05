@@ -871,20 +871,26 @@ def get_hltv_match_details(match_url: str) -> Dict[str, object]:
     except Exception as exc:
         raise HLTVRankingError(f"Failed to fetch HLTV match details with SeleniumBase UC: {exc}") from exc
 
-    maps = _extract_match_map_details(html)
-    _attach_half_scores_to_maps(html, maps)
-    veto = _extract_match_veto(html)
-    player_stats = _extract_match_player_stats(html)
+    details = parse_hltv_match_details_html(html, url)
     logger.info(
         "HLTV match details parsed: url=%s maps=%d veto=%d players=%d",
         url,
-        len(maps),
-        len(veto),
-        len(player_stats),
+        len(details["maps"]),
+        len(details["veto"]),
+        len(details["player_stats"]),
     )
+    return details
 
+
+def parse_hltv_match_details_html(html: str, match_url: str = "") -> Dict[str, object]:
+    """Run the match-page parsers over already-fetched HTML (e.g. a stored
+    page snapshot), with no scraping involved."""
+    maps = _extract_match_map_details(html or "")
+    _attach_half_scores_to_maps(html or "", maps)
+    veto = _extract_match_veto(html or "")
+    player_stats = _extract_match_player_stats(html or "")
     return {
-        "match_url": url,
+        "match_url": str(match_url or ""),
         "maps": maps,
         "veto": veto,
         "player_stats": player_stats,

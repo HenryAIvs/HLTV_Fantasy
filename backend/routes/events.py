@@ -1565,6 +1565,9 @@ def get_winrate_model_current_points(limit: int = 1000, fallback_current: int = 
 
 
 MAP_POOL = ["Mirage", "Inferno", "Nuke", "Ancient", "Anubis", "Dust2", "Cache"]
+# Maps outside the current pool still get their data stored and rated (Elo,
+# vetoes, historical stats) so nothing is lost if they rotate back in.
+KNOWN_MAPS = [*MAP_POOL, "Overpass", "Vertigo", "Train", "Cobblestone"]
 
 
 def _canonical_map_name(value: Any) -> str:
@@ -1577,9 +1580,11 @@ def _canonical_map_name(value: Any) -> str:
         "de_dust2": "Dust2",
     }
     key = raw.lower().replace("_", " ")
+    if key.startswith("de "):
+        key = key[3:]
     if key in aliases:
         return aliases[key]
-    for name in MAP_POOL:
+    for name in KNOWN_MAPS:
         if key == name.lower():
             return name
     return raw[:32]
@@ -2460,6 +2465,57 @@ def _get_latest_veto_job() -> Dict[str, Any] | None:
     return _get_veto_job_for_response(str(row["job_id"])) if row else None
 
 
+@router.get("/page-snapshots/summary")
+def get_page_snapshots_summary():
+    from backend.data.page_snapshots import snapshot_summary
+
+    return {"status": "ok", **snapshot_summary()}
+
+
+@router.post("/hltv-results/reparse-from-snapshots")
+def reparse_match_details_from_snapshots(limit: int = 0):
+    """Re-run the current match-page parsers over archived page snapshots and
+    update stored rows — no scraping. Parsed fields only overwrite when the
+    fresh parse found data, so a parser regression cannot wipe stored values.
+    """
+    from backend.data.page_snapshots import get_page_snapshot
+    from backend.services.hltv_rankings import parse_hltv_match_details_html
+
+    rows = list_hltv_results(limit=max(1, count_hltv_results()), offset=0)
+    if limit and int(limit) > 0:
+        rows = rows[: int(limit)]
+    checked = 0
+    with_snapshot = 0
+    updated = 0
+    for r in rows:
+        url = str(r.get("match_url") or "").strip()
+        if not url:
+            continue
+        checked += 1
+        snap = get_page_snapshot(url)
+        if not snap:
+            continue
+        with_snapshot += 1
+        details = parse_hltv_match_details_html(snap["html"], url)
+        maps = details.get("maps") or []
+        veto = details.get("veto") or []
+        player_stats = details.get("player_stats") or []
+        update_hltv_result_details(
+            url,
+            maps_json=json.dumps(maps) if maps else None,
+            veto_json=json.dumps(veto) if veto else None,
+            player_stats_json=json.dumps(player_stats) if player_stats else None,
+        )
+        if maps or veto or player_stats:
+            updated += 1
+    return {
+        "status": "ok",
+        "matches_checked": checked,
+        "matches_with_snapshot": with_snapshot,
+        "matches_updated": updated,
+    }
+
+
 @router.get("/hltv-results/veto-backfill/coverage")
 def get_veto_backfill_coverage():
     _missing, coverage = _veto_missing_items()
@@ -2613,6 +2669,18 @@ def _to_float_or_none(value: Any) -> float | None:
         return None
 
 
+def _model_map_win_probability(model: Dict[str, Any], values: Dict[str, float]) -> float:
+    """Map-win probability from a fitted model, honoring its training target.
+
+    map_win models output the probability directly; legacy round-share models
+    fall back to the independent-rounds conversion.
+    """
+    p = _predict_from_round_share_features(model, values)
+    if str(model.get("target") or "round_share") == "map_win":
+        return p
+    return _round_win_to_map_win_probability(p)
+
+
 def _round_win_to_map_win_probability(p_round: float) -> float:
     p = min(0.999, max(0.001, float(p_round)))
     q = 1.0 - p
@@ -2643,7 +2711,8 @@ def _build_prematch_elo_by_match(rows: List[Dict[str, Any]]) -> Dict[str, Dict[s
 
     Matches are replayed chronologically, so every entry reflects only earlier
     results (no label leakage). A team's first appearance on a map inherits its
-    overall Elo as the prior, which keeps cold-start gaps sane.
+    overall Elo as the prior, which keeps cold-start gaps sane. Rating updates
+    scale with the round margin, so a 13-1 moves ratings more than a 13-11.
     """
     overall: Dict[str, float] = {}
     per_map: Dict[tuple, float] = {}
@@ -2651,6 +2720,11 @@ def _build_prematch_elo_by_match(rows: List[Dict[str, Any]]) -> Dict[str, Dict[s
 
     def _expected(e_a: float, e_b: float) -> float:
         return 1.0 / (1.0 + 10.0 ** ((e_b - e_a) / 400.0))
+
+    def _margin_factor(s1: int, s2: int) -> float:
+        # ~0.57 for a 2-round overtime win, 1.0 around a 6-round margin,
+        # ~1.32 for a 13-1; log damping keeps blowouts from dominating.
+        return math.log1p(abs(int(s1) - int(s2))) / math.log1p(6)
 
     ordered = sorted(rows, key=lambda r: (str(r.get("match_date") or ""), str(r.get("match_id") or r.get("match_url") or "")))
     for r in ordered:
@@ -2665,7 +2739,9 @@ def _build_prematch_elo_by_match(rows: List[Dict[str, Any]]) -> Dict[str, Dict[s
         played = []
         for m in _parse_stored_maps(r.get("maps_json")):
             map_name = _canonical_map_name(m.get("map"))
-            if map_name not in MAP_POOL:
+            # Off-pool maps still update ratings: a Vertigo win is evidence of
+            # strength, and the per-map rating is ready if the map returns.
+            if not map_name:
                 continue
             try:
                 s1 = int(m["score1"])
@@ -2677,18 +2753,18 @@ def _build_prematch_elo_by_match(rows: List[Dict[str, Any]]) -> Dict[str, Dict[s
             e1 = per_map.get((k1, map_name), o1)
             e2 = per_map.get((k2, map_name), o2)
             snapshot["maps"][map_name] = (e1, e2)
-            played.append((map_name, e1, e2, 1.0 if s1 > s2 else 0.0))
+            played.append((map_name, e1, e2, 1.0 if s1 > s2 else 0.0, _margin_factor(s1, s2)))
         out[url] = snapshot
         # Update ratings only after the whole match is snapshotted.
-        for map_name, e1, e2, result in played:
+        for map_name, e1, e2, result, margin in played:
             exp_map = _expected(e1, e2)
-            per_map[(k1, map_name)] = e1 + _ELO_K_MAP * (result - exp_map)
-            per_map[(k2, map_name)] = e2 + _ELO_K_MAP * ((1.0 - result) - (1.0 - exp_map))
+            per_map[(k1, map_name)] = e1 + _ELO_K_MAP * margin * (result - exp_map)
+            per_map[(k2, map_name)] = e2 + _ELO_K_MAP * margin * ((1.0 - result) - (1.0 - exp_map))
             c1 = overall.get(k1, _ELO_START)
             c2 = overall.get(k2, _ELO_START)
             exp_overall = _expected(c1, c2)
-            overall[k1] = c1 + _ELO_K_OVERALL * (result - exp_overall)
-            overall[k2] = c2 + _ELO_K_OVERALL * ((1.0 - result) - (1.0 - exp_overall))
+            overall[k1] = c1 + _ELO_K_OVERALL * margin * (result - exp_overall)
+            overall[k2] = c2 + _ELO_K_OVERALL * margin * ((1.0 - result) - (1.0 - exp_overall))
     return out
 
 
@@ -2736,8 +2812,12 @@ def _iter_ranked_map_samples(
         h2 = _to_float_or_none(r.get("hltv_rank_2"))
         v1 = _to_float_or_none(r.get("vrs_rank_1"))
         v2 = _to_float_or_none(r.get("vrs_rank_2"))
-        if not t1 or not t2 or not maps or h1 is None or h2 is None or v1 is None or v2 is None:
+        if not t1 or not t2 or not maps or h1 is None or h2 is None:
             continue
+        # Valve's ranking barely exists before 2024; substitute the HLTV rank so
+        # CS2-era matches from late 2023 stay usable as training data.
+        if v1 is None or v2 is None:
+            v1, v2 = h1, h2
         k1 = _norm_team_name(t1)
         k2 = _norm_team_name(t2)
         window = _historical_map_stats_window(r.get("match_date")) if historical_map_stats_by_window is not None else None
@@ -2821,10 +2901,28 @@ def _iter_ranked_map_samples(
     return samples
 
 
-def _fit_map_model_set(samples: List[Dict[str, Any]], include_map_stats: bool = True) -> Dict[str, Dict[str, Any]]:
+def _fit_map_model_set(
+    samples: List[Dict[str, Any]],
+    include_map_stats: bool = True,
+    target: str = "round_share",
+) -> Dict[str, Dict[str, Any]]:
+    """Fit global + per-map logistic models over the shared feature set.
+
+    target="round_share" fits round share weighted by rounds (scoreline model);
+    target="map_win" fits the binary map result with unit weight (probability
+    model) — measured to predict winners better than converting round share
+    through an independent-rounds assumption.
+    """
+    is_win_target = str(target) == "map_win"
     symmetric: List[Dict[str, float]] = []
     by_map: Dict[str, List[Dict[str, float]]] = {m: [] for m in MAP_POOL}
     for sample in samples:
+        if is_win_target:
+            target_value = 1.0 if float(sample.get("outcome") or 0.0) > 0.5 else 0.0
+            target_weight = 1.0
+        else:
+            target_value = float(sample["round_share"])
+            target_weight = float(sample["weight"])
         row_a = {
             "hltv_gap": float(sample["hltv_gap"]),
             "hltv_level": float(sample["hltv_level"]),
@@ -2840,8 +2938,8 @@ def _fit_map_model_set(samples: List[Dict[str, Any]], include_map_stats: bool = 
             "elo_gap": float(sample.get("elo_gap") or 0.0),
             "map_elo_gap": float(sample.get("map_elo_gap") or 0.0),
             "picked_by_a": float(sample.get("picked_by_a") or 0.0),
-            "round_share": float(sample["round_share"]),
-            "weight": float(sample["weight"]),
+            "round_share": target_value,
+            "weight": target_weight,
         }
         row_b = {
             "hltv_gap": -float(sample["hltv_gap"]),
@@ -2858,8 +2956,8 @@ def _fit_map_model_set(samples: List[Dict[str, Any]], include_map_stats: bool = 
             "elo_gap": -float(sample.get("elo_gap") or 0.0),
             "map_elo_gap": -float(sample.get("map_elo_gap") or 0.0),
             "picked_by_a": -float(sample.get("picked_by_a") or 0.0),
-            "round_share": 1.0 - float(sample["round_share"]),
-            "weight": float(sample["weight"]),
+            "round_share": 1.0 - target_value,
+            "weight": target_weight,
         }
         symmetric.extend([row_a, row_b])
         by_map.setdefault(str(sample["map"]), []).extend([row_a, row_b])
@@ -2869,6 +2967,7 @@ def _fit_map_model_set(samples: List[Dict[str, Any]], include_map_stats: bool = 
         **_fit_round_share_logistic_2d(symmetric, include_map_stats=include_map_stats),
         "scope": "global",
         "samples": len(symmetric),
+        "target": str(target),
     }
     models: Dict[str, Dict[str, Any]] = {"__global__": global_model}
     for map_name, rows in by_map.items():
@@ -2877,6 +2976,7 @@ def _fit_map_model_set(samples: List[Dict[str, Any]], include_map_stats: bool = 
                 models[map_name] = {
                     **_fit_round_share_logistic_2d(rows, include_map_stats=include_map_stats),
                     "scope": "map",
+                    "target": str(target),
                     "samples": len(rows),
                 }
                 continue
@@ -3023,7 +3123,7 @@ def _build_rank_effect_curve(model: Dict[str, Any], samples: List[Dict[str, Any]
             continue
         outcome = int(sample.get("outcome") or (1 if score1 > score2 else -1 if score1 < score2 else 0))
         actual = 1.0 if outcome > 0 else 0.0 if outcome < 0 else 0.5
-        predicted = _round_win_to_map_win_probability(_predict_from_round_share_features(model, _round_share_feature_values(sample)))
+        predicted = _model_map_win_probability(model, _round_share_feature_values(sample))
         band = _rank_level_band(level)
         gap_bucket = int(math.floor(gap / 5.0) * 5)
         bucket = grouped[band["key"]].setdefault(
@@ -3078,8 +3178,10 @@ def _iter_series_contexts(
         h2 = _to_float_or_none(r.get("hltv_rank_2"))
         v1 = _to_float_or_none(r.get("vrs_rank_1"))
         v2 = _to_float_or_none(r.get("vrs_rank_2"))
-        if not url or not t1 or not t2 or h1 is None or h2 is None or v1 is None or v2 is None:
+        if not url or not t1 or not t2 or h1 is None or h2 is None:
             continue
+        if v1 is None or v2 is None:
+            v1, v2 = h1, h2
         k1 = _norm_team_name(t1)
         k2 = _norm_team_name(t2)
         window = _historical_map_stats_window(r.get("match_date")) if historical_map_stats_by_window is not None else None
@@ -3257,9 +3359,7 @@ def _veto_sim_series_metrics(
         for map_name, map_features in per_map.items():
             model = models.get(map_name) or models["__global__"]
             values = {**shared, **map_features, "picked_by_a": 0.0}
-            neutral_p[map_name] = _round_win_to_map_win_probability(
-                _predict_from_round_share_features(model, values)
-            )
+            neutral_p[map_name] = _model_map_win_probability(model, values)
         if not neutral_p:
             continue
         predicted_veto = _simulate_veto(neutral_p, wins_needed)
@@ -3269,9 +3369,7 @@ def _veto_sim_series_metrics(
         for map_name, picked_by_a in predicted_veto:
             model = models.get(map_name) or models["__global__"]
             values = {**shared, **(per_map.get(map_name) or {}), "picked_by_a": float(picked_by_a)}
-            map_probs.append(
-                _round_win_to_map_win_probability(_predict_from_round_share_features(model, values))
-            )
+            map_probs.append(_model_map_win_probability(model, values))
         p_series = _series_win_probability(map_probs, wins_needed)
         actual = 1.0 if int(s1) > int(s2) else 0.0
         n += 1
@@ -3296,7 +3394,10 @@ def _evaluate_map_model_set(
     *,
     include_rows: bool = False,
     series_contexts: Dict[str, Dict[str, Any]] | None = None,
+    score_models: Dict[str, Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
+    """Evaluate win probabilities from `models`; scorelines come from
+    `score_models` (the round-share fit) when provided, else from `models`."""
     eval_rows = []
     abs_score_error = 0.0
     abs_round_share_error = 0.0
@@ -3307,8 +3408,11 @@ def _evaluate_map_model_set(
     for sample in test_samples:
         map_name = str(sample["map"])
         model = models.get(map_name) or models["__global__"]
-        p_round = _predict_from_round_share_features(model, _round_share_feature_values(sample))
-        p_map = _round_win_to_map_win_probability(p_round)
+        values = _round_share_feature_values(sample)
+        p_map = _model_map_win_probability(model, values)
+        score_set = score_models or models
+        score_model = score_set.get(map_name) or score_set["__global__"]
+        p_round = _predict_from_round_share_features(score_model, values)
         pred_s1, pred_s2 = _approx_scoreline_from_round_probability(p_round)
         actual_s1 = int(sample["score1"])
         actual_s2 = int(sample["score2"])
@@ -3484,8 +3588,12 @@ def get_map_model_lab(
         require_map_stats=True,
         prematch_elo_by_match=prematch_elo_by_match,
     )
-    models_with_map_data = _fit_map_model_set(train_samples, include_map_stats=True)
-    models_rank_only = _fit_map_model_set(train_samples, include_map_stats=False)
+    # Win probabilities come from models trained directly on the map result;
+    # the round-share models are kept for scoreline prediction only.
+    models_with_map_data = _fit_map_model_set(train_samples, include_map_stats=True, target="map_win")
+    models_rank_only = _fit_map_model_set(train_samples, include_map_stats=False, target="map_win")
+    score_models_with = _fit_map_model_set(train_samples, include_map_stats=True)
+    score_models_rank = _fit_map_model_set(train_samples, include_map_stats=False)
     if not test_samples:
         raise HTTPException(
             status_code=400,
@@ -3498,12 +3606,18 @@ def get_map_model_lab(
         prematch_elo_by_match=prematch_elo_by_match,
     )
     with_map_data = _evaluate_map_model_set(
-        models_with_map_data, test_samples, include_rows=True, series_contexts=test_series_contexts
+        models_with_map_data,
+        test_samples,
+        include_rows=True,
+        series_contexts=test_series_contexts,
+        score_models=score_models_with,
     )
-    rank_only = _evaluate_map_model_set(models_rank_only, test_samples, series_contexts=test_series_contexts)
+    rank_only = _evaluate_map_model_set(
+        models_rank_only, test_samples, series_contexts=test_series_contexts, score_models=score_models_rank
+    )
     return {
         "status": "ok",
-        "method": "Trains two round-share logistic formulas on the same historical slice after excluding maps without cached six-month pre-match map stats for both teams. The rank-only baseline uses HLTV/VRS rank gaps, matchup rank level, and gap-by-level interactions. The map-data model adds directional Team A minus Team B deltas: six-month map-stat gaps (win/pick/ban/played share), pre-match overall and per-map Elo gaps replayed from the stored match timeline, and who picked the map in the veto (when veto data is stored). Both are evaluated on the same covered holdout slice.",
+        "method": "Trains two logistic formulas per feature set on the same historical slice: win probabilities come from a model trained directly on map results, and scorelines from a round-share model over the same features. The rank-only baseline uses HLTV/VRS rank gaps, matchup rank level, and gap-by-level interactions. The map-data model adds directional Team A minus Team B deltas: six-month map-stat gaps (win/pick/ban/played share), pre-match overall and per-map Elo gaps replayed from the stored match timeline with margin-of-victory weighting, and who picked the map in the veto (when veto data is stored). Both are evaluated on the same covered holdout slice.",
         "db_matches": db_matches,
         "split": {
             "mode": "random" if random_split else "ordered",

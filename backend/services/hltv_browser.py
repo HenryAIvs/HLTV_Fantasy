@@ -7,6 +7,8 @@ import threading
 import time
 from typing import Any
 
+from backend.data.page_snapshots import save_page_snapshot
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_RECONNECT_TIME = float(os.getenv("HLTV_UC_RECONNECT_TIME", "4"))
@@ -245,6 +247,7 @@ def fetch_hltv_html(
                 _wait_after_load()
                 html = driver.page_source or ""
                 _mark_fetch_complete()
+                save_page_snapshot(url, html)
                 logger.info(
                     "HLTV SeleniumBase UC page loaded: title='%s' final_url=%s headless=%s profile_dir=%s",
                     getattr(driver, "title", ""),
@@ -291,6 +294,12 @@ def run_hltv_browser_session(
                 _wait_after_load()
                 result = callback(driver)
                 _mark_fetch_complete()
+                try:
+                    # Archive whatever page the session ended on, keyed by its
+                    # actual URL (the callback may have navigated).
+                    save_page_snapshot(getattr(driver, "current_url", url) or url, driver.page_source or "")
+                except Exception:
+                    pass
                 return result
             except Exception as exc:
                 last_error = exc

@@ -5358,6 +5358,58 @@ function MatchesDataPanel({ notify }) {
     }
   };
 
+  const AUTO_FETCH_JOBS_KEY = "hltv_auto_fetch_jobs_after_import";
+  const [autoRunFetchJobs, setAutoRunFetchJobs] = useState(() => localStorage.getItem(AUTO_FETCH_JOBS_KEY) === "1");
+  const autoRunFetchJobsRef = useRef(autoRunFetchJobs);
+  const [autoChainStatus, setAutoChainStatus] = useState("");
+  const toggleAutoRunFetchJobs = (checked) => {
+    setAutoRunFetchJobs(checked);
+    autoRunFetchJobsRef.current = checked;
+    localStorage.setItem(AUTO_FETCH_JOBS_KEY, checked ? "1" : "0");
+  };
+
+  const pollFetchJobUntilDone = async (basePath, jobId) => {
+    for (;;) {
+      let status;
+      try {
+        status = await api.get(`${basePath}/job/${jobId}`, 60000);
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+        continue;
+      }
+      const st = String(status?.status || "");
+      if (["completed", "failed", "paused", "canceled"].includes(st)) return status;
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+    }
+  };
+
+  const runAutoFetchJobs = async () => {
+    try {
+      setAutoChainStatus("Auto: fetching missing historical map stats...");
+      const hist = await api.post("/events/hltv-results/historical-map-stats/start", {});
+      if (hist?.job_id) {
+        const done = await pollFetchJobUntilDone("/events/hltv-results/historical-map-stats", hist.job_id);
+        if (String(done?.status) !== "completed") {
+          setAutoChainStatus(`Auto: historical stats job ended (${done?.status}); veto backfill not started.`);
+          return;
+        }
+      }
+      setAutoChainStatus("Auto: fetching missing match vetoes...");
+      const veto = await api.post("/events/hltv-results/veto-backfill/start", {});
+      if (veto?.job_id) {
+        const done = await pollFetchJobUntilDone("/events/hltv-results/veto-backfill", veto.job_id);
+        if (String(done?.status) !== "completed") {
+          setAutoChainStatus(`Auto: veto backfill ended (${done?.status}).`);
+          return;
+        }
+      }
+      setAutoChainStatus("Auto: import + both fetch jobs complete.");
+      if (notify) notify("Import and fetch jobs complete");
+    } catch (e) {
+      setAutoChainStatus(`Auto fetch jobs failed: ${e?.message || e}`);
+    }
+  };
+
   const pollRecentResultsImportJob = async (jobId, startedAtMs) => {
     if (!jobId || recentResultsImportPollingRef.current) return;
     recentResultsImportPollingRef.current = true;
@@ -5410,6 +5462,7 @@ function MatchesDataPanel({ notify }) {
           }
           clearRecentResultsImportStorage();
           await loadStoredRecentResults(0);
+          if (autoRunFetchJobsRef.current) runAutoFetchJobs();
           done = true;
           break;
         }
@@ -5676,7 +5729,16 @@ function MatchesDataPanel({ notify }) {
           {recentResultsLoading ? "Loading..." : "Reload Stored Results"}
         </button>
         <span className="muted">{recentResults.length} loaded</span>
+        <label className="checkbox-inline">
+          <input
+            type="checkbox"
+            checked={autoRunFetchJobs}
+            onChange={(e) => toggleAutoRunFetchJobs(e.target.checked)}
+          />
+          <span>Auto-run fetch jobs after import (historical map stats, then vetoes)</span>
+        </label>
       </div>
+      {autoChainStatus && <p className="muted">{autoChainStatus}</p>}
       {recentResultsImporting && (
         <div className="card sub">
           <p className="muted">
