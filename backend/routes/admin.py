@@ -1,14 +1,22 @@
 import json
 import re
 import math
+import threading
 import time
+import uuid
 from html import unescape
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
 
 from backend.data.db_admin import wipe_database
-from backend.data.event_db import get_event_detail, set_active_event, set_event_hltv_ref, upsert_event_snapshot
+from backend.data.event_db import (
+    get_event_detail,
+    get_event_price_map,
+    set_active_event,
+    set_event_hltv_ref,
+    upsert_event_snapshot,
+)
 from backend.data.player_db import add_or_update_player, get_player
 from backend.data.team_db import add_or_update_team, get_team_by_name
 from backend.services.hltv_browser import HLTVBrowserError, fetch_hltv_html, run_hltv_browser_session
@@ -1102,7 +1110,10 @@ def import_trigger_rates(payload: Dict[str, Any]):
     ptr_list = data.get("playerTriggerRates") or []
     if not ptr_list:
         raise HTTPException(status_code=400, detail="playerTriggerRates missing or empty")
+    return {"status": "ok", **_ingest_trigger_rates(ptr_list)}
 
+
+def _ingest_trigger_rates(ptr_list: List[Dict[str, Any]]) -> Dict[str, Any]:
     updated = 0
     updated_players_info: List[Dict[str, Any]] = []
     seen_player_ids = set()
@@ -1186,11 +1197,1049 @@ def import_trigger_rates(payload: Dict[str, Any]):
 
     updated_player_names = [p["name"] for p in updated_players_info]
     return {
-        "status": "ok",
         "updated_players": updated,
         "updated_players_info": updated_players_info,
         "updated_player_names": updated_player_names,
     }
+
+
+# --- Automated trigger-rate acquisition -------------------------------------
+# The fantasy team page fires an XHR whose response contains playerTriggerRates
+# for the players in the current lineup. Discovery captures that request via
+# CDP logging and stores it as a template; the auto-fetch job then replays it
+# with substituted 5-player batches until every event player is covered.
+
+from backend.data.db import ROOT_DIR as _ROOT_DIR
+
+TRIGGER_TEMPLATE_PATH = _ROOT_DIR / "trigger_endpoint_template.json"
+TRIGGER_JOBS: Dict[str, Dict[str, Any]] = {}
+TRIGGER_JOBS_LOCK = threading.Lock()
+
+
+def _load_trigger_template() -> Optional[Dict[str, Any]]:
+    try:
+        if TRIGGER_TEMPLATE_PATH.exists():
+            return json.loads(TRIGGER_TEMPLATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return None
+
+
+def _save_trigger_template(template: Dict[str, Any]) -> None:
+    TRIGGER_TEMPLATE_PATH.write_text(json.dumps(template, indent=2), encoding="utf-8")
+
+
+HLTV_CREDENTIALS_PATH = _ROOT_DIR / "hltv_credentials.json"
+
+
+def _load_hltv_credentials() -> Optional[Dict[str, str]]:
+    try:
+        if HLTV_CREDENTIALS_PATH.exists():
+            data = json.loads(HLTV_CREDENTIALS_PATH.read_text(encoding="utf-8"))
+            if data.get("username") and data.get("password"):
+                return {"username": str(data["username"]), "password": str(data["password"])}
+    except Exception:
+        return None
+    return None
+
+
+@router.post("/hltv-credentials")
+def save_hltv_credentials(payload: Dict[str, Any]):
+    username = str((payload or {}).get("username") or "").strip()
+    password = str((payload or {}).get("password") or "")
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="username and password are required")
+    HLTV_CREDENTIALS_PATH.write_text(json.dumps({"username": username, "password": password}), encoding="utf-8")
+    return {"status": "ok", "username": username}
+
+
+@router.get("/hltv-credentials")
+def get_hltv_credentials_status():
+    creds = _load_hltv_credentials()
+    return {"configured": bool(creds), "username": (creds or {}).get("username", "")}
+
+
+def _is_hltv_logged_in(driver) -> bool:
+    try:
+        return bool(
+            driver.execute_script(
+                "return !!(document.querySelector('a[href*=\"logout\"]')"
+                " || document.querySelector('.navaccount, .avatarNavItem, .nav-account, img.avatar'))"
+            )
+        )
+    except Exception:
+        return False
+
+
+def _logged_in_as(driver, username: str) -> bool:
+    """True only if the current session's account nav shows this username."""
+    if not username:
+        return False
+    try:
+        return bool(
+            driver.execute_script(
+                "var u = arguments[0].toLowerCase();"
+                "var el = document.querySelector('.navaccount, .avatarNavItem, .nav-account, .account, header');"
+                "var t = (el ? el.textContent : '').toLowerCase();"
+                "return t.indexOf(u) >= 0;",
+                username,
+            )
+        )
+    except Exception:
+        return False
+
+
+def _hltv_logout(driver) -> None:
+    try:
+        driver.get("https://www.hltv.org/logout")
+        time.sleep(3)
+    except Exception:
+        pass
+
+
+def _ensure_app_login(driver) -> None:
+    """Require a persisted signed-in session (established once in the Capture
+    window, which is where the user solves HLTV's captcha). No scripted login —
+    it would hit the captcha and risk rate-limiting on every fetch."""
+    driver.get("https://www.hltv.org")
+    time.sleep(3)
+    if _is_hltv_logged_in(driver):
+        return
+    raise RuntimeError(
+        "Not signed in to HLTV. Click Capture and sign in there (add any 5 players) — the session then persists for Fetch."
+    )
+
+
+def _app_team_edit_url(driver, fantasy_id: int) -> str:
+    """The app account's own team-edit page in the real HLTV league, resolved
+    via gameredirect (which lands on that account's team for the event)."""
+    driver.get(f"https://www.hltv.org/fantasy/{fantasy_id}/gameredirect")
+    time.sleep(4)
+    url = str(getattr(driver, "current_url", "") or "")
+    if "/team/" in url and "/league/" in url:
+        return url.split("#")[0].rstrip("/").removesuffix("/edit") + "/edit"
+    # Fallback: follow the first league/team link on the overview.
+    driver.get(f"https://www.hltv.org/fantasy/{fantasy_id}/overview")
+    time.sleep(3)
+    href = driver.execute_script(
+        "var a = document.querySelector('a[href*=\"/league/\"][href*=\"/team/\"]'); return a ? a.getAttribute('href') : null;"
+    )
+    if href:
+        full = href if str(href).startswith("http") else f"https://www.hltv.org{href}"
+        return full.rstrip("/").removesuffix("/edit") + "/edit"
+    raise RuntimeError(
+        f"The app account has no fantasy team for event {fantasy_id}. Join the event's HLTV league with that account once "
+        "(open the fantasy page and pick any lineup), then retry."
+    )
+
+
+def _perform_hltv_login(driver, creds: Dict[str, str]) -> bool:
+    """Scripted login via HLTV's Sign-in modal (there is no dedicated /login
+    page — it is an in-page popup). Uses the native value setter so React's
+    controlled inputs register the typed credentials before submit."""
+    driver.get("https://www.hltv.org/")
+    time.sleep(3)
+    # Open the Sign-in modal if a password field is not already present.
+    try:
+        driver.execute_script(
+            """
+            if (!document.querySelector('input[type=password]')) {
+              var link = Array.from(document.querySelectorAll('a, button, .nav-link, [class*="sign" i]'))
+                .find(function(e){ return (e.textContent||'').trim().toLowerCase() === 'sign in'; });
+              if (link) link.click();
+            }
+            """
+        )
+    except Exception:
+        pass
+    # Wait for the modal's password field to appear.
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        try:
+            if driver.execute_script("return !!document.querySelector('input[type=password]')"):
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+
+    filled = False
+    try:
+        filled = bool(
+            driver.execute_script(
+                """
+                var user = arguments[0], pw = arguments[1];
+                var pInput = document.querySelector('input[name=password], input[type=password]');
+                if (!pInput) return false;
+                // The login modal uses name=username; prefer that over positional
+                // guessing so a nav search box is never mistaken for it.
+                var uInput = document.querySelector(
+                    'input[name*="user" i], input[placeholder*="user" i], input[placeholder*="email" i]');
+                if (!uInput) {
+                    var inputs = Array.prototype.slice.call(document.querySelectorAll('input'));
+                    for (var i = inputs.indexOf(pInput) - 1; i >= 0; i--) {
+                        var t = (inputs[i].type||'').toLowerCase();
+                        if (t === 'text' || t === 'email' || t === '') { uInput = inputs[i]; break; }
+                    }
+                }
+                if (!uInput) return false;
+                function setNative(el, val) {
+                    var d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value')
+                         || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+                    d.set.call(el, val);
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                }
+                uInput.focus(); setNative(uInput, user);
+                pInput.focus(); setNative(pInput, pw);
+                return true;
+                """,
+                creds["username"],
+                creds["password"],
+            )
+        )
+    except Exception:
+        filled = False
+    if not filled:
+        return False
+    time.sleep(1)
+    # Click the modal's own Login button (by text; avoid the Steam / Sign-up buttons).
+    try:
+        driver.execute_script(
+            """
+            var btn = Array.prototype.slice.call(document.querySelectorAll('button, input[type=submit], a'))
+                .find(function(e){
+                    var t = ((e.textContent || e.value || '')).trim().toLowerCase();
+                    return t === 'login' || t === 'log in';
+                });
+            if (btn) btn.click();
+            """
+        )
+    except Exception:
+        pass
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if _is_hltv_logged_in(driver):
+            return True
+        time.sleep(2)
+    return _is_hltv_logged_in(driver)
+
+
+def _login_failure_reason(driver) -> str:
+    """Read HLTV's own login error so failures are actionable."""
+    try:
+        low = (driver.execute_script("return document.body.innerText") or "").lower()
+        has_captcha = bool(
+            driver.execute_script(
+                "return !!document.querySelector('iframe[src*=recaptcha], iframe[src*=captcha], .g-recaptcha, [class*=captcha i]')"
+            )
+        )
+    except Exception:
+        low, has_captcha = "", False
+    if "incorrect username or password" in low or "wrong username" in low:
+        return "HLTV rejected the credentials: incorrect username or password. Re-save the app account."
+    if "too many" in low or "try again later" in low:
+        return "HLTV rate-limited the login (too many attempts). Wait a while and retry."
+    if has_captcha or "verify you are human" in low:
+        return (
+            "HLTV's login is captcha-protected, which blocks automatic sign-in. Click 'Log in to HLTV' and sign in "
+            "once in the window that opens (solve the captcha) — the session then persists and Fetch runs automatically."
+        )
+    return "Automatic login did not complete. Use 'Log in to HLTV' to sign in once in the window that opens."
+
+
+@router.post("/hltv-login-session")
+def hltv_login_session(payload: Dict[str, Any] | None = None):
+    """Open hltv.org in the scraper's Chrome so the user can log in once; the
+    profile keeps the session for later automated fantasy requests."""
+    timeout_s = max(30, min(600, int((payload or {}).get("timeout_seconds") or 240)))
+
+    def wait_for_login(driver):
+        # Open the sign-in modal so the user only has to type + solve captcha.
+        try:
+            driver.execute_script(
+                """
+                if (!document.querySelector('input[type=password]')) {
+                  var link = Array.from(document.querySelectorAll('a, button, .nav-link, [class*="sign" i]'))
+                    .find(function(e){ return (e.textContent||'').trim().toLowerCase() === 'sign in'; });
+                  if (link) link.click();
+                }
+                """
+            )
+        except Exception:
+            pass
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if _is_hltv_logged_in(driver):
+                return {"logged_in": True}
+            time.sleep(3)
+        return {"logged_in": False}
+
+    try:
+        result = run_hltv_browser_session(
+            "https://www.hltv.org/", wait_for_login, timeout_ms=(timeout_s + 30) * 1000, wait_text=None
+        )
+    except HLTVBrowserError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"status": "ok", **(result or {})}
+
+
+TRIGGER_CAPTURE_DEBUG_PATH = _ROOT_DIR / "trigger_capture_debug.json"
+
+
+def _collect_trigger_requests(driver, settle_seconds: float = 20.0) -> List[Dict[str, Any]]:
+    time.sleep(max(3.0, settle_seconds))
+    try:
+        entries = driver.get_log("performance")
+    except Exception as exc:
+        raise HLTVBrowserError(f"CDP performance logging unavailable: {exc}") from exc
+    requests_by_id: Dict[str, Dict[str, Any]] = {}
+    responses: List[tuple] = []
+    fantasy_reqs: List[Dict[str, Any]] = []
+    for entry in entries:
+        try:
+            msg = json.loads(entry.get("message") or "{}").get("message") or {}
+        except Exception:
+            continue
+        method = msg.get("method")
+        params = msg.get("params") or {}
+        rid = params.get("requestId")
+        if method == "Network.requestWillBeSent" and rid:
+            req = params.get("request") or {}
+            url = str(req.get("url") or "")
+            requests_by_id[rid] = {
+                "url": url,
+                "method": str(req.get("method") or "GET"),
+                "post_data": req.get("postData"),
+            }
+            # Log every non-GET fantasy request so the lineup-save endpoint is
+            # discoverable from a capture where the user saves a lineup.
+            if "/fantasy/" in url and str(req.get("method") or "GET").upper() != "GET":
+                fantasy_reqs.append(requests_by_id[rid])
+        elif method == "Network.responseReceived" and rid:
+            resp = params.get("response") or {}
+            responses.append((rid, str(resp.get("url") or "")))
+    if fantasy_reqs:
+        try:
+            existing = []
+            if TRIGGER_CAPTURE_DEBUG_PATH.exists():
+                existing = json.loads(TRIGGER_CAPTURE_DEBUG_PATH.read_text(encoding="utf-8"))
+            TRIGGER_CAPTURE_DEBUG_PATH.write_text(
+                json.dumps((existing + fantasy_reqs)[-100:], indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
+    found: List[Dict[str, Any]] = []
+    for rid, url in responses:
+        try:
+            body = (driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": rid}) or {}).get("body") or ""
+        except Exception:
+            continue
+        if "playerTriggerRates" not in body:
+            continue
+        req = requests_by_id.get(rid) or {"url": url, "method": "GET", "post_data": None}
+        found.append({**req, "response_body": body})
+    return found
+
+
+@router.post("/capture-trigger-endpoint")
+def capture_trigger_endpoint(payload: Dict[str, Any] | None = None):
+    """One-time interactive capture: open the draft builder in a visible window,
+    log in with the app account if needed, and watch the network while the user
+    adds a few players. Saves the reusable request template on success."""
+    from backend.data.event_db import get_active_event_id
+
+    fantasy_id = int((payload or {}).get("event_id") or get_active_event_id() or 0)
+    if not fantasy_id:
+        raise HTTPException(status_code=400, detail="No active event. Import an event first.")
+
+    def capture(driver):
+        return _auto_discover_template(driver, fantasy_id, wait_seconds=220)
+
+    try:
+        template = run_hltv_browser_session(
+            "https://www.hltv.org", capture, timeout_ms=260000, wait_text=None
+        )
+    except HLTVBrowserError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "status": "ok",
+        "template_url": template.get("url"),
+        "template_method": template.get("method"),
+        "players_in_capture": len(template.get("captured_player_ids") or []),
+    }
+
+
+@router.post("/discover-trigger-rates")
+def discover_trigger_rates(payload: Dict[str, Any]):
+    """Load the user's fantasy team page, capture the XHR that carries
+    playerTriggerRates, import what it contains, and store the request as a
+    template for automated batch fetching.
+
+    Without an explicit URL, opens the fantasy overview for the active event
+    and follows the logged-in user's own league/team link automatically."""
+    url = str((payload or {}).get("url") or "").strip()
+    auto_detect = not url.startswith("http")
+    if auto_detect:
+        from backend.data.event_db import get_active_event_id
+
+        fantasy_id = (payload or {}).get("event_id") or get_active_event_id()
+        if not fantasy_id:
+            raise HTTPException(status_code=400, detail="No active event; import an event or provide a fantasy team URL.")
+        url = f"https://www.hltv.org/fantasy/{int(fantasy_id)}/overview"
+
+    settle = float((payload or {}).get("settle_seconds") or 20)
+    detected_url: Dict[str, Any] = {}
+
+    def capture(driver):
+        if auto_detect:
+            href = driver.execute_script(
+                "var a = document.querySelector('a[href*=\"/league/\"][href*=\"/team/\"]')"
+                " || document.querySelector('a[href*=\"/league/\"]');"
+                "return a ? a.getAttribute('href') : null;"
+            )
+            if not href:
+                raise HLTVBrowserError(
+                    "Could not find your league/team link on the fantasy overview — are you logged in and joined to a league for this event?"
+                )
+            target = href if str(href).startswith("http") else f"https://www.hltv.org{href}"
+            detected_url["url"] = target
+            driver.get(target)
+            time.sleep(3)
+        return _collect_trigger_requests(driver, settle_seconds=settle)
+
+    try:
+        found = run_hltv_browser_session(url, capture, timeout_ms=120000, wait_text=None)
+    except HLTVBrowserError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if auto_detect and detected_url.get("url"):
+        url = detected_url["url"]
+
+    if not found:
+        return {
+            "status": "not_found",
+            "detail": "No response containing playerTriggerRates was captured. Make sure you are logged in (use the login window) and the URL is your fantasy team page.",
+        }
+
+    total = {"updated_players": 0, "updated_player_names": []}
+    seen_ids: List[int] = []
+    for item in found:
+        try:
+            data = json.loads(item["response_body"])
+        except Exception:
+            continue
+        ptr = data.get("playerTriggerRates") or []
+        if not ptr:
+            continue
+        for entry in ptr:
+            pid = (entry.get("playerId") or {}).get("playerId")
+            if pid is not None:
+                seen_ids.append(int(pid))
+        counts = _ingest_trigger_rates(ptr)
+        total["updated_players"] += counts["updated_players"]
+        total["updated_player_names"].extend(counts["updated_player_names"])
+
+    template = {
+        "url": found[0]["url"],
+        "method": found[0]["method"],
+        "post_data": found[0].get("post_data"),
+        "captured_player_ids": seen_ids[:10],
+        "page_url": url,
+        "captured_at": time.time(),
+    }
+    _save_trigger_template(template)
+    return {
+        "status": "ok",
+        "requests_found": len(found),
+        "template_url": template["url"],
+        "template_method": template["method"],
+        "players_in_capture": len(set(seen_ids)),
+        **total,
+    }
+
+
+def _build_trigger_batches(
+    player_prices: Dict[int, int],
+    player_teams: Dict[int, int],
+    budget: int,
+    cover: Optional[set] = None,
+) -> List[List[int]]:
+    """Greedy set cover: 5-player batches within budget and max 2 per team,
+    preferring uncovered players so each batch covers ~5 new ones. `cover`
+    limits which players must be covered; fillers may come from the rest."""
+    min_price = min(player_prices.values()) if player_prices else 0
+    all_ids = set(player_prices)
+    remaining = set(cover) & all_ids if cover is not None else set(all_ids)
+    batches: List[List[int]] = []
+    while remaining:
+        seed = max(remaining, key=lambda p: player_prices[p])
+        batch = [seed]
+        cost = player_prices[seed]
+        counts = {player_teams.get(seed, 0): 1}
+        pools = (
+            sorted(remaining - {seed}, key=lambda p: player_prices[p]),
+            sorted(all_ids - remaining - {seed}, key=lambda p: player_prices[p]),
+        )
+        for pool in pools:
+            for cand in pool:
+                if len(batch) == 5:
+                    break
+                if cand in batch:
+                    continue
+                tid = player_teams.get(cand, 0)
+                if counts.get(tid, 0) >= 2:
+                    continue
+                slots_after = 5 - len(batch) - 1
+                if cost + player_prices[cand] + slots_after * min_price > budget:
+                    continue
+                batch.append(cand)
+                counts[tid] = counts.get(tid, 0) + 1
+                cost += player_prices[cand]
+            if len(batch) == 5:
+                break
+        if len(batch) == 5 and cost <= budget:
+            batches.append(batch)
+            remaining -= set(batch)
+        else:
+            # Unfillable seed (pathological prices/teams); skip it rather than loop.
+            remaining.discard(seed)
+    return batches
+
+
+def ensure_trigger_backfill_schema() -> None:
+    from backend.data.db import connect as _db_connect
+
+    conn = _db_connect()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trigger_rates_jobs (
+                job_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                error TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                progress REAL NOT NULL DEFAULT 0,
+                processed_items INTEGER NOT NULL DEFAULT 0,
+                total_items INTEGER NOT NULL DEFAULT 0,
+                ok INTEGER NOT NULL DEFAULT 0,
+                failed INTEGER NOT NULL DEFAULT 0,
+                current_item TEXT NOT NULL DEFAULT '',
+                pause_requested INTEGER NOT NULL DEFAULT 0,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                started_at REAL,
+                finished_at REAL
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _save_trigger_job(job: Dict[str, Any]) -> None:
+    from backend.data.db import connect as _db_connect
+
+    now = time.time()
+    job["updated_at"] = now
+    conn = _db_connect()
+    try:
+        conn.execute(
+            """
+            INSERT INTO trigger_rates_jobs (
+                job_id, status, error, last_error, progress, processed_items, total_items,
+                ok, failed, current_item, pause_requested, cancel_requested,
+                created_at, updated_at, started_at, finished_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                status = excluded.status,
+                error = excluded.error,
+                last_error = excluded.last_error,
+                progress = excluded.progress,
+                processed_items = excluded.processed_items,
+                total_items = excluded.total_items,
+                ok = excluded.ok,
+                failed = excluded.failed,
+                current_item = excluded.current_item,
+                pause_requested = excluded.pause_requested,
+                cancel_requested = excluded.cancel_requested,
+                updated_at = excluded.updated_at,
+                started_at = COALESCE(excluded.started_at, trigger_rates_jobs.started_at),
+                finished_at = excluded.finished_at
+            """,
+            (
+                str(job["job_id"]),
+                str(job.get("status") or "queued"),
+                str(job.get("error") or ""),
+                str(job.get("last_error") or ""),
+                float(job.get("progress") or 0.0),
+                int(job.get("processed_items") or 0),
+                int(job.get("total_items") or 0),
+                int(job.get("ok") or 0),
+                int(job.get("failed") or 0),
+                str(job.get("current_item") or ""),
+                1 if job.get("pause_requested") else 0,
+                1 if job.get("cancel_requested") else 0,
+                float(job.get("created_at") or now),
+                now,
+                job.get("started_at"),
+                job.get("finished_at"),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _publish_trigger_job(job: Dict[str, Any]) -> None:
+    with TRIGGER_JOBS_LOCK:
+        TRIGGER_JOBS[str(job["job_id"])] = dict(job)
+    _save_trigger_job(job)
+
+
+def _get_stored_trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
+    from backend.data.db import connect as _db_connect
+
+    conn = _db_connect()
+    try:
+        row = conn.execute("SELECT * FROM trigger_rates_jobs WHERE job_id = ?", (job_id,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    job = dict(row)
+    job["pause_requested"] = bool(job.get("pause_requested"))
+    job["cancel_requested"] = bool(job.get("cancel_requested"))
+    return job
+
+
+TRIGGER_WORKERS: Dict[str, threading.Thread] = {}
+_TRIGGER_INTERRUPTION_BOILERPLATE = {"Job was interrupted before completion. Resume to continue.", "Paused", "Canceled"}
+
+
+def _trigger_worker_is_active(job_id: str) -> bool:
+    with TRIGGER_JOBS_LOCK:
+        worker = TRIGGER_WORKERS.get(job_id)
+        return bool(worker and worker.is_alive())
+
+
+def _trigger_job_response(job: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "job_id": str(job["job_id"]),
+        "status": job.get("status", "queued"),
+        "error": job.get("error", ""),
+        "last_error": job.get("last_error", ""),
+        "progress": job.get("progress", 0.0),
+        "processed_items": job.get("processed_items", 0),
+        "total_items": job.get("total_items", 0),
+        "ok": job.get("ok", 0),
+        "failed": job.get("failed", 0),
+        "current_item": job.get("current_item", ""),
+        "pause_requested": bool(job.get("pause_requested")),
+        "cancel_requested": bool(job.get("cancel_requested")),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+    }
+
+
+def _get_trigger_job_for_response(job_id: str) -> Dict[str, Any]:
+    with TRIGGER_JOBS_LOCK:
+        cached = TRIGGER_JOBS.get(job_id)
+        job = dict(cached) if cached else None
+    if not job:
+        job = _get_stored_trigger_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job_id not found")
+    if job.get("status") in {"queued", "running", "pausing", "canceling"} and not _trigger_worker_is_active(job_id):
+        job["status"] = "canceled" if job.get("cancel_requested") else "paused"
+        job["last_error"] = job.get("last_error") or "Job was interrupted before completion. Resume to continue."
+        job["error"] = ""
+        job["pause_requested"] = False
+        job["cancel_requested"] = False
+        _publish_trigger_job(job)
+    return job
+
+
+def _player_teams_map() -> Dict[int, int]:
+    from backend.data.team_db import get_all_teams
+
+    player_teams: Dict[int, int] = {}
+    for t in get_all_teams():
+        for key in ("player1_id", "player2_id", "player3_id", "player4_id", "player5_id"):
+            pid = int(t.get(key) or 0)
+            if pid > 0:
+                player_teams[pid] = int(t.get("team_id") or 0)
+    return player_teams
+
+
+def _missing_trigger_players(event_id: Optional[int] = None) -> tuple:
+    price_map = {int(k): int(v) for k, v in (get_event_price_map(event_id) or {}).items()}
+    missing = []
+    for pid in price_map:
+        row = get_player(pid) or {}
+        if not row.get("boosters_json") or not row.get("roles_json"):
+            missing.append(pid)
+    coverage = {
+        "event_players": len(price_map),
+        "with_data": len(price_map) - len(missing),
+        "missing": len(missing),
+        "template_ready": _load_trigger_template() is not None,
+    }
+    return price_map, missing, coverage
+
+
+@router.get("/trigger-rates-backfill/coverage")
+def get_trigger_backfill_coverage(event_id: Optional[int] = None):
+    _prices, _missing, coverage = _missing_trigger_players(event_id)
+    return {"status": "ok", **coverage}
+
+
+@router.post("/trigger-rates-backfill/start")
+def start_trigger_backfill(payload: Dict[str, Any] | None = None):
+    if not _load_trigger_template() and not _load_hltv_credentials():
+        raise HTTPException(
+            status_code=400,
+            detail="Save the HLTV app login first — the job logs in and discovers the endpoint by itself.",
+        )
+    latest = _get_latest_trigger_job()
+    if latest and latest.get("status") in {"queued", "running", "pausing", "canceling"}:
+        return {"job_id": latest["job_id"], "status": latest.get("status"), "reused": True}
+    price_map, missing, _cov = _missing_trigger_players((payload or {}).get("event_id"))
+    if not price_map:
+        raise HTTPException(status_code=400, detail="No event player prices found. Import the event first.")
+    now = time.time()
+    job_id = uuid.uuid4().hex
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "error": "",
+        "last_error": "",
+        "progress": 0.0,
+        "processed_items": 0,
+        "total_items": 0,
+        "ok": 0,
+        "failed": 0,
+        "current_item": "",
+        "pause_requested": False,
+        "cancel_requested": False,
+        "created_at": now,
+        "updated_at": now,
+        "started_at": None,
+        "finished_at": None,
+    }
+    _publish_trigger_job(job)
+    _start_trigger_worker(job_id, (payload or {}).get("event_id"))
+    return {"job_id": job_id, "status": "queued"}
+
+
+def _get_latest_trigger_job() -> Optional[Dict[str, Any]]:
+    from backend.data.db import connect as _db_connect
+
+    conn = _db_connect()
+    try:
+        row = conn.execute("SELECT job_id FROM trigger_rates_jobs ORDER BY updated_at DESC LIMIT 1").fetchone()
+    finally:
+        conn.close()
+    return _get_trigger_job_for_response(str(row["job_id"])) if row else None
+
+
+@router.get("/trigger-rates-backfill/latest")
+def get_latest_trigger_backfill_job():
+    job = _get_latest_trigger_job()
+    if not job:
+        return {"exists": False}
+    return {"exists": True, **_trigger_job_response(job)}
+
+
+@router.get("/trigger-rates-backfill/job/{job_id}")
+def get_trigger_backfill_job(job_id: str):
+    return _trigger_job_response(_get_trigger_job_for_response(job_id))
+
+
+@router.post("/trigger-rates-backfill/job/{job_id}/pause")
+def pause_trigger_backfill_job(job_id: str):
+    job = _get_trigger_job_for_response(job_id)
+    if job.get("status") in {"completed", "canceled", "failed", "paused"}:
+        return _trigger_job_response(job)
+    job["pause_requested"] = True
+    job["status"] = "pausing" if _trigger_worker_is_active(job_id) else "paused"
+    _publish_trigger_job(job)
+    return _trigger_job_response(job)
+
+
+@router.post("/trigger-rates-backfill/job/{job_id}/cancel")
+def cancel_trigger_backfill_job(job_id: str):
+    job = _get_trigger_job_for_response(job_id)
+    if job.get("status") in {"completed", "canceled", "failed"}:
+        return _trigger_job_response(job)
+    job["cancel_requested"] = True
+    job["status"] = "canceling" if _trigger_worker_is_active(job_id) else "canceled"
+    if job["status"] == "canceled":
+        job["cancel_requested"] = False
+        job["finished_at"] = time.time()
+    _publish_trigger_job(job)
+    return _trigger_job_response(job)
+
+
+@router.post("/trigger-rates-backfill/job/{job_id}/resume")
+def resume_trigger_backfill_job(job_id: str):
+    job = _get_trigger_job_for_response(job_id)
+    if job.get("status") in {"completed", "canceled"}:
+        return _trigger_job_response(job)
+    if job.get("status") == "running" and _trigger_worker_is_active(job_id):
+        return _trigger_job_response(job)
+    job["status"] = "queued"
+    job["pause_requested"] = False
+    job["cancel_requested"] = False
+    job["error"] = ""
+    if job.get("last_error") in _TRIGGER_INTERRUPTION_BOILERPLATE:
+        job["last_error"] = ""
+    job["finished_at"] = None
+    _publish_trigger_job(job)
+    _start_trigger_worker(job_id, None)
+    return _trigger_job_response(_get_trigger_job_for_response(job_id))
+
+
+def _start_trigger_worker(job_id: str, event_id) -> None:
+    with TRIGGER_JOBS_LOCK:
+        worker = TRIGGER_WORKERS.get(job_id)
+        if worker and worker.is_alive():
+            return
+        worker = threading.Thread(target=_run_trigger_backfill_job, args=(job_id, event_id), daemon=True)
+        TRIGGER_WORKERS[job_id] = worker
+        worker.start()
+
+
+def _auto_discover_template(driver, event_id, wait_seconds: int = 200) -> Dict[str, Any]:
+    """Capture the playerTriggerRates request template.
+
+    The rates are served by an XHR that only fires when a lineup is edited in
+    the fantasy SPA, and the endpoint is not present in any static HTML/JSON, so
+    a passive page load cannot capture it. This opens the draft builder and
+    watches the network for up to the capture window while the user adds a few
+    players; the first matching request becomes the reusable template.
+    """
+    from backend.data.event_db import get_active_event_id
+
+    fantasy_id = int(event_id or get_active_event_id() or 0)
+    if not fantasy_id:
+        raise RuntimeError("No active event to discover against.")
+
+    # Land on the fantasy area and simply watch the network. The user signs in
+    # (if needed) and adds players in this same window; we capture whenever the
+    # request fires, wherever they navigate — no pre-login/team resolution.
+    driver.get(f"https://www.hltv.org/fantasy/{fantasy_id}/gameredirect")
+    time.sleep(4)
+    deadline = time.time() + int(wait_seconds)
+    while time.time() < deadline:
+        found = _collect_trigger_requests(driver, settle_seconds=5)
+        if found:
+            seen_ids: List[int] = []
+            for item in found:
+                try:
+                    data = json.loads(item["response_body"])
+                except Exception:
+                    continue
+                ptr = data.get("playerTriggerRates") or []
+                for entry in ptr:
+                    pid = (entry.get("playerId") or {}).get("playerId")
+                    if pid is not None:
+                        seen_ids.append(int(pid))
+                if ptr:
+                    _ingest_trigger_rates(ptr)
+            if seen_ids:
+                template = {
+                    "url": found[0]["url"],
+                    "method": found[0]["method"],
+                    "post_data": found[0].get("post_data"),
+                    "captured_player_ids": seen_ids[:10],
+                    "page_url": str(getattr(driver, "current_url", "") or ""),
+                    "captured_at": time.time(),
+                }
+                _save_trigger_template(template)
+                return template
+
+    raise RuntimeError(
+        "No trigger-rates request captured. In the window, sign in and add any 5 players to your fantasy team."
+    )
+
+
+def _run_trigger_backfill_job(job_id: str, event_id) -> None:
+    job = _get_stored_trigger_job(job_id)
+    if not job:
+        return
+
+    def stop_requested() -> str:
+        with TRIGGER_JOBS_LOCK:
+            live = TRIGGER_JOBS.get(job_id) or {}
+        if live.get("cancel_requested"):
+            return "canceled"
+        if live.get("pause_requested"):
+            return "paused"
+        return ""
+
+    job["status"] = "running"
+    job["pause_requested"] = False
+    job["cancel_requested"] = False
+    job["error"] = ""
+    if job.get("last_error") in _TRIGGER_INTERRUPTION_BOILERPLATE:
+        job["last_error"] = ""
+    job["started_at"] = job.get("started_at") or time.time()
+    job["finished_at"] = None
+    job["current_item"] = "Scanning event players for missing booster/role data"
+    _publish_trigger_job(job)
+
+    try:
+        # Recomputed on every (re)start, so already-enriched players are
+        # skipped automatically and resume continues where it left off.
+        price_map, missing, _cov = _missing_trigger_players(event_id)
+        if not price_map:
+            raise RuntimeError("No event player prices found. Import the event first.")
+        batches = _build_trigger_batches(price_map, _player_teams_map(), 1_000_000, cover=set(missing))
+        total = len(batches)
+        job["total_items"] = total
+        job["processed_items"] = 0
+        job["progress"] = 0.0 if total else 1.0
+        _publish_trigger_job(job)
+
+        if not batches:
+            job["status"] = "completed"
+            job["current_item"] = ""
+            job["finished_at"] = time.time()
+            _publish_trigger_job(job)
+            return
+
+        ok = int(job.get("ok") or 0)
+        failed = int(job.get("failed") or 0)
+
+        def run_batches(driver):
+            nonlocal ok, failed
+            # Stage 1: guarantee the session is the app's own account (not any
+            # personal login that happens to be persisted in the profile).
+            job["current_item"] = "Signing in as the app account"
+            _publish_trigger_job(job)
+            _ensure_app_login(driver)
+
+            # Stage 2: need the captured trigger-rates GET (from Capture). The
+            # endpoint reads whatever lineup is saved on the team, so covering
+            # every player means saving each batch as the lineup, then reading
+            # its rates. IDs come from the captured URL's path.
+            template = _load_trigger_template()
+            trig_url = str((template or {}).get("url") or "")
+            m = re.search(r"/fantasy/(\d+)/league/(\d+)/overview/(\d+)/draft/(\d+)/triggerrates", trig_url)
+            if not m:
+                raise RuntimeError(
+                    "No usable captured endpoint. Run Capture once (add any 5 players to your team and save)."
+                )
+            fantasy_id, league_id, team_id, draft_id = (int(x) for x in m.groups())
+            save_url = f"https://www.hltv.org/fantasy/{fantasy_id}/teams/edit"
+            try:
+                driver.get(str((template or {}).get("page_url") or f"https://www.hltv.org/fantasy/{fantasy_id}/overview"))
+                time.sleep(3)
+            except Exception:
+                pass
+
+            # Save the batch as the team lineup, then read the rates it produces.
+            script = """
+                var saveUrl = arguments[0], saveBody = arguments[1], trigUrl = arguments[2];
+                var done = arguments[arguments.length - 1];
+                (async function(){
+                    try {
+                        var sr = await fetch(saveUrl, {method:"POST", headers:{"content-type":"application/json"}, credentials:"include", body: saveBody});
+                        if (!sr.ok) { done({ok:false, error:"save HTTP " + sr.status}); return; }
+                        await new Promise(function(r){ setTimeout(r, 500); });
+                        var rr = await fetch(trigUrl, {credentials:"include", headers:{accept:"application/json"}});
+                        var tt = await rr.text();
+                        done({ok:true, text: tt});
+                    } catch (e) { done({ok:false, error:String(e)}); }
+                })();
+            """
+            updated_ids: set = set()
+            for idx, batch in enumerate(batches):
+                stopped = stop_requested()
+                if stopped:
+                    return stopped
+                job["current_item"] = f"Batch {idx + 1} / {total} ({len(batch)} players)"
+                save_body = json.dumps(
+                    {
+                        "leagueId": {"id": league_id},
+                        "teamId": {"id": team_id},
+                        "draft": {"id": draft_id},
+                        "updatedPlayers": [{"playerId": int(p)} for p in batch],
+                    }
+                )
+                try:
+                    res = driver.execute_async_script(script, save_url, save_body, trig_url)
+                except Exception as exc:
+                    res = {"ok": False, "error": str(exc)}
+                new_ids = 0
+                if res and res.get("ok"):
+                    try:
+                        data = json.loads(res.get("text") or "{}")
+                        ptr = data.get("playerTriggerRates") or []
+                        if ptr:
+                            before = len(updated_ids)
+                            for entry in ptr:
+                                pid = (entry.get("playerId") or {}).get("playerId")
+                                if pid is not None:
+                                    updated_ids.add(int(pid))
+                            _ingest_trigger_rates(ptr)
+                            new_ids = len(updated_ids) - before
+                    except Exception as exc:
+                        job["last_error"] = f"Batch {idx + 1}: {exc}"
+                else:
+                    job["last_error"] = f"Batch {idx + 1}: {(res or {}).get('error') or 'request failed'}"
+                if new_ids <= 0:
+                    failed += 1
+                job["processed_items"] = idx + 1
+                # ok = unique players actually covered, so it can never exceed
+                # the event's player count (no double-counting across batches).
+                job["ok"] = len(updated_ids)
+                ok = len(updated_ids)
+                job["failed"] = failed
+                job["progress"] = (idx + 1) / float(total)
+                # Merge live pause/cancel requests before publishing.
+                with TRIGGER_JOBS_LOCK:
+                    live = TRIGGER_JOBS.get(job_id) or {}
+                job["pause_requested"] = bool(live.get("pause_requested"))
+                job["cancel_requested"] = bool(live.get("cancel_requested"))
+                if job["cancel_requested"]:
+                    job["status"] = "canceling"
+                elif job["pause_requested"]:
+                    job["status"] = "pausing"
+                else:
+                    job["status"] = "running"
+                _publish_trigger_job(job)
+                time.sleep(1.0)
+            return ""
+
+        stopped = run_hltv_browser_session("https://www.hltv.org", run_batches, timeout_ms=120000, wait_text=None)
+        if stopped:
+            job["status"] = stopped
+            job["pause_requested"] = False
+            job["cancel_requested"] = False
+            job["last_error"] = "Canceled" if stopped == "canceled" else "Paused"
+            job["finished_at"] = time.time()
+            _publish_trigger_job(job)
+            return
+
+        job["status"] = "completed"
+        job["current_item"] = ""
+        job["finished_at"] = time.time()
+        _publish_trigger_job(job)
+    except Exception as exc:
+        job["status"] = "failed"
+        job["error"] = str(exc)
+        job["finished_at"] = time.time()
+        _publish_trigger_job(job)
+    finally:
+        with TRIGGER_JOBS_LOCK:
+            TRIGGER_WORKERS.pop(job_id, None)
 
 
 @router.post("/inspect-hltv-simulator")

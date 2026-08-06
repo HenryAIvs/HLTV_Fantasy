@@ -143,7 +143,8 @@ def load_team_players(team_id: int) -> Dict[int, PlayerState]:
                 continue
 
             d = dict(prow)
-            rating = float(d.get("rating", 0.0))
+            # rating is NULL for players never enriched by an event import.
+            rating = float(d.get("rating") or 0.0)
 
             boosters_obj = _parse_json(d.get("boosters_json"))
             roles_obj = _parse_json(d.get("roles_json"))

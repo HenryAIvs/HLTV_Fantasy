@@ -11,9 +11,11 @@ from backend.data.page_snapshots import save_page_snapshot
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_RECONNECT_TIME = float(os.getenv("HLTV_UC_RECONNECT_TIME", "4"))
-_FETCH_DELAY_MIN = float(os.getenv("HLTV_FETCH_DELAY_MIN", "2"))
-_FETCH_DELAY_MAX = float(os.getenv("HLTV_FETCH_DELAY_MAX", "5"))
+# Slower default throttle: rapid successive fetches drop Cloudflare's trust
+# score and trigger interactive challenges, so a calmer pace avoids them.
+_DEFAULT_RECONNECT_TIME = float(os.getenv("HLTV_UC_RECONNECT_TIME", "5"))
+_FETCH_DELAY_MIN = float(os.getenv("HLTV_FETCH_DELAY_MIN", "5"))
+_FETCH_DELAY_MAX = float(os.getenv("HLTV_FETCH_DELAY_MAX", "10"))
 _WAIT_AFTER_LOAD_MIN = float(os.getenv("HLTV_UC_WAIT_AFTER_LOAD_MIN", os.getenv("HLTV_UC_WAIT_AFTER_LOAD", "0.8")))
 _WAIT_AFTER_LOAD_MAX = float(os.getenv("HLTV_UC_WAIT_AFTER_LOAD_MAX", "1.8"))
 _DEFAULT_WINDOW_SIZE = (1400, 900)
@@ -114,16 +116,19 @@ def _make_driver():
         "user_data_dir": str(profile_dir),
         "page_load_strategy": "eager",
         "browser": "chrome",
+        # CDP performance logging so sessions can inspect network responses
+        # (used to discover the fantasy trigger-rates endpoint).
+        "log_cdp_events": True,
     }
-    try:
-        driver = Driver(**kwargs)
-    except TypeError:
-        kwargs.pop("page_load_strategy", None)
+    driver = None
+    for drop in ("log_cdp_events", "page_load_strategy", "browser", None):
         try:
             driver = Driver(**kwargs)
+            break
         except TypeError:
-            kwargs.pop("browser", None)
-            driver = Driver(**kwargs)
+            if drop is None:
+                raise
+            kwargs.pop(drop, None)
     try:
         driver.set_page_load_timeout(45)
         driver.set_script_timeout(45)
@@ -159,6 +164,66 @@ def _accept_cookies(driver) -> None:
                 return
     except Exception:
         pass
+
+
+def _looks_like_challenge(driver) -> bool:
+    try:
+        src = (driver.page_source or "").lower()
+    except Exception:
+        return False
+    # The passive challenge-platform script is on every page; only genuine
+    # interstitial markers indicate an actual challenge.
+    if len(src) > 120000:
+        return False  # a full page loaded, not a lightweight challenge shell
+    return (
+        "just a moment" in src
+        or "challenge-running" in src
+        or 'id="challenge-form"' in src
+        or "checking your browser before accessing" in src
+    )
+
+
+def _try_gui_captcha(driver, timeout: float = 18.0) -> None:
+    """Attempt UC mode's Turnstile click, but in a watchdog thread — the click
+    drives the real mouse (PyAutoGUI) and works when Chrome is visible on a
+    desktop, yet blocks forever without one, so it must never join the caller."""
+    def run():
+        for name in ("uc_gui_click_captcha", "uc_gui_handle_captcha"):
+            fn = getattr(driver, name, None)
+            if not fn:
+                continue
+            try:
+                fn()
+                return
+            except Exception:
+                pass
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout)
+
+
+def _clear_cloudflare(driver, url: str, wait_text: str | None) -> None:
+    """Clear a Cloudflare interstitial: first wait it out with longer reconnect
+    windows (managed challenges auto-solve), then, if an interactive Turnstile
+    persists, try the mouse-click solver guarded by a watchdog timeout."""
+    for reconnect in (8.0, 12.0):
+        if not _looks_like_challenge(driver):
+            return
+        try:
+            if hasattr(driver, "uc_open_with_reconnect"):
+                driver.uc_open_with_reconnect(url, reconnect_time=reconnect)
+            else:
+                driver.get(url)
+        except Exception:
+            pass
+        if wait_text:
+            _wait_for_text(driver, wait_text, 12.0)
+    if _looks_like_challenge(driver):
+        _try_gui_captcha(driver)
+        time.sleep(3.0)
+        if _looks_like_challenge(driver) and wait_text:
+            _wait_for_text(driver, wait_text, 10.0)
 
 
 def _wait_for_text(driver, text: str, timeout: float) -> bool:
@@ -244,8 +309,30 @@ def fetch_hltv_html(
                 _accept_cookies(driver)
                 if wait_text:
                     _wait_for_text(driver, wait_text, min(12.0, max(1.0, timeout_ms / 1000.0)))
+                # If the wait_text never appeared and the page is a Cloudflare
+                # challenge, wait it out (reconnect-based, no GUI clicks).
+                if _looks_like_challenge(driver):
+                    _clear_cloudflare(driver, url, wait_text)
                 _wait_after_load()
                 html = driver.page_source or ""
+                # Still challenged after clearing? On the first attempt, retry
+                # with a brand-new driver and a long reconnect window.
+                if attempt == 0 and _looks_like_challenge(driver):
+                    logger.warning("HLTV Cloudflare challenge persisted for %s; retrying with a fresh driver.", url)
+                    _quit_driver(driver)
+                    driver = None
+                    if profile_dir is not None:
+                        _cleanup_profile_locks(profile_dir)
+                    time.sleep(2.0)
+                    driver, profile_dir, headless = _make_driver()
+                    _open_hltv_url(driver, url, reconnect_time=12.0)
+                    _accept_cookies(driver)
+                    if wait_text:
+                        _wait_for_text(driver, wait_text, min(15.0, max(1.0, timeout_ms / 1000.0)))
+                    if _looks_like_challenge(driver):
+                        _clear_cloudflare(driver, url, wait_text)
+                    _wait_after_load()
+                    html = driver.page_source or ""
                 _mark_fetch_complete()
                 save_page_snapshot(url, html)
                 logger.info(

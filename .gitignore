@@ -35,3 +35,7 @@ downloaded_files/
 # Local environment
 .env
 *.env
+hltv_credentials.json
+trigger_endpoint_template.json
+page_snapshots.db*
+trigger_capture_debug.json

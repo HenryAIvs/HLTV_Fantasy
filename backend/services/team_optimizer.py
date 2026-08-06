@@ -104,9 +104,9 @@ def iter_valid_rosters(
                 break
         else:
             assignment, _ = best_role_assignment_for_team(combo_ids, role_scores_by_player)
-            if assignment is None:
-                continue
-            role_names = [str(assignment.get(pid, "-")) for pid in combo_ids]
+            # Players without role data (not yet enriched) get no assignment;
+            # keep the roster with placeholder roles rather than dropping it.
+            role_names = [str((assignment or {}).get(pid, "-")) for pid in combo_ids]
             yield {
                 "players": combo,
                 "pids": combo_ids,

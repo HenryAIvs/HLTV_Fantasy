@@ -74,13 +74,20 @@ def build_hltv_player_stats_url(
 
 
 def _is_cloudflare_challenge_html(html: str) -> bool:
+    """True only for an actual interstitial/challenge page. Cloudflare injects a
+    passive '/cdn-cgi/challenge-platform' script into EVERY normal page, so
+    matching that (or the generic 'challenge-platform') falsely flags real,
+    fully-loaded stats pages — the misdiagnosis behind the wrong error."""
     html_l = (html or "").lower()
+    if "hltv statistics" in html_l or "featured ratings" in html_l:
+        return False  # a real stats page loaded
     return (
         "just a moment" in html_l
-        or "/cdn-cgi/challenge-platform" in html_l
         or "cf-chl-" in html_l
-        or "challenge-platform" in html_l
-        or "ray id:" in html_l
+        or "challenge-running" in html_l
+        or 'id="challenge-form"' in html_l
+        or "checking your browser before accessing" in html_l
+        or ("verify you are human" in html_l and "/stats/" not in html_l)
     )
 
 
@@ -100,14 +107,24 @@ def get_featured_ratings(
 
     try:
         html = fetch_hltv_html(url, timeout_ms=timeout_ms, wait_text="Featured ratings")
-        featured = parse_featured_ratings_html(html, tops=buckets)
+        if _is_cloudflare_challenge_html(html):
+            raise HLTVFeaturedRatingsError(
+                "HLTV returned a Cloudflare/interstitial page instead of player stats HTML."
+            )
+        try:
+            featured = parse_featured_ratings_html(html, tops=buckets)
+        except FeaturedRatingsParseError:
+            featured = {}
         overall_rating = parse_overall_rating_html(html)
     except HLTVBrowserError as exc:
         raise HLTVFeaturedRatingsError(str(exc)) from exc
 
-    if not featured:
+    # A player with few maps vs top opponents legitimately has no per-tier
+    # entries; as long as the page loaded and gave an overall rating, store it —
+    # the missing tiers are filled later from the average degradation curve.
+    if not featured and overall_rating is None:
         raise FeaturedRatingsParseError(
-            "Could not parse 'vs top X opponents' entries from the HLTV stats page."
+            "Could not parse ratings from the HLTV stats page (empty or unexpected content)."
         )
 
     return {

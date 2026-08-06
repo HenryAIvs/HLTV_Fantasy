@@ -1576,3 +1576,31 @@ tbody tr { cursor: pointer; }
     grid-template-columns: repeat(5, minmax(0, 1fr));
   }
 }
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Compact GSL group flow (Double-Elim Groups tab) */
+.gsl-flow { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.gsl-match {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 7px 11px; border: 1px solid #243556; border-radius: 8px;
+  background: #111a2e; font-size: 13px;
+}
+.gsl-match .gsl-label { min-width: 92px; color: #8aa0c6; font-weight: 700; font-size: 12px; }
+.gsl-match .gsl-teams { color: #dbe4f0; }
+.gsl-match .gsl-note { margin-left: auto; color: #6f819e; font-size: 12px; white-space: nowrap; }
+@media (max-width: 640px) {
+  .gsl-match { flex-wrap: wrap; gap: 4px 10px; }
+  .gsl-match .gsl-note { margin-left: 0; }
+}
+
+.gsl-pick { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+.gsl-pick button {
+  padding: 4px 12px; border-radius: 6px; border: 1px solid #2b3d5f;
+  background: #16233c; color: #b9c6dc; font-size: 13px; cursor: pointer;
+}
+.gsl-pick button:disabled { opacity: 0.4; cursor: not-allowed; }
+.gsl-pick button.active { background: #2563eb; border-color: #2563eb; color: #fff; font-weight: 600; }

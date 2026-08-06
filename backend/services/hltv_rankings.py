@@ -171,13 +171,17 @@ def _build_results_url(offset: int = 0) -> str:
 
 
 def _is_cloudflare_challenge_html(html: str) -> bool:
+    # The passive '/cdn-cgi/challenge-platform' script ships on every normal
+    # page, so only genuine interstitial markers should count.
     html_l = (html or "").lower()
+    if len(html_l) > 120000:
+        return False
     return (
         "just a moment" in html_l
-        or "/cdn-cgi/challenge-platform" in html_l
         or "cf-chl-" in html_l
-        or "challenge-platform" in html_l
-        or "ray id:" in html_l
+        or "challenge-running" in html_l
+        or 'id="challenge-form"' in html_l
+        or "checking your browser before accessing" in html_l
     )
 
 

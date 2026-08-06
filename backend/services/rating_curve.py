@@ -4,6 +4,40 @@ from typing import Any, Dict, List, Optional, Tuple
 
 TOP_TIERS = (5, 10, 20, 30, 50)
 SAMPLE_PRIOR_SCALE = 0.5
+
+# Average player degradation curve: how much the typical player's rating vs
+# top-N opponents sits below their overall rating, per tier. Fitted from all
+# players who have real per-tier data, then used to estimate rank-adjusted
+# ratings for players who lack that data (see predict_rating_vs_rank).
+_AVERAGE_BUCKET_OFFSETS: Dict[int, float] = {}
+
+
+def set_average_bucket_offsets(offsets: Dict[int, float]) -> None:
+    global _AVERAGE_BUCKET_OFFSETS
+    _AVERAGE_BUCKET_OFFSETS = {int(k): float(v) for k, v in (offsets or {}).items()}
+
+
+def get_average_bucket_offsets() -> Dict[int, float]:
+    return dict(_AVERAGE_BUCKET_OFFSETS)
+
+
+def fit_average_bucket_offsets(player_rows) -> Dict[int, float]:
+    """Maps-weighted mean of (rating-vs-top-N minus overall) per tier, across
+    players with real per-tier data."""
+    sums = {t: 0.0 for t in TOP_TIERS}
+    weights = {t: 0.0 for t in TOP_TIERS}
+    for row in player_rows or []:
+        for bucket in build_player_bucket_rows(row):
+            tier = int(bucket.get("tier") or 0)
+            if tier not in TOP_TIERS:
+                continue
+            maps = _safe_float(bucket.get("maps")) or 0.0
+            delta = _safe_float(bucket.get("raw_bucket_delta"))
+            if maps <= 0 or delta is None:
+                continue
+            sums[tier] += float(delta) * float(maps)
+            weights[tier] += float(maps)
+    return {t: sums[t] / weights[t] for t in TOP_TIERS if weights[t] > 0}
 BUCKET_RANGES = {
     5: (1, 5),
     10: (6, 10),
@@ -236,6 +270,13 @@ def predict_rating_vs_rank(row: Dict[str, Any], opponent_rank: Any) -> Optional[
         points.append((float(tier), float(rating)))
 
     if not points:
+        # No per-tier data: estimate from the player's overall rating plus the
+        # average degradation curve, so rank still matters instead of a flat
+        # overall rating for everyone.
+        overall = _safe_float(row.get("rating"))
+        if overall is not None and _AVERAGE_BUCKET_OFFSETS:
+            est = [(float(t), overall + off) for t, off in _AVERAGE_BUCKET_OFFSETS.items()]
+            return _linear_interpolate(est, rank)
         return None
     return _linear_interpolate(points, rank)
 

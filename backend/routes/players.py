@@ -602,6 +602,9 @@ def _run_top_ratings_batch_job(job_id: str) -> None:
         job["progress"] = 1.0
         job["finished_at"] = time.time()
         _publish_topx_job(job)
+        # New per-tier data may shift the average degradation curve used to
+        # estimate ratings for players without their own top-X data.
+        refresh_average_rating_curve()
     except Exception as exc:
         job["status"] = "failed"
         job["error"] = str(exc)
@@ -611,6 +614,15 @@ def _run_top_ratings_batch_job(job_id: str) -> None:
     finally:
         with TOPX_BATCH_JOBS_LOCK:
             TOPX_BATCH_WORKERS.pop(job_id, None)
+
+
+def refresh_average_rating_curve() -> dict:
+    """Refit the average degradation curve from all players and cache it."""
+    from backend.services.rating_curve import fit_average_bucket_offsets, set_average_bucket_offsets
+
+    offsets = fit_average_bucket_offsets(get_all_players())
+    set_average_bucket_offsets(offsets)
+    return offsets
 
 
 def _start_topx_worker(job_id: str) -> None:
@@ -626,6 +638,18 @@ def _start_topx_worker(job_id: str) -> None:
 @router.get("/")
 def list_players():
     return get_all_players()
+
+
+@router.post("/average-rating-curve/refresh")
+def refresh_rating_curve_endpoint():
+    from backend.services.rating_curve import TIER_LABELS
+
+    offsets = refresh_average_rating_curve()
+    return {
+        "status": "ok",
+        "offsets": {str(t): round(v, 4) for t, v in sorted(offsets.items())},
+        "labels": {str(t): TIER_LABELS.get(t, f"Top {t}") for t in offsets},
+    }
 
 
 @router.post("/fetch-top-ratings-batch/start")

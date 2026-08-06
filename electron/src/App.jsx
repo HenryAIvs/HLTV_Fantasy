@@ -22,6 +22,7 @@ const tabs = [
   { key: "sim", label: "Swiss Group Stage" },
   { key: "playoff", label: "Playoff Bracket" },
   { key: "bounty", label: "Bounty Event" },
+  { key: "groups", label: "Double-Elim Groups" },
   { key: "admin", label: "Data Management" },
 ];
 
@@ -51,7 +52,7 @@ const parseJsonSafe = async (res) => {
   }
 };
 
-const requestJson = async (path, init = {}, timeoutMs = 30000) => {
+const requestJson = async (path, init = {}, timeoutMs = 60000) => {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   let res;
@@ -59,7 +60,7 @@ const requestJson = async (path, init = {}, timeoutMs = 30000) => {
     res = await fetch(`http://127.0.0.1:8000${path}`, { ...init, signal: controller.signal });
   } catch (e) {
     if (e?.name === "AbortError") {
-      throw new Error("Backend did not respond in time. Restart FastAPI and try again.");
+      throw new Error("Request timed out — the backend may still be working. Wait a moment and retry.");
     }
     throw e;
   } finally {
@@ -3521,8 +3522,8 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       setTopTeams(data.top_teams || []);
       setAllTeams(data.page_teams || []);
       setFilteredCount(Number(data.filtered_count || 0));
-      setSharedComboCount(Number(data.total_teams || sharedComboCount || 0));
-      setPage(Number(data.page || nextPage || 0));
+      setSharedComboCount(data.total_teams != null ? Number(data.total_teams) : sharedComboCount);
+      setPage(Number(data.page ?? nextPage ?? 0));
       if (playoffTopSubtab === "completed") {
         setCompletedBracketResult(data);
       }
@@ -4953,6 +4954,96 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
 }
 
 function EventsTab({ refreshData, notify, players }) {
+  const [triggerCoverage, setTriggerCoverage] = useState(null);
+  const [hltvLogin, setHltvLogin] = useState({ configured: false, username: "" });
+  const [showLoginForm, setShowLoginForm] = useState(false);
+  const [loginUser, setLoginUser] = useState("");
+  const [loginPass, setLoginPass] = useState("");
+  const [triggerSetupStatus, setTriggerSetupStatus] = useState("");
+  const triggerJob = useBackfillJob("/admin/trigger-rates-backfill", "booster/role fetch");
+  const loadTriggerCoverage = async () => {
+    try {
+      const cov = await api.get("/admin/trigger-rates-backfill/coverage");
+      if (cov && cov.status === "ok") setTriggerCoverage(cov);
+    } catch {
+      // Informational only.
+    }
+  };
+  const loadHltvLogin = async () => {
+    try {
+      const res = await api.get("/admin/hltv-credentials");
+      setHltvLogin({ configured: Boolean(res?.configured), username: String(res?.username || "") });
+    } catch {
+      // Informational only.
+    }
+  };
+  triggerJob.onSettledRef.current = () => {
+    loadTriggerCoverage();
+    if (refreshData) refreshData();
+  };
+  useEffect(() => {
+    loadTriggerCoverage();
+    loadHltvLogin();
+    triggerJob.hydrate();
+  }, []);
+
+  const [captureBusy, setCaptureBusy] = useState(false);
+  const [loginWindowBusy, setLoginWindowBusy] = useState(false);
+  const saveHltvLogin = async () => {
+    if (!loginUser.trim() || !loginPass) {
+      setTriggerSetupStatus("Enter both username and password.");
+      return;
+    }
+    try {
+      await api.post("/admin/hltv-credentials", { username: loginUser.trim(), password: loginPass });
+      setTriggerSetupStatus(`Saved app account "${loginUser.trim()}".`);
+      setLoginPass("");
+      setShowLoginForm(false);
+      loadHltvLogin();
+    } catch (e) {
+      setTriggerSetupStatus(e?.message || "Failed to save login.");
+    }
+  };
+
+  const openHltvLogin = async () => {
+    setLoginWindowBusy(true);
+    setTriggerSetupStatus("A browser window is opening — sign into your throwaway HLTV account (solve the captcha). It closes once you're in.");
+    try {
+      const res = await api.post("/admin/hltv-login-session", { timeout_seconds: 300 }, 340000);
+      setTriggerSetupStatus(
+        res?.logged_in
+          ? "Signed in. The session will persist for capture and fetch."
+          : "Login window closed without detecting a sign-in. If you did log in, continue to Capture anyway."
+      );
+    } catch (e) {
+      setTriggerSetupStatus(e?.message || "Login window failed.");
+    } finally {
+      setLoginWindowBusy(false);
+    }
+  };
+
+  const captureEndpoint = async () => {
+    setCaptureBusy(true);
+    setTriggerSetupStatus("Window opening — sign in and add any 5 players to your fantasy team; it captures then closes.");
+    try {
+      const res = await api.post("/admin/capture-trigger-endpoint", {}, 220000);
+      if (res?.status === "ok") {
+        setTriggerSetupStatus(
+          `Endpoint captured (${res.players_in_capture} players seen). Booster/role fetch is now fully automatic.`
+        );
+        notify("Trigger endpoint captured");
+        loadTriggerCoverage();
+        if (refreshData) refreshData();
+      } else {
+        setTriggerSetupStatus(String(res?.detail || "Capture did not complete."));
+      }
+    } catch (e) {
+      setTriggerSetupStatus(e?.message || "Capture failed.");
+    } finally {
+      setCaptureBusy(false);
+    }
+  };
+
   const [eventId, setEventId] = useState("");
   const [events, setEvents] = useState([]);
   const [activeEventId, setActiveEventId] = useState(null);
@@ -5116,6 +5207,72 @@ function EventsTab({ refreshData, notify, players }) {
             <button className="secondary" onClick={refreshAll} disabled={busy}>
               {busy ? "Working..." : "Refresh All"}
             </button>
+          </div>
+
+          <div className="card sub">
+            <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+              <h3 style={{ margin: 0 }}>Booster &amp; Role Data</h3>
+              {triggerCoverage && (
+                <p className="muted" style={{ margin: 0 }}>
+                  {Number(triggerCoverage.with_data || 0).toLocaleString()} /{" "}
+                  {Number(triggerCoverage.event_players || 0).toLocaleString()} players have data
+                </p>
+              )}
+              <div className="actions" style={{ margin: 0 }}>
+                {!triggerJob.active && triggerJob.status !== "paused" && (
+                  <button className="secondary" onClick={captureEndpoint} disabled={captureBusy}>
+                    {captureBusy
+                      ? "Window open — add 5 players..."
+                      : triggerCoverage?.template_ready
+                      ? "Re-capture"
+                      : "Capture"}
+                  </button>
+                )}
+                {triggerCoverage?.template_ready && !triggerJob.active && triggerJob.status !== "paused" && (
+                  <button className="primary" onClick={triggerJob.start} disabled={captureBusy}>
+                    Fetch Data
+                  </button>
+                )}
+                {triggerJob.status === "running" && (
+                  <>
+                    <button className="secondary" onClick={triggerJob.pause}>
+                      Pause
+                    </button>
+                    <button className="danger" onClick={triggerJob.cancel}>
+                      Cancel
+                    </button>
+                  </>
+                )}
+                {triggerJob.status === "paused" && (
+                  <button className="secondary" onClick={triggerJob.resume}>
+                    Resume
+                  </button>
+                )}
+              </div>
+              {captureBusy && triggerSetupStatus && (
+                <p className="muted" style={{ margin: 0 }}>
+                  {triggerSetupStatus}
+                </p>
+              )}
+              {(triggerJob.active || triggerJob.status === "paused") && (
+                <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                  <p className="muted" style={{ margin: 0 }}>
+                    {triggerJob.processed.toLocaleString()} / {triggerJob.total.toLocaleString()} batches
+                    {triggerJob.status === "running" && triggerJob.total > triggerJob.processed
+                      ? ` · ETA ${formatBatchEta(triggerJob.etaSeconds)}`
+                      : ""}
+                  </p>
+                  <div className="progress">
+                    <div className="progress-bar determinate" style={{ width: `${triggerJob.pctDone}%` }} />
+                  </div>
+                </div>
+              )}
+              {triggerJob.interacted && triggerJob.lastError && (
+                <p className="muted" style={{ margin: 0 }}>
+                  Error: {triggerJob.lastError}
+                </p>
+              )}
+            </div>
           </div>
 
           {events.length > 0 && (
@@ -6379,12 +6536,10 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
   };
 
   const playerHasCompleteTopRatings = (player) => {
-    if (!Number(player?.last_topx_import_at)) return false;
-    return TOP_RATING_TIERS.every((tier) => {
-      const rating = Number(player?.[`rating_top${tier}`]);
-      const maps = Number(player?.[`maps_top${tier}`]);
-      return Number.isFinite(rating) && rating > 0 && Number.isFinite(maps) && maps > 0;
-    });
+    // "Complete" = the import ran and produced an overall rating. Players with
+    // thin per-tier data (few maps vs top teams) are still complete — their
+    // rank-adjusted ratings are estimated from the average degradation curve.
+    return Boolean(Number(player?.last_topx_import_at)) && Number(player?.rating) > 0;
   };
 
   const getTopRatingsBatchPlayerIds = (onlyMissing = false) =>
@@ -8019,8 +8174,12 @@ function AdminTab({ refresh, notify }) {
 
         {dataTab === "trigger" && (
           <div className="stack">
+            <p className="muted">
+              Booster/role data is normally fetched automatically from the Events page. This manual paste remains as a
+              fallback.
+            </p>
             <label className="field">
-              <span>Trigger Rates JSON (playerTriggerRates)</span>
+              <span>Trigger Rates JSON (playerTriggerRates) — manual fallback</span>
               <textarea
                 rows={14}
                 value={triggerJson}
@@ -8080,6 +8239,9 @@ function useBackfillJob(basePath, jobLabel) {
   const [current, setCurrent] = useState("");
   const [lastError, setLastError] = useState("");
   const [etaSeconds, setEtaSeconds] = useState(null);
+  // True only once the user acts on the job in THIS mounted session, so a
+  // stale error hydrated from a previous run stays hidden.
+  const [interacted, setInteracted] = useState(false);
   const pollingRef = useRef(false);
   const onSettledRef = useRef(null);
 
@@ -8141,6 +8303,7 @@ function useBackfillJob(basePath, jobLabel) {
   };
 
   const start = async () => {
+    setInteracted(true);
     setStatus("queued");
     setProcessed(0);
     setTotal(0);
@@ -8162,6 +8325,7 @@ function useBackfillJob(basePath, jobLabel) {
 
   const control = async (action) => {
     if (!jobId) return;
+    setInteracted(true);
     try {
       const res = await api.post(`${basePath}/job/${jobId}/${action}`, {});
       const applied = apply(res, jobId);
@@ -8192,6 +8356,7 @@ function useBackfillJob(basePath, jobLabel) {
     failed,
     current,
     lastError,
+    interacted,
     etaSeconds,
     active: ["queued", "running", "pausing", "canceling"].includes(status),
     resumable: ["paused", "failed"].includes(status),
@@ -8690,63 +8855,50 @@ function ModelLabTab() {
                 </p>
               </div>
               <div className="card sub">
-                <h3>With Map Data</h3>
-                <p className="muted">Map winner {pct(result.metrics?.winner_accuracy, 1)}</p>
-                <p className="muted">Score MAE {Number(result.metrics?.score_mae || 0).toFixed(2)}</p>
-                <p className="muted">Map Brier {Number(result.metrics?.brier || 0).toFixed(3)}</p>
-                {result.metrics?.series_winner_accuracy != null && (
-                  <>
-                    <p className="muted">
-                      Series (BO3) winner {pct(result.metrics.series_winner_accuracy, 1)} of{" "}
-                      {Number(result.metrics.n_series || 0).toLocaleString()}
-                    </p>
-                    <p className="muted">Series Brier {Number(result.metrics.series_brier || 0).toFixed(3)}</p>
-                  </>
-                )}
-                {result.metrics?.veto_sim?.winner_accuracy != null && (
-                  <>
-                    <p className="muted">
-                      Veto-sim series winner {pct(result.metrics.veto_sim.winner_accuracy, 1)} of{" "}
-                      {Number(result.metrics.veto_sim.n || 0).toLocaleString()}
-                    </p>
-                    <p className="muted">
-                      Veto-sim Brier {Number(result.metrics.veto_sim.brier || 0).toFixed(3)} | maps matched{" "}
-                      {pct(result.metrics.veto_sim.map_match_rate, 1)}
-                    </p>
-                  </>
-                )}
+                <h3>Model Comparison</h3>
+                {(() => {
+                  const wm = result.metrics || {};
+                  const ro = result.rank_only_metrics || {};
+                  const rows = [
+                    { label: "Map winner", a: wm.winner_accuracy, b: ro.winner_accuracy, fmt: (v) => pct(v, 1), higherBetter: true },
+                    { label: "Map Brier", a: wm.brier, b: ro.brier, fmt: (v) => Number(v).toFixed(3), higherBetter: false },
+                    { label: "Score MAE", a: wm.score_mae, b: ro.score_mae, fmt: (v) => Number(v).toFixed(2), higherBetter: false },
+                    { label: `Series winner (n ${Number(wm.n_series || 0).toLocaleString()})`, a: wm.series_winner_accuracy, b: ro.series_winner_accuracy, fmt: (v) => pct(v, 1), higherBetter: true },
+                    { label: "Series Brier", a: wm.series_brier, b: ro.series_brier, fmt: (v) => Number(v).toFixed(3), higherBetter: false },
+                    { label: `Veto-sim winner (n ${Number(wm.veto_sim?.n || 0).toLocaleString()})`, a: wm.veto_sim?.winner_accuracy, b: ro.veto_sim?.winner_accuracy, fmt: (v) => pct(v, 1), higherBetter: true },
+                    { label: "Veto-sim Brier", a: wm.veto_sim?.brier, b: ro.veto_sim?.brier, fmt: (v) => Number(v).toFixed(3), higherBetter: false },
+                    { label: "Veto maps matched", a: wm.veto_sim?.map_match_rate, b: ro.veto_sim?.map_match_rate, fmt: (v) => pct(v, 1), higherBetter: true },
+                  ].filter((row) => row.a != null && row.b != null);
+                  return (
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Metric</th>
+                          <th>With Map Data</th>
+                          <th>Rank Only</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {rows.map((row) => {
+                          const aWins = row.higherBetter ? Number(row.a) > Number(row.b) : Number(row.a) < Number(row.b);
+                          const bWins = row.higherBetter ? Number(row.b) > Number(row.a) : Number(row.b) < Number(row.a);
+                          return (
+                            <tr key={row.label}>
+                              <td>{row.label}</td>
+                              <td>{aWins ? <strong>{row.fmt(row.a)}</strong> : row.fmt(row.a)}</td>
+                              <td>{bWins ? <strong>{row.fmt(row.b)}</strong> : row.fmt(row.b)}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  );
+                })()}
                 <p className="muted">
-                  Historical maps kept {pct(result.input_summary?.train?.map_stats_coverage, 1)} (
+                  Bold = better. Historical maps kept {pct(result.input_summary?.train?.map_stats_coverage, 1)} (
                   {Number(result.input_summary?.train?.maps || 0).toLocaleString()} /{" "}
                   {Number(result.input_summary?.train?.candidate_maps || 0).toLocaleString()})
                 </p>
-              </div>
-              <div className="card sub">
-                <h3>Rank Only</h3>
-                <p className="muted">Map winner {pct(result.rank_only_metrics?.winner_accuracy, 1)}</p>
-                <p className="muted">Score MAE {Number(result.rank_only_metrics?.score_mae || 0).toFixed(2)}</p>
-                <p className="muted">Map Brier {Number(result.rank_only_metrics?.brier || 0).toFixed(3)}</p>
-                {result.rank_only_metrics?.series_winner_accuracy != null && (
-                  <>
-                    <p className="muted">
-                      Series (BO3) winner {pct(result.rank_only_metrics.series_winner_accuracy, 1)} of{" "}
-                      {Number(result.rank_only_metrics.n_series || 0).toLocaleString()}
-                    </p>
-                    <p className="muted">Series Brier {Number(result.rank_only_metrics.series_brier || 0).toFixed(3)}</p>
-                  </>
-                )}
-                {result.rank_only_metrics?.veto_sim?.winner_accuracy != null && (
-                  <>
-                    <p className="muted">
-                      Veto-sim series winner {pct(result.rank_only_metrics.veto_sim.winner_accuracy, 1)} of{" "}
-                      {Number(result.rank_only_metrics.veto_sim.n || 0).toLocaleString()}
-                    </p>
-                    <p className="muted">
-                      Veto-sim Brier {Number(result.rank_only_metrics.veto_sim.brier || 0).toFixed(3)} | maps matched{" "}
-                      {pct(result.rank_only_metrics.veto_sim.map_match_rate, 1)}
-                    </p>
-                  </>
-                )}
               </div>
             </div>
             {rankEffectLevelBands.length > 0 && (
@@ -9303,6 +9455,862 @@ function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
   );
 }
 
+function GroupsTab({ teams, teamLookup, players, refresh }) {
+  const [groupsTab, setGroupsTab] = useState("stage");
+  const [events, setEvents] = useState([]);
+  const [selectedEventId, setSelectedEventId] = useState("");
+  const [eventTeamNames, setEventTeamNames] = useState(new Set());
+  const [groupCount, setGroupCount] = useState(2);
+  const [combinedPlayoffs, setCombinedPlayoffs] = useState(false);
+  const [playoffSims, setPlayoffSims] = useState("2000");
+  const [playoffStopTeams, setPlayoffStopTeams] = useState("1");
+  const [slots, setSlots] = useState(Array(8).fill(""));
+  const [results, setResults] = useState(null);
+  const [updatedAt, setUpdatedAt] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [runMessage, setRunMessage] = useState("");
+  const [runProgress, setRunProgress] = useState({ done: 0, total: 0 });
+  const [autofillBusy, setAutofillBusy] = useState(false);
+  const [autofillMessage, setAutofillMessage] = useState("");
+  const [comboMode, setComboMode] = useState("average");
+  const [comboSearch, setComboSearch] = useState("");
+  const [sortKey, setSortKey] = useState("ev_desc");
+  const [topTeams, setTopTeams] = useState(null);
+  const [allTeams, setAllTeams] = useState(null);
+  const [filteredCount, setFilteredCount] = useState(0);
+  const [page, setPage] = useState(0);
+  const [combosReady, setCombosReady] = useState(false);
+  const [liveMode, setLiveMode] = useState(false);
+  const [combosUpdatedAt, setCombosUpdatedAt] = useState("");
+  const [comboProgress, setComboProgress] = useState({ done: 0, total: 0 });
+  const [topMessage, setTopMessage] = useState("");
+  const [completedPicks, setCompletedPicks] = useState({});
+  const [completedResult, setCompletedResult] = useState(null);
+  const [completedMessage, setCompletedMessage] = useState("");
+  const pollingRef = useRef(false);
+  const querySeqRef = useRef(0);
+
+  const normalizeTeamName = (name) => String(name || "").trim().toLowerCase();
+  const filteredTeams = useMemo(() => {
+    if (!selectedEventId || !eventTeamNames || eventTeamNames.size === 0) return [];
+    return teams.filter((t) => eventTeamNames.has(normalizeTeamName(t.name)));
+  }, [teams, selectedEventId, eventTeamNames]);
+  // Fantasy pools often cover only part of a big field (e.g. 35 of 64 open
+  // qualifier teams); missing opponents are filled with generic rank-250
+  // unknowns, selectable as many times as needed.
+  const teamOptions = useMemo(() => {
+    const base = [
+      { value: "", label: "Select team" },
+      { value: "unknown", label: "Unknown team (rank 250)" },
+      ...filteredTeams.map((t) => ({ value: String(t.team_id), label: `${t.name} (${t.team_id})` })),
+    ];
+    // Slots restored from a stored run may reference materialized Unknown-N
+    // teams (or other non-event teams); keep them displayable.
+    const known = new Set(base.map((o) => o.value));
+    const extras = [];
+    slots.forEach((s) => {
+      if (!s || s === "unknown" || known.has(String(s))) return;
+      known.add(String(s));
+      extras.push({ value: String(s), label: `${teamLookup[Number(s)] || `Team ${s}`} (${s})` });
+    });
+    return [...base, ...extras];
+  }, [filteredTeams, slots, teamLookup]);
+
+  const setSlot = (idx, val) => {
+    setSlots((prev) => {
+      const next = [...prev];
+      next[idx] = val;
+      return next;
+    });
+  };
+  const setGroupCountSafe = (n) => {
+    const count = Math.max(1, Math.min(16, Number(n) || 1));
+    setGroupCount(count);
+    setSlots((prev) => {
+      const next = Array(count * 4).fill("");
+      prev.slice(0, count * 4).forEach((v, i) => (next[i] = v));
+      return next;
+    });
+  };
+  const groupSlots = useMemo(() => {
+    const out = [];
+    for (let g = 0; g < groupCount; g++) out.push(slots.slice(g * 4, g * 4 + 4));
+    return out;
+  }, [slots, groupCount]);
+
+  const autofillFromHltv = async () => {
+    setAutofillBusy(true);
+    setAutofillMessage("");
+    try {
+      const data = await api.post("/groups/autofill-from-hltv-event", {}, 90000);
+      if (data?.detail) {
+        setAutofillMessage(String(data.detail));
+        return;
+      }
+      const groups = data.groups || [];
+      if (groups.length === 0) {
+        setAutofillMessage("No groups found on the event page.");
+        return;
+      }
+      const nextSlots = groups.flatMap((grp) => (grp.team_ids || []).map((id) => (id > 0 ? String(id) : "unknown")));
+      setGroupCount(groups.length);
+      setSlots(nextSlots);
+      const tbd = nextSlots.filter((s) => s === "unknown").length;
+      setAutofillMessage(
+        `Filled ${groups.length} groups from HLTV${tbd ? ` (${tbd} undecided slots set to Unknown)` : ""}.`
+      );
+      if (refresh) await refresh();
+    } catch (e) {
+      setAutofillMessage(e?.message || "Autofill failed.");
+    } finally {
+      setAutofillBusy(false);
+    }
+  };
+  const allSlotsFilled =
+    slots.length === groupCount * 4 && slots.every((s) => s === "unknown" || Number(s) > 0);
+  const teamName = (id) => {
+    if (id === "unknown") return "Unknown team";
+    return teamLookup[Number(id)] || (id ? `Team ${id}` : "TBD");
+  };
+
+  const loadEvents = async (retriesLeft = 3) => {
+    let data = null;
+    try {
+      data = await api.get("/events/");
+    } catch {
+      if (retriesLeft > 0) setTimeout(() => loadEvents(retriesLeft - 1), 5000);
+      return;
+    }
+    if (data?.detail) return;
+    const allEvents = Array.isArray(data.events) ? data.events : [];
+    setEvents(allEvents);
+    const active = data.active_event_id;
+    const fallback = allEvents.length > 0 ? allEvents[0].event_id : "";
+    const nextSelected = active ?? fallback;
+    setSelectedEventId(nextSelected === "" ? "" : String(nextSelected));
+  };
+  const loadEventTeams = async (eventId) => {
+    if (!eventId) {
+      setEventTeamNames(new Set());
+      return;
+    }
+    const data = await api.get(`/events/${eventId}`);
+    if (data?.detail) return;
+    setEventTeamNames(new Set((data.teams || []).map((t) => normalizeTeamName(t.team_name))));
+  };
+  const loadLatest = async () => {
+    const data = await api.get("/groups/latest", 120000);
+    if (!data?.exists) return;
+    const payload = data.payload || {};
+    const savedGroups = payload.groups || [];
+    if (savedGroups.length > 0) {
+      setGroupCount(savedGroups.length);
+      setSlots(savedGroups.flat().map((x) => String(x)));
+    }
+    setCombinedPlayoffs(Boolean(payload.combined_playoffs));
+    if (payload.n_playoff_sims) setPlayoffSims(String(payload.n_playoff_sims));
+    if (payload.playoff_stop_teams) setPlayoffStopTeams(String(payload.playoff_stop_teams));
+    setResults(data.results || null);
+    setUpdatedAt(data.updated_at ? new Date(Number(data.updated_at) * 1000).toISOString() : "");
+  };
+  const loadLatestCombos = async () => {
+    const data = await api.get("/groups/best-team/latest", 60000);
+    if (!data?.exists) {
+      setLiveMode(false);
+      return;
+    }
+    setLiveMode(Boolean(data.live));
+    setCombosReady(true);
+    setCombosUpdatedAt(data.updated_at ? new Date(Number(data.updated_at) * 1000).toISOString() : "");
+  };
+
+  useEffect(() => {
+    loadEvents();
+    loadLatest();
+    loadLatestCombos();
+  }, []);
+  useEffect(() => {
+    loadEventTeams(selectedEventId);
+  }, [selectedEventId]);
+
+  const run = async () => {
+    if (!allSlotsFilled) return;
+    setBusy(true);
+    setRunMessage("");
+    setRunProgress({ done: 0, total: 0 });
+    try {
+      const start = await api.post("/groups/start", {
+        groups: groupSlots.map((g) => g.map((v) => (v === "unknown" ? "unknown" : Number(v)))),
+        combined_playoffs: combinedPlayoffs,
+        n_playoff_sims: Math.max(200, Math.min(20000, Number(playoffSims) || 2000)),
+        playoff_stop_teams: Number(playoffStopTeams) || 1,
+      });
+      if (start?.detail) {
+        setRunMessage(String(start.detail));
+        return;
+      }
+      let done = false;
+      while (!done) {
+        const status = await api.get(`/groups/job/${start.job_id}`);
+        if (status?.detail) {
+          setRunMessage(String(status.detail));
+          return;
+        }
+        setRunProgress({ done: Number(status.processed_units || 0), total: Number(status.total_units || 0) });
+        if (status.status === "failed") {
+          setRunMessage(status.error || "Group simulation failed.");
+          return;
+        }
+        if (status.status === "completed") {
+          await loadLatest();
+          setCombosReady(false);
+          setTopTeams(null);
+          setAllTeams(null);
+          await loadLatestCombos();
+          if (refresh) await refresh(); // pick up any newly created Unknown teams
+          done = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+    } catch (e) {
+      setRunMessage(e?.message || "Failed to run group simulation.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const resetStored = async () => {
+    await api.delete("/groups/latest");
+    setResults(null);
+    setUpdatedAt("");
+    setTopTeams(null);
+    setAllTeams(null);
+    setCombosReady(false);
+    setCombosUpdatedAt("");
+    setCompletedResult(null);
+    setTopMessage("");
+  };
+
+  const runCombinations = async () => {
+    setBusy(true);
+    setTopMessage("");
+    setComboProgress({ done: 0, total: 0 });
+    try {
+      const start = await api.post("/groups/best-team/start", {});
+      if (start?.detail) {
+        setTopMessage(String(start.detail));
+        return;
+      }
+      if (pollingRef.current) return;
+      pollingRef.current = true;
+      try {
+        let done = false;
+        while (!done) {
+          const status = await api.get(`/groups/best-team/job/${start.job_id}`);
+          if (status?.detail) {
+            setTopMessage(String(status.detail));
+            return;
+          }
+          setComboProgress({
+            done: Number(status.processed_combinations || 0),
+            total: Number(status.total_combinations || 0),
+          });
+          if (status.status === "failed") {
+            setTopMessage(status.error || "Combination job failed.");
+            return;
+          }
+          if (status.status === "completed") {
+            setCombosReady(true);
+            setCombosUpdatedAt(new Date().toISOString());
+            done = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+      } finally {
+        pollingRef.current = false;
+      }
+    } catch (e) {
+      setTopMessage(e?.message || "Failed to run combinations.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const queryCombos = async (nextPage = 0) => {
+    if (!combosReady) return;
+    const seq = ++querySeqRef.current;
+    try {
+      const data = await api.post(
+        "/groups/best-team/query",
+        { mode: comboMode, search: comboSearch, sort: sortKey, page: nextPage, page_size: 200 },
+        120000
+      );
+      if (seq !== querySeqRef.current) return;
+      setTopTeams(data.top_teams || []);
+      setAllTeams(data.page_teams || []);
+      setFilteredCount(Number(data.filtered_count || 0));
+      setPage(Number(data.page || nextPage || 0));
+      setTopMessage(
+        data.exact === false
+          ? "Search hit its time budget — showing the best rosters found so far (near-optimal, not proven optimal)."
+          : ""
+      );
+    } catch (e) {
+      if (seq !== querySeqRef.current) return;
+      setTopMessage(e?.message || "Failed to load combinations.");
+    }
+  };
+  useEffect(() => {
+    if (!combosReady) return;
+    queryCombos(0);
+  }, [combosReady, comboMode, comboSearch, sortKey]);
+
+  const completedDerived = useMemo(() => {
+    return groupSlots.map((group, g) => {
+      const picks = completedPicks[g] || ["", "", "", "", ""];
+      const [s1, s2, s3, s4] = group;
+      const o1 = [s1, s2];
+      const o2 = [s3, s4];
+      const o1w = picks[0];
+      const o2w = picks[1];
+      const winnersPair =
+        o1w && o2w ? [o1w, o2w] : [];
+      const losersPair =
+        o1w && o2w
+          ? [o1.find((t) => String(t) !== String(o1w)), o2.find((t) => String(t) !== String(o2w))]
+          : [];
+      const wWinner = picks[2];
+      const eWinner = picks[3];
+      const deciderPair =
+        wWinner && eWinner && winnersPair.length
+          ? [winnersPair.find((t) => String(t) !== String(wWinner)), eWinner]
+          : [];
+      const pairs = [o1, o2, winnersPair, losersPair, deciderPair];
+      const complete = picks.every((p, i) => Boolean(p) && pairs[i].some((t) => String(t) === String(p)));
+      return { pairs, picks, complete };
+    });
+  }, [groupSlots, completedPicks]);
+  const allGroupsComplete = completedDerived.length > 0 && completedDerived.every((g) => g.complete);
+
+  const setCompletedPick = (g, matchIdx, value) => {
+    setCompletedPicks((prev) => {
+      const picks = [...(prev[g] || ["", "", "", "", ""])];
+      picks[matchIdx] = value;
+      // later rounds depend on earlier winners
+      if (matchIdx <= 1) {
+        picks[2] = "";
+        picks[3] = "";
+        picks[4] = "";
+      } else if (matchIdx <= 3) {
+        picks[4] = "";
+      }
+      return { ...prev, [g]: picks };
+    });
+    setCompletedResult(null);
+  };
+
+  const scoreCompleted = async () => {
+    setCompletedMessage("");
+    try {
+      const data = await api.post(
+        "/groups/best-team/completed-query",
+        {
+          group_winners: completedDerived.map((g) => g.picks.map(Number)),
+          search: comboSearch,
+          page: 0,
+          page_size: 200,
+        },
+        120000
+      );
+      if (data?.detail) {
+        setCompletedMessage(String(data.detail));
+        return;
+      }
+      setCompletedResult(data);
+    } catch (e) {
+      setCompletedMessage(e?.message || "Failed to score completed groups.");
+    }
+  };
+
+  const valueData = useMemo(() => buildPlayerValueRowsFromSimulation(results, players), [results, players]);
+  const matchLabels = ["Opening 1", "Opening 2", "Winners' match", "Elimination", "Decider"];
+  const metricLabel = (team) =>
+    comboMode === "single_outcome"
+      ? `Ceiling ${Number(team?.ceiling_points || 0).toFixed(2)}`
+      : `EV ${Number(team?.average_ev ?? team?.total_ev ?? 0).toFixed(2)}`;
+  const groupTeamInitials = (teamId) => {
+    if (teamId === "unknown") return "??";
+    const name = teamLookup[Number(teamId)] || "";
+    const parts = String(name).trim().split(/\s+/).filter(Boolean);
+    if (parts.length >= 2) return `${parts[0][0] || ""}${parts[1][0] || ""}`.toUpperCase();
+    return String(name || "?").slice(0, 2).toUpperCase();
+  };
+  const GroupTeamRow = ({ teamId, placeholder }) => (
+    <div className={`playoff-team-row ${teamId ? "" : "muted"}`}>
+      <span className={`playoff-team-badge ${teamId ? "" : "empty"}`}>{teamId ? groupTeamInitials(teamId) : "?"}</span>
+      {teamId ? <span>{teamName(teamId)}</span> : <span className="playoff-team-tbd">{placeholder || "TBD"}</span>}
+    </div>
+  );
+  const GroupMatchCard = ({ title, rows, className = "" }) => (
+    <div className={`playoff-match-card ${className}`}>
+      <div className="playoff-match-head">
+        <strong>{title}</strong>
+        <span>BO3</span>
+      </div>
+      <div className="playoff-match-teams">{rows}</div>
+    </div>
+  );
+  const GroupPickRow = ({ teamId, selected, onSelect, placeholder }) => (
+    <button
+      type="button"
+      className={`playoff-team-row completed-pick ${teamId ? "" : "muted"} ${selected ? "active" : ""}`}
+      onClick={() => teamId && onSelect(String(teamId))}
+      disabled={!teamId}
+    >
+      <span className={`playoff-team-badge ${teamId ? "" : "empty"}`}>{teamId ? groupTeamInitials(teamId) : "?"}</span>
+      <span>{teamId ? teamName(teamId) : placeholder || "TBD"}</span>
+    </button>
+  );
+  const qualificationOdds = useMemo(() => {
+    const rates = results?.playoff?.advance_rate;
+    if (!rates) return [];
+    return Object.entries(rates)
+      .map(([tid, rate]) => ({ teamId: Number(tid), rate: Number(rate) }))
+      .sort((a, b) => b.rate - a.rate);
+  }, [results?.playoff?.advance_rate]);
+
+  return (
+    <Section title="Double-Elimination Groups (BO3)">
+      <div className="stack">
+        <div className="grid three">
+          <Select
+            label="Event"
+            value={selectedEventId}
+            onChange={setSelectedEventId}
+            options={
+              events.length > 0
+                ? events.map((e) => ({
+                    value: String(e.event_id),
+                    label: e.hltv_event_id ? `Fantasy ${e.event_id} -> HLTV ${e.hltv_event_id}` : `Fantasy ${e.event_id}`,
+                  }))
+                : [{ value: "", label: "No events imported" }]
+            }
+          />
+          <Select
+            label="Groups"
+            value={String(groupCount)}
+            onChange={setGroupCountSafe}
+            options={Array.from({ length: 16 }, (_, i) => i + 1).map((n) => ({
+              value: String(n),
+              label: `${n} group${n > 1 ? "s" : ""} (${n * 4} teams)`,
+            }))}
+          />
+          <div className="field">
+            <span>Stored Valuations</span>
+            <div className="pill">{results ? "Loaded" : "None"}</div>
+          </div>
+        </div>
+        <div className="tab-bar small">
+          <button className={groupsTab === "stage" ? "tab active" : "tab"} onClick={() => setGroupsTab("stage")}>
+            Group Stage
+          </button>
+          <button className={groupsTab === "top5" ? "tab active" : "tab"} onClick={() => setGroupsTab("top5")}>
+            Top 5 Teams
+          </button>
+          <button className={groupsTab === "completed" ? "tab active" : "tab"} onClick={() => setGroupsTab("completed")}>
+            Completed Groups
+          </button>
+          <button className={groupsTab === "value" ? "tab active" : "tab"} onClick={() => setGroupsTab("value")}>
+            Player Value
+          </button>
+        </div>
+
+        {groupsTab === "stage" && (
+          <>
+            <div className="actions" style={{ marginTop: 0 }}>
+              <button className="secondary" onClick={autofillFromHltv} disabled={busy || autofillBusy}>
+                {autofillBusy ? "Fetching event..." : "Autofill from HLTV event"}
+              </button>
+              {autofillMessage && <span className="muted">{autofillMessage}</span>}
+            </div>
+            {groupSlots.map((group, g) => (
+              <div className="card sub" key={`group-${g}`}>
+                <h3>Group {g + 1}</h3>
+                <div className="grid two">
+                  {group.map((slotValue, idx) => (
+                    <div className="field" key={`g${g}-s${idx}`}>
+                      <span>Seed {idx + 1}</span>
+                      <select value={slotValue} onChange={(e) => setSlot(g * 4 + idx, e.target.value)} disabled={busy}>
+                        {teamOptions.map((option) => (
+                          <option key={option.value || "empty"} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+            <div className="actions">
+              <label className="checkbox-inline">
+                <input
+                  type="checkbox"
+                  checked={combinedPlayoffs}
+                  onChange={(e) => setCombinedPlayoffs(e.target.checked)}
+                  disabled={busy || ![1, 2, 4, 8, 16].includes(groupCount)}
+                />
+                <span>Combined playoffs (qualifiers feed one single-elim bracket)</span>
+              </label>
+              <button className="primary" onClick={run} disabled={busy || !allSlotsFilled}>
+                {busy ? "Running..." : "Run Groups And Store Valuations"}
+              </button>
+              <button className="danger" onClick={resetStored} disabled={busy || !results}>
+                Reset Stored Valuations
+              </button>
+              {updatedAt && <p className="muted">Stored: {new Date(updatedAt).toLocaleString()}</p>}
+            </div>
+            {![1, 2, 4, 8, 16].includes(groupCount) && (
+              <p className="muted">Combined playoffs need 1, 2, 4, 8, or 16 groups (a power-of-two bracket).</p>
+            )}
+            {busy && runProgress.total > 0 && (
+              <>
+                <p className="muted">
+                  {runProgress.done <= groupCount
+                    ? `Enumerating groups: ${Math.min(runProgress.done, groupCount)} / ${groupCount}`
+                    : `Playoff simulations: ${(runProgress.done - groupCount).toLocaleString()} / ${(
+                        runProgress.total - groupCount
+                      ).toLocaleString()}`}
+                </p>
+                <div className="progress">
+                  <div
+                    className="progress-bar determinate"
+                    style={{ width: `${Math.min(100, (runProgress.done / runProgress.total) * 100)}%` }}
+                  />
+                </div>
+              </>
+            )}
+            {results?.playoff && qualificationOdds.length > 0 && (
+              <div className="card sub">
+                <h3>
+                  {Number(results.playoff.stop_teams || 1) > 1
+                    ? `Qualification Odds (top ${results.playoff.stop_teams})`
+                    : "Championship Odds"}
+                </h3>
+                <p className="muted">
+                  From {Number(results.playoff.n_sims || 0).toLocaleString()} playoff simulations on top of the exact
+                  group stage.
+                </p>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Team</th>
+                      <th>{Number(results.playoff.stop_teams || 1) > 1 ? "Qualify %" : "Win %"}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {qualificationOdds.slice(0, 16).map((row, idx) => (
+                      <tr key={row.teamId}>
+                        <td>{idx + 1}</td>
+                        <td>{teamName(row.teamId)}</td>
+                        <td>{(row.rate * 100).toFixed(1)}%</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {combinedPlayoffs && (
+              <>
+                <div className="grid two">
+                  <Input label="Playoff Simulations" value={playoffSims} onChange={setPlayoffSims} placeholder="2000" />
+                  <Select
+                    label="Bracket Ends At"
+                    value={playoffStopTeams}
+                    onChange={setPlayoffStopTeams}
+                    options={(() => {
+                      const bracket = groupCount * 2;
+                      const roundName = (teamsInRound) => {
+                        if (teamsInRound === 2) return "grand final";
+                        if (teamsInRound === 4) return "semi-finals";
+                        if (teamsInRound === 8) return "quarter-finals";
+                        return `round of ${teamsInRound}`;
+                      };
+                      const options = [{ value: "1", label: "Play out full bracket (champion)" }];
+                      for (let t = 2; t < bracket; t *= 2) {
+                        options.push({
+                          value: String(t),
+                          label: `Top ${t} qualify (last round: ${roundName(t * 2)})`,
+                        });
+                      }
+                      return options;
+                    })()}
+                  />
+                </div>
+                <p className="muted">
+                  Bracket seeding: group 1 winner vs group 2 runner-up (and vice versa), then onward in listed order.
+                  Player valuations add a Monte Carlo playoff run on top of the exact group stage; teams reaching the
+                  chosen end point qualify without playing further (and take no elimination penalty).
+                </p>
+              </>
+            )}
+            {runMessage && <p className="muted">{runMessage}</p>}
+          </>
+        )}
+
+        {groupsTab === "top5" && (
+          <>
+            {!results && (
+              <div className="card sub">
+                <p className="muted">Run the group stage first.</p>
+              </div>
+            )}
+            {results && (
+              <>
+                <div className="actions">
+                  {!liveMode && (
+                    <button className="primary" onClick={runCombinations} disabled={busy}>
+                      {busy && comboProgress.total > 0
+                        ? `Running Combinations... ${comboProgress.done.toLocaleString()} / ${comboProgress.total.toLocaleString()}`
+                        : "Run Combinations"}
+                    </button>
+                  )}
+                  {liveMode && (
+                    <p className="muted">
+                      Large event: rosters are optimized live per query (top 2,000 under current constraints) — no
+                      precompute needed.
+                    </p>
+                  )}
+                  {!liveMode && combosUpdatedAt && (
+                    <p className="muted">Combinations stored: {new Date(combosUpdatedAt).toLocaleString()}</p>
+                  )}
+                </div>
+                <div className="tab-bar small">
+                  <button className={comboMode === "average" ? "tab active" : "tab"} onClick={() => setComboMode("average")}>
+                    Average Player Value
+                  </button>
+                  <button
+                    className={comboMode === "single_outcome" ? "tab active" : "tab"}
+                    onClick={() => setComboMode("single_outcome")}
+                  >
+                    Best Single Outcome
+                  </button>
+                </div>
+                {results?.combined_playoffs && (
+                  <p className="muted">
+                    Average EVs cover the whole event (exact groups + {Number(results?.playoff?.n_sims || 0).toLocaleString()}-sim
+                    playoff run). Ceiling and Completed Groups score the group stage only.
+                  </p>
+                )}
+                <div className="grid two">
+                  <Input label="Search Combos" value={comboSearch} onChange={setComboSearch} placeholder="Player/team name or id" />
+                  <div className="field">
+                    <span>Filtered / Stored</span>
+                    <div className="pill">{filteredCount.toLocaleString()}</div>
+                  </div>
+                </div>
+                {topTeams && topTeams.length > 0 && (
+                  <div className="card sub">
+                    <h3>Top Teams</h3>
+                    {topTeams.map((team, idx) => (
+                      <div key={idx} className="card sub">
+                        <h4>
+                          #{idx + 1} {metricLabel(team)} | Cost {team.cost}
+                        </h4>
+                        <p className="muted">
+                          {(team.players || [])
+                            .map((p) => `${p.name} (${teamLookup[p.team_id] || p.team_id})`)
+                            .join(", ")}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {allTeams && allTeams.length > 0 && (
+                  <div className="card sub">
+                    <h3>All Filtered Teams ({filteredCount.toLocaleString()})</h3>
+                    <div className="actions">
+                      <button className="secondary" onClick={() => queryCombos(Math.max(0, page - 1))} disabled={page === 0}>
+                        Prev 200
+                      </button>
+                      <button
+                        className="secondary"
+                        onClick={() => queryCombos((page + 1) * 200 < filteredCount ? page + 1 : page)}
+                        disabled={(page + 1) * 200 >= filteredCount}
+                      >
+                        Next 200
+                      </button>
+                      <p className="muted">Page {page + 1}</p>
+                    </div>
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>#</th>
+                          <th>{comboMode === "single_outcome" ? "Ceiling" : "Avg EV"}</th>
+                          <th>Cost</th>
+                          <th>Players</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {allTeams.map((team, idx) => (
+                          <tr key={idx + page * 200}>
+                            <td>{idx + 1 + page * 200}</td>
+                            <td>
+                              {Number(
+                                comboMode === "single_outcome" ? team.ceiling_points || 0 : team.average_ev ?? team.total_ev ?? 0
+                              ).toFixed(2)}
+                            </td>
+                            <td>{team.cost}</td>
+                            <td>
+                              {(team.players || [])
+                                .map((p) => `${p.name} (${teamLookup[p.team_id] || p.team_id})`)
+                                .join(", ")}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+                {topMessage && <p className="muted">{topMessage}</p>}
+              </>
+            )}
+          </>
+        )}
+
+        {groupsTab === "completed" && (
+          <>
+            {!results && (
+              <div className="card sub">
+                <p className="muted">Run the group stage first.</p>
+              </div>
+            )}
+            {results &&
+              completedDerived.map((group, g) => {
+                const pickRow = (matchIdx, placeholders) => {
+                  const ready = group.pairs[matchIdx].length === 2 && group.pairs[matchIdx].every(Boolean);
+                  return (
+                    <div className="gsl-match" key={`c-${g}-${matchIdx}`}>
+                      <span className="gsl-label">{matchLabels[matchIdx]}</span>
+                      <span className="gsl-pick">
+                        {[0, 1].map((rowIdx) => {
+                          const tid = ready ? group.pairs[matchIdx][rowIdx] : "";
+                          const selected = ready && String(group.picks[matchIdx]) === String(tid);
+                          return (
+                            <button
+                              key={rowIdx}
+                              disabled={!tid}
+                              className={selected ? "active" : ""}
+                              onClick={() => tid && setCompletedPick(g, matchIdx, String(tid))}
+                            >
+                              {tid ? teamName(tid) : placeholders[rowIdx]}
+                            </button>
+                          );
+                        })}
+                      </span>
+                    </div>
+                  );
+                };
+                return (
+                  <div className="card sub" key={`completed-${g}`}>
+                    <h3>Group {g + 1} Results</h3>
+                    <p className="muted">Click each match winner; later matchups fill in from earlier picks.</p>
+                    <div className="gsl-flow">
+                      {pickRow(0, ["Seed 1", "Seed 2"])}
+                      {pickRow(1, ["Seed 3", "Seed 4"])}
+                      {pickRow(2, ["Opening 1 winner", "Opening 2 winner"])}
+                      {pickRow(3, ["Opening 1 loser", "Opening 2 loser"])}
+                      {pickRow(4, ["Winners' loser", "Elimination winner"])}
+                    </div>
+                  </div>
+                );
+              })}
+            {results && (
+              <div className="actions">
+                <button className="primary" onClick={scoreCompleted} disabled={!allGroupsComplete || !combosReady}>
+                  Score Completed Groups
+                </button>
+                {!combosReady && <span className="muted">Run Combinations in Top 5 Teams first.</span>}
+                {combosReady && !allGroupsComplete && <span className="muted">Pick every match winner first.</span>}
+              </div>
+            )}
+            {completedMessage && <p className="muted">{completedMessage}</p>}
+            {completedResult && (
+              <>
+                <div className="card sub">
+                  <h3>Best Team For These Results</h3>
+                  <p className="muted">
+                    Outcome probability {(Number(completedResult.outcome_probability || 0) * 100).toFixed(3)}% of{" "}
+                    {Number(completedResult.outcomes_count || 0).toLocaleString()} stored outcomes.
+                  </p>
+                  {(completedResult.top_teams || []).slice(0, 10).map((team, idx) => (
+                    <div key={idx} className="card sub">
+                      <h4>
+                        #{idx + 1} Score {Number(team.bracket_score || 0).toFixed(2)} | Cost {team.cost}
+                      </h4>
+                      <p className="muted">
+                        {(team.players || [])
+                          .map((p) => `${p.name} ${Number(p.mode_score || 0).toFixed(1)}`)
+                          .join(", ")}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+                <div className="card sub">
+                  <h3>Player Scores</h3>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Player</th>
+                        <th>Cost</th>
+                        <th>Points</th>
+                        <th>Rating</th>
+                        <th>Win</th>
+                        <th>Role</th>
+                        <th>Booster</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(completedResult.player_values || []).map((row) => (
+                        <tr key={row.player_id}>
+                          <td>{row.name}</td>
+                          <td>{Number(row.price || 0).toLocaleString()}</td>
+                          <td>{Number(row.points || 0).toFixed(2)}</td>
+                          <td>{Number(row.rating || 0).toFixed(2)}</td>
+                          <td>{Number(row.win || 0).toFixed(2)}</td>
+                          <td>{Number(row.role || 0).toFixed(2)}</td>
+                          <td>{Number(row.booster || 0).toFixed(2)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+          </>
+        )}
+
+        {groupsTab === "value" && results && (
+          <PriceVsPointsPanel
+            title="Player Price vs Points (Groups)"
+            rows={valueData.rows}
+            slope={valueData.slope}
+            intercept={valueData.intercept}
+          />
+        )}
+        {groupsTab === "value" && !results && (
+          <div className="card sub">
+            <p className="muted">Run the group stage first.</p>
+          </div>
+        )}
+      </div>
+    </Section>
+  );
+}
+
 function BountyTab(props) {
   const [bountyTab, setBountyTab] = useState("playoffs");
   return (
@@ -9455,6 +10463,7 @@ export default function App() {
         onOpenPlayer={handleOpenPlayerFromAnywhere}
       />
     ),
+    groups: <GroupsTab teams={teams} teamLookup={teamLookup} players={players} refresh={load} />,
     admin: <AdminTab refresh={load} notify={notify} />,
   };
 
