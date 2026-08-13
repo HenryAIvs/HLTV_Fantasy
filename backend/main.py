@@ -11,11 +11,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.routes import players, teams, simulation, bracket, best_team, playoff, groups, admin, events
 from backend.data.event_db import ensure_event_schema
-from backend.data.player_db import ensure_schema
+from backend.data.player_db import ensure_schema, ensure_topx_windows_schema
 from backend.data.team_db import ensure_team_schema
 
 SCHEMA_INITIALIZERS = (
     ensure_schema,
+    ensure_topx_windows_schema,
     ensure_team_schema,
     ensure_event_schema,
     simulation.ensure_simulation_schema,

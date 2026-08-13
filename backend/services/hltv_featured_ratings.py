@@ -46,10 +46,16 @@ def slugify_hltv_player_name(name: str | None) -> str:
     return slug or "player"
 
 
-def _last_3_months_range(end: date | None = None) -> tuple[str, str]:
+def _months_range(months: int = 3, end: date | None = None) -> tuple[str, str]:
+    """(start, end) ISO dates spanning the last `months` months."""
+    m = max(1, min(int(months or 3), 60))
     end_d = end or date.today()
-    start_d = end_d - relativedelta(months=3)
+    start_d = end_d - relativedelta(months=m)
     return start_d.isoformat(), end_d.isoformat()
+
+
+def _last_3_months_range(end: date | None = None) -> tuple[str, str]:
+    return _months_range(3, end)
 
 
 def build_hltv_player_stats_url(
@@ -97,9 +103,10 @@ def get_featured_ratings(
     player_name: str | None = None,
     tops: list[int] | tuple[int, ...] | None = None,
     timeout: int = 45,
+    months: int = 3,
 ) -> dict:
     buckets = tuple(tops or DEFAULT_TOP_BUCKETS)
-    start_date, end_date = _last_3_months_range()
+    start_date, end_date = _months_range(months)
     url = build_hltv_player_stats_url(
         player_id, player_name, start_date=start_date, end_date=end_date
     )
@@ -131,6 +138,7 @@ def get_featured_ratings(
         "player_id": int(player_id),
         "player_name": player_name,
         "url": url,
+        "months": int(months),
         "startDate": start_date,
         "endDate": end_date,
         "overall_rating": overall_rating,

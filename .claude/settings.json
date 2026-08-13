@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(awk -F: '$1>=6600 && $1<=6720')",
+      "Bash(timeout 100 python -c ' *)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\goats\\.claude\\projects\\c--Users-goats-OneDrive-Desktop-Github-HLTV-Fantasy\\memory"
+    ]
+  }
+}

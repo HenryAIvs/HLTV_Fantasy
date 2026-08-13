@@ -1229,6 +1229,32 @@ def _save_trigger_template(template: Dict[str, Any]) -> None:
     TRIGGER_TEMPLATE_PATH.write_text(json.dumps(template, indent=2), encoding="utf-8")
 
 
+def _template_fantasy_id(template: Optional[Dict[str, Any]]) -> Optional[int]:
+    """The fantasy (event) id baked into a captured trigger-rates endpoint.
+
+    The captured URL embeds the fantasy page it was taken on, e.g.
+    /fantasy/642/league/.../draft/.../triggerrates. That id is event-specific,
+    so a template captured for one event must never be reused for another —
+    doing so saves the lineup to, and reads rates from, the wrong event's team.
+    """
+    trig_url = str((template or {}).get("url") or "")
+    m = re.search(r"/fantasy/(\d+)/league/(\d+)/overview/(\d+)/draft/(\d+)/triggerrates", trig_url)
+    return int(m.group(1)) if m else None
+
+
+def _template_matches_event(template: Optional[Dict[str, Any]], event_id: Optional[int]) -> bool:
+    """True when the template's captured event matches the target event."""
+    tpl_fid = _template_fantasy_id(template)
+    if tpl_fid is None:
+        return False
+    target = int(event_id or 0)
+    if not target:
+        from backend.data.event_db import get_active_event_id
+
+        target = int(get_active_event_id() or 0)
+    return bool(target) and tpl_fid == target
+
+
 HLTV_CREDENTIALS_PATH = _ROOT_DIR / "hltv_credentials.json"
 
 
@@ -1884,11 +1910,15 @@ def _missing_trigger_players(event_id: Optional[int] = None) -> tuple:
         row = get_player(pid) or {}
         if not row.get("boosters_json") or not row.get("roles_json"):
             missing.append(pid)
+    template = _load_trigger_template()
     coverage = {
         "event_players": len(price_map),
         "with_data": len(price_map) - len(missing),
         "missing": len(missing),
-        "template_ready": _load_trigger_template() is not None,
+        # Only "ready" when the captured endpoint belongs to THIS event; a
+        # template from a prior event must be re-captured before it can be used.
+        "template_ready": _template_matches_event(template, event_id),
+        "template_event_id": _template_fantasy_id(template),
     }
     return price_map, missing, coverage
 
@@ -1901,10 +1931,24 @@ def get_trigger_backfill_coverage(event_id: Optional[int] = None):
 
 @router.post("/trigger-rates-backfill/start")
 def start_trigger_backfill(payload: Dict[str, Any] | None = None):
-    if not _load_trigger_template() and not _load_hltv_credentials():
+    template = _load_trigger_template()
+    if not template and not _load_hltv_credentials():
         raise HTTPException(
             status_code=400,
             detail="Save the HLTV app login first — the job logs in and discovers the endpoint by itself.",
+        )
+    event_id = (payload or {}).get("event_id")
+    if template and not _template_matches_event(template, event_id):
+        tpl_fid = _template_fantasy_id(template)
+        from backend.data.event_db import get_active_event_id
+
+        target_fid = int(event_id or get_active_event_id() or 0)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"The captured endpoint is for event {tpl_fid}, but this is event {target_fid}. "
+                f"Run Capture again on event {target_fid} (add any 5 players to your team and save) before importing."
+            ),
         )
     latest = _get_latest_trigger_job()
     if latest and latest.get("status") in {"queued", "running", "pausing", "canceling"}:
@@ -2137,6 +2181,18 @@ def _run_trigger_backfill_job(job_id: str, event_id) -> None:
                     "No usable captured endpoint. Run Capture once (add any 5 players to your team and save)."
                 )
             fantasy_id, league_id, team_id, draft_id = (int(x) for x in m.groups())
+            # The captured endpoint is event-specific. If it was taken on a
+            # different event, saving/reading here would hit that event's team
+            # (the previous event's fantasy page), so refuse and ask for a fresh
+            # capture rather than silently importing the wrong lineup's rates.
+            from backend.data.event_db import get_active_event_id
+
+            target_fid = int(event_id or get_active_event_id() or 0)
+            if target_fid and fantasy_id != target_fid:
+                raise RuntimeError(
+                    f"Captured endpoint is for event {fantasy_id}, but you're importing event {target_fid}. "
+                    f"Run Capture again on event {target_fid} (add any 5 players to your team and save)."
+                )
             save_url = f"https://www.hltv.org/fantasy/{fantasy_id}/teams/edit"
             try:
                 driver.get(str((template or {}).get("page_url") or f"https://www.hltv.org/fantasy/{fantasy_id}/overview"))

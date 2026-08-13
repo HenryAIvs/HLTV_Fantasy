@@ -26,6 +26,13 @@ def ensure_event_schema() -> None:
             conn.execute("ALTER TABLE events ADD COLUMN hltv_event_id INTEGER")
         if "hltv_event_url" not in event_col_names:
             conn.execute("ALTER TABLE events ADD COLUMN hltv_event_url TEXT")
+        # Detected group format ("gsl4" | "de8") and the auto-parsed group seeds
+        # (as this app's team ids), captured at import so the Groups tab can
+        # prefill without a manual "Autofill from HLTV event" click.
+        if "group_format" not in event_col_names:
+            conn.execute("ALTER TABLE events ADD COLUMN group_format TEXT")
+        if "groups_autofill_json" not in event_col_names:
+            conn.execute("ALTER TABLE events ADD COLUMN groups_autofill_json TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS event_teams (
@@ -367,6 +374,53 @@ def set_event_hltv_ref(event_id: int, hltv_event_id: Optional[int], hltv_event_u
             ),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def set_event_groups_autofill(
+    event_id: int, group_format: Optional[str], groups: Optional[List[Dict[str, Any]]]
+) -> None:
+    """Persist the detected group format and auto-parsed group seeds for an event."""
+    conn = connect()
+    try:
+        conn.execute(
+            """
+            UPDATE events
+            SET group_format = ?,
+                groups_autofill_json = ?
+            WHERE event_id = ?
+            """,
+            (
+                str(group_format).strip().lower() if group_format else None,
+                json.dumps(groups) if groups is not None else None,
+                int(event_id),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_event_groups_autofill(event_id: int) -> Optional[Dict[str, Any]]:
+    """The stored {group_format, groups} for an event, or None if not captured."""
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT group_format, groups_autofill_json FROM events WHERE event_id = ?",
+            (int(event_id),),
+        ).fetchone()
+        if not row:
+            return None
+        fmt = row["group_format"]
+        raw = row["groups_autofill_json"]
+        if not fmt and not raw:
+            return None
+        try:
+            groups = json.loads(raw) if raw else []
+        except Exception:
+            groups = []
+        return {"group_format": fmt or "gsl4", "groups": groups}
     finally:
         conn.close()
 

@@ -3752,4 +3752,30 @@ def import_hltv_event(payload: Dict[str, Any]):
         hltv_event_id=ref.get("hltv_event_id"),
         hltv_event_url=ref.get("hltv_event_url"),
     )
-    return {"status": "ok", **counts, "event_id": int(event_id), "active_event_id": int(event_id), **ref}
+
+    # Best-effort: fetch the HLTV event page (which is snapshotted by the
+    # browser fetch), detect the group format, and prefill the group seeds so
+    # the Groups tab is ready without a manual autofill. Never fail the import
+    # if the event has no group bracket (Swiss/single-elim) or the fetch is
+    # blocked — the manual "Autofill from HLTV event" button still works.
+    autofill = None
+    try:
+        from backend.routes.groups import store_event_groups_autofill
+
+        autofill = store_event_groups_autofill(
+            int(event_id),
+            hltv_event_url=ref.get("hltv_event_url") or "",
+            hltv_event_id=ref.get("hltv_event_id"),
+        )
+    except Exception:
+        autofill = None
+
+    return {
+        "status": "ok",
+        **counts,
+        "event_id": int(event_id),
+        "active_event_id": int(event_id),
+        **ref,
+        "group_format": (autofill or {}).get("group_format"),
+        "group_count": len((autofill or {}).get("groups") or []) if autofill else 0,
+    }
