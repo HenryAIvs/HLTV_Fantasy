@@ -47,10 +47,16 @@ def _normalize_sim_payload(payload: dict) -> dict:
             if tid not in vrs_ranks:
                 vrs_ranks[tid] = db_vrs.get(tid, 999)
 
+    # Bo mode comes from the event's detected format (Swiss Bo3 events run
+    # 'all'; Major-style Bo1-with-Bo3-deciders runs 'elim_qual').
+    bo3_mode = str(payload.get("bo3_mode") or "elim_qual")
+    if bo3_mode not in ("all", "none", "elim_qual"):
+        raise HTTPException(status_code=400, detail=f"Unknown bo3_mode '{bo3_mode}'")
+
     return {
         "team_ids": team_ids,
         "vrs_ranks": vrs_ranks,
-        "bo3_mode": "elim_qual",
+        "bo3_mode": bo3_mode,
         "n_sims": int(payload["n_sims"]),
     }
 

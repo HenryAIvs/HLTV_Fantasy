@@ -12,24 +12,11 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Definition
 Set-Location $root
 
-function Stop-StaleBackend {
-    # Free 127.0.0.1:8000 so a previous backend doesn't block the new one.
-    try {
-        $listeners = netstat -ano | Select-String "127.0.0.1:8000" | Where-Object { $_.Line -match "LISTENING" }
-        foreach ($line in $listeners) {
-            $parts = ($line -replace "\s+", " ").Trim().Split(" ")
-            if ($parts.Length -ge 5) {
-                $procId = [int]$parts[-1]
-                if ($procId -gt 0) {
-                    Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
-                }
-            }
-        }
-    } catch {
-        # Non-fatal: continue startup even if netstat parsing fails.
-    }
-}
-Stop-StaleBackend
+# NOTE: we intentionally do NOT kill a running backend here. The backend is now
+# an always-on service (see scripts\install-autostart.ps1) and Electron connects
+# to it if it's already up, only spawning its own when none is running. To pick
+# up backend code changes, run scripts\restart-backend.ps1 (the watchdog brings
+# it straight back with the new code).
 
 # --- 1) Python venv + backend deps -----------------------------------------
 $venvPath = Join-Path $root ".venv"

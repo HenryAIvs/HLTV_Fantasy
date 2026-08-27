@@ -33,6 +33,13 @@ def ensure_event_schema() -> None:
             conn.execute("ALTER TABLE events ADD COLUMN group_format TEXT")
         if "groups_autofill_json" not in event_col_names:
             conn.execute("ALTER TABLE events ADD COLUMN groups_autofill_json TEXT")
+        # Manual override of the auto-detected tournament kind for this fantasy
+        # event ("swiss" | "groups" | "playoff" | "bounty"); NULL = auto-detect.
+        if "tournament_kind" not in event_col_names:
+            conn.execute("ALTER TABLE events ADD COLUMN tournament_kind TEXT")
+        # Human-readable event name derived from the linked HLTV event URL.
+        if "name" not in event_col_names:
+            conn.execute("ALTER TABLE events ADD COLUMN name TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS event_teams (
@@ -134,6 +141,8 @@ def ensure_event_schema() -> None:
             conn.execute("ALTER TABLE hltv_results ADD COLUMN veto_json TEXT")
         if "player_stats_json" not in hltv_col_names:
             conn.execute("ALTER TABLE hltv_results ADD COLUMN player_stats_json TEXT")
+        if "map_player_stats_json" not in hltv_col_names:
+            conn.execute("ALTER TABLE hltv_results ADD COLUMN map_player_stats_json TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hltv_results_match_id ON hltv_results(match_id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hltv_results_imported ON hltv_results(imported_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hltv_results_match_date ON hltv_results(match_date DESC)")
@@ -425,6 +434,60 @@ def get_event_groups_autofill(event_id: int) -> Optional[Dict[str, Any]]:
         conn.close()
 
 
+def get_player_latest_teams() -> Dict[int, Dict[str, Any]]:
+    """Each player's CURRENT team, defined by the most recent event they were
+    rostered in (event_teams, highest event_id). Team creation order can't be
+    used — a player can move to a team whose row is older than their previous
+    team's. Returns {player_id: {team_name, event_id}}."""
+    conn = connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT event_id, team_name,
+                   player1_id, player2_id, player3_id, player4_id, player5_id
+            FROM event_teams
+            ORDER BY event_id ASC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    latest: Dict[int, Dict[str, Any]] = {}
+    # Ascending event order: later events simply overwrite earlier entries.
+    for r in rows:
+        for col in ("player1_id", "player2_id", "player3_id", "player4_id", "player5_id"):
+            pid = r[col]
+            if pid:
+                latest[int(pid)] = {"team_name": str(r["team_name"]), "event_id": int(r["event_id"])}
+    return latest
+
+
+def set_event_tournament_kind(event_id: int, kind: Optional[str]) -> None:
+    """Store (or clear with None) the manual tournament-kind override."""
+    value = str(kind).strip().lower() if kind else None
+    if value not in (None, "swiss", "groups", "playoff", "bounty"):
+        value = None
+    conn = connect()
+    try:
+        conn.execute(
+            "UPDATE events SET tournament_kind = ? WHERE event_id = ?",
+            (value, int(event_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_event_tournament_kind(event_id: int) -> Optional[str]:
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT tournament_kind FROM events WHERE event_id = ?", (int(event_id),)
+        ).fetchone()
+        return (row["tournament_kind"] or None) if row else None
+    finally:
+        conn.close()
+
+
 def set_active_event(event_id: Optional[int]) -> None:
     conn = connect()
     try:
@@ -461,6 +524,7 @@ def list_events() -> List[Dict[str, Any]]:
             """
             SELECT
                 e.event_id,
+                e.name,
                 e.hltv_event_id,
                 e.hltv_event_url,
                 e.imported_at,
@@ -473,6 +537,31 @@ def list_events() -> List[Dict[str, Any]]:
             """
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def set_event_name(
+    event_id: int,
+    name: Optional[str] = None,
+    hltv_event_id: Optional[int] = None,
+    hltv_event_url: Optional[str] = None,
+) -> None:
+    """Fill in the event name (and any newly recovered HLTV event ref) without
+    overwriting values that already exist."""
+    conn = connect()
+    try:
+        conn.execute(
+            """
+            UPDATE events SET
+                name = COALESCE(?, name),
+                hltv_event_id = COALESCE(?, hltv_event_id),
+                hltv_event_url = COALESCE(?, hltv_event_url)
+            WHERE event_id = ?
+            """,
+            (str(name).strip() or None if name else None, hltv_event_id, str(hltv_event_url or "").strip() or None, int(event_id)),
+        )
+        conn.commit()
     finally:
         conn.close()
 
@@ -638,8 +727,8 @@ def upsert_hltv_results(rows: List[Dict[str, Any]]) -> Dict[str, int]:
                 """
                 INSERT INTO hltv_results (
                     match_url, match_id, match_date, team1, team2, score1, score2, winner, event_name, source_offset,
-                    maps_json, veto_json, player_stats_json, imported_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+                    maps_json, veto_json, player_stats_json, map_player_stats_json, imported_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
                 ON CONFLICT(match_url) DO UPDATE SET
                     match_id = excluded.match_id,
                     match_date = COALESCE(excluded.match_date, hltv_results.match_date),
@@ -653,6 +742,7 @@ def upsert_hltv_results(rows: List[Dict[str, Any]]) -> Dict[str, int]:
                     maps_json = COALESCE(excluded.maps_json, hltv_results.maps_json),
                     veto_json = COALESCE(excluded.veto_json, hltv_results.veto_json),
                     player_stats_json = COALESCE(excluded.player_stats_json, hltv_results.player_stats_json),
+                    map_player_stats_json = COALESCE(excluded.map_player_stats_json, hltv_results.map_player_stats_json),
                     last_seen_at = datetime('now')
                 """,
                 (
@@ -669,6 +759,7 @@ def upsert_hltv_results(rows: List[Dict[str, Any]]) -> Dict[str, int]:
                     str(r.get("maps_json")) if r.get("maps_json") is not None else None,
                     str(r.get("veto_json")) if r.get("veto_json") is not None else None,
                     str(r.get("player_stats_json")) if r.get("player_stats_json") is not None else None,
+                    str(r.get("map_player_stats_json")) if r.get("map_player_stats_json") is not None else None,
                 ),
             )
             if existing:
@@ -784,13 +875,100 @@ def update_hltv_results_points(rows: List[Dict[str, Any]]) -> int:
         conn.close()
 
 
-def list_hltv_results(limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-    lim = max(1, min(int(limit), 100000))
-    off = max(0, int(offset))
+def list_hltv_results_for_team(team_name: str, limit: int = 30) -> List[Dict[str, Any]]:
+    """A team's stored matches, newest first, however old — the recent-form
+    endpoint needs a team's history even when they haven't played in months."""
+    name = str(team_name or "").strip().lower()
+    if not name:
+        return []
     conn = connect()
     try:
         rows = conn.execute(
             """
+            SELECT match_url, match_date, team1, team2, score1, score2, winner,
+                   player_stats_json
+            FROM hltv_results
+            WHERE LOWER(TRIM(team1)) = ? OR LOWER(TRIM(team2)) = ?
+            ORDER BY match_date DESC, imported_at DESC
+            LIMIT ?
+            """,
+            (name, name, max(1, min(int(limit), 200))),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# Sort keys the stored-matches browser can request; anything else falls back
+# to the historical default (match_id desc = newest import first).
+_HLTV_RESULTS_SORTS = {
+    "date_desc": "match_date DESC, match_id DESC",
+    "date_asc": "match_date ASC, match_id ASC",
+    "team1_asc": "team1 COLLATE NOCASE ASC, match_date DESC",
+    "team1_desc": "team1 COLLATE NOCASE DESC, match_date DESC",
+    "team2_asc": "team2 COLLATE NOCASE ASC, match_date DESC",
+    "team2_desc": "team2 COLLATE NOCASE DESC, match_date DESC",
+    "winner_asc": "winner COLLATE NOCASE ASC, match_date DESC",
+    "winner_desc": "winner COLLATE NOCASE DESC, match_date DESC",
+}
+
+
+def list_hltv_results(
+    limit: int = 100,
+    offset: int = 0,
+    search: str = "",
+    sort: str = "",
+    vrs_rank: int = 0,
+    vrs_scope: str = "",
+    vrs_dir: str = "",
+) -> List[Dict[str, Any]]:
+    lim = max(1, min(int(limit), 100000))
+    off = max(0, int(offset))
+    q = str(search or "").strip()
+    # The UI shows day/month/year, so date searches arrive that way too;
+    # translate to the stored ISO format (24/08/2026 → 2026-08-24,
+    # 08/2026 → 2026-08, 24/08 → -08-24).
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", q)
+    if m:
+        q = f"{m.group(3)}-{int(m.group(2)):02d}-{int(m.group(1)):02d}"
+    else:
+        m = re.fullmatch(r"(\d{1,2})/(\d{4})", q)
+        if m:
+            q = f"{m.group(2)}-{int(m.group(1)):02d}"
+        else:
+            m = re.fullmatch(r"(\d{1,2})/(\d{1,2})", q)
+            if m:
+                q = f"-{int(m.group(2)):02d}-{int(m.group(1)):02d}"
+    conds: list = []
+    params: list = []
+    if q:
+        conds.append("(team1 LIKE ? OR team2 LIKE ? OR match_date LIKE ?)")
+        like = f"%{q}%"
+        params += [like, like, like]
+    # VRS rank filter: matches where both/at least one team is inside (<= N)
+    # or outside (> N) the top N. Teams with no VRS rank count as outside.
+    rank_n = int(vrs_rank or 0)
+    scope = str(vrs_scope or "").strip().lower()
+    direction = str(vrs_dir or "").strip().lower()
+    if rank_n > 0 and scope in {"both", "either"} and direction in {"within", "outside"}:
+        if direction == "within":
+            c1 = "(vrs_rank_1 IS NOT NULL AND vrs_rank_1 <= ?)"
+            c2 = "(vrs_rank_2 IS NOT NULL AND vrs_rank_2 <= ?)"
+        else:
+            c1 = "(vrs_rank_1 IS NULL OR vrs_rank_1 > ?)"
+            c2 = "(vrs_rank_2 IS NULL OR vrs_rank_2 > ?)"
+        joiner = " AND " if scope == "both" else " OR "
+        conds.append(f"({c1}{joiner}{c2})")
+        params += [rank_n, rank_n]
+    where = f"WHERE {' AND '.join(conds)}" if conds else ""
+    order = _HLTV_RESULTS_SORTS.get(
+        str(sort or "").strip().lower(),
+        "CASE WHEN match_id IS NULL THEN 1 ELSE 0 END ASC, match_id DESC, imported_at DESC",
+    )
+    conn = connect()
+    try:
+        rows = conn.execute(
+            f"""
             SELECT
                 match_url,
                 match_id,
@@ -813,19 +991,18 @@ def list_hltv_results(limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]
                 maps_json,
                 veto_json,
                 player_stats_json,
+                map_player_stats_json,
                 hltv_effective_date,
                 vrs_effective_date,
                 points_enriched_at,
                 imported_at,
                 last_seen_at
             FROM hltv_results
-            ORDER BY
-                CASE WHEN match_id IS NULL THEN 1 ELSE 0 END ASC,
-                match_id DESC,
-                imported_at DESC
+            {where}
+            ORDER BY {order}
             LIMIT ? OFFSET ?
             """,
-            (lim, off),
+            (*params, lim, off),
         ).fetchall()
         out = []
         for r in rows:
@@ -843,11 +1020,17 @@ def update_hltv_result_details(
     veto_json: Optional[str] = None,
     player_stats_json: Optional[str] = None,
     maps_json: Optional[str] = None,
+    map_player_stats_json: Optional[str] = None,
 ) -> None:
     """Backfill match-page details on an already stored result row."""
     sets = []
     params: list = []
-    for col, val in (("veto_json", veto_json), ("player_stats_json", player_stats_json), ("maps_json", maps_json)):
+    for col, val in (
+        ("veto_json", veto_json),
+        ("player_stats_json", player_stats_json),
+        ("maps_json", maps_json),
+        ("map_player_stats_json", map_player_stats_json),
+    ):
         if val is not None:
             sets.append(f"{col} = ?")
             params.append(val)
@@ -891,6 +1074,7 @@ def get_hltv_result_by_url(match_url: str) -> Optional[Dict[str, Any]]:
                 maps_json,
                 veto_json,
                 player_stats_json,
+                map_player_stats_json,
                 hltv_effective_date,
                 vrs_effective_date,
                 points_enriched_at,

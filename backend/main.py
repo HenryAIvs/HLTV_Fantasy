@@ -9,10 +9,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.routes import players, teams, simulation, bracket, best_team, playoff, groups, admin, events
+from backend.routes import players, teams, simulation, bracket, best_team, playoff, groups, admin, events, schedule, assets
 from backend.data.event_db import ensure_event_schema
 from backend.data.player_db import ensure_schema, ensure_topx_windows_schema
 from backend.data.team_db import ensure_team_schema
+from backend.data.schedule_db import ensure_schedule_schema
+from backend.services.scheduler import scheduler
 
 SCHEMA_INITIALIZERS = (
     ensure_schema,
@@ -28,7 +30,9 @@ SCHEMA_INITIALIZERS = (
     teams.ensure_rankings_refresh_schema,
     events.ensure_historical_stats_job_schema,
     events.ensure_veto_backfill_job_schema,
+    events.ensure_map_sb_job_schema,
     admin.ensure_trigger_backfill_schema,
+    ensure_schedule_schema,
 )
 
 ROUTERS = (
@@ -41,6 +45,8 @@ ROUTERS = (
     (groups.router, "/groups", "groups"),
     (admin.router, "/admin", "admin"),
     (events.router, "/events", "events"),
+    (schedule.router, "/schedule", "schedule"),
+    (assets.router, "/assets", "assets"),
 )
 
 
@@ -59,7 +65,13 @@ async def _lifespan(app: FastAPI):
         players.refresh_average_rating_curve()
     except Exception:
         logging.getLogger(__name__).warning("Could not fit average rating curve at startup", exc_info=True)
+    # Nightly data-ingestion scheduler runs for as long as the backend is up.
+    try:
+        scheduler.start()
+    except Exception:
+        logging.getLogger(__name__).warning("Could not start data scheduler", exc_info=True)
     yield
+    scheduler.stop()
 
 
 def create_app() -> FastAPI:
@@ -73,6 +85,14 @@ def create_app() -> FastAPI:
     )
     for router, prefix, tag in ROUTERS:
         app.include_router(router, prefix=prefix, tags=[tag])
+
+    @app.get("/health")
+    def health() -> dict:
+        # Cheap liveness probe: the Electron launcher hits this to decide whether
+        # a backend is already running (so it connects instead of spawning a
+        # second one), and the auto-start watchdog uses it too.
+        return {"status": "ok"}
+
     return app
 
 

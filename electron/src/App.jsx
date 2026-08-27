@@ -7,6 +7,8 @@ import {
   ComposedChart,
   Legend,
   Line,
+  Pie,
+  PieChart,
   Rectangle,
   ResponsiveContainer,
   Scatter,
@@ -14,32 +16,150 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import roleBadgesUrl from "./assets/role_sprites.png";
+import boosterBadgesUrl from "./assets/booster_sprites.png";
+
+// Glyph sprite sheets: transparent-background glyphs, one per grid cell,
+// centered and sized uniformly (see scratchpad process_sprites.py, which
+// un-blended the original navy background and recentered each cell).
+// Both sheets are in id order (row-major).
+const SpriteBadge = ({ url, cols, rows, index, size, className }) => {
+  const idx = Number(index);
+  if (!Number.isFinite(idx) || idx < 0 || idx >= cols * rows) return null;
+  const col = idx % cols;
+  const row = Math.floor(idx / cols);
+  // Geometry goes through CSS variables so stylesheet rules can render the
+  // sprite either as a normal image (default) or as a mask filled with a flat
+  // medal color (gold/silver/bronze cards) — inline background-* would win
+  // over any stylesheet override.
+  return (
+    <span
+      className={className}
+      style={{
+        width: size,
+        height: size,
+        "--sprite-url": `url(${url})`,
+        "--sprite-size": `${cols * 100}% ${rows * 100}%`,
+        "--sprite-pos": `${(col * 100) / (cols - 1)}% ${(row * 100) / (rows - 1)}%`,
+      }}
+    />
+  );
+};
+
+// role_sprites.png — 4x3, role-id order: 0 crosshair (Main AWP), 1 soldier
+// (Support), 2 AK-on-T (Attacker), 3 IGL helmet (Leader), 4 rising chart
+// (Stathunter), 5 bullets (Entry Fragger), 6 tent+campfire (Camper), 7 CT
+// eagle (Defender), 8 headshot burst (HS Machine), 9 falling chart (Noob),
+// 10 three skulls (Multi Fragger), 11 UMP (Eco Friendly).
+const RoleBadge = ({ roleId, size = 68 }) => (
+  <SpriteBadge url={roleBadgesUrl} cols={4} rows={3} index={Number(roleId)} size={size} className="role-badge" />
+);
+
+// booster_sprites.png — 5x4 (18 icons, last two cells empty), booster-id order
+// EXCEPT cells 14/15: the sheet draws shot-in-the-back at cell 14 and the
+// arms-raised hero at 15, which semantically are Cannon fodder (15) and
+// Carry (14) respectively — hence the swap. 0 crossed pistols (Best Pistol
+// Round), 1 red down arrow (Bottom of scoreboard), 2 CLUTCH, 3 green up arrow
+// (Top of scoreboard), 4 trade arrows (Avenger), 5 fish hook (Bait), 6 knife
+// (Rambo), 7 flash burst (Flash), 8 scales (Mister consistent), 9 grenade
+// (Kobe), 10 runner (Saver), 11 helping-up (Assist), 12 robot (Aim bot),
+// 13 4x skull (Quad), 16 UZI+dollars (Farmer), 17 flame (Hellcase).
+const BOOSTER_BADGE_SPRITE = { 14: 15, 15: 14 };
+const BoosterBadge = ({ boosterId, size = 68 }) => {
+  const id = Number(boosterId);
+  const idx = BOOSTER_BADGE_SPRITE[id] !== undefined ? BOOSTER_BADGE_SPRITE[id] : id;
+  return <SpriteBadge url={boosterBadgesUrl} cols={5} rows={4} index={idx} size={size} className="role-badge booster-badge" />;
+};
+
+// Cached HLTV images served by the backend (see backend/services/image_cache).
+// Both components fall back to an initials chip when the image isn't cached.
+const ASSETS_BASE = "http://127.0.0.1:8000/assets";
+
+const initialsOf = (name) => {
+  const parts = String(name || "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) return `${parts[0][0] || ""}${parts[1][0] || ""}`.toUpperCase();
+  return String(name || "?").slice(0, 2).toUpperCase();
+};
+
+// Stored dates are ISO (YYYY-MM-DD); the UI shows day/month/year.
+const formatDMY = (iso) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso || "").trim());
+  if (m) return `${m[3]}/${m[2]}/${m[1]}`;
+  return String(iso || "").trim() || "-";
+};
+
+function TeamLogo({ hltvTeamId, name, size = 22, className = "" }) {
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [hltvTeamId]);
+  const id = Number(hltvTeamId);
+  if (!Number.isFinite(id) || id <= 0 || failed) {
+    return (
+      <span className={`img-fallback ${className}`} style={{ width: size, height: size, fontSize: Math.max(8, size * 0.36) }}>
+        {initialsOf(name)}
+      </span>
+    );
+  }
+  return (
+    <img
+      className={`team-logo-img ${className}`}
+      src={`${ASSETS_BASE}/team/${id}?v=2`}
+      width={size}
+      height={size}
+      alt=""
+      loading="lazy"
+      onError={() => setFailed(true)}
+    />
+  );
+}
+
+function PlayerPhoto({ playerId, name, size = 26, className = "" }) {
+  const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [playerId]);
+  const id = Number(playerId);
+  if (!Number.isFinite(id) || id <= 0 || failed) {
+    return (
+      <span className={`img-fallback round ${className}`} style={{ width: size, height: size, fontSize: Math.max(8, size * 0.36) }}>
+        {initialsOf(name)}
+      </span>
+    );
+  }
+  return (
+    <img
+      className={`player-photo-img ${className}`}
+      src={`${ASSETS_BASE}/player/${id}?v=2`}
+      width={size}
+      height={size}
+      alt=""
+      loading="lazy"
+      onError={() => setFailed(true)}
+    />
+  );
+}
 
 const tabs = [
   { key: "view", label: "Database" },
   { key: "events", label: "Events" },
-  { key: "ratingLab", label: "Rating Lab" },
-  { key: "modelLab", label: "Model Lab" },
-  { key: "sim", label: "Swiss Group Stage" },
-  { key: "playoff", label: "Playoff Bracket" },
-  { key: "bounty", label: "Bounty Event" },
-  { key: "groups", label: "Double-Elim Groups" },
-  { key: "admin", label: "Data Management" },
+  { key: "tournament", label: "Tournament" },
+  { key: "devlab", label: "Dev Lab" },
+  { key: "scheduling", label: "Scheduling" },
 ];
 
 const ACTIVE_MAP_POOL = ["Mirage", "Inferno", "Nuke", "Ancient", "Anubis", "Dust2", "Cache"];
 
-// Map-themed bar colors, validated for the dark surface (lightness band, chroma,
-// contrast). With 7 thematic hues some pairs sit below CVD separation targets;
-// identity never relies on color alone because every bar is labeled with its map.
+// Map identity colors — vibrant takes on the familiar map hues (user-tuned:
+// Inferno is dark blue, per HLTV's scheme). Identity never relies on color
+// alone — every bar/card is labeled with its map.
 const MAP_BAR_COLORS = {
-  Dust2: "#b38a1f", // sand gold
-  Inferno: "#d64545", // red
-  Nuke: "#6b9c10", // hazard green
-  Ancient: "#159f78", // jungle green
-  Anubis: "#0aa2c0", // canal teal
-  Mirage: "#4d8fd6", // desert sky
-  Cache: "#8b5cf6", // industrial violet
+  Dust2: "#eab308", // vivid gold
+  Inferno: "#3e63dd", // dark royal blue
+  Nuke: "#f4694b", // hot terracotta
+  Ancient: "#2fbf71", // emerald
+  Anubis: "#ec4899", // hot magenta
+  Mirage: "#a855f7", // electric purple
+  Cache: "#38bdf8", // bright sky blue
+  Overpass: "#14b8a6", // vivid teal
+  Vertigo: "#818cf8", // indigo
+  Train: "#94a3b8", // railyard steel
 };
 const MAP_BAR_FALLBACK_COLOR = "#64748b";
 
@@ -96,12 +216,6 @@ const api = window.api || {
 };
 
 const TOP_RATING_TIERS = [5, 10, 20, 30, 50];
-
-const formatTopxImportedAt = (unixSeconds) => {
-  const ts = Number(unixSeconds);
-  if (!Number.isFinite(ts) || ts <= 0) return "Not imported yet";
-  return new Date(ts * 1000).toLocaleString();
-};
 
 const TabButton = ({ active, onClick, children }) => (
   <button className={active ? "tab active" : "tab"} onClick={onClick}>
@@ -619,8 +733,8 @@ function PriceVsPointsPanel({ title, rows, slope, intercept, showTable = true, o
     const d = scatterEntry?.payload;
     if (!d) return null;
     return (
-      <div style={{ background: "#0e1f3f", border: "1px solid #2f5ca5", borderRadius: 10, color: "#dcecff", padding: 10 }}>
-        <div style={{ fontWeight: 700 }}>{d.name} ({d.player_id})</div>
+      <div style={{ background: "#14181f", border: "1px solid #3a4452", borderRadius: 10, color: "#e9edf3", padding: 10 }}>
+        <div style={{ fontWeight: 700 }}>{d.name}</div>
         <div>Points: {Number(d.points).toFixed(2)}</div>
         <div>Average line: {Number(d.trend).toFixed(2)}</div>
         <div>Distance: {Number(d.distance) >= 0 ? "+" : ""}{Number(d.distance).toFixed(2)}</div>
@@ -639,22 +753,22 @@ function PriceVsPointsPanel({ title, rows, slope, intercept, showTable = true, o
           <div className="value-chart-wrap">
             <ResponsiveContainer width="100%" height={380}>
               <ComposedChart data={chartRows} margin={{ top: 12, right: 18, left: 6, bottom: 12 }}>
-                <CartesianGrid stroke="#284061" strokeDasharray="3 3" />
+                <CartesianGrid stroke="#232a34" strokeDasharray="3 3" />
                 <XAxis
                   type="number"
                   dataKey="price"
                   domain={[minPrice, maxPrice]}
-                  tick={{ fill: "#9fc5ff", fontSize: 12 }}
-                  axisLine={{ stroke: "#365a89" }}
-                  tickLine={{ stroke: "#365a89" }}
+                  tick={{ fill: "#9fb2c9", fontSize: 12 }}
+                  axisLine={{ stroke: "#3a4452" }}
+                  tickLine={{ stroke: "#3a4452" }}
                   name="Price"
                 />
                 <YAxis
                   type="number"
                   dataKey="points"
-                  tick={{ fill: "#9fc5ff", fontSize: 12 }}
-                  axisLine={{ stroke: "#365a89" }}
-                  tickLine={{ stroke: "#365a89" }}
+                  tick={{ fill: "#9fb2c9", fontSize: 12 }}
+                  axisLine={{ stroke: "#3a4452" }}
+                  tickLine={{ stroke: "#3a4452" }}
                   name="Points"
                 />
                 <Tooltip
@@ -662,7 +776,7 @@ function PriceVsPointsPanel({ title, rows, slope, intercept, showTable = true, o
                   cursor={false}
                   content={<PlayerValueTooltip />}
                 />
-                <Legend wrapperStyle={{ color: "#9fc5ff" }} />
+                <Legend wrapperStyle={{ color: "#9fb2c9" }} />
                 <Line
                   type="linear"
                   dataKey="trend"
@@ -964,6 +1078,8 @@ function GroupStageTab({
   simUpdatedAt,
   onResetSimulation,
   onOpenPlayer,
+  eventSeeds = null,
+  eventSwissInfo = null,
 }) {
   const [busy, setBusy] = useState(false);
   const [processedSims, setProcessedSims] = useState(0);
@@ -1023,14 +1139,18 @@ function GroupStageTab({
     setProcessedSims(0);
     setTotalSims(128);
     setEtaSeconds(null);
+    // Seed order: the event page's official seeding when detected, VRS ranks
+    // otherwise. Bo mode comes from the event's detected format rules.
     const vrs = {};
     teams.forEach((t) => {
-      if (selected.includes(t.team_id)) vrs[t.team_id] = t.vrs_rank ?? 999;
+      if (selected.includes(t.team_id)) {
+        vrs[t.team_id] = (eventSeeds && eventSeeds[String(t.team_id)]) ?? t.vrs_rank ?? 999;
+      }
     });
     const body = {
       team_ids: selected,
       vrs_ranks: vrs,
-      bo3_mode: "elim_qual",
+      bo3_mode: bo || "elim_qual",
       n_sims: Number(sims || 0),
     };
     const pollSimulationJob = async (jobId, startedAtMs) => {
@@ -1167,14 +1287,19 @@ function GroupStageTab({
               className={selected.includes(t.team_id) ? "chip active" : "chip"}
               onClick={() => toggle(t.team_id)}
             >
-              {t.name} <Badge>id {t.team_id}</Badge>
+              {t.name}
             </button>
           ))}
         </div>
         <div className="grid three">
           <div className="field">
             <span>Match Format</span>
-            <div className="pill">CS2 Swiss: BO3 on qualification/elimination</div>
+            <div className="pill">
+              {{ all: "All matches Bo3", none: "All matches Bo1", elim_qual: "Bo1, deciders Bo3" }[bo] ||
+                "Bo1, deciders Bo3"}
+              {" · "}
+              {eventSeeds ? "event seeding" : "VRS-rank seeding"}
+            </div>
           </div>
           <Input label="# Sims" value={sims} onChange={setSims} />
           <div className="field">
@@ -1184,6 +1309,15 @@ function GroupStageTab({
             </button>
           </div>
         </div>
+        {eventSwissInfo && (
+          <p className="muted">
+            From event page: {eventSwissInfo.stage_name || "Swiss"} — {eventSwissInfo.team_count} teams
+            {eventSwissInfo.advance_count ? `, top ${eventSwissInfo.advance_count} advance` : ""}
+            {eventSwissInfo.unmatched?.length
+              ? ` · not in our DB: ${eventSwissInfo.unmatched.join(", ")}`
+              : ""}
+          </p>
+        )}
         <div className="actions" style={{ marginTop: 8 }}>
           <button className="danger" onClick={onResetSimulation} disabled={busy || !results}>
             Reset Stored Simulation
@@ -2089,7 +2223,7 @@ function BracketTab({ teams, teamLookup }) {
                   className={selected.includes(t.team_id) ? "chip active" : "chip"}
                   onClick={() => toggle(t.team_id)}
                 >
-                  {t.name} <Badge>id {t.team_id}</Badge>
+                  {t.name}
                 </button>
               ))}
             </div>
@@ -2487,7 +2621,7 @@ const MapsBarTooltip = ({ active, payload, label }) => {
   if (!active || !payload || !payload.length) return null;
   const row = payload[0]?.payload || {};
   return (
-    <div className="card sub" style={{ padding: "8px 12px", border: "1px solid #284061" }}>
+    <div className="card sub" style={{ padding: "8px 12px", border: "1px solid #232a34" }}>
       <p style={{ margin: 0, fontWeight: 600 }}>{label}</p>
       {Number(row.played || 0) === 0 ? (
         <p className="muted" style={{ margin: 0 }}>Not played in the last 3 months</p>
@@ -2521,62 +2655,275 @@ const MapBarWithWinRate = (props) => {
   );
 };
 
-function MapsTab({ teams, mapStats }) {
-  const [selectedTeamId, setSelectedTeamId] = useState("");
+function PredictedVetoPanel({ teams }) {
+  // Greedy veto prediction from each team's stored pick/ban tendencies
+  // (per-team map-profile): bans follow historical ban rates, nudged toward
+  // denying the opponent's best map; picks follow pick rates and map strength.
+  const [teamAId, setTeamAId] = useState("");
+  const [teamBId, setTeamBId] = useState("");
+  const [months, setMonths] = useState("3");
+  const [bo, setBo] = useState("bo3");
+  const [profiles, setProfiles] = useState({});
+  const [loading, setLoading] = useState(false);
 
-  const teamsWithStats = useMemo(
-    () => (teams || []).filter((t) => parseMapStatsRows(t.map_stats_json).length > 0),
+  const teamOptions = useMemo(
+    () => [
+      { value: "", label: "Select team" },
+      ...(teams || [])
+        .slice()
+        .sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")))
+        .map((t) => ({ value: String(t.team_id), label: t.name || `Team ${t.team_id}` })),
+    ],
     [teams]
   );
+  const teamById = useMemo(() => {
+    const m = {};
+    (teams || []).forEach((t) => (m[String(t.team_id)] = t));
+    return m;
+  }, [teams]);
 
-  const overallRows = useMemo(() => {
-    const totals = new Map();
-    teamsWithStats.forEach((team) => {
-      parseMapStatsRows(team.map_stats_json).forEach((row) => {
-        const name = String(row.map || "").trim();
-        if (!name) return;
-        const bucket =
-          totals.get(name) || { map: name, played: 0, teams: 0, inPool: ACTIVE_MAP_POOL.includes(name) };
-        bucket.played += Number(row.played || 0);
-        bucket.teams += 1;
-        totals.set(name, bucket);
+  useEffect(() => {
+    const ids = [teamAId, teamBId].filter((id) => Number(id) > 0);
+    const missing = ids.filter((id) => !profiles[`${id}:${months}`]);
+    if (missing.length === 0) return undefined;
+    let cancelled = false;
+    setLoading(true);
+    Promise.all(
+      missing.map((id) =>
+        api
+          .get(`/teams/${id}/map-profile?months=${months}`, 60000)
+          .then((d) => ({ id, d }))
+          .catch(() => ({ id, d: null }))
+      )
+    ).then((results) => {
+      if (cancelled) return;
+      setProfiles((prev) => {
+        const next = { ...prev };
+        results.forEach(({ id, d }) => {
+          if (d?.status === "ok") next[`${id}:${months}`] = d;
+        });
+        return next;
       });
+      setLoading(false);
     });
-    // Out-of-pool maps (e.g. Overpass) stay in the stored data but are hidden from display.
-    // Every active-pool map is always shown, even with zero plays.
-    ACTIVE_MAP_POOL.forEach((name) => {
-      if (!totals.has(name)) totals.set(name, { map: name, played: 0, teams: 0, inPool: true });
-    });
-    return Array.from(totals.values())
-      .filter((row) => row.inPool)
-      .sort((a, b) => b.played - a.played);
-  }, [teamsWithStats]);
+    return () => {
+      cancelled = true;
+    };
+  }, [teamAId, teamBId, months, profiles]);
 
-  const selectedTeam = useMemo(
-    () => teamsWithStats.find((t) => String(t.team_id) === String(selectedTeamId)) || null,
-    [teamsWithStats, selectedTeamId]
+  const profA = profiles[`${teamAId}:${months}`];
+  const profB = profiles[`${teamBId}:${months}`];
+  const bothSelected = Number(teamAId) > 0 && Number(teamBId) > 0 && teamAId !== teamBId;
+
+  const prediction = useMemo(() => {
+    if (!bothSelected || !profA || !profB) return null;
+    const index = (prof) => {
+      const m = {};
+      (prof.maps || []).forEach((r) => {
+        m[r.map] = r;
+      });
+      return m;
+    };
+    const ra = index(profA);
+    const rb = index(profB);
+    const val = (row, key, dflt = 0) => {
+      const v = row?.[key];
+      return v === null || v === undefined ? dflt : Number(v);
+    };
+    const banScore = (own, opp, m) =>
+      val(own[m], "ban_rate") * 3 + val(opp[m], "win_rate", 0.5) - val(own[m], "win_rate", 0.5);
+    const pickScore = (own, opp, m) =>
+      val(own[m], "pick_rate") * 3 + val(own[m], "win_rate", 0.5) - val(opp[m], "win_rate", 0.5);
+    const sequence = {
+      bo1: ["ban", "ban", "ban", "ban", "ban", "ban"],
+      bo3: ["ban", "ban", "pick", "pick", "ban", "ban"],
+      bo5: ["ban", "ban", "pick", "pick", "pick", "pick"],
+    }[bo];
+    let pool = [...ACTIVE_MAP_POOL];
+    const steps = [];
+    sequence.forEach((action, i) => {
+      const aTurn = i % 2 === 0;
+      const own = aTurn ? ra : rb;
+      const opp = aTurn ? rb : ra;
+      const best = pool
+        .map((m) => ({ m, s: action === "ban" ? banScore(own, opp, m) : pickScore(own, opp, m) }))
+        .sort((x, y) => y.s - x.s)[0];
+      if (!best) return;
+      pool = pool.filter((m) => m !== best.m);
+      steps.push({ teamId: aTurn ? teamAId : teamBId, action, map: best.m });
+    });
+    return { steps, decider: pool[0] || null };
+  }, [bothSelected, profA, profB, bo, teamAId, teamBId]);
+
+  const renderTeam = (id) => {
+    const t = teamById[String(id)];
+    return (
+      <span className="veto-step-team">
+        <TeamLogo hltvTeamId={t?.hltv_team_id} name={t?.name} size={22} />
+        <span>{t?.name || "-"}</span>
+      </span>
+    );
+  };
+  const lowData =
+    bothSelected &&
+    profA &&
+    profB &&
+    (Number(profA.veto_matches || 0) < 5 || Number(profB.veto_matches || 0) < 5);
+
+  return (
+    <div className="card sub">
+      <h3>Predicted Veto</h3>
+      <div className="veto-controls">
+        <Select label="Team A" value={teamAId} onChange={setTeamAId} options={teamOptions} />
+        <Select label="Team B" value={teamBId} onChange={setTeamBId} options={teamOptions} />
+        <Select
+          label="Timeframe"
+          value={months}
+          onChange={setMonths}
+          options={[
+            { value: "1", label: "Last month" },
+            { value: "3", label: "Last 3 months" },
+            { value: "6", label: "Last 6 months" },
+            { value: "12", label: "Last 12 months" },
+          ]}
+        />
+        <Select
+          label="Format"
+          value={bo}
+          onChange={setBo}
+          options={[
+            { value: "bo1", label: "Best of 1" },
+            { value: "bo3", label: "Best of 3" },
+            { value: "bo5", label: "Best of 5" },
+          ]}
+        />
+      </div>
+      {!bothSelected ? (
+        teamAId && teamAId === teamBId ? <p className="muted">Pick two different teams.</p> : null
+      ) : loading && (!profA || !profB) ? (
+        <p className="muted">Loading team veto data...</p>
+      ) : !prediction ? (
+        <p className="muted">No stored veto data for these teams in this window.</p>
+      ) : (
+        <>
+          <p className="muted">
+            Based on {Number(profA?.veto_matches || 0)} stored vetoes for {teamById[String(teamAId)]?.name} and{" "}
+            {Number(profB?.veto_matches || 0)} for {teamById[String(teamBId)]?.name}. Team A starts the veto.
+            {lowData ? " Limited data — treat with caution." : ""}
+          </p>
+          <div className="veto-steps">
+            {prediction.steps.map((s, i) => (
+              <div
+                className="veto-step"
+                key={`veto-${i}`}
+                style={{ "--map-color": MAP_BAR_COLORS[s.map] || MAP_BAR_FALLBACK_COLOR }}
+              >
+                <span className="veto-step-idx">{i + 1}</span>
+                {renderTeam(s.teamId)}
+                <span className={`veto-action ${s.action}`}>{s.action === "ban" ? "BAN" : "PICK"}</span>
+                <span className="veto-step-map">{s.map}</span>
+              </div>
+            ))}
+            {prediction.decider && (
+              <div
+                className="veto-step decider"
+                style={{ "--map-color": MAP_BAR_COLORS[prediction.decider] || MAP_BAR_FALLBACK_COLOR }}
+              >
+                <span className="veto-step-idx">{prediction.steps.length + 1}</span>
+                <span className="veto-step-team muted">Leftover</span>
+                <span className="veto-action decider-label">DECIDER</span>
+                <span className="veto-step-map">{prediction.decider}</span>
+              </div>
+            )}
+          </div>
+        </>
+      )}
+    </div>
   );
+}
+
+function MapsTab({ teams }) {
+  const [mapsSubTab, setMapsSubTab] = useState("popularity");
+  const [selectedTeamId, setSelectedTeamId] = useState("");
+  // The hover tooltip can float over the donut hole; hide the center totals
+  // while a slice is hovered so the two never overlap.
+  const [pieHovered, setPieHovered] = useState(false);
+  // Pie filters: computed live from stored match results, so the window and
+  // the VRS-rank restriction are adjustable (unlike the fixed team-stats
+  // scrape). Same filter semantics as the Matches browser.
+  const [pieMonths, setPieMonths] = useState("3");
+  const [pieRank, setPieRank] = useState("");
+  const [pieDir, setPieDir] = useState("within");
+  const [pieScope, setPieScope] = useState("both");
+  const [pieData, setPieData] = useState(null);
+  const [pieLoading, setPieLoading] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    // Debounce so typing a rank doesn't fire a request per keystroke.
+    const timer = setTimeout(() => {
+      setPieLoading(true);
+      const rankParams =
+        Number(pieRank) > 0
+          ? `&vrs_rank=${Number(pieRank)}&vrs_scope=${encodeURIComponent(pieScope)}&vrs_dir=${encodeURIComponent(pieDir)}`
+          : "";
+      api
+        .get(`/events/map-play-distribution?months=${pieMonths}${rankParams}`, 60000)
+        .then((d) => {
+          if (!cancelled && d?.status === "ok") setPieData(d);
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (!cancelled) setPieLoading(false);
+        });
+    }, 350);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [pieMonths, pieRank, pieDir, pieScope]);
+
+  // Team map profile: computed live from stored matches (map scores + vetoes)
+  // so the window is adjustable, unlike the fixed HLTV team-page scrape.
+  const [teamMonths, setTeamMonths] = useState("3");
+  const [teamProfile, setTeamProfile] = useState(null);
+  const [teamProfileLoading, setTeamProfileLoading] = useState(false);
+  useEffect(() => {
+    if (!selectedTeamId) {
+      setTeamProfile(null);
+      return undefined;
+    }
+    let cancelled = false;
+    setTeamProfileLoading(true);
+    api
+      .get(`/teams/${selectedTeamId}/map-profile?months=${teamMonths}`, 60000)
+      .then((d) => {
+        if (!cancelled && d?.status === "ok") setTeamProfile(d);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) setTeamProfileLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedTeamId, teamMonths]);
 
   const teamRows = useMemo(() => {
-    if (!selectedTeam) return [];
-    const rows = parseMapStatsRows(selectedTeam.map_stats_json)
-      .map((row) => {
-        const name = String(row.map || "").trim();
-        const rate = (value) => (value === null || value === undefined ? null : Number(value));
-        return {
-          map: name,
-          played: Number(row.played || 0),
-          wins: Number(row.wins || 0),
-          draws: Number(row.draws || 0),
-          losses: Number(row.losses || 0),
-          win_rate: rate(row.win_rate),
-          total_rounds: Number(row.total_rounds || 0),
-          pick_rate: rate(row.pick_rate),
-          ban_rate: rate(row.ban_rate),
-          inPool: ACTIVE_MAP_POOL.includes(name),
-        };
-      })
-      .filter((row) => row.map && row.inPool);
+    const rate = (value) => (value === null || value === undefined ? null : Number(value));
+    const rows = (teamProfile?.maps || []).map((row) => {
+      const name = String(row.map || "").trim();
+      return {
+        map: name,
+        played: Number(row.played || 0),
+        wins: Number(row.wins || 0),
+        losses: Number(row.losses || 0),
+        win_rate: rate(row.win_rate),
+        total_rounds: Number(row.total_rounds || 0),
+        pick_rate: rate(row.pick_rate),
+        ban_rate: rate(row.ban_rate),
+        inPool: ACTIVE_MAP_POOL.includes(name),
+      };
+    });
     const present = new Set(rows.map((row) => row.map));
     ACTIVE_MAP_POOL.forEach((name) => {
       if (!present.has(name)) {
@@ -2584,7 +2931,6 @@ function MapsTab({ teams, mapStats }) {
           map: name,
           played: 0,
           wins: 0,
-          draws: 0,
           losses: 0,
           win_rate: null,
           total_rounds: 0,
@@ -2595,41 +2941,41 @@ function MapsTab({ teams, mapStats }) {
       }
     });
     return rows.sort((a, b) => b.played - a.played);
-  }, [selectedTeam]);
+  }, [teamProfile]);
 
   const teamOptions = useMemo(
     () => [
       { value: "", label: "Select team" },
-      ...teamsWithStats
+      ...(teams || [])
         .slice()
         .sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")))
         .map((t) => ({ value: String(t.team_id), label: t.name || `Team ${t.team_id}` })),
     ],
-    [teamsWithStats]
+    [teams]
   );
 
   const formatRate = (value, digits = 1) =>
     value === null || !Number.isFinite(value) ? "-" : `${(value * 100).toFixed(digits)}%`;
 
-  const renderMapBars = (rows, { withWinRate = false } = {}) => (
+  const renderMapBars = (rows) => (
     <ResponsiveContainer width="100%" height={320}>
       <BarChart
         data={rows.map((r) => ({ ...r, label: r.inPool ? r.map : `${r.map} (out)` }))}
         margin={{ top: 12, right: 18, left: 6, bottom: 12 }}
       >
-        <CartesianGrid stroke="#284061" strokeDasharray="3 3" vertical={false} />
+        <CartesianGrid stroke="#232a34" strokeDasharray="3 3" vertical={false} />
         <XAxis
           dataKey="label"
           interval={0}
-          tick={{ fill: "#9fc5ff", fontSize: 12 }}
-          axisLine={{ stroke: "#365a89" }}
-          tickLine={{ stroke: "#365a89" }}
+          tick={{ fill: "#9fb2c9", fontSize: 12 }}
+          axisLine={{ stroke: "#3a4452" }}
+          tickLine={{ stroke: "#3a4452" }}
         />
         <YAxis
           allowDecimals={false}
-          tick={{ fill: "#9fc5ff", fontSize: 12 }}
-          axisLine={{ stroke: "#365a89" }}
-          tickLine={{ stroke: "#365a89" }}
+          tick={{ fill: "#9fb2c9", fontSize: 12 }}
+          axisLine={{ stroke: "#3a4452" }}
+          tickLine={{ stroke: "#3a4452" }}
         />
         <Tooltip cursor={{ fill: "rgba(59, 130, 246, 0.08)" }} content={<MapsBarTooltip />} />
         <Bar
@@ -2637,7 +2983,7 @@ function MapsTab({ teams, mapStats }) {
           isAnimationActive={false}
           radius={[4, 4, 0, 0]}
           maxBarSize={48}
-          shape={withWinRate ? <MapBarWithWinRate /> : undefined}
+          shape={<MapBarWithWinRate />}
         >
           {rows.map((r) => (
             <Cell key={r.map} fill={r.inPool ? MAP_BAR_COLORS[r.map] || MAP_BAR_FALLBACK_COLOR : MAP_BAR_FALLBACK_COLOR} />
@@ -2649,53 +2995,200 @@ function MapsTab({ teams, mapStats }) {
 
   return (
     <Section title="Maps">
+      <div className="tab-bar small">
+        <button className={mapsSubTab === "popularity" ? "tab active" : "tab"} onClick={() => setMapsSubTab("popularity")}>
+          Most Played
+        </button>
+        <button className={mapsSubTab === "teams" ? "tab active" : "tab"} onClick={() => setMapsSubTab("teams")}>
+          Team Map Stats
+        </button>
+        <button className={mapsSubTab === "veto" ? "tab active" : "tab"} onClick={() => setMapsSubTab("veto")}>
+          Predicted Veto
+        </button>
+      </div>
       <div className="stack">
+        {mapsSubTab === "popularity" && (
         <div className="card sub">
-          <h3>Map Stats Import</h3>
-          <p className="muted">
-            Scrapes each team's HLTV map page (last 3 months). Pausable and resumable; safe to leave running.
-          </p>
-          <MapStatsJobControls job={mapStats} teamsAvailable={(teams || []).length > 0} />
-          <MapStatsJobProgress job={mapStats} />
+          <h3>Most Played Maps</h3>
+          {(() => {
+            const totalPlayed = Number(pieData?.total_maps || 0);
+            // Fold slivers (single show-match maps etc.) into "Other", and
+            // only draw outside labels for slices wide enough to label
+            // cleanly — thinner ones stay hoverable without colliding text.
+            const MIN_SLICE_PCT = 0.012;
+            const MIN_LABEL_PCT = 0.022;
+            const major = [];
+            let otherPlayed = 0;
+            (pieData?.maps || [])
+              .filter((r) => Number(r.played || 0) > 0)
+              .forEach((r) => {
+                if (totalPlayed > 0 && Number(r.played) / totalPlayed < MIN_SLICE_PCT) {
+                  otherPlayed += Number(r.played);
+                } else {
+                  major.push(r);
+                }
+              });
+            const pieRows = otherPlayed > 0 ? [...major, { map: "Other", played: otherPlayed }] : major;
+            const chart =
+              pieRows.length === 0 ? (
+                <p className="muted">{pieLoading ? "Loading map data..." : "No stored matches in this window."}</p>
+              ) : (
+                <div className="pie-wrap" style={pieLoading ? { opacity: 0.6 } : undefined}>
+                  <ResponsiveContainer width="100%" height={460}>
+                    <PieChart accessibilityLayer={false}>
+                      <Pie
+                        data={pieRows}
+                        dataKey="played"
+                        nameKey="map"
+                        cx="50%"
+                        cy="50%"
+                        outerRadius={168}
+                        innerRadius={92}
+                        stroke="#0a0c10"
+                        strokeWidth={2}
+                        isAnimationActive={false}
+                        onMouseEnter={() => setPieHovered(true)}
+                        onMouseLeave={() => setPieHovered(false)}
+                        label={({ cx, cy, midAngle, outerRadius: or2, map, played }) => {
+                          if (totalPlayed > 0 && Number(played) / totalPlayed < MIN_LABEL_PCT) return null;
+                          const rad = (-midAngle * Math.PI) / 180;
+                          const cos = Math.cos(rad);
+                          const sin = Math.sin(rad);
+                          const x = cx + (or2 + 28) * cos;
+                          const y = cy + (or2 + 28) * sin;
+                          // Near-vertical labels center on the line end (offset
+                          // above/below it) so the line points at the text, not
+                          // at one end of it.
+                          const vertical = Math.abs(cos) < 0.35;
+                          return (
+                            <text
+                              x={x}
+                              y={vertical ? y + (sin > 0 ? 11 : -11) : y}
+                              textAnchor={vertical ? "middle" : cos > 0 ? "start" : "end"}
+                              dominantBaseline="central"
+                              fill="#f2f5f9"
+                              fontSize={15}
+                              fontWeight={600}
+                            >
+                              {totalPlayed > 0 ? `${map} ${((played / totalPlayed) * 100).toFixed(1)}%` : map}
+                            </text>
+                          );
+                        }}
+                        labelLine={(props) => {
+                          const { cx, cy, midAngle, outerRadius: or2 } = props;
+                          const linePlayed = Number(props?.played ?? props?.payload?.played ?? 0);
+                          if (totalPlayed > 0 && linePlayed / totalPlayed < MIN_LABEL_PCT) return null;
+                          const rad = (-midAngle * Math.PI) / 180;
+                          const sx = cx + (or2 + 3) * Math.cos(rad);
+                          const sy = cy + (or2 + 3) * Math.sin(rad);
+                          const ex = cx + (or2 + 20) * Math.cos(rad);
+                          const ey = cy + (or2 + 20) * Math.sin(rad);
+                          return <path d={`M${sx},${sy}L${ex},${ey}`} stroke="#3a4452" fill="none" />;
+                        }}
+                      >
+                        {pieRows.map((r) => (
+                          <Cell
+                            key={`pie-${r.map}`}
+                            fill={r.map === "Other" ? "#64748b" : MAP_BAR_COLORS[r.map] || MAP_BAR_FALLBACK_COLOR}
+                          />
+                        ))}
+                      </Pie>
+                      <Tooltip
+                        contentStyle={{ background: "#14181f", border: "1px solid #3a4452", borderRadius: 10 }}
+                        itemStyle={{ color: "#e9edf3" }}
+                        formatter={(value, name) => [
+                          `${Number(value).toLocaleString()} maps (${totalPlayed > 0 ? ((Number(value) / totalPlayed) * 100).toFixed(1) : 0}%)`,
+                          name,
+                        ]}
+                      />
+                    </PieChart>
+                  </ResponsiveContainer>
+                  <div className="pie-center-label" style={{ opacity: pieHovered ? 0 : 1 }}>
+                    <div className="pie-center-number">{totalPlayed.toLocaleString()}</div>
+                    <div className="pie-center-sub">maps played</div>
+                    <div className="pie-center-sub">
+                      last {Number(pieMonths)} month{Number(pieMonths) > 1 ? "s" : ""}
+                    </div>
+                    {Number(pieRank) > 0 && (
+                      <div className="pie-center-sub">
+                        {pieDir === "within" ? "inside" : "outside"} top {Number(pieRank)}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            return (
+              <div className="pie-layout">
+                <div className="pie-filter-col">
+                  <Select
+                    label="Timeframe"
+                    value={pieMonths}
+                    onChange={setPieMonths}
+                    options={[
+                      { value: "1", label: "Last month" },
+                      { value: "3", label: "Last 3 months" },
+                      { value: "6", label: "Last 6 months" },
+                      { value: "12", label: "Last 12 months" },
+                    ]}
+                  />
+                  <Input label="VRS Rank" value={pieRank} onChange={setPieRank} placeholder="e.g. 50" />
+                  <Select
+                    label="Direction"
+                    value={pieDir}
+                    onChange={setPieDir}
+                    options={[
+                      { value: "within", label: "Inside top N" },
+                      { value: "outside", label: "Outside top N" },
+                    ]}
+                  />
+                  <Select
+                    label="Teams"
+                    value={pieScope}
+                    onChange={setPieScope}
+                    options={[
+                      { value: "both", label: "Both teams" },
+                      { value: "either", label: "At least one team" },
+                    ]}
+                  />
+                </div>
+                {chart}
+              </div>
+            );
+          })()}
         </div>
-        <div className="card sub">
-          <h3>Most Played Maps (All Teams)</h3>
-          <p className="muted">
-            Total maps played across {teamsWithStats.length} teams with imported map stats (HLTV, last 3 months).
-            Only the current active-duty pool is shown; out-of-pool data is kept in the database.
-          </p>
-          {overallRows.length === 0 ? (
-            <p className="muted">No map stats imported yet. Use "Import All Map Stats" in the Database tab.</p>
-          ) : (
-            renderMapBars(overallRows)
-          )}
-        </div>
+        )}
+        {mapsSubTab === "teams" && (
         <div className="card sub">
           <h3>Team Map Stats</h3>
           <div className="grid two">
             <Select label="Team" value={selectedTeamId} onChange={setSelectedTeamId} options={teamOptions} />
-            <div className="field">
-              <span>Stats Imported</span>
-              <div className="pill">{selectedTeam?.map_stats_imported_at || "-"}</div>
-            </div>
+            <Select
+              label="Timeframe"
+              value={teamMonths}
+              onChange={setTeamMonths}
+              options={[
+                { value: "1", label: "Last month" },
+                { value: "3", label: "Last 3 months" },
+                { value: "6", label: "Last 6 months" },
+                { value: "12", label: "Last 12 months" },
+              ]}
+            />
           </div>
-          {!selectedTeam ? (
+          {!selectedTeamId ? (
             <p className="muted">Select a team to see its per-map record.</p>
-          ) : teamRows.length === 0 ? (
-            <p className="muted">No map stats stored for this team yet.</p>
+          ) : teamProfileLoading && !teamProfile ? (
+            <p className="muted">Loading map data...</p>
+          ) : Number(teamProfile?.matches || 0) === 0 && Number(teamProfile?.veto_matches || 0) === 0 ? (
+            <p className="muted">No stored matches for this team in this window.</p>
           ) : (
             <>
-              <p className="muted">
-                The white tick on each bar marks the team's win rate on that map — top of the bar is 100%, the
-                baseline is 0%. Exact numbers are in the table below.
-              </p>
-              {renderMapBars(teamRows, { withWinRate: true })}
+              {renderMapBars(teamRows)}
               <table>
                 <thead>
                   <tr>
                     <th>Map</th>
                     <th>Played</th>
-                    <th>W - D - L</th>
+                    <th>W - L</th>
                     <th>Win Rate</th>
                     <th>Rounds</th>
                     <th>Pick Rate</th>
@@ -2707,7 +3200,7 @@ function MapsTab({ teams, mapStats }) {
                     <tr key={row.map}>
                       <td>{row.map}</td>
                       <td>{row.played}</td>
-                      <td>{`${row.wins} - ${row.draws} - ${row.losses}`}</td>
+                      <td>{`${row.wins} - ${row.losses}`}</td>
                       <td>{formatRate(row.win_rate)}</td>
                       <td>{row.total_rounds || "-"}</td>
                       <td>{formatRate(row.pick_rate)}</td>
@@ -2719,6 +3212,8 @@ function MapsTab({ teams, mapStats }) {
             </>
           )}
         </div>
+        )}
+        {mapsSubTab === "veto" && <PredictedVetoPanel teams={teams} />}
       </div>
     </Section>
   );
@@ -2733,6 +3228,63 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   const [latestPayload, setLatestPayload] = useState(null);
   const [updatedAt, setUpdatedAt] = useState("");
   const [slots, setSlots] = useState(Array(8).fill(""));
+  const [bracketSize, setBracketSize] = useState(8); // 8 = exact, 16 = Monte-Carlo
+  const [mcSims, setMcSims] = useState(5000); // Monte-Carlo samples for large (16-team) fields
+  const changeBracketSize = (n) => {
+    const size = Number(n) || 8;
+    setBracketSize(size);
+    setSlots(Array(size).fill(""));
+    setResults(null);
+    setTopTeams(null);
+    setAllTeams(null);
+    setBaseTeams(null);
+    setCompletedBracket({ rounds: emptyCompletedRounds(size), third: "" });
+    setCompletedBracketResult(null);
+    setCompletedBracketMessage("");
+  };
+  // Fill the seed slots + bracket size straight from the linked HLTV event's
+  // single-elimination playoff bracket (16/8/4), in bracket order.
+  const autofillPlayoffFromEvent = async () => {
+    setPlayoffAutofillBusy(true);
+    setPlayoffAutofillMessage("");
+    try {
+      const data = await api.post(
+        "/playoff/autofill-from-hltv-event",
+        { fantasy_event_id: selectedEventId ? Number(selectedEventId) : undefined },
+        90000
+      );
+      if (data?.detail || data?.error) {
+        setPlayoffAutofillMessage(String(data.detail || data.error));
+        return;
+      }
+      const ids = (data.team_ids || []).map((x) => String(x || ""));
+      const names = data.team_names || [];
+      const size = Number(data.bracket_size || ids.length);
+      if (![2, 4, 8, 16].includes(size)) {
+        setPlayoffAutofillMessage(`Unsupported bracket size (${size}).`);
+        return;
+      }
+      setBracketSize(size);
+      setSlots([...ids, ...Array(size).fill("")].slice(0, size));
+      setResults(null);
+      setTopTeams(null);
+      setAllTeams(null);
+      setBaseTeams(null);
+      setCompletedBracket({ rounds: emptyCompletedRounds(size), third: "" });
+      setCompletedBracketResult(null);
+      setCompletedBracketMessage("");
+      const tbd = names.filter((_, i) => !Number(ids[i]));
+      setPlayoffAutofillMessage(
+        tbd.length
+          ? `Filled ${size}-team bracket; ${tbd.length} seed(s) not matched to a team yet (${tbd.join(", ")}).`
+          : `Filled ${size}-team bracket from the event.`
+      );
+    } catch (e) {
+      setPlayoffAutofillMessage(e?.message || "Autofill from HLTV event failed.");
+    } finally {
+      setPlayoffAutofillBusy(false);
+    }
+  };
   const [hasThirdPlaceDecider, setHasThirdPlaceDecider] = useState(false);
   // Bounty draft state: seeds 5-7 pick their QF opponent (seed 8 gets the
   // leftover), and per QF-winner scenario the first SF drafter's pick.
@@ -2744,6 +3296,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   const [allTeams, setAllTeams] = useState(null);
   const [baseTeams, setBaseTeams] = useState(null);
   const [sharedComboCount, setSharedComboCount] = useState(0);
+  const [combosApproximate, setCombosApproximate] = useState(false);
   const [sharedCombosUpdatedAt, setSharedCombosUpdatedAt] = useState("");
   const [filteredCount, setFilteredCount] = useState(0);
   const [page, setPage] = useState(0);
@@ -2762,10 +3315,11 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   const [sortKey, setSortKey] = useState("ev_desc");
   const [playoffTopSubtab, setPlayoffTopSubtab] = useState("average");
   const [playoffBestMode, setPlayoffBestMode] = useState("average");
+  // `rounds` holds one winner-array per round in bracket order (round 0 first,
+  // final last); `third` is the third-place decider pick. Generalised from the
+  // old {qf,sf,final,third} shape so the picker supports 8- and 16-team fields.
   const [completedBracket, setCompletedBracket] = useState({
-    qf: ["", "", "", ""],
-    sf: ["", ""],
-    final: "",
+    rounds: [["", "", "", ""], ["", ""], [""]],
     third: "",
   });
   const [completedBracketResult, setCompletedBracketResult] = useState(null);
@@ -2782,6 +3336,8 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   const [completedEtaSeconds, setCompletedEtaSeconds] = useState(null);
   const [etaSeconds, setEtaSeconds] = useState(null);
   const [runMessage, setRunMessage] = useState("");
+  const [playoffAutofillBusy, setPlayoffAutofillBusy] = useState(false);
+  const [playoffAutofillMessage, setPlayoffAutofillMessage] = useState("");
   const playoffPollingRef = useRef(false);
   const comboQuerySeqRef = useRef(0);
   const normalizeTeamName = (name) => String(name || "").trim().toLowerCase();
@@ -2877,7 +3433,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   const playoffTeamOptions = useMemo(
     () => [
       { value: "", label: "Select team" },
-      ...filteredTeams.map((t) => ({ value: String(t.team_id), label: `${t.name} (${t.team_id})` })),
+      ...filteredTeams.map((t) => ({ value: String(t.team_id), label: t.name || `Team ${t.team_id}` })),
     ],
     [filteredTeams]
   );
@@ -2887,12 +3443,41 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     if (parts.length >= 2) return `${parts[0][0] || ""}${parts[1][0] || ""}`.toUpperCase();
     return String(name || "?").slice(0, 2).toUpperCase();
   };
+  const hltvIdByTeamId = useMemo(() => {
+    const m = {};
+    teams.forEach((t) => {
+      if (t.hltv_team_id) m[Number(t.team_id)] = Number(t.hltv_team_id);
+    });
+    return m;
+  }, [teams]);
+  const TeamBadge = ({ teamId }) => {
+    const id = Number(teamId);
+    if (!Number.isFinite(id) || id <= 0) return <span className="playoff-team-badge empty">?</span>;
+    return <TeamLogo hltvTeamId={hltvIdByTeamId[id]} name={teamLookup[id]} size={24} />;
+  };
+  // Bracket geometry helpers shared by the seeding view and the completed-bracket
+  // picker so both work for any power-of-two field (8 exact, 16 Monte-Carlo).
+  const bracketTotalRounds = (n) => (n >= 2 ? Math.round(Math.log2(n)) : 0);
+  const roundTitleForTeams = (teamsInRound) =>
+    ({ 2: "Grand final", 4: "Semi-finals", 8: "Quarter-finals", 16: "Round of 16", 32: "Round of 32" }[teamsInRound] ||
+      `Round of ${teamsInRound}`);
+  const roundShortForTeams = (teamsInRound) =>
+    ({ 2: "F", 4: "SF", 8: "QF", 16: "R16", 32: "R32" }[teamsInRound] || `R${teamsInRound}`);
+  const roundNameForTeams = (teamsInRound) =>
+    ({ 2: "final", 4: "semis", 8: "quarters", 16: "round_of_16", 32: "round_of_32" }[teamsInRound] ||
+      `round_of_${teamsInRound}`);
+  const emptyCompletedRounds = (n) => {
+    const rounds = [];
+    const total = bracketTotalRounds(n);
+    for (let r = 0; r < total; r++) rounds.push(Array(n >> (r + 1)).fill(""));
+    return rounds;
+  };
   const BracketTeamRow = ({ slotIndex, placeholder, muted = false }) => {
     const selectedTeamId = slotIndex !== null && slotIndex !== undefined ? slots[slotIndex] : "";
     const hasTeam = Boolean(selectedTeamId);
     return (
       <div className={`playoff-team-row ${muted ? "muted" : ""}`}>
-        <span className={`playoff-team-badge ${hasTeam ? "" : "empty"}`}>{hasTeam ? teamInitials(selectedTeamId) : "?"}</span>
+        <TeamBadge teamId={hasTeam ? selectedTeamId : 0} />
         {slotIndex !== null && slotIndex !== undefined ? (
           <select value={selectedTeamId} onChange={(e) => setSlot(slotIndex, e.target.value)} disabled={busy}>
             {playoffTeamOptions.map((option) => (
@@ -2916,7 +3501,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
         onClick={() => hasTeam && onSelect(String(teamId))}
         disabled={!hasTeam}
       >
-        <span className={`playoff-team-badge ${hasTeam ? "" : "empty"}`}>{hasTeam ? teamInitials(teamId) : "?"}</span>
+        <TeamBadge teamId={hasTeam ? teamId : 0} />
         <span>{hasTeam ? teamLookup[Number(teamId)] || `Team ${teamId}` : placeholder}</span>
       </button>
     );
@@ -2930,51 +3515,161 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       <div className="playoff-match-teams">{rows}</div>
     </div>
   );
-  const setCompletedPick = (round, index, value) => {
+  const matchCardTitle = (teamsInRound, matchIdx) =>
+    teamsInRound === 2 ? "Final" : `${roundShortForTeams(teamsInRound)} ${matchIdx + 1}`;
+  const matchCardMeta = (teamsInRound) => (teamsInRound === 2 ? "BO5" : "BO3");
+  // Seeding view (Run tab): round 0 has the seed selects; later rounds show the
+  // muted winner placeholders. Auto-distributed via .pb-bracket for any size.
+  const renderSeedingBracket = () => {
+    const n = bracketSize;
+    const totalRounds = bracketTotalRounds(n);
+    return (
+      <div className="pb-bracket">
+        {Array.from({ length: totalRounds }, (_, r) => {
+          const teamsInRound = n >> r;
+          const matches = n >> (r + 1);
+          const feederShort = r > 0 ? roundShortForTeams(n >> (r - 1)) : "";
+          return (
+            <div className="pb-round" key={`seed-round-${r}`}>
+              <div className="pb-round-title">{roundTitleForTeams(teamsInRound)}</div>
+              <div className="pb-matches">
+                {Array.from({ length: matches }, (_, m) => (
+                  <div className="pb-match-wrap" key={`seed-${r}-${m}`}>
+                    <BracketMatchCard
+                      title={matchCardTitle(teamsInRound, m)}
+                      meta={matchCardMeta(teamsInRound)}
+                      rows={
+                        r === 0 ? (
+                          <>
+                            <BracketTeamRow slotIndex={2 * m} />
+                            <BracketTeamRow slotIndex={2 * m + 1} />
+                          </>
+                        ) : (
+                          <>
+                            <BracketTeamRow placeholder={`Winner ${feederShort} ${2 * m + 1}`} muted />
+                            <BracketTeamRow placeholder={`Winner ${feederShort} ${2 * m + 2}`} muted />
+                          </>
+                        )
+                      }
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+  // Completed-bracket picker: the same auto-distributed bracket, but each row is
+  // a clickable winner pick sourced from completedBracketDerived.roundsPairs.
+  const renderCompletedPicker = () => {
+    const n = slots.length;
+    const totalRounds = bracketTotalRounds(n);
+    const { roundsPairs, thirdPair } = completedBracketDerived;
+    return (
+      <>
+        <div className="pb-bracket">
+          {Array.from({ length: totalRounds }, (_, r) => {
+            const teamsInRound = n >> r;
+            const matches = n >> (r + 1);
+            const pairs = roundsPairs[r] || [];
+            const picks = (completedBracket.rounds || [])[r] || [];
+            return (
+              <div className="pb-round" key={`cmp-round-${r}`}>
+                <div className="pb-round-title">{roundTitleForTeams(teamsInRound)}</div>
+                <div className="pb-matches">
+                  {Array.from({ length: matches }, (_, m) => {
+                    const pair = pairs[m] || ["", ""];
+                    return (
+                      <div className="pb-match-wrap" key={`cmp-${r}-${m}`}>
+                        <BracketMatchCard
+                          title={matchCardTitle(teamsInRound, m)}
+                          meta={matchCardMeta(teamsInRound)}
+                          rows={pair.map((teamId, rowIdx) => (
+                            <CompletedBracketTeamRow
+                              key={`cmp-${r}-${m}-${rowIdx}`}
+                              teamId={teamId}
+                              selected={Boolean(teamId) && String(picks[m]) === String(teamId)}
+                              onSelect={(val) => setCompletedPick(r, m, val)}
+                              placeholder="TBD"
+                            />
+                          ))}
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        {hasThirdPlaceDecider && !isBounty && (
+          <div className="pb-thirdplace">
+            <BracketMatchCard
+              title="Third-place decider"
+              rows={thirdPair.map((teamId, idx) => (
+                <CompletedBracketTeamRow
+                  key={`cmp-third-${idx}`}
+                  teamId={teamId}
+                  selected={Boolean(teamId) && String(completedBracket.third) === String(teamId)}
+                  onSelect={(val) => setCompletedThird(val)}
+                  placeholder={idx === 0 ? "Semi-final 1 loser" : "Semi-final 2 loser"}
+                />
+              ))}
+            />
+          </div>
+        )}
+      </>
+    );
+  };
+  const setCompletedPick = (roundIdx, matchIdx, value) => {
     setCompletedBracket((prev) => {
-      const next = { ...prev, qf: [...prev.qf], sf: [...prev.sf] };
-      if (round === "qf") {
-        next.qf[index] = value;
-        if (isBounty) {
-          // Bounty semis are re-drafted from the surviving four, so any QF
-          // change invalidates both SF pairings.
-          next.sf = ["", ""];
-        } else if (index < 2) next.sf[0] = "";
-        else next.sf[1] = "";
-        next.final = "";
-        next.third = "";
-      } else if (round === "sf") {
-        next.sf[index] = value;
-        next.final = "";
-        next.third = "";
-      } else if (round === "final") {
-        next.final = value;
-      } else if (round === "third") {
-        next.third = value;
+      const rounds = (prev.rounds || []).map((r) => [...r]);
+      if (!rounds[roundIdx]) return prev;
+      rounds[roundIdx][matchIdx] = value;
+      // Invalidate downstream picks that depended on this result.
+      if (isBounty && roundIdx === 0) {
+        // Bounty semis are re-drafted from the surviving four, so any QF change
+        // invalidates the entire SF round (and everything after it).
+        for (let r = 1; r < rounds.length; r++) rounds[r] = rounds[r].map(() => "");
+      } else {
+        // Standard single-elim: only the descendant match in each later round
+        // depended on this pick.
+        let descendant = matchIdx;
+        for (let r = roundIdx + 1; r < rounds.length; r++) {
+          descendant = Math.floor(descendant / 2);
+          if (rounds[r] && rounds[r][descendant] !== undefined) rounds[r][descendant] = "";
+        }
       }
-      return next;
+      return { ...prev, rounds, third: "" };
     });
     setCompletedBracketResult(null);
     setCompletedBracketMessage("");
   };
-  const hydrateCompletedBracketFromBracket = (bracket) => {
+  const setCompletedThird = (value) => {
+    setCompletedBracket((prev) => ({ ...prev, third: value }));
+    setCompletedBracketResult(null);
+    setCompletedBracketMessage("");
+  };
+  const hydrateCompletedBracketFromBracket = (bracket, n = bracketSize) => {
     if (!bracket) return;
-    const quarters = bracket.quarters || [];
-    const semis = bracket.semis || [];
-    const finals = bracket.final || [];
-    const thirdPlace = bracket.third_place || [];
-    const qf = quarters.slice(0, 4).map((row) => (row?.winner ? String(row.winner) : ""));
-    const sf = semis.slice(0, 2).map((row) => (row?.winner ? String(row.winner) : ""));
-    const finalWinner = finals[0]?.winner ? String(finals[0].winner) : "";
-    const thirdWinner = thirdPlace[0]?.winner ? String(thirdPlace[0].winner) : "";
-    if (qf.some(Boolean) || sf.some(Boolean) || finalWinner || thirdWinner) {
-      setCompletedBracket({
-        qf: [...qf, "", "", "", ""].slice(0, 4),
-        sf: [...sf, ""].slice(0, 2),
-        final: finalWinner,
-        third: thirdWinner,
-      });
+    const totalRounds = bracketTotalRounds(n);
+    const rounds = [];
+    let anyPicked = false;
+    for (let r = 0; r < totalRounds; r++) {
+      const teamsInRound = n >> r;
+      const matches = bracket[roundNameForTeams(teamsInRound)] || [];
+      const winners = [];
+      for (let i = 0; i < n >> (r + 1); i++) {
+        const w = matches[i]?.winner ? String(matches[i].winner) : "";
+        if (w) anyPicked = true;
+        winners.push(w);
+      }
+      rounds.push(winners);
     }
+    const thirdWinner = (bracket.third_place || [])[0]?.winner ? String(bracket.third_place[0].winner) : "";
+    if (anyPicked || thirdWinner) setCompletedBracket({ rounds, third: thirdWinner });
   };
   const openScoringBreakdown = (row) => {
     if (!row) return;
@@ -3046,35 +3741,71 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   };
   const completedBracketDerived = useMemo(() => {
     const isPickedFrom = (value, ids) => Boolean(value) && ids.some((id) => String(id) === String(value));
-    const qfPairs = isBounty
-      ? (draftedQfPairs || [["", ""], ["", ""], ["", ""], ["", ""]]).map((pair) => pair.map((id) => (id ? String(id) : "")))
-      : [
-          [slots[0], slots[1]],
-          [slots[2], slots[3]],
-          [slots[4], slots[5]],
-          [slots[6], slots[7]],
-        ];
-    const qfWinnersPicked = completedBracket.qf.every((pick) => Boolean(pick));
-    const sfPairs = isBounty
-      ? qfWinnersPicked
-        ? bountySfPairsFor(completedBracket.qf).map((pair) => pair.map((id) => (id ? String(id) : "")))
-        : [["", ""], ["", ""]]
-      : [
-          [completedBracket.qf[0], completedBracket.qf[1]],
-          [completedBracket.qf[2], completedBracket.qf[3]],
-        ];
-    const finalPair = [completedBracket.sf[0], completedBracket.sf[1]];
-    const thirdPair = [
-      sfPairs[0].find((id) => id && String(id) !== String(completedBracket.sf[0])) || "",
-      sfPairs[1].find((id) => id && String(id) !== String(completedBracket.sf[1])) || "",
-    ];
-    const complete =
-      completedBracket.qf.every((pick, idx) => isPickedFrom(pick, qfPairs[idx])) &&
-      completedBracket.sf.every((pick, idx) => isPickedFrom(pick, sfPairs[idx])) &&
-      isPickedFrom(completedBracket.final, finalPair) &&
-      (!hasThirdPlaceDecider || isPickedFrom(completedBracket.third, thirdPair));
-    return { qfPairs, sfPairs, finalPair, thirdPair, complete };
+    const n = slots.length;
+    const totalRounds = bracketTotalRounds(n);
+    const picks = completedBracket.rounds || [];
+    // The match-ups a user picks from, per round. Round 0 is the seeded field
+    // (or the bounty draft); later rounds are formed from the previous round's
+    // picked winners (bounty semis are re-drafted from the surviving four).
+    const roundsPairs = [];
+    for (let r = 0; r < totalRounds; r++) {
+      const matches = n >> (r + 1);
+      let pairs;
+      if (r === 0) {
+        pairs = isBounty
+          ? (draftedQfPairs || Array.from({ length: matches }, () => ["", ""])).map((pair) =>
+              pair.map((id) => (id ? String(id) : ""))
+            )
+          : Array.from({ length: matches }, (_, i) => [slots[2 * i] || "", slots[2 * i + 1] || ""]);
+      } else if (isBounty && r === 1) {
+        const qfPicks = picks[0] || [];
+        pairs =
+          qfPicks.length === n / 2 && qfPicks.every(Boolean)
+            ? bountySfPairsFor(qfPicks).map((pair) => pair.map((id) => (id ? String(id) : "")))
+            : Array.from({ length: matches }, () => ["", ""]);
+      } else {
+        const prev = picks[r - 1] || [];
+        pairs = Array.from({ length: matches }, (_, i) => [prev[2 * i] || "", prev[2 * i + 1] || ""]);
+      }
+      roundsPairs.push(pairs);
+    }
+    // Third-place decider is between the two semi-final losers (the 4-team round).
+    const semiRoundIdx = totalRounds - 2;
+    let thirdPair = ["", ""];
+    if (semiRoundIdx >= 0 && !isBounty) {
+      const semiPairs = roundsPairs[semiRoundIdx] || [];
+      const semiPicks = picks[semiRoundIdx] || [];
+      thirdPair = semiPairs.map((pair, idx) => pair.find((id) => id && String(id) !== String(semiPicks[idx])) || "");
+    }
+    let complete = totalRounds > 0;
+    for (let r = 0; r < totalRounds && complete; r++) {
+      const roundPicks = picks[r] || [];
+      const pairs = roundsPairs[r] || [];
+      if (roundPicks.length !== pairs.length) complete = false;
+      else complete = pairs.every((pair, i) => isPickedFrom(roundPicks[i], pair));
+    }
+    if (complete && hasThirdPlaceDecider && !isBounty) {
+      complete = isPickedFrom(completedBracket.third, thirdPair);
+    }
+    return { roundsPairs, thirdPair, semiRoundIdx, complete };
   }, [slots, completedBracket, hasThirdPlaceDecider, isBounty, draftedQfPairs, sfPicks, seedIndexById]);
+  // Request fields describing the picked bracket. The backend computes the
+  // bracket deterministically from `round_winners` (any field size); the bounty
+  // variant is still looked up among stored 8-team outcomes, so send the legacy
+  // qf/sf/final fields for it too.
+  const completedBracketPayloadFields = () => {
+    const rounds = (completedBracket.rounds || []).map((r) => r.map((id) => Number(id)));
+    const fields = {
+      round_winners: rounds,
+      third_place_winner: !isBounty && hasThirdPlaceDecider ? Number(completedBracket.third) : 0,
+    };
+    if (isBounty) {
+      fields.qf_winners = rounds[0] || [];
+      fields.sf_winners = rounds[1] || [];
+      fields.final_winner = (rounds[2] || [])[0] || 0;
+    }
+    return fields;
+  };
   const runCompletedBracket = async () => {
     setBusy(true);
     setCompletedBracketMessage("");
@@ -3085,10 +3816,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     setCompletedEtaSeconds(null);
     try {
       const start = await api.post("/playoff/best-team/bracket-from-latest/start", {
-        qf_winners: completedBracket.qf.map((id) => Number(id)),
-        sf_winners: completedBracket.sf.map((id) => Number(id)),
-        final_winner: Number(completedBracket.final),
-        third_place_winner: !isBounty && hasThirdPlaceDecider ? Number(completedBracket.third) : 0,
+        ...completedBracketPayloadFields(),
         include_player_ids: Array.from(effectiveAppliedFilters.include),
         exclude_player_ids: Array.from(effectiveAppliedFilters.exclude),
         variant,
@@ -3266,6 +3994,8 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     const payload = data.payload || {};
     setLatestPayload(payload);
     setSlots((payload.team_slots || []).map((x) => String(x)));
+    setBracketSize((payload.team_slots || []).length >= 16 ? 16 : 8);
+    setMcSims(Number(payload.mc_sims) || 5000);
     setHasThirdPlaceDecider(Boolean(payload.has_third_place_decider));
     if (isBounty) {
       const savedPairs = payload.qf_pairs || [];
@@ -3280,7 +4010,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       setSfPicks(restored);
     }
     setResults(data.results || null);
-    hydrateCompletedBracketFromBracket(data.results?.bracket);
+    hydrateCompletedBracketFromBracket(data.results?.bracket, (payload.team_slots || []).length || bracketSize);
     setUpdatedAt(data.updated_at ? new Date(Number(data.updated_at) * 1000).toISOString() : "");
   };
 
@@ -3288,14 +4018,20 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     const data = await api.get(`/playoff/best-team/bracket-from-latest/latest?variant=${variant}`, 120000);
     if (!data?.exists) return;
     const payload = data.payload || {};
-    const savedQf = (payload.qf_winners || []).slice(0, 4).map((id) => String(id || ""));
-    const savedSf = (payload.sf_winners || []).slice(0, 2).map((id) => String(id || ""));
-    setCompletedBracket({
-      qf: [...savedQf, "", "", "", ""].slice(0, 4),
-      sf: [...savedSf, ""].slice(0, 2),
-      final: payload.final_winner ? String(payload.final_winner) : "",
-      third: payload.third_place_winner ? String(payload.third_place_winner) : "",
-    });
+    // Prefer the general round_winners; fall back to the legacy 8-team fields.
+    let rounds;
+    if (Array.isArray(payload.round_winners) && payload.round_winners.length) {
+      rounds = payload.round_winners.map((r) => (r || []).map((id) => String(id || "")));
+    } else {
+      const savedQf = (payload.qf_winners || []).slice(0, 4).map((id) => String(id || ""));
+      const savedSf = (payload.sf_winners || []).slice(0, 2).map((id) => String(id || ""));
+      rounds = [
+        [...savedQf, "", "", "", ""].slice(0, 4),
+        [...savedSf, ""].slice(0, 2),
+        [payload.final_winner ? String(payload.final_winner) : ""],
+      ];
+    }
+    setCompletedBracket({ rounds, third: payload.third_place_winner ? String(payload.third_place_winner) : "" });
     setCompletedBracketUpdatedAt(data.updated_at ? new Date(Number(data.updated_at) * 1000).toISOString() : "");
   };
 
@@ -3330,10 +4066,11 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     const ids = slots.map((s) => Number(s));
     if (ids.some((id) => !id)) return;
     if (isBounty && !draftedQfPairs) return;
+    const sims = Math.max(500, Math.min(200000, Number(mcSims) || 5000));
     setBusy(true);
     setRunMessage("");
     setProcessedSims(0);
-    setTotalSims(!isBounty && hasThirdPlaceDecider ? 256 : 128);
+    setTotalSims(slots.length >= 16 ? sims : !isBounty && hasThirdPlaceDecider ? 256 : 128);
     setEtaSeconds(null);
 
     const pollPlayoffJob = async (jobId, startedAtMs) => {
@@ -3387,6 +4124,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       const start = await api.post("/playoff/start", {
         team_slots: ids,
         has_third_place_decider: isBounty ? false : hasThirdPlaceDecider,
+        mc_sims: sims,
         ...(isBounty ? { variant: "bounty", qf_pairs: draftedQfPairs, sf_picks: bountySfPicksPayload() } : {}),
       });
       if (start?.detail) {
@@ -3562,10 +4300,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       };
       if (playoffTopSubtab === "completed") {
         if (!completedBracketDerived.complete) return;
-        body.qf_winners = completedBracket.qf.map((id) => Number(id));
-        body.sf_winners = completedBracket.sf.map((id) => Number(id));
-        body.final_winner = Number(completedBracket.final);
-        body.third_place_winner = !isBounty && hasThirdPlaceDecider ? Number(completedBracket.third) : 0;
+        Object.assign(body, completedBracketPayloadFields());
       }
       const data = await api.post(endpoint, body, 120000);
       if (seq !== comboQuerySeqRef.current) return;
@@ -3573,6 +4308,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       setAllTeams(data.page_teams || []);
       setFilteredCount(Number(data.filtered_count || 0));
       setSharedComboCount(data.total_teams != null ? Number(data.total_teams) : sharedComboCount);
+      setCombosApproximate(Boolean(data.approximate));
       setPage(Number(data.page ?? nextPage ?? 0));
       if (playoffTopSubtab === "completed") {
         setCompletedBracketResult(data);
@@ -3619,99 +4355,6 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     () => buildPlayerValueRowsFromSimulation(results, players),
     [results, players]
   );
-  const completedBracketSharedResult = useMemo(() => {
-    if (!results || !baseTeams || !completedBracketDerived.complete) return null;
-    const qf = completedBracket.qf.map((id) => Number(id));
-    const sf = completedBracket.sf.map((id) => Number(id));
-    const finalWinner = Number(completedBracket.final);
-    const thirdWinner = Number(completedBracket.third || 0);
-    const selectedOutcome = (results.outcomes || []).find((outcome) => {
-      const bracket = outcome?.bracket || {};
-      const quarters = bracket.quarters || [];
-      const semis = bracket.semis || [];
-      const finals = bracket.final || [];
-      const third = bracket.third_place || [];
-      if (quarters.length < 4 || semis.length < 2 || finals.length < 1) return false;
-      if (quarters.slice(0, 4).some((row, idx) => Number(row?.winner || 0) !== qf[idx])) return false;
-      if (semis.slice(0, 2).some((row, idx) => Number(row?.winner || 0) !== sf[idx])) return false;
-      if (Number(finals[0]?.winner || 0) !== finalWinner) return false;
-      if (third.length > 0) return thirdWinner > 0 && Number(third[0]?.winner || 0) === thirdWinner;
-      return thirdWinner <= 0;
-    });
-    if (!selectedOutcome) return null;
-
-    const scoresByPid = {};
-    Object.entries(selectedOutcome.players || {}).forEach(([pid, score]) => {
-      scoresByPid[Number(pid)] = Number(score || 0);
-    });
-    const componentsByPid = {};
-    Object.entries(selectedOutcome.player_components || {}).forEach(([pid, comps]) => {
-      componentsByPid[Number(pid)] = comps || {};
-    });
-    const playerValues = Object.entries(scoresByPid)
-      .map(([pidRaw, score]) => {
-        const pid = Number(pidRaw);
-        const p = playerById[pid] || {};
-        const comps = componentsByPid[pid] || {};
-        return {
-          player_id: pid,
-          name: p.name || playerLookup[pid] || `Player ${pid}`,
-          team_id: Number(playerTeamById[pid] || 0),
-          price: Number(p.price || 0),
-          points: Number(score || 0),
-          rating: Number(comps.rating || 0),
-          win: Number(comps.win || 0),
-          role: Number(comps.role || 0),
-          booster: Number(comps.booster || 0),
-          components_available: Boolean(componentsByPid[pid]),
-        };
-      })
-      .sort((a, b) => b.points - a.points);
-
-    let teamsForBracket = applyFilters(baseTeams || [], effectiveAppliedFilters.include, effectiveAppliedFilters.exclude);
-    const q = comboSearch.trim().toLowerCase();
-    if (q) {
-      teamsForBracket = teamsForBracket.filter((team) =>
-        (team.players || []).some((p) => {
-          const name = String(p.name || "").toLowerCase();
-          const teamName = String(teamLookup[p.team_id] || "").toLowerCase();
-          return name.includes(q) || teamName.includes(q) || String(p.player_id).includes(q) || String(p.team_id).includes(q);
-        })
-      );
-    }
-    const scoredTeams = teamsForBracket
-      .map((team) => {
-        const playersForBracket = (team.players || []).map((p) => {
-          const score = Number(scoresByPid[Number(p.player_id)] || 0);
-          return { ...p, mode_score: score, total_ev: score };
-        });
-        const bracketScore = playersForBracket.reduce((sum, p) => sum + Number(p.mode_score || 0), 0);
-        return { ...team, players: playersForBracket, total_ev: bracketScore, bracket_score: bracketScore };
-      })
-      .sort((a, b) => Number(b.bracket_score || 0) - Number(a.bracket_score || 0));
-
-    return {
-      bracket_probability: Number(selectedOutcome.probability || 0),
-      bracket: selectedOutcome.bracket || {},
-      outcomes_count: Number(results.outcomes_count || (results.outcomes || []).length || 0),
-      player_values: playerValues,
-      top_teams: scoredTeams.slice(0, 10),
-      all_teams: scoredTeams,
-      mode: "completed_bracket",
-    };
-  }, [
-    results,
-    baseTeams,
-    completedBracket,
-    completedBracketDerived.complete,
-    effectiveAppliedFilters,
-    comboSearch,
-    playerById,
-    playerLookup,
-    playerTeamById,
-    teamLookup,
-    applyFilters,
-  ]);
   const activeCompletedBracketResult = completedBracketResult;
   const completedBracketValueData = useMemo(() => {
     const rows = (activeCompletedBracketResult?.player_values || [])
@@ -3897,7 +4540,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                           <>
                             {pair.map((teamId, rowIdx) => (
                               <div className="playoff-team-row" key={`bounty-qf-${idx}-${rowIdx}`}>
-                                <span className="playoff-team-badge">{teamInitials(teamId)}</span>
+                                <TeamBadge teamId={teamId} />
                                 <span>{teamLookup[teamId] || teamId}</span>
                               </div>
                             ))}
@@ -3969,61 +4612,56 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
         )}
         {playoffTab === "stage" && !isBounty && (
           <>
-            <div className="playoff-bracket-shell">
-              <div className="playoff-bracket-column qf">
-                <h3>Quarter-finals</h3>
-                {[0, 2, 4, 6].map((slotStart, matchIdx) => (
-                  <BracketMatchCard
-                    key={`qf-${matchIdx}`}
-                    title={`QF ${matchIdx + 1}`}
-                    className="connector-out"
-                    rows={
-                      <>
-                        <BracketTeamRow slotIndex={slotStart} />
-                        <BracketTeamRow slotIndex={slotStart + 1} />
-                      </>
-                    }
+            <div className="card sub">
+              <div className="grid two">
+                <Select
+                  label="Bracket size"
+                  value={String(bracketSize)}
+                  onChange={changeBracketSize}
+                  options={[
+                    { value: "8", label: "8 teams (exact enumeration)" },
+                    { value: "16", label: "16 teams (Monte-Carlo)" },
+                  ]}
+                />
+                <div className="field">
+                  <span>Seeding</span>
+                  <div className="actions">
+                    <button
+                      className="secondary"
+                      onClick={autofillPlayoffFromEvent}
+                      disabled={busy || playoffAutofillBusy}
+                    >
+                      {playoffAutofillBusy ? "Fetching event..." : "Autofill bracket from HLTV event"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+              {playoffAutofillMessage && <p className="muted">{playoffAutofillMessage}</p>}
+              {bracketSize === 16 && (
+                <div className="field" style={{ maxWidth: 340, marginTop: 12 }}>
+                  <span>Monte-Carlo simulations</span>
+                  <input
+                    type="number"
+                    min={500}
+                    max={200000}
+                    step={1000}
+                    value={mcSims}
+                    onChange={(e) => setMcSims(Number(e.target.value))}
+                    disabled={busy}
                   />
-                ))}
-              </div>
-              <div className="playoff-bracket-column sf">
-                <h3>Semi-finals</h3>
-                <BracketMatchCard
-                  title="SF 1"
-                  className="connector-in connector-out"
-                  rows={
-                    <>
-                      <BracketTeamRow placeholder="Winner QF 1" muted />
-                      <BracketTeamRow placeholder="Winner QF 2" muted />
-                    </>
-                  }
-                />
-                <BracketMatchCard
-                  title="SF 2"
-                  className="connector-in connector-out"
-                  rows={
-                    <>
-                      <BracketTeamRow placeholder="Winner QF 3" muted />
-                      <BracketTeamRow placeholder="Winner QF 4" muted />
-                    </>
-                  }
-                />
-              </div>
-              <div className="playoff-bracket-column final">
-                <h3>Grand final</h3>
-                <BracketMatchCard
-                  title="Final"
-                  meta="BO5"
-                  className="connector-in"
-                  rows={
-                    <>
-                      <BracketTeamRow placeholder="Winner SF 1" muted />
-                      <BracketTeamRow placeholder="Winner SF 2" muted />
-                    </>
-                  }
-                />
-              </div>
+                  <span className="muted">
+                    More simulations = smoother estimates but longer runs (~5,000 ≈ 18s). Clamped to 500–200,000.
+                  </span>
+                </div>
+              )}
             </div>
+            {bracketSize === 16 && (
+              <p className="muted">
+                Pick the 16 seeds in bracket order — seed 1 plays seed 2, seed 3 plays seed 4, and so on. 16-team
+                results are Monte-Carlo estimated rather than exact.
+              </p>
+            )}
+            {renderSeedingBracket()}
             <div className="actions">
               <label className="checkbox-inline">
                 <input
@@ -4060,6 +4698,12 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                   </button>
                   {sharedCombosUpdatedAt && <p className="muted">Combinations stored: {new Date(sharedCombosUpdatedAt).toLocaleString()}</p>}
                 </div>
+                {combosApproximate && (
+                  <p className="muted">
+                    16-team field: too large to score every roster exactly, so the strongest {sharedComboCount.toLocaleString()} candidate
+                    teams are ranked. Average value is exact; ceiling and most-likely-winner are near-exact among these candidates.
+                  </p>
+                )}
                 {busy && (
                   <div className="card sub">
                     {comboPhase === "saving" ? (
@@ -4295,96 +4939,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
             )}
             {results && (
               <>
-                <div className="playoff-bracket-shell">
-                  <div className="playoff-bracket-column qf">
-                    <h3>Quarter-finals</h3>
-                    {completedBracketDerived.qfPairs.map((pair, idx) => (
-                      <BracketMatchCard
-                        key={`completed-qf-${idx}`}
-                        title={`QF ${idx + 1}`}
-                        className="connector-out"
-                        rows={
-                          <>
-                            {pair.map((teamId) => (
-                              <CompletedBracketTeamRow
-                                key={`completed-qf-${idx}-${teamId || "empty"}`}
-                                teamId={teamId}
-                                selected={Boolean(teamId) && String(completedBracket.qf[idx]) === String(teamId)}
-                                onSelect={(value) => setCompletedPick("qf", idx, value)}
-                              />
-                            ))}
-                          </>
-                        }
-                      />
-                    ))}
-                  </div>
-                  <div className="playoff-bracket-column sf">
-                    <h3>Semi-finals</h3>
-                    {completedBracketDerived.sfPairs.map((pair, idx) => (
-                      <BracketMatchCard
-                        key={`completed-sf-${idx}`}
-                        title={`SF ${idx + 1}`}
-                        className="connector-in connector-out"
-                        rows={
-                          <>
-                            {pair.map((teamId, rowIdx) => (
-                              <CompletedBracketTeamRow
-                                key={`completed-sf-${idx}-${rowIdx}-${teamId || "empty"}`}
-                                teamId={teamId}
-                                placeholder={`Winner QF ${idx * 2 + rowIdx + 1}`}
-                                muted={!teamId}
-                                selected={Boolean(teamId) && String(completedBracket.sf[idx]) === String(teamId)}
-                                onSelect={(value) => setCompletedPick("sf", idx, value)}
-                              />
-                            ))}
-                          </>
-                        }
-                      />
-                    ))}
-                    {hasThirdPlaceDecider && (
-                      <BracketMatchCard
-                        title="Third-place"
-                        className="connector-in"
-                        rows={
-                          <>
-                            {completedBracketDerived.thirdPair.map((teamId, idx) => (
-                              <CompletedBracketTeamRow
-                                key={`completed-third-${idx}-${teamId || "empty"}`}
-                                teamId={teamId}
-                                placeholder="SF loser"
-                                muted={!teamId}
-                                selected={Boolean(teamId) && String(completedBracket.third) === String(teamId)}
-                                onSelect={(value) => setCompletedPick("third", 0, value)}
-                              />
-                            ))}
-                          </>
-                        }
-                      />
-                    )}
-                  </div>
-                  <div className="playoff-bracket-column final">
-                    <h3>Grand final</h3>
-                    <BracketMatchCard
-                      title="Final"
-                      meta="BO5"
-                      className="connector-in"
-                      rows={
-                        <>
-                          {completedBracketDerived.finalPair.map((teamId, idx) => (
-                            <CompletedBracketTeamRow
-                              key={`completed-final-${idx}-${teamId || "empty"}`}
-                              teamId={teamId}
-                              placeholder={`Winner SF ${idx + 1}`}
-                              muted={!teamId}
-                              selected={Boolean(teamId) && String(completedBracket.final) === String(teamId)}
-                              onSelect={(value) => setCompletedPick("final", 0, value)}
-                            />
-                          ))}
-                        </>
-                      }
-                    />
-                  </div>
-                </div>
+                {renderCompletedPicker()}
                 <div className="actions">
                   {!baseTeams && <p className="muted">Run Combinations once above to score this bracket.</p>}
                   {baseTeams && !completedBracketDerived.complete && <p className="muted">Complete the bracket to score the saved combinations.</p>}
@@ -5003,132 +5558,356 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   );
 }
 
-function EventsTab({ refreshData, notify, players }) {
-  const [triggerCoverage, setTriggerCoverage] = useState(null);
-  const [hltvLogin, setHltvLogin] = useState({ configured: false, username: "" });
-  const [showLoginForm, setShowLoginForm] = useState(false);
-  const [loginUser, setLoginUser] = useState("");
-  const [loginPass, setLoginPass] = useState("");
-  const [triggerSetupStatus, setTriggerSetupStatus] = useState("");
-  const triggerJob = useBackfillJob("/admin/trigger-rates-backfill", "booster/role fetch");
-  const loadTriggerCoverage = async () => {
-    try {
-      const cov = await api.get("/admin/trigger-rates-backfill/coverage");
-      if (cov && cov.status === "ok") setTriggerCoverage(cov);
-    } catch {
-      // Informational only.
+// Human labels for detected tournament structures. Built from everything the
+// kind detector reports (kind + group format + combined playoff bracket), so
+// "groups with a combined playoff" reads as exactly that instead of a bare
+// "groups"/"playoff" pick.
+const describeEventFormat = (k) => {
+  if (!k || !k.kind) return null;
+  // The backend now composes an authoritative label from the event page's
+  // structured data (variant, group count/size, bracket size) — prefer it.
+  if (k.label) return { key: k.label, short: k.label, long: "" };
+  const gf = String(k.group_format || "");
+  const po = Number(k.playoff_size || 0);
+  const teams = Number(k.team_count || 0);
+  if (k.kind === "swiss") {
+    return {
+      key: "swiss",
+      short: "Swiss Stage",
+      long: `Swiss system${teams ? ` (${teams} teams)` : ""} — win three rounds to advance, lose three and you're out.`,
+    };
+  }
+  if (k.kind === "bounty") {
+    return {
+      key: "bounty",
+      short: "Bounty",
+      long: "BLAST Bounty draft — seeded teams pick their quarter-final opponents in a single-elimination bracket.",
+    };
+  }
+  if (k.kind === "groups") {
+    const gfShort = gf === "gsl4" ? "GSL Groups" : gf === "de8" ? "Double-Elim Groups" : "Group Stage";
+    const gfLong =
+      gf === "gsl4"
+        ? "Four-team GSL groups — opening, winners', elimination and decider matches (double elimination inside each group)."
+        : gf === "de8"
+        ? "Eight-team double-elimination groups — an upper and lower bracket inside each group."
+        : "Round-robin style group stage.";
+    if (po > 0) {
+      return {
+        key: `groups-${gf || "rr"}-po`,
+        short: `${gfShort} + Playoff`,
+        long: `${gfLong} Combined with a ${po}-team playoff bracket that the group placings feed into.`,
+      };
     }
-  };
-  const loadHltvLogin = async () => {
-    try {
-      const res = await api.get("/admin/hltv-credentials");
-      setHltvLogin({ configured: Boolean(res?.configured), username: String(res?.username || "") });
-    } catch {
-      // Informational only.
-    }
-  };
-  triggerJob.onSettledRef.current = () => {
-    loadTriggerCoverage();
-    if (refreshData) refreshData();
-  };
-  useEffect(() => {
-    loadTriggerCoverage();
-    loadHltvLogin();
-    triggerJob.hydrate();
-  }, []);
+    return { key: `groups-${gf || "rr"}`, short: gfShort, long: gfLong };
+  }
+  if (k.kind === "playoff") {
+    return {
+      key: `playoff-${teams || po || 0}`,
+      short: `Playoff${teams ? ` (${teams} teams)` : ""}`,
+      long: `Single-elimination playoff bracket${teams ? ` with ${teams} priced teams` : ""}.`,
+    };
+  }
+  return { key: String(k.kind), short: String(k.kind), long: "" };
+};
 
-  const [captureBusy, setCaptureBusy] = useState(false);
-  const [loginWindowBusy, setLoginWindowBusy] = useState(false);
-  const saveHltvLogin = async () => {
-    if (!loginUser.trim() || !loginPass) {
-      setTriggerSetupStatus("Enter both username and password.");
-      return;
-    }
-    try {
-      await api.post("/admin/hltv-credentials", { username: loginUser.trim(), password: loginPass });
-      setTriggerSetupStatus(`Saved app account "${loginUser.trim()}".`);
-      setLoginPass("");
-      setShowLoginForm(false);
-      loadHltvLogin();
-    } catch (e) {
-      setTriggerSetupStatus(e?.message || "Failed to save login.");
-    }
-  };
+function FormatsPanel() {
+  // Static catalog of the tournament formats the app is built to handle.
+  return (
+          <div className="stack">
+            <p className="muted">
+              Tournament formats this app has been built to handle — the modes the Tournament page can simulate
+              and optimize for.
+            </p>
+            <div className="card sub">
+              <h4>Swiss Stage</h4>
+              <div className="fmt-diagram">
+                {[
+                  ["0-0"],
+                  ["1-0", "0-1"],
+                  ["2-0", "1-1", "0-2"],
+                  ["3-0 ✓", "2-1", "1-2", "0-3 ✗"],
+                  ["3-1 ✓", "2-2", "1-3 ✗"],
+                  ["3-2 ✓", "2-3 ✗"],
+                ].map((col, i) => (
+                  <div className="fmt-col" key={`sw-${i}`}>
+                    <span className="fmt-col-label">R{i + 1}</span>
+                    {col.map((rec) => (
+                      <span
+                        key={rec}
+                        className={`fmt-node ${rec.includes("✓") ? "win" : rec.includes("✗") ? "loss" : ""}`}
+                      >
+                        {rec}
+                      </span>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="card sub">
+              <h4>GSL Groups (4-team double elimination)</h4>
+              <div className="fmt-diagram">
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Opening</span>
+                  <span className="fmt-node">Match 1</span>
+                  <span className="fmt-node">Match 2</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Winners / Losers</span>
+                  <span className="fmt-node win">Winners' match</span>
+                  <span className="fmt-node loss">Elimination match</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Last chance</span>
+                  <span className="fmt-node hot">Decider</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Out of group</span>
+                  <span className="fmt-node win">1st — winners' winner</span>
+                  <span className="fmt-node win">2nd — decider winner</span>
+                  <span className="fmt-node loss">Out — elim &amp; decider losers</span>
+                </div>
+              </div>
+            </div>
+            <div className="card sub">
+              <h4>Double-Elimination Groups (8 teams, top 4 qualify — EWC)</h4>
+              <div className="fmt-diagram">
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Opening round</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Upper semi-finals</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-node win">Winners qualify (2)</span>
+                </div>
+              </div>
+              <div className="fmt-diagram">
+                <span className="fmt-drop">losers drop ↓</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Lower round 1</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node loss">Losers out</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Lower semi-finals</span>
+                  <span className="fmt-node muted-node">Upper-SF losers join</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-node win">Winners qualify (2)</span>
+                  <span className="fmt-node loss">Losers out</span>
+                </div>
+              </div>
+            </div>
+            <div className="card sub">
+              <h4>Double-Elimination Groups (8 teams, top 3 qualify — Cologne)</h4>
+              <div className="fmt-diagram">
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Opening round</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Upper semi-finals</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Upper final</span>
+                  <span className="fmt-node hot">Match</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-node win">Winner → playoff semis</span>
+                  <span className="fmt-node win">Loser qualifies</span>
+                </div>
+              </div>
+              <div className="fmt-diagram">
+                <span className="fmt-drop">losers drop ↓</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Lower round 1</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node loss">Losers out</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Lower semi-finals</span>
+                  <span className="fmt-node muted-node">Upper-SF losers join</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node loss">Losers out</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Lower final</span>
+                  <span className="fmt-node hot">Match</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-node win">Winner qualifies</span>
+                  <span className="fmt-node loss">Loser out</span>
+                </div>
+              </div>
+            </div>
+            <div className="card sub">
+              <h4>Single-Elimination Playoff</h4>
+              <div className="fmt-diagram">
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Quarter-finals</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Semi-finals</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Final</span>
+                  <span className="fmt-node hot">Match</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-node win">Champion</span>
+                </div>
+              </div>
+              <p className="muted">Also runs as 2, 4 and 16-team brackets.</p>
+            </div>
+            <div className="card sub">
+              <h4>Playoff with Semi-final Byes (6 teams)</h4>
+              <div className="fmt-diagram">
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Quarter-finals</span>
+                  <span className="fmt-node muted-node">4 lower seeds</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Semi-finals</span>
+                  <span className="fmt-node hot">2 top seeds enter here</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Final</span>
+                  <span className="fmt-node hot">Match</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-node win">Champion</span>
+                </div>
+              </div>
+              <p className="muted">
+                The bracket the Cologne-style groups feed: group winners skip the quarter-finals. Not yet supported
+                by the playoff simulator (full 2/4/8/16 brackets only).
+              </p>
+            </div>
+            <div className="card sub">
+              <h4>Bounty Draft</h4>
+              <div className="fmt-diagram">
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Challengers</span>
+                  <span className="fmt-node hot">Seed 5</span>
+                  <span className="fmt-node hot">Seed 6</span>
+                  <span className="fmt-node hot">Seed 7</span>
+                  <span className="fmt-node">Seed 8 — leftover</span>
+                </div>
+                <span className="fmt-arrow">
+                  pick
+                  <br />→
+                </span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Targets</span>
+                  <span className="fmt-node">Seed 1</span>
+                  <span className="fmt-node">Seed 2</span>
+                  <span className="fmt-node">Seed 3</span>
+                  <span className="fmt-node">Seed 4</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Then</span>
+                  <span className="fmt-node">8-team single-elim bracket</span>
+                  <span className="fmt-node muted-node">Semi-final drafts per scenario</span>
+                </div>
+              </div>
+            </div>
+          </div>
+  );
+}
 
-  const openHltvLogin = async () => {
-    setLoginWindowBusy(true);
-    setTriggerSetupStatus("A browser window is opening — sign into your throwaway HLTV account (solve the captcha). It closes once you're in.");
-    try {
-      const res = await api.post("/admin/hltv-login-session", { timeout_seconds: 300 }, 340000);
-      setTriggerSetupStatus(
-        res?.logged_in
-          ? "Signed in. The session will persist for capture and fetch."
-          : "Login window closed without detecting a sign-in. If you did log in, continue to Capture anyway."
-      );
-    } catch (e) {
-      setTriggerSetupStatus(e?.message || "Login window failed.");
-    } finally {
-      setLoginWindowBusy(false);
-    }
-  };
+function DevLabTab({ players }) {
+  const [devTab, setDevTab] = useState("rating");
+  return (
+    <div className="stack">
+      <div className="tab-bar small">
+        <button className={devTab === "rating" ? "tab active" : "tab"} onClick={() => setDevTab("rating")}>
+          Rating Lab
+        </button>
+        <button className={devTab === "model" ? "tab active" : "tab"} onClick={() => setDevTab("model")}>
+          Model Lab
+        </button>
+        <button className={devTab === "formats" ? "tab active" : "tab"} onClick={() => setDevTab("formats")}>
+          Formats
+        </button>
+      </div>
+      {devTab === "rating" && <RatingLabTab players={players} />}
+      {devTab === "model" && <ModelLabTab />}
+      {devTab === "formats" && <FormatsPanel />}
+    </div>
+  );
+}
 
-  const captureEndpoint = async () => {
-    setCaptureBusy(true);
-    setTriggerSetupStatus("Window opening — sign in and add any 5 players to your fantasy team; it captures then closes.");
-    try {
-      const res = await api.post("/admin/capture-trigger-endpoint", {}, 220000);
-      if (res?.status === "ok") {
-        setTriggerSetupStatus(
-          `Endpoint captured (${res.players_in_capture} players seen). Booster/role fetch is now fully automatic.`
-        );
-        notify("Trigger endpoint captured");
-        loadTriggerCoverage();
-        if (refreshData) refreshData();
-      } else {
-        setTriggerSetupStatus(String(res?.detail || "Capture did not complete."));
-      }
-    } catch (e) {
-      setTriggerSetupStatus(e?.message || "Capture failed.");
-    } finally {
-      setCaptureBusy(false);
-    }
-  };
-
-  const [eventId, setEventId] = useState("");
+function EventsTab({ refreshData, notify, players, teams = [] }) {
   const [events, setEvents] = useState([]);
   const [activeEventId, setActiveEventId] = useState(null);
-  const [selectedEventId, setSelectedEventId] = useState(null);
-  const [selectedEvent, setSelectedEvent] = useState(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
-
-  const playerById = useMemo(() => {
-    const out = {};
-    (players || []).forEach((p) => {
-      out[p.player_id] = p;
+  // Full kind-detection result per event (kind, group format, playoff size,
+  // team count) — drives the Type column and the Formats sub-tab.
+  const [eventKinds, setEventKinds] = useState({});
+  useEffect(() => {
+    let cancelled = false;
+    (events || []).forEach((ev) => {
+      const id = Number(ev.event_id);
+      if (!id || eventKinds[id] !== undefined) return;
+      api
+        .get(`/events/${id}/kind`, 60000)
+        .then((d) => {
+          if (!cancelled && d?.kind) setEventKinds((prev) => ({ ...prev, [id]: d }));
+        })
+        .catch(() => {});
     });
-    return out;
-  }, [players]);
-
-  const hasJsonEntries = (raw) => {
-    if (!raw) return false;
-    try {
-      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-      if (Array.isArray(parsed)) return parsed.length > 0;
-      if (parsed && typeof parsed === "object") return Object.keys(parsed).length > 0;
-      return false;
-    } catch {
-      return false;
-    }
-  };
-
-  const isPlayerComplete = (playerId) => {
-    const p = playerById[Number(playerId)];
-    if (!p) return false;
-    const hasCore = typeof p.name === "string" && p.name.trim().length > 0 && Number.isFinite(Number(p.rating));
-    const hasRolesAndBoosters = hasJsonEntries(p.boosters_json) && hasJsonEntries(p.roles_json);
-    return hasCore && hasRolesAndBoosters;
-  };
+    return () => {
+      cancelled = true;
+    };
+  }, [events]);
 
   const loadEvents = async () => {
     const res = await api.get("/events/");
@@ -5138,76 +5917,63 @@ function EventsTab({ refreshData, notify, players }) {
     }
     setEvents(res.events || []);
     setActiveEventId(res.active_event_id ?? null);
-    if (!selectedEventId && Array.isArray(res.events) && res.events.length > 0) {
-      setSelectedEventId(res.events[0].event_id);
-    }
-  };
-
-  const loadEventDetail = async (targetEventId) => {
-    if (!targetEventId) {
-      setSelectedEvent(null);
-      return;
-    }
-    const detail = await api.get(`/events/${targetEventId}`);
-    if (detail?.detail) {
-      setMessage(String(detail.detail));
-      return;
-    }
-    setSelectedEvent(detail);
   };
 
   useEffect(() => {
     loadEvents();
   }, []);
 
+  // Teams & Prices below the table always shows the ACTIVE event.
+  const [activeEventDetail, setActiveEventDetail] = useState(null);
   useEffect(() => {
-    if (!selectedEventId) return;
-    loadEventDetail(selectedEventId);
-  }, [selectedEventId]);
+    if (!activeEventId) {
+      setActiveEventDetail(null);
+      return undefined;
+    }
+    let cancelled = false;
+    api
+      .get(`/events/${activeEventId}`)
+      .then((d) => {
+        if (!cancelled && d && !d.detail) setActiveEventDetail(d);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [activeEventId]);
 
-  const importEvent = async () => {
-    if (!eventId.trim()) {
-      setMessage("Enter an event id first.");
-      return;
-    }
-    setBusy(true);
-    setMessage("");
-    try {
-      const res = await api.post("/events/import-hltv-event", { event_id: eventId.trim() });
-      if (res?.detail) {
-        setMessage(String(res.detail));
-        return;
-      }
-      setActiveEventId(res.active_event_id ?? Number(eventId.trim()));
-      setSelectedEventId(Number(res.event_id));
-      setEventId("");
-      setMessage(
-        `Imported fantasy event ${res.event_id}: players ${res.imported_players ?? 0}, teams ${res.imported_teams ?? 0}.` +
-          (res.hltv_event_id ? ` Linked HLTV event ${res.hltv_event_id}.` : "")
-      );
-      notify("Event imported");
-      await loadEvents();
-      await loadEventDetail(Number(res.event_id));
-      await refreshData();
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const refreshAll = async () => {
-    setBusy(true);
-    setMessage("");
-    try {
-      await loadEvents();
-      if (selectedEventId) {
-        await loadEventDetail(selectedEventId);
-      }
-      await refreshData();
-      notify("Refreshed events and player data");
-    } finally {
-      setBusy(false);
-    }
-  };
+  // Active event rosters: teams in HLTV-rank order (best first, unranked
+  // last), players by price, each joined with their overall rating.
+  const eventTeamGroups = useMemo(() => {
+    const byTeam = {};
+    (activeEventDetail?.players || []).forEach((p) => {
+      const teamName = p.team_name || "Unknown Team";
+      if (!byTeam[teamName]) byTeam[teamName] = [];
+      byTeam[teamName].push(p);
+    });
+    const teamByName = {};
+    (teams || []).forEach((t) => {
+      teamByName[String(t.name || "").trim().toLowerCase()] = t;
+    });
+    const ratingById = {};
+    (players || []).forEach((p) => {
+      ratingById[Number(p.player_id)] = p.rating;
+    });
+    const groups = Object.entries(byTeam).map(([teamName, teamPlayers]) => {
+      const info = teamByName[teamName.trim().toLowerCase()] || null;
+      return {
+        teamName,
+        info,
+        rank: Number(info?.hltv_rank) > 0 ? Number(info.hltv_rank) : null,
+        players: teamPlayers
+          .slice()
+          .sort((a, b) => Number(b.price || 0) - Number(a.price || 0))
+          .map((p) => ({ ...p, rating: ratingById[Number(p.player_id)] })),
+      };
+    });
+    groups.sort((a, b) => (a.rank ?? 9999) - (b.rank ?? 9999) || a.teamName.localeCompare(b.teamName));
+    return groups;
+  }, [activeEventDetail, teams, players]);
 
   const activateEvent = async (targetEventId) => {
     setBusy(true);
@@ -5219,157 +5985,40 @@ function EventsTab({ refreshData, notify, players }) {
         return;
       }
       setActiveEventId(res.active_event_id);
-      notify(`Active event set to ${res.active_event_id}`);
       await refreshData();
     } finally {
       setBusy(false);
     }
   };
 
-  const groupedPlayers = useMemo(() => {
-    const byTeam = {};
-    (selectedEvent?.players || []).forEach((p) => {
-      const teamName = p.team_name || "Unknown Team";
-      if (!byTeam[teamName]) byTeam[teamName] = [];
-      byTeam[teamName].push(p);
-    });
-    return byTeam;
-  }, [selectedEvent]);
-
   return (
     <div className="stack">
       <Section title="Events">
         <div className="stack">
-          <div className="grid three">
-            <Input label="Fantasy Event ID" value={eventId} onChange={setEventId} placeholder="e.g. 12345" />
-            <div className="field">
-              <span>Import</span>
-              <button className="primary" onClick={importEvent} disabled={busy}>
-                {busy ? "Working..." : "Import Event"}
-              </button>
-            </div>
-            <div className="field">
-              <span>Active Event</span>
-              <div className="pill">{activeEventId ? `Event ${activeEventId}` : "None"}</div>
-            </div>
-          </div>
-          <div className="actions" style={{ marginTop: 0 }}>
-            <button className="secondary" onClick={refreshAll} disabled={busy}>
-              {busy ? "Working..." : "Refresh All"}
-            </button>
-          </div>
-
-          <div className="card sub">
-            <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
-              <h3 style={{ margin: 0 }}>Booster &amp; Role Data</h3>
-              {triggerCoverage && (
-                <p className="muted" style={{ margin: 0 }}>
-                  {Number(triggerCoverage.with_data || 0).toLocaleString()} /{" "}
-                  {Number(triggerCoverage.event_players || 0).toLocaleString()} players have data
-                </p>
-              )}
-              {triggerCoverage &&
-                !triggerCoverage.template_ready &&
-                triggerCoverage.template_event_id &&
-                activeEventId &&
-                Number(triggerCoverage.template_event_id) !== Number(activeEventId) && (
-                  <p className="muted" style={{ margin: 0, color: "#e0a458" }}>
-                    Captured endpoint is for event {triggerCoverage.template_event_id}. Capture again on this
-                    event ({activeEventId}) — add any 5 players to your team and save — before fetching.
-                  </p>
-                )}
-              <div className="actions" style={{ margin: 0 }}>
-                {!triggerJob.active && triggerJob.status !== "paused" && (
-                  <button className="secondary" onClick={captureEndpoint} disabled={captureBusy}>
-                    {captureBusy
-                      ? "Window open — add 5 players..."
-                      : triggerCoverage?.template_ready
-                      ? "Re-capture"
-                      : "Capture"}
-                  </button>
-                )}
-                {triggerCoverage?.template_ready && !triggerJob.active && triggerJob.status !== "paused" && (
-                  <button className="primary" onClick={triggerJob.start} disabled={captureBusy}>
-                    Fetch Data
-                  </button>
-                )}
-                {triggerJob.status === "running" && (
-                  <>
-                    <button className="secondary" onClick={triggerJob.pause}>
-                      Pause
-                    </button>
-                    <button className="danger" onClick={triggerJob.cancel}>
-                      Cancel
-                    </button>
-                  </>
-                )}
-                {triggerJob.status === "paused" && (
-                  <button className="secondary" onClick={triggerJob.resume}>
-                    Resume
-                  </button>
-                )}
-              </div>
-              {captureBusy && triggerSetupStatus && (
-                <p className="muted" style={{ margin: 0 }}>
-                  {triggerSetupStatus}
-                </p>
-              )}
-              {(triggerJob.active || triggerJob.status === "paused") && (
-                <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-                  <p className="muted" style={{ margin: 0 }}>
-                    {triggerJob.processed.toLocaleString()} / {triggerJob.total.toLocaleString()} batches
-                    {triggerJob.status === "running" && triggerJob.total > triggerJob.processed
-                      ? ` · ETA ${formatBatchEta(triggerJob.etaSeconds)}`
-                      : ""}
-                  </p>
-                  <div className="progress">
-                    <div className="progress-bar determinate" style={{ width: `${triggerJob.pctDone}%` }} />
-                  </div>
-                </div>
-              )}
-              {triggerJob.interacted && triggerJob.lastError && (
-                <p className="muted" style={{ margin: 0 }}>
-                  Error: {triggerJob.lastError}
-                </p>
-              )}
-            </div>
-          </div>
-
           {events.length > 0 && (
             <div className="card sub">
               <h4>Imported Events</h4>
               <table>
                 <thead>
                   <tr>
+                    <th>Name</th>
                     <th>Fantasy Event</th>
                     <th>HLTV Event</th>
-                    <th>Imported</th>
+                    <th>Type</th>
                     <th>Teams</th>
-                    <th>Players</th>
-                    <th>Price Range</th>
                     <th>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
                   {events.map((ev) => (
-                    <tr key={ev.event_id} className={selectedEventId === ev.event_id ? "row-active" : ""}>
+                    <tr key={ev.event_id}>
+                      <td>{ev.name || "-"}</td>
                       <td>{ev.event_id}</td>
                       <td>{ev.hltv_event_id ?? "-"}</td>
-                      <td>{ev.imported_at ? new Date(ev.imported_at).toLocaleString() : "-"}</td>
+                      <td>{describeEventFormat(eventKinds[ev.event_id])?.short || "..."}</td>
                       <td>{ev.team_count ?? 0}</td>
-                      <td>{ev.player_count ?? 0}</td>
-                      <td>
-                        {ev.min_price ?? "-"} - {ev.max_price ?? "-"}
-                      </td>
                       <td>
                         <div className="actions" style={{ marginTop: 0 }}>
-                          <button
-                            className="secondary"
-                            onClick={() => setSelectedEventId(ev.event_id)}
-                            disabled={busy}
-                          >
-                            View
-                          </button>
                           <button
                             className={activeEventId === ev.event_id ? "primary" : "secondary"}
                             onClick={() => activateEvent(ev.event_id)}
@@ -5386,40 +6035,43 @@ function EventsTab({ refreshData, notify, players }) {
             </div>
           )}
 
-          {selectedEvent && (
+          {activeEventDetail && (
             <div className="card sub">
-              <h4>Event {selectedEvent.event_id} Teams & Prices</h4>
-              <div className="grid two">
-                {Object.entries(groupedPlayers).map(([teamName, teamPlayers]) => (
-                  <div key={teamName} className="card sub">
-                    <h4>{teamName}</h4>
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>Status</th>
-                          <th>Player</th>
-                          <th>ID</th>
-                          <th>Price</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {teamPlayers.map((p) => {
-                          const complete = isPlayerComplete(p.player_id);
-                          return (
-                          <tr key={`${teamName}-${p.player_id}`}>
-                            <td className="status-cell">
-                              <span
-                                className={`status-dot ${complete ? "ok" : "missing"}`}
-                                title={complete ? "All player data present" : "Missing player data"}
-                              />
-                            </td>
-                            <td>{p.player_name || `Player ${p.player_id}`}</td>
-                            <td>{p.player_id}</td>
-                            <td>{p.price}</td>
-                          </tr>
-                        )})}
-                      </tbody>
-                    </table>
+              <h4>
+                {events.find((e) => e.event_id === activeEventDetail.event_id)?.name ||
+                  `Event ${activeEventDetail.event_id}`}{" "}
+                — Teams &amp; Prices
+              </h4>
+              <div className="event-team-rows">
+                {eventTeamGroups.map((g) => (
+                  <div className="event-team-row" key={g.teamName}>
+                    <div className="event-team-head">
+                      <TeamLogo hltvTeamId={g.info?.hltv_team_id} name={g.teamName} size={42} />
+                      <div className="event-team-headtext">
+                        <span className="event-team-name">{g.teamName}</span>
+                        {g.rank && <span className="event-team-rank">HLTV #{g.rank}</span>}
+                      </div>
+                    </div>
+                    <div className="event-team-players">
+                      {g.players.map((p) => (
+                        <div className="event-player-card" key={`${g.teamName}-${p.player_id}`}>
+                          <PlayerPhoto playerId={p.player_id} name={p.player_name} size={56} />
+                          <div className="event-player-name">{p.player_name || `Player ${p.player_id}`}</div>
+                          <div className="event-player-stats">
+                            <div className="event-player-stat">
+                              <div className="event-player-rating">
+                                {Number.isFinite(Number(p.rating)) ? Number(p.rating).toFixed(2) : "-"}
+                              </div>
+                              <div className="event-player-stat-label">Rating</div>
+                            </div>
+                            <div className="event-player-stat">
+                              <div className="event-player-price">${Number(p.price || 0).toLocaleString()}</div>
+                              <div className="event-player-stat-label">Price</div>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 ))}
               </div>
@@ -5433,7 +6085,11 @@ function EventsTab({ refreshData, notify, players }) {
   );
 }
 
-function MatchesDataPanel({ notify }) {
+function MatchesDataPanel({ notify, mode = "full", teams = [], players = [], onOpenPlayer, onOpenTeam }) {
+  // Split across pages: Scheduling renders mode="import" (ingestion controls +
+  // progress), Database > Matches renders mode="view" (stored-matches browser).
+  const showImport = mode !== "view";
+  const showTable = mode !== "import";
   const [recentResults, setRecentResults] = useState([]);
   const [recentResultsLoading, setRecentResultsLoading] = useState(false);
   const [recentResultsError, setRecentResultsError] = useState("");
@@ -5554,12 +6210,26 @@ function MatchesDataPanel({ notify }) {
     setRecentResultsImportJobId("");
   };
 
-  const loadStoredRecentResults = async (offset = 0) => {
+  const [matchSearch, setMatchSearch] = useState("");
+  const [matchSort, setMatchSort] = useState("date_desc");
+  const [matchRankValue, setMatchRankValue] = useState("");
+  const [matchRankScope, setMatchRankScope] = useState("both");
+  const [matchRankDir, setMatchRankDir] = useState("within");
+  const loadStoredRecentResults = async (offset = 0, searchOverride = null, sortOverride = null, rankOverride = {}) => {
     const safeOffset = Math.max(0, Number(offset) || 0);
+    const q = searchOverride !== null ? searchOverride : matchSearch;
+    const s = sortOverride !== null ? sortOverride : matchSort;
+    const rv = rankOverride.value !== undefined ? rankOverride.value : matchRankValue;
+    const rs = rankOverride.scope !== undefined ? rankOverride.scope : matchRankScope;
+    const rd = rankOverride.dir !== undefined ? rankOverride.dir : matchRankDir;
+    const rankParams =
+      Number(rv) > 0 ? `&vrs_rank=${Number(rv)}&vrs_scope=${encodeURIComponent(rs)}&vrs_dir=${encodeURIComponent(rd)}` : "";
     setRecentResultsLoading(true);
     setRecentResultsError("");
     try {
-      const res = await api.get(`/events/hltv-results?limit=100&offset=${safeOffset}`);
+      const res = await api.get(
+        `/events/hltv-results?limit=100&offset=${safeOffset}&search=${encodeURIComponent(q)}&sort=${encodeURIComponent(s)}${rankParams}`
+      );
       if (res?.detail) {
         setRecentResults([]);
         setRecentResultsError(String(res.detail));
@@ -5574,6 +6244,34 @@ function MatchesDataPanel({ notify }) {
       setRecentResultsLoading(false);
     }
   };
+  const changeMatchSearch = (value) => {
+    setMatchSearch(value);
+    loadStoredRecentResults(0, value, null);
+  };
+  const changeMatchSort = (value) => {
+    setMatchSort(value);
+    loadStoredRecentResults(0, null, value);
+  };
+  const changeMatchRankValue = (value) => {
+    setMatchRankValue(value);
+    loadStoredRecentResults(0, null, null, { value });
+  };
+  const changeMatchRankScope = (value) => {
+    setMatchRankScope(value);
+    loadStoredRecentResults(0, null, null, { scope: value });
+  };
+  const changeMatchRankDir = (value) => {
+    setMatchRankDir(value);
+    loadStoredRecentResults(0, null, null, { dir: value });
+  };
+  const hltvIdByTeamName = useMemo(() => {
+    const m = {};
+    (teams || []).forEach((t) => {
+      if (t.hltv_team_id) m[String(t.name || "").trim().toLowerCase()] = Number(t.hltv_team_id);
+    });
+    return m;
+  }, [teams]);
+  const logoForTeamName = (name) => hltvIdByTeamName[String(name || "").trim().toLowerCase()];
 
   const AUTO_FETCH_JOBS_KEY = "hltv_auto_fetch_jobs_after_import";
   const [autoRunFetchJobs, setAutoRunFetchJobs] = useState(() => localStorage.getItem(AUTO_FETCH_JOBS_KEY) === "1");
@@ -5875,6 +6573,8 @@ function MatchesDataPanel({ notify }) {
 
   return (
     <div className="stack">
+      {showImport && (
+      <>
       <div className="grid four">
         <Select
           label="Import Mode"
@@ -5942,10 +6642,6 @@ function MatchesDataPanel({ notify }) {
             {recentResultsImportStatus === "canceling" ? "Canceling..." : "Cancel"}
           </button>
         )}
-        <button className="secondary" onClick={loadStoredRecentResults} disabled={recentResultsBusy}>
-          {recentResultsLoading ? "Loading..." : "Reload Stored Results"}
-        </button>
-        <span className="muted">{recentResults.length} loaded</span>
         <label className="checkbox-inline">
           <input
             type="checkbox"
@@ -5986,153 +6682,417 @@ function MatchesDataPanel({ notify }) {
           </p>
         </div>
       )}
+      </>
+      )}
+      {showTable && (
+      <>
+      <div className="grid two">
+        <Input label="Search Matches" value={matchSearch} onChange={changeMatchSearch} placeholder="Team or day/month/year" />
+        <div className="match-rank-filter">
+          <Input label="VRS Rank" value={matchRankValue} onChange={changeMatchRankValue} placeholder="e.g. 50" />
+          <Select
+            label="Direction"
+            value={matchRankDir}
+            onChange={changeMatchRankDir}
+            options={[
+              { value: "within", label: "Inside top N" },
+              { value: "outside", label: "Outside top N" },
+            ]}
+          />
+          <Select
+            label="Teams"
+            value={matchRankScope}
+            onChange={changeMatchRankScope}
+            options={[
+              { value: "both", label: "Both teams" },
+              { value: "either", label: "At least one team" },
+            ]}
+          />
+        </div>
+      </div>
       <div className="actions" style={{ marginTop: 0 }}>
         <button
           className="secondary"
           onClick={() => loadStoredRecentResults(Math.max(0, recentResultsOffset - 100))}
-          disabled={recentResultsBusy || recentResultsOffset <= 0}
+          disabled={recentResultsLoading || recentResultsOffset <= 0}
         >
-          Prev 100
+          Previous
         </button>
         <button
           className="secondary"
           onClick={() => loadStoredRecentResults(recentResultsOffset + 100)}
-          disabled={recentResultsBusy || recentResults.length < 100}
+          disabled={recentResultsLoading || recentResults.length < 100}
         >
-          Next 100
+          Next
         </button>
-        <span className="muted">Offset: {recentResultsOffset}</span>
       </div>
       {recentResultsError && <p className="error">{recentResultsError}</p>}
-      {!recentResultsLoading && !recentResultsError && recentResults.length === 0 && <p className="muted">No results loaded yet.</p>}
+      {!recentResultsLoading && !recentResultsError && recentResults.length === 0 && <p className="muted">No matches found.</p>}
       {recentResults.length > 0 && (
         <table>
           <thead>
             <tr>
-              <th>#</th>
               <th>Team A</th>
               <th>Score</th>
               <th>Team B</th>
-              <th>Winner</th>
-              <th>Date Played</th>
-              <th>Match</th>
+              <SortHeader sortValue={matchSort} asc="date_asc" desc="date_desc" defaultDirection="desc" onChange={changeMatchSort}>Date</SortHeader>
             </tr>
           </thead>
           <tbody>
             {recentResults.map((r, idx) => {
               const s1 = Number(r?.score1);
               const s2 = Number(r?.score2);
-              const scoreText = Number.isFinite(s1) && Number.isFinite(s2) ? `${s1} - ${s2}` : "-";
+              const haveScore = Number.isFinite(s1) && Number.isFinite(s2);
               return (
                 <tr
                   key={`hltv-res-${idx}-${r?.match_url || ""}`}
-                  className={String(r?.match_url || "") === selectedMatchUrl ? "row-active" : ""}
+                  className={`row-link ${String(r?.match_url || "") === selectedMatchUrl ? "row-active" : ""}`}
                   onClick={() => openMatchModal(r)}
                 >
-                  <td>{idx + 1}</td>
-                  <td>{r?.team1 || "-"}</td>
-                  <td>{scoreText}</td>
-                  <td>{r?.team2 || "-"}</td>
-                  <td>{r?.winner || "-"}</td>
-                  <td>{r?.match_date || "-"}</td>
-                  <td>
-                    {r?.match_url ? (
-                      <a href={String(r.match_url)} target="_blank" rel="noreferrer">
-                        Open
-                      </a>
+                  <td><TeamLogo hltvTeamId={logoForTeamName(r?.team1)} name={r?.team1} size={22} />{r?.team1 || "-"}</td>
+                  <td className="score-cell">
+                    {haveScore ? (
+                      <>
+                        <span className={s1 > s2 ? "score-win" : s1 < s2 ? "score-loss" : ""}>{s1}</span>
+                        {" - "}
+                        <span className={s2 > s1 ? "score-win" : s2 < s1 ? "score-loss" : ""}>{s2}</span>
+                      </>
                     ) : (
                       "-"
                     )}
                   </td>
+                  <td><TeamLogo hltvTeamId={logoForTeamName(r?.team2)} name={r?.team2} size={22} />{r?.team2 || "-"}</td>
+                  <td>{formatDMY(r?.match_date)}</td>
                 </tr>
               );
             })}
           </tbody>
         </table>
       )}
+      <div className="actions" style={{ marginTop: 0 }}>
+        <button
+          className="secondary"
+          onClick={() => loadStoredRecentResults(Math.max(0, recentResultsOffset - 100))}
+          disabled={recentResultsLoading || recentResultsOffset <= 0}
+        >
+          Previous
+        </button>
+        <button
+          className="secondary"
+          onClick={() => loadStoredRecentResults(recentResultsOffset + 100)}
+          disabled={recentResultsLoading || recentResults.length < 100}
+        >
+          Next
+        </button>
+      </div>
       {showMatchModal && selectedMatchRow && (
-        <div className="modal-backdrop" onClick={() => setShowMatchModal(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <header className="modal-header">
-              <h3 className="player-modal-title">
-                {selectedMatchRow?.team1 || "-"} vs {selectedMatchRow?.team2 || "-"}
-              </h3>
-              <button className="close" onClick={() => setShowMatchModal(false)}>
-                &times;
-              </button>
-            </header>
-            <div className="modal-body">
-              <p className="muted">
-                Date played: {selectedMatchRow?.match_date || "-"} | Final score:{" "}
-                {Number.isFinite(Number(selectedMatchRow?.score1)) && Number.isFinite(Number(selectedMatchRow?.score2))
-                  ? `${Number(selectedMatchRow.score1)} - ${Number(selectedMatchRow.score2)}`
-                  : "-"}
-              </p>
-              <table>
-                <thead>
-                  <tr>
-                    <th>Team</th>
-                    <th>HLTV Rank</th>
-                    <th>HLTV Points</th>
-                    <th>VRS Rank</th>
-                    <th>VRS Points</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr>
-                    <td>{selectedMatchRow?.team1 || "-"}</td>
-                    <td>{selectedMatchRow?.hltv_rank_1 ?? "-"}</td>
-                    <td>{selectedMatchRow?.hltv_points_1 ?? "-"}</td>
-                    <td>{selectedMatchRow?.vrs_rank_1 ?? "-"}</td>
-                    <td>{selectedMatchRow?.vrs_points_1 ?? "-"}</td>
-                  </tr>
-                  <tr>
-                    <td>{selectedMatchRow?.team2 || "-"}</td>
-                    <td>{selectedMatchRow?.hltv_rank_2 ?? "-"}</td>
-                    <td>{selectedMatchRow?.hltv_points_2 ?? "-"}</td>
-                    <td>{selectedMatchRow?.vrs_rank_2 ?? "-"}</td>
-                    <td>{selectedMatchRow?.vrs_points_2 ?? "-"}</td>
-                  </tr>
-                </tbody>
-              </table>
-              <h4>Maps Played</h4>
-              {(() => {
-                let maps = [];
-                try {
-                  const parsed = JSON.parse(String(selectedMatchRow?.maps_json || "[]"));
-                  if (Array.isArray(parsed)) maps = parsed;
-                } catch {}
-                if (maps.length === 0) return <p className="muted">No map details stored for this match.</p>;
-                return (
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Map</th>
-                        <th>{selectedMatchRow?.team1 || "Team 1"}</th>
-                        <th>{selectedMatchRow?.team2 || "Team 2"}</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {maps.map((m, i) => (
-                        <tr key={`map-${i}-${m?.map || ""}`}>
-                          <td>{m?.map || "-"}</td>
-                          <td>{m?.score1 ?? "-"}</td>
-                          <td>{m?.score2 ?? "-"}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                );
-              })()}
+        <MatchDetailModal
+          row={selectedMatchRow}
+          teams={teams}
+          players={players}
+          onClose={() => setShowMatchModal(false)}
+          onOpenPlayer={
+            onOpenPlayer
+              ? (pid) => {
+                  setShowMatchModal(false);
+                  onOpenPlayer(pid);
+                }
+              : undefined
+          }
+          onOpenTeam={
+            onOpenTeam
+              ? (tid) => {
+                  setShowMatchModal(false);
+                  onOpenTeam(tid);
+                }
+              : undefined
+          }
+        />
+      )}
+      </>
+      )}
+    </div>
+  );
+}
+
+function MatchDetailModal({ row, onClose, teams = [], players = [], onOpenPlayer, onOpenTeam }) {
+  // Stored-match detail view shared by the Matches browser and the player
+  // card's Recent Matches list.
+  let maps = [];
+  try {
+    const parsed = JSON.parse(String(row?.maps_json || "[]"));
+    if (Array.isArray(parsed)) maps = parsed;
+  } catch {}
+  let playerStats = [];
+  try {
+    const parsed = JSON.parse(String(row?.player_stats_json || "[]"));
+    if (Array.isArray(parsed)) playerStats = parsed;
+  } catch {}
+  // Per-map scoreboards ({map: [entries]}), filled by the map-scoreboards
+  // backfill; "{}" means the page has no per-map tabs.
+  let mapPlayerStats = {};
+  try {
+    const parsed = JSON.parse(String(row?.map_player_stats_json || "{}"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) mapPlayerStats = parsed;
+  } catch {}
+  const sbMapNames = Object.keys(mapPlayerStats).filter(
+    (k) => Array.isArray(mapPlayerStats[k]) && mapPlayerStats[k].length > 0
+  );
+  const [sbMap, setSbMap] = useState("all");
+  useEffect(() => setSbMap("all"), [row?.match_url]);
+  const activeStats = sbMap !== "all" && mapPlayerStats[sbMap] ? mapPlayerStats[sbMap] : playerStats;
+  const hltvIdByName = useMemo(() => {
+    const m = {};
+    (teams || []).forEach((t) => {
+      if (t.hltv_team_id) m[String(t.name || "").trim().toLowerCase()] = Number(t.hltv_team_id);
+    });
+    return m;
+  }, [teams]);
+  const logoIdFor = (name) => hltvIdByName[String(name || "").trim().toLowerCase()];
+  // Click-through to stored player/team cards — only for ids we actually have.
+  const knownPlayerIds = useMemo(
+    () => new Set((players || []).map((p) => Number(p.player_id))),
+    [players]
+  );
+  const teamIdByName = useMemo(() => {
+    const m = {};
+    (teams || []).forEach((t) => {
+      if (t.team_id) m[String(t.name || "").trim().toLowerCase()] = Number(t.team_id);
+    });
+    return m;
+  }, [teams]);
+  const playerLinkable = (pid) => Boolean(onOpenPlayer) && knownPlayerIds.has(Number(pid));
+  const teamIdFor = (name) => teamIdByName[String(name || "").trim().toLowerCase()] || 0;
+  const teamLinkable = (name) => Boolean(onOpenTeam) && teamIdFor(name) > 0;
+  // Group the selected scoreboard by team, team1's block first, best rating on top.
+  const groups = new Map();
+  activeStats.forEach((p) => {
+    const key = String(p?.team || "").trim() || "Unknown";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(p);
+  });
+  const t1Name = String(row?.team1 || "").trim().toLowerCase();
+  const scoreboards = Array.from(groups.entries()).map(([team, entries]) => ({
+    team,
+    entries: entries.slice().sort((a, b) => (Number(b?.rating) || 0) - (Number(a?.rating) || 0)),
+  }));
+  scoreboards.sort(
+    (a, b) =>
+      (a.team.trim().toLowerCase() === t1Name ? 0 : 1) -
+      (b.team.trim().toLowerCase() === t1Name ? 0 : 1)
+  );
+  const ratingClass = (v) => {
+    if (!Number.isFinite(v)) return "";
+    if (v >= 1.05) return "score-win";
+    if (v < 0.95) return "score-loss";
+    return "";
+  };
+  // One rank per team next to its name: HLTV rank when both teams have one,
+  // otherwise VRS ranks (many lower-tier matches never have an HLTV rank).
+  const toRank = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
+  const useHltvRanks = toRank(row?.hltv_rank_1) !== null && toRank(row?.hltv_rank_2) !== null;
+  const rankLabel = useHltvRanks ? "HLTV" : "VRS";
+  const rank1 = useHltvRanks ? toRank(row?.hltv_rank_1) : toRank(row?.vrs_rank_1);
+  const rank2 = useHltvRanks ? toRank(row?.hltv_rank_2) : toRank(row?.vrs_rank_2);
+  const s1 = Number(row?.score1);
+  const s2 = Number(row?.score2);
+  const haveScore = Number.isFinite(s1) && Number.isFinite(s2);
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal match-modal" onClick={(e) => e.stopPropagation()}>
+        <header className="modal-header match-hero-header">
+          <button className="close" onClick={onClose}>
+            &times;
+          </button>
+          <div className="match-hero">
+            <div
+              className={`match-hero-team away-from-center ${teamLinkable(row?.team1) ? "clickable" : ""}`}
+              onClick={() => teamLinkable(row?.team1) && onOpenTeam(teamIdFor(row?.team1))}
+            >
+              <span className="match-team-block">
+                <span className="match-team-name">{row?.team1 || "-"}</span>
+                {rank1 !== null && <span className="match-team-rank">{rankLabel} #{rank1}</span>}
+              </span>
+              <TeamLogo hltvTeamId={logoIdFor(row?.team1)} name={row?.team1} size={58} />
             </div>
-            <div className="actions">
-              <button className="secondary" onClick={() => setShowMatchModal(false)}>
-                Close
-              </button>
+            <div className="match-hero-score">
+              {haveScore ? (
+                <>
+                  <span className={s1 > s2 ? "score-win" : s1 < s2 ? "score-loss" : ""}>{s1}</span>
+                  <span className="match-hero-dash">:</span>
+                  <span className={s2 > s1 ? "score-win" : s2 < s1 ? "score-loss" : ""}>{s2}</span>
+                </>
+              ) : (
+                <span className="match-hero-dash">vs</span>
+              )}
+            </div>
+            <div
+              className={`match-hero-team ${teamLinkable(row?.team2) ? "clickable" : ""}`}
+              onClick={() => teamLinkable(row?.team2) && onOpenTeam(teamIdFor(row?.team2))}
+            >
+              <TeamLogo hltvTeamId={logoIdFor(row?.team2)} name={row?.team2} size={58} />
+              <span className="match-team-block">
+                <span className="match-team-name">{row?.team2 || "-"}</span>
+                {rank2 !== null && <span className="match-team-rank">{rankLabel} #{rank2}</span>}
+              </span>
             </div>
           </div>
+          <p className="match-hero-sub">
+            {formatDMY(row?.match_date)}
+            {row?.event || row?.event_name ? ` | ${row?.event || row?.event_name}` : ""}
+          </p>
+        </header>
+        <div className="modal-body">
+          <h4>Maps Played</h4>
+          {maps.length === 0 ? (
+            <p className="muted">No map details stored for this match.</p>
+          ) : (
+            <div className="match-maps">
+              {maps.map((m, i) => {
+                const ms1 = Number(m?.score1);
+                const ms2 = Number(m?.score2);
+                const haveMapScore = Number.isFinite(ms1) && Number.isFinite(ms2);
+                const halves = Array.isArray(m?.halves) ? m.halves : [];
+                return (
+                  <div
+                    className="match-map-row"
+                    key={`map-${i}-${m?.map || ""}`}
+                    style={{ "--map-color": MAP_BAR_COLORS[m?.map] || "#3a4452" }}
+                  >
+                    <span className="match-map-name">{m?.map || "-"}</span>
+                    <span className="match-map-score">
+                      <TeamLogo hltvTeamId={logoIdFor(row?.team1)} name={row?.team1} size={18} />
+                      <span className={`match-map-num ${haveMapScore ? (ms1 > ms2 ? "score-win" : ms1 < ms2 ? "score-loss" : "") : ""}`}>
+                        {m?.score1 ?? "-"}
+                      </span>
+                      <span className="match-map-score-dash">-</span>
+                      <span className={`match-map-num away ${haveMapScore ? (ms2 > ms1 ? "score-win" : ms2 < ms1 ? "score-loss" : "") : ""}`}>
+                        {m?.score2 ?? "-"}
+                      </span>
+                      <TeamLogo hltvTeamId={logoIdFor(row?.team2)} name={row?.team2} size={18} />
+                    </span>
+                    <span className="match-map-halves">
+                      {halves.map((h, j) => (
+                        <span key={`half-${j}`} className="match-map-half">
+                          {j > 0 && <span className="match-map-half-sep">·</span>}
+                          <span className={`match-map-half-num side-${String(h?.side1 || "").toLowerCase()}`}>{h?.score1 ?? "-"}</span>
+                          <span className="match-map-half-colon">:</span>
+                          <span className={`match-map-half-num side-${String(h?.side2 || "").toLowerCase()}`}>{h?.score2 ?? "-"}</span>
+                        </span>
+                      ))}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          <h4>Scoreboard</h4>
+          {sbMapNames.length > 0 && (
+            <div className="sb-map-tabs">
+              <button
+                className={`sb-map-tab ${sbMap === "all" ? "active" : ""}`}
+                onClick={() => setSbMap("all")}
+              >
+                All maps
+              </button>
+              {sbMapNames.map((m) => (
+                <button
+                  key={`sbt-${m}`}
+                  className={`sb-map-tab ${sbMap === m ? "active" : ""}`}
+                  style={{ "--map-color": MAP_BAR_COLORS[m] || "#ff6b1a" }}
+                  onClick={() => setSbMap(m)}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+          )}
+          {scoreboards.length === 0 ? (
+            <p className="muted">No player stats stored for this match yet.</p>
+          ) : (
+            scoreboards.map((sb) => (
+              <div className="scoreboard-card" key={`sb-${sb.team}`}>
+                <table className="scoreboard-table">
+                  <thead>
+                    <tr>
+                      <th
+                        className={`scoreboard-team ${teamLinkable(sb.team) ? "clickable" : ""}`}
+                        onClick={() => teamLinkable(sb.team) && onOpenTeam(teamIdFor(sb.team))}
+                      >
+                        <TeamLogo hltvTeamId={logoIdFor(sb.team)} name={sb.team} size={24} />
+                        <span>{sb.team}</span>
+                      </th>
+                      <th className="num">K-D</th>
+                      <th className="num">+/-</th>
+                      <th className="num">ADR</th>
+                      <th className="num">KAST</th>
+                      <th className="num">Rating</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sb.entries.map((p, i) => {
+                      const kills = Number(p?.kills);
+                      const deaths = Number(p?.deaths);
+                      const pm = Number(p?.plus_minus);
+                      const adr = Number(p?.adr);
+                      const kast = Number(p?.kast);
+                      const rating = Number(p?.rating);
+                      return (
+                        <tr key={`sb-p-${p?.player_id || i}`}>
+                          <td className="scoreboard-player">
+                            <PlayerPhoto playerId={p?.player_id} name={p?.player} size={24} />
+                            {playerLinkable(p?.player_id) ? (
+                              <button
+                                className="sb-player-link"
+                                onClick={() => onOpenPlayer(Number(p.player_id))}
+                              >
+                                {p?.player || "-"}
+                              </button>
+                            ) : (
+                              <span>{p?.player || "-"}</span>
+                            )}
+                          </td>
+                          <td className="num">
+                            {Number.isFinite(kills) && Number.isFinite(deaths)
+                              ? `${kills} - ${deaths}`
+                              : "-"}
+                          </td>
+                          <td
+                            className={`num ${
+                              Number.isFinite(pm)
+                                ? pm > 0
+                                  ? "score-win"
+                                  : pm < 0
+                                  ? "score-loss"
+                                  : ""
+                                : ""
+                            }`}
+                          >
+                            {Number.isFinite(pm) ? (pm > 0 ? `+${pm}` : `${pm}`) : "-"}
+                          </td>
+                          <td className="num">{Number.isFinite(adr) ? adr.toFixed(1) : "-"}</td>
+                          <td className="num">{Number.isFinite(kast) ? `${kast.toFixed(1)}%` : "-"}</td>
+                          <td className={`num scoreboard-rating ${ratingClass(rating)}`}>
+                            {Number.isFinite(rating) ? rating.toFixed(2) : "-"}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ))
+          )}
         </div>
-      )}
+        <div className="actions">
+          <button className="secondary" onClick={onClose}>
+            Close
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -6162,82 +7122,12 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     rating_top50: "",
     maps_top50: "",
   });
-  const [topRatingsBusy, setTopRatingsBusy] = useState(false);
-  const [topxMonths, setTopxMonths] = useState("3"); // active window (months of HLTV history)
-  const [topxCoverage, setTopxCoverage] = useState({}); // { "3": 337, "6": 0, ... }
-  const [topxWindowBusy, setTopxWindowBusy] = useState(false);
-
-  const loadTopxWindow = async () => {
-    try {
-      const data = await api.get("/players/topx-window", 30000);
-      if (data?.active) setTopxMonths(String(data.active));
-      if (data?.coverage) setTopxCoverage(data.coverage);
-    } catch {
-      /* non-fatal */
-    }
-  };
-  useEffect(() => {
-    loadTopxWindow();
-  }, []);
-
-  // Switching the window rebuilds the shared tier columns from that window's
-  // archive (no re-scrape), so 3/6/12-month data coexist and are swappable.
-  const changeTopxWindow = async (months) => {
-    setTopxMonths(String(months));
-    setTopxWindowBusy(true);
-    try {
-      const res = await api.post("/players/topx-window/active", { months: Number(months) || 3 }, 60000);
-      if (res?.coverage) setTopxCoverage(res.coverage);
-      await refresh();
-      notify(`Active Top-X window: last ${months} months`);
-    } catch (e) {
-      notify(`Failed to switch window: ${e?.message || "unknown error"}`);
-    } finally {
-      setTopxWindowBusy(false);
-    }
-  };
-  const [playerTopxFeedback, setPlayerTopxFeedback] = useState(null);
-  const [batchTopRatingsBusy, setBatchTopRatingsBusy] = useState(false);
-  const [batchTopRatingsStatus, setBatchTopRatingsStatus] = useState("idle");
-  const [batchTopRatingsJobId, setBatchTopRatingsJobId] = useState("");
-  const [batchTopRatingsProcessed, setBatchTopRatingsProcessed] = useState(0);
-  const [batchTopRatingsTotal, setBatchTopRatingsTotal] = useState(0);
-  const [batchTopRatingsOk, setBatchTopRatingsOk] = useState(0);
-  const [batchTopRatingsFailed, setBatchTopRatingsFailed] = useState(0);
-  const [batchTopRatingsLastError, setBatchTopRatingsLastError] = useState("");
-  const [batchTopRatingsEtaSeconds, setBatchTopRatingsEtaSeconds] = useState(null);
   const [playerCurve, setPlayerCurve] = useState(null);
   const [playerCurveLoading, setPlayerCurveLoading] = useState(false);
   const [playerCurveError, setPlayerCurveError] = useState("");
-  const [eventPlayerIds, setEventPlayerIds] = useState([]);
-  const batchTopRatingsPollingRef = useRef(false);
-  // Exponentially-weighted seconds-per-player so the ETA tracks the CURRENT pace
-  // (recent samples weighted most, older ones decaying), instead of the lifetime
-  // average which lags badly when the speed changes mid-run.
-  const batchTopRatingsEmaRef = useRef({ lastT: 0, lastProcessed: 0, ema: null });
-
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .get("/players/event-player-ids", 30000)
-      .then((data) => {
-        if (!cancelled) setEventPlayerIds(Array.isArray(data?.player_ids) ? data.player_ids : []);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [players]);
 
   const [selectedTeam, setSelectedTeam] = useState(null);
   const [showTeamModal, setShowTeamModal] = useState(false);
-  const [rankingsJobStatus, setRankingsJobStatus] = useState("idle");
-  const [rankingsJobId, setRankingsJobId] = useState("");
-  const [rankingsJobProcessed, setRankingsJobProcessed] = useState(0);
-  const [rankingsJobTotal, setRankingsJobTotal] = useState(2);
-  const [rankingsJobLastError, setRankingsJobLastError] = useState("");
-  const [rankingsJobResults, setRankingsJobResults] = useState([]);
-  const rankingsJobPollingRef = useRef(false);
   const [teamForm, setTeamForm] = useState({
     team_id: "",
     hltv_team_id: "",
@@ -6261,28 +7151,60 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     players.forEach((p) => (m[p.player_id] = p.name));
     return m;
   }, [players]);
+  // A player can sit on several stored rosters (old event teams are kept);
+  // only their CURRENT team is shown: the roster of the most recent EVENT they
+  // appeared in (backend /events/player-latest-teams). Team-row creation order
+  // is no signal — a player can move to a team whose row is older than their
+  // previous team's. Players never priced into an event fall back to any
+  // stored roster containing them. One-element arrays keep join()/[0]
+  // consumers working unchanged.
+  const [eventLatestTeams, setEventLatestTeams] = useState({});
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .get("/events/player-latest-teams", 30000)
+      .then((data) => {
+        if (!cancelled) setEventLatestTeams(data?.teams || {});
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [players]);
+  const latestTeamByPlayer = useMemo(() => {
+    const teamIdByName = {};
+    teams.forEach((t) => {
+      teamIdByName[String(t.name || "").trim().toLowerCase()] = Number(t.team_id) || 0;
+    });
+    const best = {};
+    Object.entries(eventLatestTeams).forEach(([pid, row]) => {
+      const name = String(row?.team_name || "").trim();
+      if (!name) return;
+      best[pid] = { team_id: teamIdByName[name.toLowerCase()] || 0, team_name: name };
+    });
+    // Fallback for players outside any event's rosters.
+    teams.forEach((t) => {
+      const tid = Number(t.team_id) || 0;
+      [t.player1_id, t.player2_id, t.player3_id, t.player4_id, t.player5_id].filter(Boolean).forEach((pid) => {
+        if (!best[pid]) best[pid] = { team_id: tid, team_name: t.name || `Team ${tid}` };
+      });
+    });
+    return best;
+  }, [teams, eventLatestTeams]);
   const playerTeamLookup = useMemo(() => {
     const m = {};
-    teams.forEach((t) => {
-      const ids = [t.player1_id, t.player2_id, t.player3_id, t.player4_id, t.player5_id].filter(Boolean);
-      ids.forEach((pid) => {
-        if (!m[pid]) m[pid] = [];
-        m[pid].push(t.name || `Team ${t.team_id}`);
-      });
+    Object.entries(latestTeamByPlayer).forEach(([pid, team]) => {
+      m[pid] = [team.team_name];
     });
     return m;
-  }, [teams]);
+  }, [latestTeamByPlayer]);
   const playerTeamLinks = useMemo(() => {
     const m = {};
-    teams.forEach((t) => {
-      const ids = [t.player1_id, t.player2_id, t.player3_id, t.player4_id, t.player5_id].filter(Boolean);
-      ids.forEach((pid) => {
-        if (!m[pid]) m[pid] = [];
-        m[pid].push({ team_id: t.team_id, team_name: t.name || `Team ${t.team_id}` });
-      });
+    Object.entries(latestTeamByPlayer).forEach(([pid, team]) => {
+      m[pid] = [team];
     });
     return m;
-  }, [teams]);
+  }, [latestTeamByPlayer]);
 
   const boosterNames = {
     0: "Best Pistol Round",
@@ -6346,12 +7268,84 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     return avg;
   }, [players]);
 
+  // Hero enrichment: the selected player's current team (with HLTV id for the
+  // logo), headline chips, and their team's recent match form.
+  const heroTeam = useMemo(() => {
+    const link = (playerTeamLinks[playerForm.player_id] || [])[0];
+    if (!link) return null;
+    const t = teams.find((x) => Number(x.team_id) === Number(link.team_id));
+    return { ...link, hltv_team_id: t?.hltv_team_id };
+  }, [playerTeamLinks, playerForm.player_id, teams]);
+  const heroExtras = useMemo(() => {
+    const pid = Number(selectedPlayer);
+    const p = players.find((x) => Number(x.player_id) === pid);
+    if (!p) return null;
+    const normalizeRate = (v) => {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return null;
+      if (n < 0) return 0;
+      return n > 1 ? n / 100 : n;
+    };
+    const rated = players.filter((x) => Number(x.rating) > 0);
+    const rank = 1 + rated.filter((x) => Number(x.rating) > Number(p.rating || 0)).length;
+    let bestRole = null;
+    Object.entries(roleNames).forEach(([id, label]) => {
+      const maj = normalizeRate(roleForm[id]?.major ?? roleForm[id]?.major_win_pct);
+      const min = normalizeRate(roleForm[id]?.minor ?? roleForm[id]?.minor_win_pct);
+      if (maj === null || min === null) return;
+      const expected = 5 * maj + 2 * min - 2 * (1 - maj - min);
+      if (!bestRole || expected > bestRole.expected) bestRole = { id: Number(id), label, expected };
+    });
+    // Best booster = the one that beats the field-wide average by the most —
+    // a high raw rate on a booster everyone triggers isn't an edge.
+    let bestBooster = null;
+    Object.entries(boosterNames).forEach(([id, label]) => {
+      const v = Number(boosterForm[id]);
+      const avg = Number(boosterAverages[id]);
+      if (!Number.isFinite(v) || !Number.isFinite(avg)) return;
+      const delta = v - avg;
+      if (!bestBooster || delta > bestBooster.delta) bestBooster = { id: Number(id), label, value: v, delta };
+    });
+    return { price: Number(p.price || 0), rank, ratedCount: rated.length, bestRole, bestBooster };
+  }, [players, selectedPlayer, roleForm, boosterForm, boosterAverages]);
+  // Recent form: the player's last matches with their per-match rating,
+  // extracted server-side from the archived match-page scoreboards.
+  const [playerRecentForm, setPlayerRecentForm] = useState([]);
+  const [playerMatchDetail, setPlayerMatchDetail] = useState(null);
+  const openStoredMatch = async (matchUrl) => {
+    if (!matchUrl) return;
+    try {
+      const row = await api.get(`/events/hltv-results/stored?match_url=${encodeURIComponent(matchUrl)}`, 15000);
+      if (row && row.team1) setPlayerMatchDetail(row);
+      else notify("No stored details for that match.");
+    } catch (e) {
+      notify(`Could not load match: ${e?.message || "unknown error"}`);
+    }
+  };
+  useEffect(() => {
+    const pid = Number(selectedPlayer);
+    if (!showPlayerModal || !Number.isFinite(pid) || pid <= 0) {
+      setPlayerRecentForm([]);
+      return;
+    }
+    let cancelled = false;
+    api
+      .get(`/players/${pid}/recent-form?limit=5`, 30000)
+      .then((res) => {
+        if (!cancelled) setPlayerRecentForm(Array.isArray(res?.matches) ? res.matches : []);
+      })
+      .catch(() => {
+        if (!cancelled) setPlayerRecentForm([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [showPlayerModal, selectedPlayer]);
+
   useEffect(() => {
     if (selectedPlayer) {
       const p = players.find((x) => x.player_id === selectedPlayer);
       if (p) {
-        setTopRatingsBusy(false);
-        setPlayerTopxFeedback(null);
         let boostersObj = {};
         let rolesObj = {};
         try {
@@ -6453,343 +7447,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     }
   }, [selectedTeam, teams]);
 
-  const saveTeam = async () => {
-    if (!teamForm.name) return;
-    const ids = [teamForm.p1, teamForm.p2, teamForm.p3, teamForm.p4, teamForm.p5].map((x) => Number(x || 0));
-    await api.post("/teams/", {
-      name: teamForm.name,
-      hltv_team_id: teamForm.hltv_team_id === "" ? undefined : Number(teamForm.hltv_team_id),
-      hltv_rank: teamForm.hltv_rank === "" ? undefined : Number(teamForm.hltv_rank),
-      hltv_points: teamForm.hltv_points === "" ? undefined : Number(teamForm.hltv_points),
-      vrs_rank: teamForm.vrs_rank === "" ? undefined : Number(teamForm.vrs_rank),
-      vrs_points: teamForm.vrs_points === "" ? undefined : Number(teamForm.vrs_points),
-      win_rate: teamForm.win_rate === "" ? undefined : Number(teamForm.win_rate),
-      player_ids: ids,
-    });
-    notify("Team saved");
-    refresh();
-    setShowTeamModal(false);
-  };
-
-  const deleteTeam = async () => {
-    if (!selectedTeam) return;
-    await api.delete(`/teams/${selectedTeam}`);
-    notify("Team deleted");
-    setSelectedTeam(null);
-    setTeamForm({
-      team_id: "",
-      hltv_team_id: "",
-      name: "",
-      hltv_rank: "",
-      hltv_points: "",
-      vrs_rank: "",
-      vrs_points: "",
-      win_rate: "",
-      map_stats_json: "",
-      map_stats_imported_at: "",
-      map_stats_source_url: "",
-      p1: "",
-      p2: "",
-      p3: "",
-      p4: "",
-      p5: "",
-    });
-    refresh();
-    setShowTeamModal(false);
-  };
-
-  const newTeam = () => {
-    setSelectedTeam(null);
-    setTeamForm({
-      team_id: "",
-      hltv_team_id: "",
-      name: "",
-      hltv_rank: "",
-      hltv_points: "",
-      vrs_rank: "",
-      vrs_points: "",
-      win_rate: "",
-      map_stats_json: "",
-      map_stats_imported_at: "",
-      map_stats_source_url: "",
-      p1: "",
-      p2: "",
-      p3: "",
-      p4: "",
-      p5: "",
-    });
-    setShowTeamModal(true);
-  };
-
-  const fetchPlayerTopRatings = async () => {
-    const playerId = Number(playerForm.player_id);
-    if (!Number.isFinite(playerId) || playerId <= 0) {
-      setPlayerTopxFeedback({ kind: "error", message: "Player is missing a valid HLTV id." });
-      notify("Player is missing a valid HLTV id.");
-      return;
-    }
-    setTopRatingsBusy(true);
-    setPlayerTopxFeedback({ kind: "info", message: "Importing Top-X data from HLTV..." });
-    try {
-      const res = await api.post(`/players/${playerId}/fetch-top-ratings`, { months: Number(topxMonths) || 3 });
-      await refresh();
-      const rangeText = res?.startDate && res?.endDate ? ` (${res.startDate} to ${res.endDate})` : "";
-      setPlayerTopxFeedback({
-        kind: "success",
-        message: `Top-X import succeeded${rangeText}.`,
-      });
-      notify(`Top-X imported for ${playerForm.name || `player ${playerId}`}${rangeText}`);
-    } catch (e) {
-      setPlayerTopxFeedback({
-        kind: "error",
-        message: `Import failed: ${e?.message || "unknown error"}`,
-      });
-      notify(`Top-X import failed: ${e?.message || "unknown error"}`);
-    } finally {
-      setTopRatingsBusy(false);
-    }
-  };
-
-  const applyBatchTopRatingsStatus = (status, jobIdOverride = "") => {
-    const jobId = String(jobIdOverride || status?.job_id || "");
-    const processed = Number(status?.processed_players || 0);
-    const total = Number(status?.total_players || 0);
-    const ok = Number(status?.ok || 0);
-    const failed = Number(status?.failed || 0);
-    const nextStatus = String(status?.status || "queued");
-    const lastError = String(status?.last_error || status?.error || "");
-
-    setBatchTopRatingsStatus(nextStatus);
-    setBatchTopRatingsJobId(jobId);
-    setBatchTopRatingsProcessed(processed);
-    setBatchTopRatingsTotal(total);
-    setBatchTopRatingsOk(ok);
-    setBatchTopRatingsFailed(failed);
-    setBatchTopRatingsLastError(lastError);
-    setBatchTopRatingsBusy(["queued", "running", "pausing", "canceling"].includes(nextStatus));
-
-    if (processed > 0 && total > processed) {
-      const nowMs = Date.now();
-      const st = batchTopRatingsEmaRef.current;
-      const ALPHA = 0.3; // smoothing: higher = reacts faster to recent pace
-      if (st.lastProcessed > 0 && processed > st.lastProcessed) {
-        const instantSecPerItem = (nowMs - st.lastT) / 1000 / (processed - st.lastProcessed);
-        st.ema = st.ema == null ? instantSecPerItem : ALPHA * instantSecPerItem + (1 - ALPHA) * st.ema;
-      } else if (st.lastProcessed === 0) {
-        // Seed from the lifetime average so we show something on the first tick.
-        const elapsedSec = Math.max(0.001, (nowMs - getBatchStartedAtMs(status)) / 1000);
-        st.ema = elapsedSec / processed;
-      }
-      if (processed !== st.lastProcessed) {
-        st.lastT = nowMs;
-        st.lastProcessed = processed;
-      }
-      const secPerItem = st.ema;
-      setBatchTopRatingsEtaSeconds(secPerItem && secPerItem > 0 ? (total - processed) * secPerItem : null);
-    } else if (total > 0 && processed >= total) {
-      setBatchTopRatingsEtaSeconds(0);
-    } else {
-      setBatchTopRatingsEtaSeconds(null);
-    }
-
-    return { jobId, processed, total, ok, failed, nextStatus, lastError };
-  };
-
-  const pollBatchTopRatingsJob = async (jobId) => {
-    if (!jobId || batchTopRatingsPollingRef.current) return;
-    batchTopRatingsPollingRef.current = true;
-    try {
-      let done = false;
-      let pollFailures = 0;
-      while (!done) {
-        let status;
-        try {
-          status = await api.get(`/players/fetch-top-ratings-batch/job/${jobId}`, 60000);
-          pollFailures = 0;
-        } catch (pollError) {
-          // The job keeps running server-side; only give up after repeated failures.
-          pollFailures += 1;
-          if (pollFailures >= 5) throw pollError;
-          await new Promise((resolve) => setTimeout(resolve, 3000));
-          continue;
-        }
-        const { ok, failed, nextStatus, lastError } = applyBatchTopRatingsStatus(status, jobId);
-
-        if (nextStatus === "failed") {
-          setBatchTopRatingsBusy(false);
-          notify(lastError || "Top-X batch failed.");
-          done = true;
-          break;
-        }
-        if (nextStatus === "paused") {
-          setBatchTopRatingsBusy(false);
-          done = true;
-          break;
-        }
-        if (nextStatus === "canceled") {
-          setBatchTopRatingsBusy(false);
-          done = true;
-          break;
-        }
-        if (nextStatus === "completed") {
-          setBatchTopRatingsBusy(false);
-          setBatchTopRatingsStatus("idle");
-          setBatchTopRatingsEtaSeconds(null);
-          await refresh();
-          await loadTopxWindow();
-          const rows = Array.isArray(status?.result?.results) ? status.result.results : Array.isArray(status?.results) ? status.results : [];
-          const failedRows = rows.filter((row) => row?.status !== "ok");
-          const failedPreview = failedRows
-            .slice(0, 3)
-            .map((row) => row?.player_name || `player ${row?.player_id}`)
-            .join(", ");
-          const failedSuffix = failedPreview ? ` | Failed: ${failedPreview}${failedRows.length > 3 ? "..." : ""}` : "";
-          notify(`Top-X batch finished: ok ${ok} failed ${failed}${failedSuffix}`);
-          done = true;
-          break;
-        }
-
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-      }
-    } catch (e) {
-      setBatchTopRatingsBusy(false);
-      setBatchTopRatingsStatus("failed");
-      setBatchTopRatingsLastError(String(e?.message || "Failed to poll Top-X batch status."));
-      notify(`Top-X batch failed: ${e?.message || "unknown error"}`);
-    } finally {
-      batchTopRatingsPollingRef.current = false;
-    }
-  };
-
-  const playerHasCompleteTopRatings = (player) => {
-    // "Complete" = the import ran and produced an overall rating. Players with
-    // thin per-tier data (few maps vs top teams) are still complete — their
-    // rank-adjusted ratings are estimated from the average degradation curve.
-    return Boolean(Number(player?.last_topx_import_at)) && Number(player?.rating) > 0;
-  };
-
-  const getTopRatingsBatchPlayerIds = (onlyMissing = false) =>
-    (players || [])
-      .filter((player) => !onlyMissing || !playerHasCompleteTopRatings(player))
-      .map((player) => Number(player?.player_id))
-      .filter((value) => Number.isFinite(value) && value > 0);
-
-  const runTopRatingsBatch = async (playerIds, emptyMsg) => {
-    if (!playerIds || playerIds.length === 0) {
-      notify(emptyMsg);
-      return;
-    }
-    setBatchTopRatingsBusy(true);
-    setBatchTopRatingsStatus("queued");
-    setBatchTopRatingsProcessed(0);
-    setBatchTopRatingsTotal(playerIds.length);
-    setBatchTopRatingsOk(0);
-    setBatchTopRatingsFailed(0);
-    setBatchTopRatingsLastError("");
-    setBatchTopRatingsEtaSeconds(null);
-    batchTopRatingsEmaRef.current = { lastT: 0, lastProcessed: 0, ema: null };
-    try {
-      const start = await api.post("/players/fetch-top-ratings-batch/start", {
-        player_ids: playerIds,
-        months: Number(topxMonths) || 3,
-      });
-      const jobId = String(start?.job_id || "");
-      if (!jobId) {
-        throw new Error("Failed to start Top-X batch job.");
-      }
-      setBatchTopRatingsJobId(jobId);
-      await pollBatchTopRatingsJob(jobId);
-    } catch (e) {
-      setBatchTopRatingsStatus("failed");
-      setBatchTopRatingsLastError(String(e?.message || "Failed to start Top-X batch job."));
-      notify(`Top-X batch failed: ${e?.message || "unknown error"}`);
-    } finally {
-      setBatchTopRatingsBusy(false);
-    }
-  };
-
-  const importPlayerTopRatingsBatch = (onlyMissing = false) =>
-    runTopRatingsBatch(
-      getTopRatingsBatchPlayerIds(onlyMissing),
-      onlyMissing ? "No players are missing Top-X data." : "No players available to import."
-    );
-
-  const importEventTopRatingsBatch = () =>
-    runTopRatingsBatch(
-      eventPlayerIds,
-      "No players found for the current event. Import an event first."
-    );
-
-  const pauseBatchTopRatingsJob = async () => {
-    if (!batchTopRatingsJobId) return;
-    setBatchTopRatingsStatus("pausing");
-    setBatchTopRatingsBusy(true);
-    try {
-      const status = await api.post(`/players/fetch-top-ratings-batch/job/${batchTopRatingsJobId}/pause`, {});
-      const applied = applyBatchTopRatingsStatus(status, batchTopRatingsJobId);
-      if (["pausing", "running", "queued"].includes(applied.nextStatus)) {
-        pollBatchTopRatingsJob(batchTopRatingsJobId);
-      }
-    } catch (e) {
-      setBatchTopRatingsStatus("running");
-      notify(`Failed to pause Top-X batch: ${e?.message || "unknown error"}`);
-    }
-  };
-
-  const cancelBatchTopRatingsJob = async () => {
-    if (!batchTopRatingsJobId) return;
-    setBatchTopRatingsStatus("canceling");
-    setBatchTopRatingsBusy(true);
-    try {
-      const status = await api.post(`/players/fetch-top-ratings-batch/job/${batchTopRatingsJobId}/cancel`, {});
-      const applied = applyBatchTopRatingsStatus(status, batchTopRatingsJobId);
-      if (["canceling", "running", "queued", "pausing"].includes(applied.nextStatus)) {
-        pollBatchTopRatingsJob(batchTopRatingsJobId);
-      }
-    } catch (e) {
-      setBatchTopRatingsBusy(false);
-      notify(`Failed to cancel Top-X batch: ${e?.message || "unknown error"}`);
-    }
-  };
-
-  const resumeBatchTopRatingsJob = async () => {
-    if (!batchTopRatingsJobId) return;
-    setBatchTopRatingsBusy(true);
-    try {
-      const status = await api.post(`/players/fetch-top-ratings-batch/job/${batchTopRatingsJobId}/resume`, {});
-      const applied = applyBatchTopRatingsStatus(status, batchTopRatingsJobId);
-      if (["queued", "running", "pausing"].includes(applied.nextStatus)) {
-        pollBatchTopRatingsJob(batchTopRatingsJobId);
-      }
-    } catch (e) {
-      setBatchTopRatingsBusy(false);
-      notify(`Failed to resume Top-X batch: ${e?.message || "unknown error"}`);
-    }
-  };
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const hydrateLatestTopRatingsJob = async () => {
-      try {
-        const latest = await api.get("/players/fetch-top-ratings-batch/latest");
-        if (cancelled || !latest?.exists) return;
-        if (latest?.status === "completed") return;
-        const applied = applyBatchTopRatingsStatus(latest);
-        if (["queued", "running", "pausing", "canceling"].includes(applied.nextStatus)) {
-          pollBatchTopRatingsJob(applied.jobId);
-        }
-      } catch {
-        // The batch progress panel is optional on startup; failures should not block the database view.
-      }
-    };
-
-    hydrateLatestTopRatingsJob();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
   const openPlayerDetailsFromTeam = (playerId) => {
     const pid = Number(playerId);
     if (!Number.isFinite(pid) || pid <= 0) return;
@@ -6805,161 +7462,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     setShowPlayerModal(false);
     setSelectedTeam(teamId);
     setShowTeamModal(true);
-  };
-
-  const applyRankingsJobStatus = (status, jobIdOverride = "") => {
-    const jobId = String(jobIdOverride || status?.job_id || "");
-    const nextStatus = String(status?.status || "queued");
-    const lastError = String(status?.last_error || status?.error || "");
-    setRankingsJobStatus(nextStatus);
-    setRankingsJobId(jobId);
-    setRankingsJobProcessed(Number(status?.processed_phases || 0));
-    setRankingsJobTotal(Number(status?.total_phases || 2));
-    setRankingsJobLastError(lastError);
-    setRankingsJobResults(Array.isArray(status?.results) ? status.results : []);
-    return { jobId, nextStatus, lastError };
-  };
-
-  const summarizeRankingsResults = (results) =>
-    (results || [])
-      .map((row) =>
-        row?.status === "ok"
-          ? `${String(row.phase || "").toUpperCase()} u:${row.updated || 0} i:${row.inserted || 0} f:${row.failed || 0}`
-          : `${String(row.phase || "").toUpperCase()} error`
-      )
-      .join(" | ");
-
-  const pollRankingsJob = async (jobId) => {
-    if (!jobId || rankingsJobPollingRef.current) return;
-    rankingsJobPollingRef.current = true;
-    try {
-      let done = false;
-      let pollFailures = 0;
-      while (!done) {
-        let status;
-        try {
-          status = await api.get(`/teams/rankings-refresh/job/${jobId}`, 60000);
-          pollFailures = 0;
-        } catch (pollError) {
-          // The job keeps running server-side; only give up after repeated failures.
-          pollFailures += 1;
-          if (pollFailures >= 5) throw pollError;
-          await new Promise((resolve) => setTimeout(resolve, 3000));
-          continue;
-        }
-        const { nextStatus, lastError } = applyRankingsJobStatus(status, jobId);
-        if (nextStatus === "completed") {
-          await refresh();
-          notify(`Rankings refreshed: ${summarizeRankingsResults(status?.results) || "done"}`);
-          done = true;
-          break;
-        }
-        if (nextStatus === "failed") {
-          notify(lastError || "Rankings refresh failed.");
-          done = true;
-          break;
-        }
-        if (["paused", "canceled"].includes(nextStatus)) {
-          await refresh();
-          done = true;
-          break;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-      }
-    } catch (e) {
-      setRankingsJobStatus("failed");
-      setRankingsJobLastError(String(e?.message || "Failed to poll rankings refresh job."));
-      notify(`Rankings refresh failed: ${e?.message || "unknown error"}`);
-    } finally {
-      rankingsJobPollingRef.current = false;
-    }
-  };
-
-  const startRankingsRefreshJob = async () => {
-    setRankingsJobStatus("queued");
-    setRankingsJobProcessed(0);
-    setRankingsJobTotal(2);
-    setRankingsJobLastError("");
-    setRankingsJobResults([]);
-    try {
-      const start = await api.post("/teams/rankings-refresh/start", {});
-      const jobId = String(start?.job_id || "");
-      if (!jobId) throw new Error("Failed to start rankings refresh job.");
-      setRankingsJobId(jobId);
-      if (start?.reused) notify("A rankings refresh is already running. Reusing that job.");
-      await pollRankingsJob(jobId);
-    } catch (e) {
-      setRankingsJobStatus("failed");
-      setRankingsJobLastError(String(e?.message || "Failed to start rankings refresh job."));
-      notify(`Rankings refresh failed: ${e?.message || "unknown error"}`);
-    }
-  };
-
-  const pauseRankingsJob = async () => {
-    if (!rankingsJobId) return;
-    setRankingsJobStatus("pausing");
-    try {
-      const status = await api.post(`/teams/rankings-refresh/job/${rankingsJobId}/pause`, {});
-      const applied = applyRankingsJobStatus(status, rankingsJobId);
-      if (["pausing", "running", "queued"].includes(applied.nextStatus)) {
-        pollRankingsJob(rankingsJobId);
-      }
-    } catch (e) {
-      notify(`Failed to pause rankings refresh: ${e?.message || "unknown error"}`);
-    }
-  };
-
-  const cancelRankingsJob = async () => {
-    if (!rankingsJobId) return;
-    setRankingsJobStatus("canceling");
-    try {
-      const status = await api.post(`/teams/rankings-refresh/job/${rankingsJobId}/cancel`, {});
-      const applied = applyRankingsJobStatus(status, rankingsJobId);
-      if (["canceling", "running", "queued"].includes(applied.nextStatus)) {
-        pollRankingsJob(rankingsJobId);
-      }
-    } catch (e) {
-      notify(`Failed to cancel rankings refresh: ${e?.message || "unknown error"}`);
-    }
-  };
-
-  const resumeRankingsJob = async () => {
-    if (!rankingsJobId) return;
-    try {
-      const status = await api.post(`/teams/rankings-refresh/job/${rankingsJobId}/resume`, {});
-      const applied = applyRankingsJobStatus(status, rankingsJobId);
-      if (["queued", "running", "pausing"].includes(applied.nextStatus)) {
-        pollRankingsJob(rankingsJobId);
-      }
-    } catch (e) {
-      notify(`Failed to resume rankings refresh: ${e?.message || "unknown error"}`);
-    }
-  };
-
-  useEffect(() => {
-    let cancelled = false;
-    const hydrateLatestRankingsJob = async () => {
-      try {
-        const latest = await api.get("/teams/rankings-refresh/latest");
-        if (cancelled || !latest?.exists) return;
-        if (["completed", "canceled"].includes(String(latest?.status || ""))) return;
-        const applied = applyRankingsJobStatus(latest);
-        if (["queued", "running", "pausing", "canceling"].includes(applied.nextStatus)) {
-          pollRankingsJob(applied.jobId);
-        }
-      } catch {
-        // The rankings progress panel is optional on startup.
-      }
-    };
-    hydrateLatestRankingsJob();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const refreshSelectedTeamMapStats = async () => {
-    if (!selectedTeam) return;
-    await mapStats.start(false, [selectedTeam]);
   };
 
   // Keep an open team modal's map stats fresh when the shared import job finishes.
@@ -6985,19 +7487,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     };
   }, [selectedTeam, mapStatsModalRefreshRef]);
 
-  const hasJsonEntries = (raw) => {
-    if (!raw) return false;
-    try {
-      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-      if (Array.isArray(parsed)) return parsed.length > 0;
-      if (parsed && typeof parsed === "object") return Object.keys(parsed).length > 0;
-      return false;
-    } catch {
-      return false;
-    }
-  };
-
-  const hasBoostersAndRoles = (player) => hasJsonEntries(player.boosters_json) && hasJsonEntries(player.roles_json);
   const currentMapPool = ACTIVE_MAP_POOL;
   const canonicalMapName = (value) => {
     const raw = String(value || "").trim();
@@ -7010,32 +7499,63 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     const n = Number(value);
     return Number.isFinite(n) ? `${(n * 100).toFixed(digits)}%` : "-";
   };
+  // Self-computed veto profile from stored match vetoes — covers maps HLTV's
+  // team-maps page omits entirely (a permaban has no played-stats there).
+  const [teamVetoProfile, setTeamVetoProfile] = useState(null);
+  useEffect(() => {
+    const tid = Number(selectedTeam);
+    if (!showTeamModal || !Number.isFinite(tid) || tid <= 0) {
+      setTeamVetoProfile(null);
+      return;
+    }
+    let cancelled = false;
+    api
+      .get(`/teams/${tid}/veto-profile?months=3`, 30000)
+      .then((res) => {
+        if (!cancelled) setTeamVetoProfile(res || null);
+      })
+      .catch(() => {
+        if (!cancelled) setTeamVetoProfile(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [showTeamModal, selectedTeam]);
   const teamMapStatsRows = useMemo(() => {
     try {
       const parsed = JSON.parse(String(teamForm.map_stats_json || "[]"));
-      if (!Array.isArray(parsed)) return [];
       const byMap = {};
-      parsed.forEach((row) => {
+      (Array.isArray(parsed) ? parsed : []).forEach((row) => {
         const map = canonicalMapName(row?.map);
         if (map) byMap[map] = row;
       });
-      return currentMapPool
-        .map((map) => {
-          const row = byMap[map];
-          if (!row) return null;
-          return {
-            map,
-            played: Number(row.played || 0),
-            winRate: Number(row.win_rate || 0),
-            pickRate: Number(row.pick_rate || 0),
-            banRate: Number(row.ban_rate || 0),
-          };
-        })
-        .filter(Boolean);
+      const vetoByMap = {};
+      const vetoMatches = Number(teamVetoProfile?.matches || 0);
+      Object.entries(teamVetoProfile?.maps || {}).forEach(([m, v]) => {
+        const map = canonicalMapName(m);
+        if (map) vetoByMap[map] = v;
+      });
+      if (Object.keys(byMap).length === 0 && vetoMatches === 0) return [];
+      // Every active-pool map gets a card — a map the team never touches is
+      // itself information (usually their permaban). Our own veto data wins
+      // over HLTV's page rates: it also covers never-played maps.
+      return currentMapPool.map((map) => {
+        const row = byMap[map] || {};
+        const veto = vetoByMap[map];
+        const useVeto = vetoMatches > 0;
+        return {
+          map,
+          hasData: Boolean(byMap[map]) || Boolean(veto),
+          played: Number(row.played || 0),
+          winRate: Number(row.win_rate || 0),
+          pickRate: useVeto ? Number(veto?.pick_rate || 0) : Number(row.pick_rate || 0),
+          banRate: useVeto ? Number(veto?.ban_rate || 0) : Number(row.ban_rate || 0),
+        };
+      });
     } catch {
       return [];
     }
-  }, [teamForm.map_stats_json]);
+  }, [teamForm.map_stats_json, teamVetoProfile]);
   const teamMapStatsTotalPlayed = useMemo(
     () => teamMapStatsRows.reduce((sum, row) => sum + Math.max(0, Number(row.played || 0)), 0),
     [teamMapStatsRows]
@@ -7044,44 +7564,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     const n = Number(v);
     return Number.isFinite(n) ? n : fallback;
   };
-  const batchTopRatingsProgressPct =
-    batchTopRatingsTotal > 0 ? Math.min(100, Math.max(0, (batchTopRatingsProcessed / batchTopRatingsTotal) * 100)) : 0;
-  const showBatchTopRatingsProgress = batchTopRatingsStatus !== "idle";
-  const batchTopRatingsActive = ["queued", "running", "pausing", "canceling"].includes(batchTopRatingsStatus);
-  const batchTopRatingsResumable = ["paused", "failed"].includes(batchTopRatingsStatus);
-  const rankingsJobProgressPct =
-    rankingsJobTotal > 0 ? Math.min(100, Math.max(0, (rankingsJobProcessed / rankingsJobTotal) * 100)) : 0;
-  const showRankingsJobProgress = rankingsJobStatus !== "idle" && rankingsJobStatus !== "completed";
-  const rankingsJobActive = ["queued", "running", "pausing", "canceling"].includes(rankingsJobStatus);
-  const rankingsJobResumable = ["paused", "failed"].includes(rankingsJobStatus);
-  const rankingsJobPhaseLabel = rankingsJobActive
-    ? rankingsJobProcessed === 0
-      ? "HLTV ranking"
-      : "VRS ranking"
-    : "";
-  const missingTopRatingsCount = (players || []).filter((player) => !playerHasCompleteTopRatings(player)).length;
-  const batchTopRatingsStatusLabel =
-    {
-      completed: "Completed",
-      failed: "Failed",
-      canceled: "Canceled",
-      canceling: "Canceling",
-      paused: "Paused",
-      pausing: "Pausing",
-      running: "Running",
-      queued: "Queued",
-    }[batchTopRatingsStatus] || "Queued";
-  const rankingsJobStatusLabel =
-    {
-      completed: "Completed",
-      failed: "Failed",
-      canceled: "Canceled",
-      canceling: "Canceling",
-      paused: "Paused",
-      pausing: "Pausing",
-      running: "Running",
-      queued: "Queued",
-    }[rankingsJobStatus] || "Queued";
   const playerTopxBucketRows = useMemo(() => {
     const rows = Array.isArray(playerCurve?.bucket_rows) ? playerCurve.bucket_rows : [];
     return rows
@@ -7094,12 +7576,20 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
         rawBucketDelta: Number.isFinite(Number(row?.raw_bucket_delta)) ? Number(row.raw_bucket_delta) : null,
         rawBucketRating: Number.isFinite(Number(row?.raw_bucket_rating)) ? Number(row.raw_bucket_rating) : null,
         priorRating: Number.isFinite(Number(row?.prior_rating)) ? Number(row.prior_rating) : null,
+        adjustedPriorRating: Number.isFinite(Number(row?.adjusted_prior_rating)) ? Number(row.adjusted_prior_rating) : null,
         shrinkageWeight: Number.isFinite(Number(row?.shrinkage_weight)) ? Number(row.shrinkage_weight) : null,
         maps: Number(row?.maps || 0),
         estimated: Boolean(row?.estimated),
       }))
       .filter((row) => Number.isFinite(row.tier) && row.tier > 0 && row.tier < 100)
       .sort((a, b) => a.tier - b.tier);
+  }, [playerCurve]);
+  // The per-player vs-ranked shift baked into the weighted line; surfaced as
+  // its own dashed curve so "weighted below both predicted AND actual" is
+  // visibly the shift at work, not a glitch.
+  const playerTopxShift = useMemo(() => {
+    const v = Number(playerCurve?.personal_offset);
+    return Number.isFinite(v) ? v : 0;
   }, [playerCurve]);
   const playerTopxRows = useMemo(() => {
     const rows = Array.isArray(playerCurve?.graph_rows) ? playerCurve.graph_rows : [];
@@ -7110,19 +7600,24 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
           rankLabel: String(row.tier),
           finalRating: row.bucketRating,
           predictedRating: row.priorRating,
+          shiftedRating: row.adjustedPriorRating,
         }))
         .filter((row) => Number.isFinite(row.rank) && row.rank > 0 && row.finalRating !== null);
     }
     return rows
-      .map((row) => ({
-        rank: Number(row?.rank),
-        rankLabel: String(row?.rank_label || row?.rank || ""),
-        finalRating: Number.isFinite(Number(row?.final_rating)) ? Number(row.final_rating) : null,
-        predictedRating: Number.isFinite(Number(row?.predicted_rating)) ? Number(row.predicted_rating) : null,
-      }))
+      .map((row) => {
+        const predicted = Number.isFinite(Number(row?.predicted_rating)) ? Number(row.predicted_rating) : null;
+        return {
+          rank: Number(row?.rank),
+          rankLabel: String(row?.rank_label || row?.rank || ""),
+          finalRating: Number.isFinite(Number(row?.final_rating)) ? Number(row.final_rating) : null,
+          predictedRating: predicted,
+          shiftedRating: predicted === null ? null : predicted + playerTopxShift,
+        };
+      })
       .filter((row) => Number.isFinite(row.rank) && row.rank > 0 && row.finalRating !== null)
       .sort((a, b) => a.rank - b.rank);
-  }, [playerCurve, playerTopxBucketRows]);
+  }, [playerCurve, playerTopxBucketRows, playerTopxShift]);
   // Actual (observed) ratings — only at tiers with real map data, plotted as points.
   const playerTopxActualPoints = useMemo(
     () =>
@@ -7136,6 +7631,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
       [
         ...playerTopxRows.map((row) => row.finalRating),
         ...playerTopxRows.map((row) => row.predictedRating),
+        ...playerTopxRows.map((row) => row.shiftedRating),
         ...playerTopxActualPoints.map((p) => p.rating),
       ].filter((v) => Number.isFinite(v)),
       0.05
@@ -7157,10 +7653,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
       switch (playerSort) {
         case "name_desc":
           return String(b.name || "").localeCompare(String(a.name || ""));
-        case "id_asc":
-          return toNum(a.player_id) - toNum(b.player_id);
-        case "id_desc":
-          return toNum(b.player_id) - toNum(a.player_id);
         case "rating_desc":
           return toNum(b.rating) - toNum(a.rating);
         case "rating_asc":
@@ -7169,10 +7661,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
           return ((playerTeamLookup[a.player_id] || [])[0] || "").localeCompare(((playerTeamLookup[b.player_id] || [])[0] || ""));
         case "team_desc":
           return ((playerTeamLookup[b.player_id] || [])[0] || "").localeCompare(((playerTeamLookup[a.player_id] || [])[0] || ""));
-        case "boost_asc":
-          return Number(hasBoostersAndRoles(a)) - Number(hasBoostersAndRoles(b));
-        case "boost_desc":
-          return Number(hasBoostersAndRoles(b)) - Number(hasBoostersAndRoles(a));
         case "name_asc":
         default:
           return String(a.name || "").localeCompare(String(b.name || ""));
@@ -7201,10 +7689,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
       switch (teamSort) {
         case "name_desc":
           return String(b.name || "").localeCompare(String(a.name || ""));
-        case "id_asc":
-          return toNum(a.team_id) - toNum(b.team_id);
-        case "id_desc":
-          return toNum(b.team_id) - toNum(a.team_id);
         case "hltv_asc":
           return toNum(a.hltv_rank, 9999) - toNum(b.hltv_rank, 9999);
         case "hltv_desc":
@@ -7247,7 +7731,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
         </button>
       </div>
 
-      {dbTab === "maps" && <MapsTab teams={teams} mapStats={mapStats} />}
+      {dbTab === "maps" && <MapsTab teams={teams} />}
 
       {dbTab === "players" && <Section title="Players">
         {loading ? (
@@ -7257,106 +7741,20 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
         ) : (
           <div className="players-panel">
             <div className="grid two">
-              <Input label="Search Players" value={playerSearch} onChange={setPlayerSearch} placeholder="Name, ID, or team" />
+              <Input label="Search Players" value={playerSearch} onChange={setPlayerSearch} placeholder="Name or team" />
             </div>
-            <div className="card sub players-batch-toolbar">
-              <div className="actions" style={{ marginTop: 0, alignItems: "center" }}>
-                <label className="field" style={{ margin: 0 }}>
-                  <span>Timeframe {topxWindowBusy ? "(switching…)" : ""}</span>
-                  <select
-                    value={topxMonths}
-                    onChange={(e) => changeTopxWindow(e.target.value)}
-                    disabled={batchTopRatingsActive || topxWindowBusy}
-                  >
-                    {["3", "6", "12"].map((m) => (
-                      <option key={m} value={m}>
-                        Last {m} months{Number(topxCoverage[m] || 0) > 0 ? ` (${topxCoverage[m]} stored)` : " (none stored)"}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <button
-                  className="primary"
-                  onClick={() => importPlayerTopRatingsBatch(false)}
-                  disabled={players.length === 0 || batchTopRatingsActive}
-                >
-                  {batchTopRatingsActive ? `Importing ${batchTopRatingsTotal} players...` : `Import All (${players.length})`}
-                </button>
-                <button
-                  className="secondary"
-                  onClick={importEventTopRatingsBatch}
-                  disabled={eventPlayerIds.length === 0 || batchTopRatingsActive}
-                  title="Import Top-X data only for players in the active event"
-                >
-                  {batchTopRatingsActive ? "Importing..." : `Import Current Event (${eventPlayerIds.length})`}
-                </button>
-                <button
-                  className="secondary"
-                  onClick={() => importPlayerTopRatingsBatch(true)}
-                  disabled={missingTopRatingsCount === 0 || batchTopRatingsActive}
-                >
-                  {batchTopRatingsActive ? "Importing..." : `Import Missing (${missingTopRatingsCount})`}
-                </button>
-                {batchTopRatingsActive && batchTopRatingsJobId && (
-                  <button className="secondary" onClick={pauseBatchTopRatingsJob} disabled={batchTopRatingsStatus === "pausing"}>
-                    {batchTopRatingsStatus === "pausing" ? "Pausing..." : "Pause"}
-                  </button>
-                )}
-                {batchTopRatingsActive && batchTopRatingsJobId && (
-                  <button className="danger" onClick={cancelBatchTopRatingsJob} disabled={batchTopRatingsStatus === "canceling"}>
-                    {batchTopRatingsStatus === "canceling" ? "Canceling..." : "Cancel"}
-                  </button>
-                )}
-                {batchTopRatingsResumable && batchTopRatingsJobId && (
-                  <button className="secondary" onClick={resumeBatchTopRatingsJob} disabled={batchTopRatingsBusy}>
-                    Resume
-                  </button>
-                )}
-              </div>
-            </div>
-            {showBatchTopRatingsProgress && (
-              <div className="card sub">
-                <p className="muted">
-                  Top-X progress: {batchTopRatingsProcessed.toLocaleString()} / {batchTopRatingsTotal.toLocaleString()} | ok{" "}
-                  {batchTopRatingsOk} | failed {batchTopRatingsFailed}
-                  {["queued", "running", "pausing", "canceling"].includes(batchTopRatingsStatus) && batchTopRatingsTotal > batchTopRatingsProcessed
-                    ? ` | ETA: ${formatBatchEta(batchTopRatingsEtaSeconds)}`
-                    : ""}
-                </p>
-                <div className="progress">
-                  <div className="progress-bar determinate" style={{ width: `${batchTopRatingsProgressPct}%` }} />
-                </div>
-                <p className="muted">
-                  Status: {batchTopRatingsStatusLabel}
-                </p>
-                {batchTopRatingsLastError && <p className="muted">Last error: {batchTopRatingsLastError}</p>}
-              </div>
-            )}
             <div className="players-table-wrap">
             <table className="players-table">
               <colgroup>
+                <col style={{ width: "34%" }} />
+                <col style={{ width: "44%" }} />
                 <col style={{ width: "22%" }} />
-                <col style={{ width: "16%" }} />
-                <col style={{ width: "30%" }} />
-                <col style={{ width: "16%" }} />
-                <col style={{ width: "16%" }} />
               </colgroup>
               <thead>
                 <tr>
                   <SortHeader sortValue={playerSort} asc="name_asc" desc="name_desc" onChange={setPlayerSort}>Name</SortHeader>
-                  <SortHeader sortValue={playerSort} asc="id_asc" desc="id_desc" onChange={setPlayerSort}>ID</SortHeader>
                   <SortHeader sortValue={playerSort} asc="team_asc" desc="team_desc" onChange={setPlayerSort}>Team</SortHeader>
                   <SortHeader sortValue={playerSort} asc="rating_asc" desc="rating_desc" defaultDirection="desc" onChange={setPlayerSort}>Rating</SortHeader>
-                  <SortHeader
-                    sortValue={playerSort}
-                    asc="boost_asc"
-                    desc="boost_desc"
-                    defaultDirection="desc"
-                    onChange={setPlayerSort}
-                    title="Boosters and Roles imported"
-                  >
-                    Boost/Role
-                  </SortHeader>
                 </tr>
               </thead>
               <tbody>
@@ -7369,16 +7767,9 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                       setShowPlayerModal(true);
                     }}
                     >
-                      <td>{p.name}</td>
-                      <td>{p.player_id}</td>
+                      <td><PlayerPhoto playerId={p.player_id} name={p.name} size={26} />{p.name}</td>
                       <td>{(playerTeamLookup[p.player_id] || []).join(", ") || "-"}</td>
                       <td>{Number(p.rating || 0).toFixed(2)}</td>
-                      <td className="status-cell">
-                        <span
-                          className={hasBoostersAndRoles(p) ? "status-dot ok" : "status-dot missing"}
-                        title={hasBoostersAndRoles(p) ? "Boosters and roles imported" : "Boosters and roles missing"}
-                      />
-                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -7390,101 +7781,140 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
 
       {showPlayerModal && (
         <div className="modal-backdrop" onClick={() => setShowPlayerModal(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <header className="modal-header">
-              <h3 className="player-modal-title">{playerForm.name || "Player Details"}</h3>
+          <div className="modal player-modal" onClick={(e) => e.stopPropagation()}>
+            <header className="modal-header player-hero-header">
+              <div className="player-hero">
+                <PlayerPhoto playerId={playerForm.player_id} name={playerForm.name} size={132} className="hero" />
+                <div className="player-hero-main">
+                  <h3 className="player-modal-title">{playerForm.name || "Player Details"}</h3>
+                  <div className="hero-rating">
+                    <span className="hero-rating-label">Rating</span>
+                    <span className="hero-rating-value">{Number(playerForm.rating || 0).toFixed(2)}</span>
+                  </div>
+                </div>
+                {heroTeam && (
+                  <button
+                    type="button"
+                    className="player-hero-team"
+                    onClick={() => openTeamDetailsFromPlayer(heroTeam.team_id)}
+                    title={`Open ${heroTeam.team_name}`}
+                  >
+                    <TeamLogo hltvTeamId={heroTeam.hltv_team_id} name={heroTeam.team_name} size={84} />
+                    <span>{heroTeam.team_name}</span>
+                  </button>
+                )}
+              </div>
               <button className="close" onClick={() => setShowPlayerModal(false)}>
                 &times;
               </button>
             </header>
             <div className="modal-body">
-              <div className="player-summary">
-                <div className="player-summary-meta">
-                  <span className="player-summary-chip player-summary-id">ID {playerForm.player_id || "-"}</span>
-                  <span className="player-summary-chip player-summary-rating">Rating {Number(playerForm.rating || 0).toFixed(2)}</span>
-                  <div className="player-summary-teams-wrap">
-                    {(playerTeamLinks[playerForm.player_id] || []).length > 0 ? (
-                      (playerTeamLinks[playerForm.player_id] || []).map((team) => (
-                        <button
-                          key={`${playerForm.player_id}-${team.team_id}`}
-                          type="button"
-                          className="player-summary-chip player-summary-team-btn"
-                          onClick={() => openTeamDetailsFromPlayer(team.team_id)}
-                          title={`Open ${team.team_name}`}
-                        >
-                          {team.team_name}
-                        </button>
-                      ))
-                    ) : (
-                      <span className="player-summary-chip player-summary-teams">-</span>
-                    )}
-                  </div>
-                </div>
-              </div>
               <div className="tab-bar small">
                 <button className={playerTab === "info" ? "tab active" : "tab"} onClick={() => setPlayerTab("info")}>
                   Ratings
                 </button>
-                <button className={playerTab === "topxGraph" ? "tab active" : "tab"} onClick={() => setPlayerTab("topxGraph")}>
-                  Top X Graph
+                <button className={playerTab === "roles" ? "tab active" : "tab"} onClick={() => setPlayerTab("roles")}>
+                  Roles
                 </button>
                 <button className={playerTab === "boosters" ? "tab active" : "tab"} onClick={() => setPlayerTab("boosters")}>
                   Boosters
                 </button>
-                <button className={playerTab === "roles" ? "tab active" : "tab"} onClick={() => setPlayerTab("roles")}>
-                  Roles
+                <button className={playerTab === "topxGraph" ? "tab active" : "tab"} onClick={() => setPlayerTab("topxGraph")}>
+                  Top X
                 </button>
               </div>
               {playerTab === "info" && (
                 <div className="stack">
-                  <div className="actions" style={{ marginTop: 0 }}>
-                    <button
-                      className="primary button-with-spinner"
-                      onClick={fetchPlayerTopRatings}
-                      disabled={!playerForm.player_id || topRatingsBusy}
-                    >
-                      {topRatingsBusy && <span className="button-spinner" aria-hidden="true" />}
-                      <span>{topRatingsBusy ? "Importing..." : "Import Top-X Data"}</span>
-                    </button>
+                  <div className="topx-tile-row">
+                    {TOP_RATING_TIERS.map((tier) => {
+                      // A tier with no maps has no real rating either — a
+                      // stored 0/0 just marks "never played vs this tier".
+                      const maps = Number(playerForm[`maps_top${tier}`]);
+                      const rating = Number(playerForm[`rating_top${tier}`]);
+                      const hasData = Number.isFinite(maps) && maps > 0 && Number.isFinite(rating) && rating > 0;
+                      return (
+                        <div key={`tile-${tier}`} className={`topx-tile ${hasData ? "" : "empty"}`}>
+                          <div className="topx-tile-label">Top {tier}</div>
+                          <div className="topx-tile-value">{hasData ? rating.toFixed(2) : "---"}</div>
+                          <div className="topx-tile-maps">{hasData ? `${Math.round(maps)} maps` : "no maps"}</div>
+                        </div>
+                      );
+                    })}
                   </div>
-                  {playerTopxFeedback?.message && (
-                    <p className={`inline-status ${playerTopxFeedback.kind || "info"}`}>{playerTopxFeedback.message}</p>
-                  )}
-                  <p className="muted">Last Top-X import: {formatTopxImportedAt(playerForm.last_topx_import_at)}</p>
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Metric</th>
-                        {TOP_RATING_TIERS.map((tier) => (
-                          <th key={`head-${tier}`}>{`Top ${tier}`}</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <tr>
-                        <td>Rating</td>
-                        {TOP_RATING_TIERS.map((tier) => {
-                          const ratingRaw = playerForm[`rating_top${tier}`];
-                          const rating =
-                            ratingRaw === "" || ratingRaw === null || ratingRaw === undefined ? NaN : Number(ratingRaw);
-                          return <td key={`rating-${tier}`}>{Number.isFinite(rating) ? rating.toFixed(2) : "-"}</td>;
-                        })}
-                      </tr>
-                      <tr>
-                        <td>Maps Played</td>
-                        {TOP_RATING_TIERS.map((tier) => {
-                          const mapsRaw = playerForm[`maps_top${tier}`];
-                          const maps = mapsRaw === "" || mapsRaw === null || mapsRaw === undefined ? NaN : Number(mapsRaw);
-                          return <td key={`maps-${tier}`}>{Number.isFinite(maps) ? Math.round(maps) : "-"}</td>;
-                        })}
-                      </tr>
-                    </tbody>
-                  </table>
+                  <div className="player-highlight-row">
+                    {heroExtras?.bestRole && (
+                      <div className="player-highlight-card">
+                        <RoleBadge roleId={heroExtras.bestRole.id} size={46} />
+                        <div>
+                          <div className="player-highlight-label">Best Role</div>
+                          <div className="player-highlight-value">{heroExtras.bestRole.label}</div>
+                          <div className="player-highlight-sub">{heroExtras.bestRole.expected.toFixed(2)} pts/game</div>
+                        </div>
+                      </div>
+                    )}
+                    {heroExtras?.bestBooster && (
+                      <div className="player-highlight-card">
+                        <BoosterBadge boosterId={heroExtras.bestBooster.id} size={46} />
+                        <div>
+                          <div className="player-highlight-label">Best Booster</div>
+                          <div className="player-highlight-value">{heroExtras.bestBooster.label}</div>
+                          <div className="player-highlight-sub">
+                            {heroExtras.bestBooster.delta >= 0 ? "+" : ""}
+                            {Math.round(heroExtras.bestBooster.delta * 100)}% vs average ({Math.round(heroExtras.bestBooster.value * 100)}%)
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  <div className="form-section">
+                    <h4 className="form-heading">Recent Matches</h4>
+                    {playerRecentForm.length === 0 && <p className="muted">No stored matches for this player's team yet.</p>}
+                    {playerRecentForm.length > 0 && (
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Date</th>
+                            <th>Opponent</th>
+                            <th>Result</th>
+                            <th>Rating</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {playerRecentForm.map((m) => {
+                            const opp = teams.find(
+                              (x) => String(x.name || "").trim().toLowerCase() === String(m.opponent || "").trim().toLowerCase()
+                            );
+                            return (
+                              <tr
+                                key={m.match_url || `${m.date}-${m.opponent}`}
+                                className={m.match_url ? "row-link" : ""}
+                                onClick={() => openStoredMatch(m.match_url)}
+                                title={m.match_url ? "Open stored match details" : undefined}
+                              >
+                                <td>{formatDMY(m.date)}</td>
+                                <td>
+                                  <TeamLogo hltvTeamId={opp?.hltv_team_id} name={m.opponent} size={20} />
+                                  {m.opponent}
+                                </td>
+                                <td>
+                                  <span className={`hero-form-chip ${m.won ? "win" : "loss"}`}>{m.won ? "W" : "L"}</span>{" "}
+                                  {m.score}
+                                </td>
+                                <td className="form-rating">
+                                  {m.rating !== null && Number.isFinite(Number(m.rating)) ? Number(m.rating).toFixed(2) : "—"}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
                 </div>
               )}
               {playerTab === "topxGraph" && (
                 <div className="stack">
-                  {playerCurveLoading && <p className="muted">Loading Top-X graph...</p>}
+                  {playerCurveLoading && <p className="muted">Loading Top-X data...</p>}
                   {playerCurveError && <p className="error">{playerCurveError}</p>}
                   {!playerCurveLoading && !playerCurveError && playerTopxBucketRows.length === 0 && (
                     <p className="muted">No adjusted Top-X bucket data available yet.</p>
@@ -7505,10 +7935,10 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                           </>
                         ) : null}
                       </p>
-                      <div className="value-chart-wrap">
-                        <ResponsiveContainer width="100%" height={320}>
+                      <div className="value-chart-wrap topx-chart">
+                        <ResponsiveContainer width="100%" height={260}>
                           <ComposedChart data={playerTopxRows} margin={{ top: 12, right: 18, left: 6, bottom: 12 }}>
-                            <CartesianGrid stroke="#284061" strokeDasharray="3 3" />
+                            <CartesianGrid stroke="#232a34" strokeDasharray="3 3" />
                             <XAxis
                               type="number"
                               dataKey="rank"
@@ -7516,15 +7946,15 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                               ticks={[1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50]}
                               interval={0}
                               minTickGap={0}
-                              tick={{ fill: "#9fc5ff", fontSize: 12 }}
-                              axisLine={{ stroke: "#365a89" }}
-                              tickLine={{ stroke: "#365a89" }}
+                              tick={{ fill: "#9fb2c9", fontSize: 12 }}
+                              axisLine={{ stroke: "#3a4452" }}
+                              tickLine={{ stroke: "#3a4452" }}
                               tickFormatter={(v) => String(v)}
                             />
                             <YAxis
-                              tick={{ fill: "#9fc5ff", fontSize: 12 }}
-                              axisLine={{ stroke: "#365a89" }}
-                              tickLine={{ stroke: "#365a89" }}
+                              tick={{ fill: "#9fb2c9", fontSize: 12 }}
+                              axisLine={{ stroke: "#3a4452" }}
+                              tickLine={{ stroke: "#3a4452" }}
                               domain={playerTopxRatingAxis.domain}
                               ticks={playerTopxRatingAxis.ticks}
                               interval={0}
@@ -7532,7 +7962,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                               tickFormatter={(v) => Number(v).toFixed(2)}
                             />
                             <Tooltip
-                              contentStyle={{ background: "#0e1f3f", border: "1px solid #2f5ca5", borderRadius: 10, color: "#dcecff" }}
+                              contentStyle={{ background: "#14181f", border: "1px solid #3a4452", borderRadius: 10, color: "#e9edf3" }}
                               formatter={(value, name, props) => {
                                 if (value == null) return ["—", name];
                                 if (name === "Actual (observed)") {
@@ -7543,7 +7973,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                               }}
                               labelFormatter={(v) => `Rank ${v}`}
                             />
-                            <Legend wrapperStyle={{ color: "#9fc5ff" }} />
+                            <Legend wrapperStyle={{ color: "#9fb2c9" }} />
                             <Line
                               type="linear"
                               dataKey="predictedRating"
@@ -7555,6 +7985,19 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                               connectNulls
                               isAnimationActive={false}
                             />
+                            {Math.abs(playerTopxShift) >= 0.005 && (
+                              <Line
+                                type="linear"
+                                dataKey="shiftedRating"
+                                name={`Predicted + shift (${playerTopxShift >= 0 ? "+" : ""}${playerTopxShift.toFixed(3)})`}
+                                stroke="#a78bfa"
+                                strokeWidth={1.8}
+                                strokeDasharray="2 4"
+                                dot={false}
+                                connectNulls
+                                isAnimationActive={false}
+                              />
+                            )}
                             <Line
                               type="linear"
                               dataKey="finalRating"
@@ -7575,11 +8018,15 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                           </ComposedChart>
                         </ResponsiveContainer>
                       </div>
-                      <table>
+                      <table className="topx-bucket-table">
                         <thead>
                           <tr>
                             <th>Bucket</th>
                             <th>Predicted</th>
+                            <th title="Predicted curve after this player's vs-ranked shift — the baseline the weighted value blends from">
+                              + Shift ({playerTopxShift >= 0 ? "+" : ""}
+                              {playerTopxShift.toFixed(3)})
+                            </th>
                             <th>Actual</th>
                             <th>Weighted</th>
                             <th>Sample Weight</th>
@@ -7595,6 +8042,9 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                               </td>
                               <td style={{ color: "#8aa0c6" }}>
                                 {Number.isFinite(row.priorRating) ? row.priorRating.toFixed(3) : "-"}
+                              </td>
+                              <td style={{ color: "#a78bfa" }}>
+                                {Number.isFinite(row.adjustedPriorRating) ? row.adjustedPriorRating.toFixed(3) : "-"}
                               </td>
                               <td style={{ color: "#f0a763" }}>
                                 {!row.estimated && row.maps > 0 && Number.isFinite(row.rawBucketRating)
@@ -7639,6 +8089,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                     }
                     return (
                       <div key={id} className="booster-tier-card">
+                        <BoosterBadge boosterId={id} size={54} />
                         <div className="booster-tier-label">{label}</div>
                         <div className="booster-tier-value">{percentText}</div>
                         <div className={`booster-tier-delta ${deltaClass}`}>{deltaText}</div>
@@ -7693,6 +8144,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
 
                       return (
                         <div key={r.id} className={`role-tier-card ${medalClass}`}>
+                          <RoleBadge roleId={r.id} />
                           <div className="role-tier-label">{r.label}</div>
                           <div className="role-tier-split">
                             <span>Major: {majorText}</span>
@@ -7714,7 +8166,10 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
         <div className="modal-backdrop" onClick={() => setShowTeamModal(false)}>
           <div className="modal team-modal" onClick={(e) => e.stopPropagation()}>
             <header className="modal-header">
-              <h3 className="player-modal-title">{teamForm.name || "Team"}</h3>
+              <div className="modal-title-wrap">
+                <TeamLogo hltvTeamId={teamForm.hltv_team_id} name={teamForm.name} size={44} />
+                <h3 className="player-modal-title">{teamForm.name || "Team"}</h3>
+              </div>
               <button className="close" onClick={() => setShowTeamModal(false)}>
                 &times;
               </button>
@@ -7732,7 +8187,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                       disabled={!Number(pid)}
                       title={Number(pid) ? `Open ${playerLookup[Number(pid)] || "player"}` : "No player"}
                     >
-                      <div className="team-player-slot">Player {idx + 1}</div>
+                      <PlayerPhoto playerId={pid} name={playerLookup[Number(pid)]} size={72} className="roster-photo" />
                       <div className="team-player-name">{playerLookup[Number(pid)] || "-"}</div>
                     </button>
                   ))}
@@ -7741,14 +8196,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
 
               <section className="team-detail-block">
                 <h4 className="team-detail-heading">Rankings</h4>
-                <div className="grid two">
-                  <Input
-                    label="HLTV Team ID"
-                    value={teamForm.hltv_team_id}
-                    onChange={(v) => setTeamForm({ ...teamForm, hltv_team_id: v })}
-                    placeholder="e.g. 12468"
-                  />
-                </div>
                 <div className="team-stats-grid">
                   <div className="team-stat-card">
                     <div className="team-stat-label">HLTV Rank</div>
@@ -7774,12 +8221,14 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                   <div>
                     <h4 className="team-detail-heading">Map Stats</h4>
                     {teamMapStatsRows.length > 0 && (
-                      <p className="muted">Last 3 months: {teamMapStatsTotalPlayed.toLocaleString()} maps played</p>
+                      <p className="muted">
+                        Last 3 months: {teamMapStatsTotalPlayed.toLocaleString()} maps played
+                        {Number(teamVetoProfile?.matches || 0) > 0
+                          ? ` · pick/ban from ${teamVetoProfile.matches} stored vetoes`
+                          : ""}
+                      </p>
                     )}
                   </div>
-                  <button className="secondary" onClick={refreshSelectedTeamMapStats} disabled={!selectedTeam || mapStats.active}>
-                    {mapStats.active ? "Importing..." : "Import Map Stats"}
-                  </button>
                 </div>
                 {mapStats.show && (
                   <div className="team-map-stats-progress">
@@ -7797,13 +8246,43 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                 <div className="team-map-stats-grid">
                   {teamMapStatsRows.length > 0 ? (
                     teamMapStatsRows.map((row) => (
-                      <div className="team-map-stat-card" key={`team-map-${row.map}`}>
-                        <div className="team-map-stat-title">{row.map}</div>
-                        <div className="team-map-stat-main">{formatTeamPct(row.winRate, 1)}</div>
-                        <div className="team-map-stat-split">
-                          <span>Pick {formatTeamPct(row.pickRate, 1)}</span>
-                          <span>Ban {formatTeamPct(row.banRate, 1)}</span>
-                          <span>{Number(row.played || 0)} maps</span>
+                      <div
+                        className={`team-map-stat-card ${row.hasData ? "" : "empty"}`}
+                        key={`team-map-${row.map}`}
+                        style={{ "--map-color": MAP_BAR_COLORS[row.map] || MAP_BAR_FALLBACK_COLOR }}
+                      >
+                        <div className="team-map-stat-head">
+                          <span className="team-map-stat-title">{row.map}</span>
+                          <span className="team-map-stat-count">{row.played > 0 ? `${row.played} maps` : "not played"}</span>
+                        </div>
+                        <div className="team-map-stat-main">{row.played > 0 ? formatTeamPct(row.winRate, 1) : "—"}</div>
+                        <div className="team-map-stat-bar">
+                          <div
+                            className="team-map-stat-bar-fill"
+                            style={{ width: `${row.played > 0 ? Math.max(0, Math.min(100, Number(row.winRate || 0) * 100)) : 0}%` }}
+                          />
+                        </div>
+                        <div className="team-map-stat-veto">
+                          <div className="veto-row">
+                            <span className="veto-label">Pick</span>
+                            <div className="veto-bar">
+                              <div
+                                className="veto-fill pick"
+                                style={{ width: `${Math.max(0, Math.min(100, Number(row.pickRate || 0) * 100))}%` }}
+                              />
+                            </div>
+                            <span className="veto-val">{formatTeamPct(row.pickRate, 1)}</span>
+                          </div>
+                          <div className="veto-row">
+                            <span className="veto-label">Ban</span>
+                            <div className="veto-bar">
+                              <div
+                                className="veto-fill ban"
+                                style={{ width: `${Math.max(0, Math.min(100, Number(row.banRate || 0) * 100))}%` }}
+                              />
+                            </div>
+                            <span className="veto-val">{formatTeamPct(row.banRate, 1)}</span>
+                          </div>
                         </div>
                       </div>
                     ))
@@ -7813,19 +8292,25 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                 </div>
               </section>
             </div>
-            <div className="actions">
-              <button className="primary" onClick={saveTeam} disabled={!teamForm.name}>
-                Save Team
-              </button>
-              <button className="danger" onClick={deleteTeam} disabled={!selectedTeam}>
-                Delete Team
-              </button>
-              <button className="secondary" onClick={() => setShowTeamModal(false)}>
-                Close
-              </button>
-            </div>
           </div>
         </div>
+      )}
+
+      {playerMatchDetail && (
+        <MatchDetailModal
+          row={playerMatchDetail}
+          teams={teams}
+          players={players}
+          onClose={() => setPlayerMatchDetail(null)}
+          onOpenPlayer={(pid) => {
+            setPlayerMatchDetail(null);
+            openPlayerDetailsFromTeam(pid);
+          }}
+          onOpenTeam={(tid) => {
+            setPlayerMatchDetail(null);
+            openTeamDetailsFromPlayer(tid);
+          }}
+        />
       )}
 
       {dbTab === "teams" && <Section title="Teams">
@@ -7836,50 +8321,14 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
         ) : (
           <>
             <div className="teams-controls">
-              <div className="teams-toolbar">
-                <button className="primary" onClick={startRankingsRefreshJob} disabled={rankingsJobActive || teams.length === 0}>
-                  {rankingsJobActive ? `Refreshing Rankings ${rankingsJobProcessed}/${rankingsJobTotal}` : "Refresh Rankings (HLTV + VRS)"}
-                </button>
-                {rankingsJobActive && rankingsJobId && (
-                  <button className="secondary" onClick={pauseRankingsJob} disabled={rankingsJobStatus === "pausing"}>
-                    {rankingsJobStatus === "pausing" ? "Pausing..." : "Pause"}
-                  </button>
-                )}
-                {rankingsJobActive && rankingsJobId && (
-                  <button className="danger" onClick={cancelRankingsJob} disabled={rankingsJobStatus === "canceling"}>
-                    {rankingsJobStatus === "canceling" ? "Canceling..." : "Cancel"}
-                  </button>
-                )}
-                {rankingsJobResumable && rankingsJobId && (
-                  <button className="secondary" onClick={resumeRankingsJob}>
-                    Resume
-                  </button>
-                )}
-                <span className="teams-meta">{filteredSortedTeams.length} teams shown</span>
-              </div>
               <div className="grid two teams-filters">
-                <Input label="Search Teams" value={teamSearch} onChange={setTeamSearch} placeholder="Name, ID, or player" />
+                <Input label="Search Teams" value={teamSearch} onChange={setTeamSearch} placeholder="Name or player" />
               </div>
             </div>
-            {showRankingsJobProgress && (
-              <div className="card sub">
-                <p className="muted">
-                  Rankings refresh: {rankingsJobProcessed} / {rankingsJobTotal} phases
-                  {rankingsJobPhaseLabel ? ` | current: ${rankingsJobPhaseLabel}` : ""}
-                  {rankingsJobResults.length > 0 ? ` | ${summarizeRankingsResults(rankingsJobResults)}` : ""}
-                </p>
-                <div className="progress">
-                  <div className="progress-bar determinate" style={{ width: `${rankingsJobProgressPct}%` }} />
-                </div>
-                <p className="muted">Status: {rankingsJobStatusLabel}</p>
-                {rankingsJobLastError && <p className="muted">Last error: {rankingsJobLastError}</p>}
-              </div>
-            )}
             <table>
               <thead>
                 <tr>
                   <SortHeader sortValue={teamSort} asc="name_asc" desc="name_desc" onChange={setTeamSort}>Name</SortHeader>
-                  <SortHeader sortValue={teamSort} asc="id_asc" desc="id_desc" onChange={setTeamSort}>ID</SortHeader>
                   <SortHeader sortValue={teamSort} asc="hltv_asc" desc="hltv_desc" onChange={setTeamSort}>HLTV Rank</SortHeader>
                   <SortHeader sortValue={teamSort} asc="hltv_points_asc" desc="hltv_points_desc" defaultDirection="desc" onChange={setTeamSort}>HLTV Points</SortHeader>
                   <SortHeader sortValue={teamSort} asc="vrs_asc" desc="vrs_desc" onChange={setTeamSort}>VRS Rank</SortHeader>
@@ -7897,8 +8346,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                         setShowTeamModal(true);
                       }}
                     >
-                    <td>{t.name}</td>
-                    <td>{t.team_id}</td>
+                    <td><TeamLogo hltvTeamId={t.hltv_team_id} name={t.name} size={28} />{t.name}</td>
                     <td>{t.hltv_rank}</td>
                     <td>{t.hltv_points ?? "-"}</td>
                     <td>{t.vrs_rank}</td>
@@ -7918,7 +8366,14 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
       </Section>}
       {dbTab === "matches" && (
         <Section title="Matches">
-          <MatchesDataPanel notify={notify} />
+          <MatchesDataPanel
+            notify={notify}
+            mode="view"
+            teams={teams}
+            players={players}
+            onOpenPlayer={openPlayerDetailsFromTeam}
+            onOpenTeam={openTeamDetailsFromPlayer}
+          />
         </Section>
       )}
 
@@ -8327,274 +8782,641 @@ function HltvReplicaSimulatorPanel({ eventId, hltvEventId, hltvEventUrl }) {
   );
 }
 
-function AdminTab({ refresh, notify }) {
-  const [dataTab, setDataTab] = useState("trigger");
-  const [triggerJson, setTriggerJson] = useState("");
-  const [triggerUpdatedPlayers, setTriggerUpdatedPlayers] = useState([]);
-  const [importResult, setImportResult] = useState("");
-  const [importBusy, setImportBusy] = useState(false);
-  const [wipeBusy, setWipeBusy] = useState(false);
-  const [deleteMatchesBusy, setDeleteMatchesBusy] = useState(false);
+function TopxImportPanel({ players, notify, refresh }) {
+  // Player Top-X data controls (timeframe window + manual batch imports),
+  // relocated from the Database tab so all data ingestion lives on the
+  // Scheduling page alongside the nightly schedule.
+  const [topxMonths, setTopxMonths] = useState("3"); // active window (months of HLTV history)
+  const [topxCoverage, setTopxCoverage] = useState({}); // { "3": 337, "6": 0, ... }
+  const [topxWindowBusy, setTopxWindowBusy] = useState(false);
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [batchStatus, setBatchStatus] = useState("idle");
+  const [batchJobId, setBatchJobId] = useState("");
+  const [batchProcessed, setBatchProcessed] = useState(0);
+  const [batchTotal, setBatchTotal] = useState(0);
+  const [batchOk, setBatchOk] = useState(0);
+  const [batchFailed, setBatchFailed] = useState(0);
+  const [batchLastError, setBatchLastError] = useState("");
+  const [batchEtaSeconds, setBatchEtaSeconds] = useState(null);
+  const [eventPlayerIds, setEventPlayerIds] = useState([]);
+  const batchPollingRef = useRef(false);
+  // Exponentially-weighted seconds-per-player so the ETA tracks the CURRENT pace
+  // (recent samples weighted most, older ones decaying), instead of the lifetime
+  // average which lags badly when the speed changes mid-run.
+  const batchEmaRef = useRef({ lastT: 0, lastProcessed: 0, ema: null });
 
-  const importTriggers = async () => {
-    if (!triggerJson.trim()) {
-      setImportResult("Paste triggerRates JSON first.");
-      return;
-    }
-    setImportBusy(true);
-    setImportResult("");
-    setTriggerUpdatedPlayers([]);
+  const loadTopxWindow = async () => {
     try {
-      const res = await api.post("/admin/import-trigger-rates", { trigger_json: triggerJson });
-      const msg = `Updated players: ${res.updated_players ?? 0}`;
-      setImportResult(msg);
-      setTriggerUpdatedPlayers(res.updated_players_info || []);
-      setTriggerJson("");
-      notify("Trigger rates imported");
-      refresh();
-    } finally {
-      setImportBusy(false);
+      const data = await api.get("/players/topx-window", 30000);
+      if (data?.active) setTopxMonths(String(data.active));
+      if (data?.coverage) setTopxCoverage(data.coverage);
+    } catch {
+      /* non-fatal */
     }
   };
+  useEffect(() => {
+    loadTopxWindow();
+  }, []);
 
-  const wipeDb = async () => {
-    setWipeBusy(true);
-    await api.post("/admin/wipe", {});
-    notify("Database wiped");
-    setWipeBusy(false);
-    refresh();
-  };
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .get("/players/event-player-ids", 30000)
+      .then((data) => {
+        if (!cancelled) setEventPlayerIds(Array.isArray(data?.player_ids) ? data.player_ids : []);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [players]);
 
-  const deleteStoredMatches = async () => {
-    setDeleteMatchesBusy(true);
+  // Switching the window rebuilds the shared tier columns from that window's
+  // archive (no re-scrape), so 3/6/12-month data coexist and are swappable.
+  const changeTopxWindow = async (months) => {
+    setTopxMonths(String(months));
+    setTopxWindowBusy(true);
     try {
-      const res = await api.delete("/events/hltv-results");
-      notify(`Deleted ${Number(res?.deleted || 0)} stored matches`);
+      const res = await api.post("/players/topx-window/active", { months: Number(months) || 3 }, 60000);
+      if (res?.coverage) setTopxCoverage(res.coverage);
+      await refresh();
+      notify(`Active Top-X window: last ${months} months`);
     } catch (e) {
-      notify(`Failed to delete stored matches: ${e?.message || "unknown error"}`);
+      notify(`Failed to switch window: ${e?.message || "unknown error"}`);
     } finally {
-      setDeleteMatchesBusy(false);
+      setTopxWindowBusy(false);
     }
   };
 
-  return (
-    <div className="stack">
-      <Section title="Data Management Tools">
-        <div className="tab-bar small">
-          <button className={dataTab === "trigger" ? "tab active" : "tab"} onClick={() => setDataTab("trigger")}>
-            Trigger Rates
-          </button>
-          <button className={dataTab === "maintenance" ? "tab active" : "tab"} onClick={() => setDataTab("maintenance")}>
-            Maintenance
-          </button>
-        </div>
+  const applyBatchStatus = (status, jobIdOverride = "") => {
+    const jobId = String(jobIdOverride || status?.job_id || "");
+    const processed = Number(status?.processed_players || 0);
+    const total = Number(status?.total_players || 0);
+    const ok = Number(status?.ok || 0);
+    const failed = Number(status?.failed || 0);
+    const nextStatus = String(status?.status || "queued");
+    const lastError = String(status?.last_error || status?.error || "");
 
-        {dataTab === "trigger" && (
-          <div className="stack">
-            <p className="muted">
-              Booster/role data is normally fetched automatically from the Events page. This manual paste remains as a
-              fallback.
-            </p>
-            <label className="field">
-              <span>Trigger Rates JSON (playerTriggerRates) — manual fallback</span>
-              <textarea
-                rows={14}
-                value={triggerJson}
-                onChange={(e) => setTriggerJson(e.target.value)}
-                placeholder="Paste the triggerRates JSON here"
-              />
-            </label>
-            <div className="actions">
-              <button className="primary" onClick={importTriggers} disabled={importBusy}>
-                {importBusy ? "Importing..." : "Import Trigger Rates"}
-              </button>
-            </div>
-            {triggerUpdatedPlayers.length > 0 && (
-              <div className="card sub">
-                <h4>Updated Players ({triggerUpdatedPlayers.length})</h4>
-                <ul>
-                  {triggerUpdatedPlayers.map((p) => (
-                    <li key={p.player_id}>
-                      {p.name} (ID {p.player_id})
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-          </div>
-        )}
+    setBatchStatus(nextStatus);
+    setBatchJobId(jobId);
+    setBatchProcessed(processed);
+    setBatchTotal(total);
+    setBatchOk(ok);
+    setBatchFailed(failed);
+    setBatchLastError(lastError);
+    setBatchBusy(["queued", "running", "pausing", "canceling"].includes(nextStatus));
 
-        {dataTab === "maintenance" && (
-          <div className="stack">
-            <button className="danger" onClick={wipeDb} disabled={wipeBusy}>
-              {wipeBusy ? "Wiping..." : "Wipe Database"}
-            </button>
-            <p className="muted">Deletes all players and teams (schema is kept).</p>
-            <button className="danger" onClick={deleteStoredMatches} disabled={deleteMatchesBusy}>
-              {deleteMatchesBusy ? "Deleting..." : "Delete All Stored Matches"}
-            </button>
-            <p className="muted">
-              Removes every imported HLTV match result (map scores, vetoes, player stats). The next match import
-              starts from scratch.
-            </p>
-          </div>
-        )}
-
-        {importResult && <p className="muted">{importResult}</p>}
-      </Section>
-    </div>
-  );
-}
-
-function useBackfillJob(basePath, jobLabel) {
-  const [status, setStatus] = useState("idle");
-  const [jobId, setJobId] = useState("");
-  const [processed, setProcessed] = useState(0);
-  const [total, setTotal] = useState(0);
-  const [ok, setOk] = useState(0);
-  const [failed, setFailed] = useState(0);
-  const [current, setCurrent] = useState("");
-  const [lastError, setLastError] = useState("");
-  const [etaSeconds, setEtaSeconds] = useState(null);
-  // True only once the user acts on the job in THIS mounted session, so a
-  // stale error hydrated from a previous run stays hidden.
-  const [interacted, setInteracted] = useState(false);
-  const pollingRef = useRef(false);
-  const onSettledRef = useRef(null);
-
-  const apply = (data, jobIdOverride = "") => {
-    const id = String(jobIdOverride || data?.job_id || "");
-    const nextStatus = String(data?.status || "queued");
-    const nextProcessed = Number(data?.processed_items || 0);
-    const nextTotal = Number(data?.total_items || 0);
-    setStatus(nextStatus);
-    setJobId(id);
-    setProcessed(nextProcessed);
-    setTotal(nextTotal);
-    setOk(Number(data?.ok || 0));
-    setFailed(Number(data?.failed || 0));
-    setCurrent(String(data?.current_item || ""));
-    setLastError(String(data?.last_error || data?.error || ""));
-    const startedAtMs = getBatchStartedAtMs(data);
-    if (nextProcessed > 0 && nextTotal > nextProcessed && ["queued", "running", "pausing", "canceling"].includes(nextStatus)) {
-      const elapsedSeconds = Math.max(1, (Date.now() - startedAtMs) / 1000);
-      const rate = nextProcessed / elapsedSeconds;
-      setEtaSeconds(rate > 0 ? (nextTotal - nextProcessed) / rate : null);
+    if (processed > 0 && total > processed) {
+      const nowMs = Date.now();
+      const st = batchEmaRef.current;
+      const ALPHA = 0.3; // smoothing: higher = reacts faster to recent pace
+      if (st.lastProcessed > 0 && processed > st.lastProcessed) {
+        const instantSecPerItem = (nowMs - st.lastT) / 1000 / (processed - st.lastProcessed);
+        st.ema = st.ema == null ? instantSecPerItem : ALPHA * instantSecPerItem + (1 - ALPHA) * st.ema;
+      } else if (st.lastProcessed === 0) {
+        // Seed from the lifetime average so we show something on the first tick.
+        const elapsedSec = Math.max(0.001, (nowMs - getBatchStartedAtMs(status)) / 1000);
+        st.ema = elapsedSec / processed;
+      }
+      if (processed !== st.lastProcessed) {
+        st.lastT = nowMs;
+        st.lastProcessed = processed;
+      }
+      const secPerItem = st.ema;
+      setBatchEtaSeconds(secPerItem && secPerItem > 0 ? (total - processed) * secPerItem : null);
+    } else if (total > 0 && processed >= total) {
+      setBatchEtaSeconds(0);
     } else {
-      setEtaSeconds(null);
+      setBatchEtaSeconds(null);
     }
-    return { jobId: id, nextStatus };
+
+    return { jobId, processed, total, ok, failed, nextStatus, lastError };
   };
 
-  const poll = async (id) => {
-    if (!id || pollingRef.current) return;
-    pollingRef.current = true;
+  const pollBatchJob = async (jobId) => {
+    if (!jobId || batchPollingRef.current) return;
+    batchPollingRef.current = true;
     try {
       let done = false;
       let pollFailures = 0;
       while (!done) {
-        let data;
+        let status;
         try {
-          data = await api.get(`${basePath}/job/${id}`, 60000);
+          status = await api.get(`/players/fetch-top-ratings-batch/job/${jobId}`, 60000);
           pollFailures = 0;
         } catch (pollError) {
+          // The job keeps running server-side; only give up after repeated failures.
           pollFailures += 1;
           if (pollFailures >= 5) throw pollError;
           await new Promise((resolve) => setTimeout(resolve, 3000));
           continue;
         }
-        const applied = apply(data, id);
-        if (["completed", "failed", "paused", "canceled"].includes(applied.nextStatus)) {
-          if (onSettledRef.current) onSettledRef.current();
+        const { ok, failed, nextStatus, lastError } = applyBatchStatus(status, jobId);
+
+        if (["failed", "paused", "canceled"].includes(nextStatus)) {
+          setBatchBusy(false);
+          if (nextStatus === "failed") notify(lastError || "Top-X batch failed.");
           done = true;
           break;
         }
+        if (nextStatus === "completed") {
+          setBatchBusy(false);
+          setBatchStatus("idle");
+          setBatchEtaSeconds(null);
+          await refresh();
+          await loadTopxWindow();
+          const rows = Array.isArray(status?.result?.results) ? status.result.results : Array.isArray(status?.results) ? status.results : [];
+          const failedRows = rows.filter((row) => row?.status !== "ok");
+          const failedPreview = failedRows
+            .slice(0, 3)
+            .map((row) => row?.player_name || `player ${row?.player_id}`)
+            .join(", ");
+          const failedSuffix = failedPreview ? ` | Failed: ${failedPreview}${failedRows.length > 3 ? "..." : ""}` : "";
+          notify(`Top-X batch finished: ok ${ok} failed ${failed}${failedSuffix}`);
+          done = true;
+          break;
+        }
+
         await new Promise((resolve) => setTimeout(resolve, 1500));
       }
     } catch (e) {
-      setStatus("failed");
-      setLastError(String(e?.message || `Failed to poll ${jobLabel} job.`));
+      setBatchBusy(false);
+      setBatchStatus("failed");
+      setBatchLastError(String(e?.message || "Failed to poll Top-X batch status."));
+      notify(`Top-X batch failed: ${e?.message || "unknown error"}`);
     } finally {
-      pollingRef.current = false;
+      batchPollingRef.current = false;
     }
   };
 
-  const start = async () => {
-    setInteracted(true);
-    setStatus("queued");
-    setProcessed(0);
-    setTotal(0);
-    setOk(0);
-    setFailed(0);
-    setLastError("");
-    setCurrent("");
+  const playerHasCompleteTopRatings = (player) => {
+    // "Complete" = the import ran and produced an overall rating. Players with
+    // thin per-tier data (few maps vs top teams) are still complete — their
+    // rank-adjusted ratings are estimated from the average degradation curve.
+    return Boolean(Number(player?.last_topx_import_at)) && Number(player?.rating) > 0;
+  };
+
+  const getBatchPlayerIds = (onlyMissing = false) =>
+    (players || [])
+      .filter((player) => !onlyMissing || !playerHasCompleteTopRatings(player))
+      .map((player) => Number(player?.player_id))
+      .filter((value) => Number.isFinite(value) && value > 0);
+
+  const runBatch = async (playerIds, emptyMsg) => {
+    if (!playerIds || playerIds.length === 0) {
+      notify(emptyMsg);
+      return;
+    }
+    setBatchBusy(true);
+    setBatchStatus("queued");
+    setBatchProcessed(0);
+    setBatchTotal(playerIds.length);
+    setBatchOk(0);
+    setBatchFailed(0);
+    setBatchLastError("");
+    setBatchEtaSeconds(null);
+    batchEmaRef.current = { lastT: 0, lastProcessed: 0, ema: null };
     try {
-      const res = await api.post(`${basePath}/start`, {});
-      const id = String(res?.job_id || "");
-      if (!id) throw new Error(`Failed to start ${jobLabel} job.`);
-      setJobId(id);
-      await poll(id);
+      const start = await api.post("/players/fetch-top-ratings-batch/start", {
+        player_ids: playerIds,
+        months: Number(topxMonths) || 3,
+      });
+      const jobId = String(start?.job_id || "");
+      if (!jobId) {
+        throw new Error("Failed to start Top-X batch job.");
+      }
+      setBatchJobId(jobId);
+      await pollBatchJob(jobId);
     } catch (e) {
-      setStatus("failed");
-      setLastError(String(e?.message || `Failed to start ${jobLabel} job.`));
+      setBatchStatus("failed");
+      setBatchLastError(String(e?.message || "Failed to start Top-X batch job."));
+      notify(`Top-X batch failed: ${e?.message || "unknown error"}`);
+    } finally {
+      setBatchBusy(false);
     }
   };
 
-  const control = async (action) => {
-    if (!jobId) return;
-    setInteracted(true);
+  const importAll = (onlyMissing = false) =>
+    runBatch(
+      getBatchPlayerIds(onlyMissing),
+      onlyMissing ? "No players are missing Top-X data." : "No players available to import."
+    );
+  const importCurrentEvent = () =>
+    runBatch(eventPlayerIds, "No players found for the current event. Import an event first.");
+
+  const pauseBatchJob = async () => {
+    if (!batchJobId) return;
+    setBatchStatus("pausing");
+    setBatchBusy(true);
     try {
-      const res = await api.post(`${basePath}/job/${jobId}/${action}`, {});
-      const applied = apply(res, jobId);
-      if (["queued", "running", "pausing", "canceling"].includes(applied.nextStatus)) poll(jobId);
+      const status = await api.post(`/players/fetch-top-ratings-batch/job/${batchJobId}/pause`, {});
+      const applied = applyBatchStatus(status, batchJobId);
+      if (["pausing", "running", "queued"].includes(applied.nextStatus)) {
+        pollBatchJob(batchJobId);
+      }
     } catch (e) {
-      setLastError(String(e?.message || `Failed to ${action} ${jobLabel} job.`));
+      setBatchStatus("running");
+      notify(`Failed to pause Top-X batch: ${e?.message || "unknown error"}`);
     }
   };
 
-  const hydrate = async () => {
+  const cancelBatchJob = async () => {
+    if (!batchJobId) return;
+    setBatchStatus("canceling");
+    setBatchBusy(true);
     try {
-      const latest = await api.get(`${basePath}/latest`);
-      if (!latest?.exists) return;
-      if (["completed", "canceled"].includes(String(latest?.status || ""))) return;
-      const applied = apply(latest);
-      if (["queued", "running", "pausing", "canceling"].includes(applied.nextStatus)) poll(applied.jobId);
-    } catch {
-      // Optional panel; ignore startup failures.
+      const status = await api.post(`/players/fetch-top-ratings-batch/job/${batchJobId}/cancel`, {});
+      const applied = applyBatchStatus(status, batchJobId);
+      if (["canceling", "running", "queued", "pausing"].includes(applied.nextStatus)) {
+        pollBatchJob(batchJobId);
+      }
+    } catch (e) {
+      setBatchBusy(false);
+      notify(`Failed to cancel Top-X batch: ${e?.message || "unknown error"}`);
     }
   };
 
-  return {
-    status,
-    jobId,
-    processed,
-    total,
-    ok,
-    failed,
-    current,
-    lastError,
-    interacted,
-    etaSeconds,
-    active: ["queued", "running", "pausing", "canceling"].includes(status),
-    resumable: ["paused", "failed"].includes(status),
-    pctDone: total > 0 ? Math.min(100, Math.max(0, (processed / total) * 100)) : 0,
-    start,
-    pause: () => control("pause"),
-    cancel: () => control("cancel"),
-    resume: () => control("resume"),
-    hydrate,
-    onSettledRef,
+  const resumeBatchJob = async () => {
+    if (!batchJobId) return;
+    setBatchBusy(true);
+    try {
+      const status = await api.post(`/players/fetch-top-ratings-batch/job/${batchJobId}/resume`, {});
+      const applied = applyBatchStatus(status, batchJobId);
+      if (["queued", "running", "pausing"].includes(applied.nextStatus)) {
+        pollBatchJob(batchJobId);
+      }
+    } catch (e) {
+      setBatchBusy(false);
+      notify(`Failed to resume Top-X batch: ${e?.message || "unknown error"}`);
+    }
   };
+
+  // Re-attach to an in-flight batch (e.g. started by the nightly scheduler or a
+  // previous session) so progress is visible here.
+  useEffect(() => {
+    let cancelled = false;
+    const hydrateLatestJob = async () => {
+      try {
+        const latest = await api.get("/players/fetch-top-ratings-batch/latest");
+        if (cancelled || !latest?.exists) return;
+        if (latest?.status === "completed") return;
+        const applied = applyBatchStatus(latest);
+        if (["queued", "running", "pausing", "canceling"].includes(applied.nextStatus)) {
+          pollBatchJob(applied.jobId);
+        }
+      } catch {
+        /* progress panel is optional on startup */
+      }
+    };
+    hydrateLatestJob();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const progressPct = batchTotal > 0 ? Math.min(100, Math.max(0, (batchProcessed / batchTotal) * 100)) : 0;
+  const showProgress = batchStatus !== "idle";
+  const batchActive = ["queued", "running", "pausing", "canceling"].includes(batchStatus);
+  const batchResumable = ["paused", "failed"].includes(batchStatus);
+  const missingCount = (players || []).filter((player) => !playerHasCompleteTopRatings(player)).length;
+  const statusLabel =
+    {
+      completed: "Completed",
+      failed: "Failed",
+      canceled: "Canceled",
+      canceling: "Canceling",
+      paused: "Paused",
+      pausing: "Pausing",
+      running: "Running",
+      queued: "Queued",
+    }[batchStatus] || "Queued";
+
+  return (
+    <Section title="Player Top-X Data">
+      <div className="actions" style={{ marginTop: 0, alignItems: "center" }}>
+        <label className="field" style={{ margin: 0 }}>
+          <span>Timeframe {topxWindowBusy ? "(switching…)" : ""}</span>
+          <select value={topxMonths} onChange={(e) => changeTopxWindow(e.target.value)} disabled={batchActive || topxWindowBusy}>
+            {["3", "6", "12"].map((m) => (
+              <option key={m} value={m}>
+                Last {m} months{Number(topxCoverage[m] || 0) > 0 ? ` (${topxCoverage[m]} stored)` : " (none stored)"}
+              </option>
+            ))}
+          </select>
+        </label>
+        <button className="primary" onClick={() => importAll(false)} disabled={(players || []).length === 0 || batchActive}>
+          {batchActive ? `Importing ${batchTotal} players...` : `Import All (${(players || []).length})`}
+        </button>
+        <button
+          className="secondary"
+          onClick={importCurrentEvent}
+          disabled={eventPlayerIds.length === 0 || batchActive}
+          title="Import Top-X data only for players in the active event"
+        >
+          {batchActive ? "Importing..." : `Import Current Event (${eventPlayerIds.length})`}
+        </button>
+        <button className="secondary" onClick={() => importAll(true)} disabled={missingCount === 0 || batchActive}>
+          {batchActive ? "Importing..." : `Import Missing (${missingCount})`}
+        </button>
+        {batchActive && batchJobId && (
+          <button className="secondary" onClick={pauseBatchJob} disabled={batchStatus === "pausing"}>
+            {batchStatus === "pausing" ? "Pausing..." : "Pause"}
+          </button>
+        )}
+        {batchActive && batchJobId && (
+          <button className="danger" onClick={cancelBatchJob} disabled={batchStatus === "canceling"}>
+            {batchStatus === "canceling" ? "Canceling..." : "Cancel"}
+          </button>
+        )}
+        {batchResumable && batchJobId && (
+          <button className="secondary" onClick={resumeBatchJob} disabled={batchBusy}>
+            Resume
+          </button>
+        )}
+      </div>
+      {showProgress && (
+        <div className="card sub">
+          <p className="muted">
+            Top-X progress: {batchProcessed.toLocaleString()} / {batchTotal.toLocaleString()} | ok {batchOk} | failed{" "}
+            {batchFailed}
+            {batchActive && batchTotal > batchProcessed ? ` | ETA: ${formatBatchEta(batchEtaSeconds)}` : ""}
+          </p>
+          <div className="progress">
+            <div className="progress-bar determinate" style={{ width: `${progressPct}%` }} />
+          </div>
+          <p className="muted">Status: {statusLabel}</p>
+          {batchLastError && <p className="muted">Last error: {batchLastError}</p>}
+        </div>
+      )}
+    </Section>
+  );
 }
 
-const RATING_LAB_TIERS = [
-  { tier: 5, label: "Top 5" },
-  { tier: 10, label: "Top 10" },
-  { tier: 20, label: "Top 20" },
-  { tier: 30, label: "Top 30" },
-  { tier: 50, label: "Top 50" },
-];
-const TIER_COLORS = { 5: "#f97316", 10: "#eab308", 20: "#22d3ee", 30: "#a78bfa", 50: "#34d399" };
+function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
+  const [status, setStatus] = useState(null);
+  const [runs, setRuns] = useState([]);
+  const [saveBusy, setSaveBusy] = useState(false);
+  const [runBusy, setRunBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  // Local edit state so typing a time doesn't fire a save per keystroke.
+  const [runTime, setRunTime] = useState("00:00");
+  const [lookbackDays, setLookbackDays] = useState(3);
+  const pollRef = useRef(null);
+
+  const TASK_LABELS = {
+    events: "New fantasy events",
+    rankings: "Team rankings (HLTV + VRS)",
+    matches: "New matches played",
+    ratings: "Player Top-X ratings",
+  };
+
+  const loadStatus = async () => {
+    try {
+      const data = await api.get("/schedule/status", 15000);
+      setStatus(data);
+      if (data?.config) {
+        setRunTime(String(data.config.run_time || "00:00"));
+        setLookbackDays(Number(data.config.matches_lookback_days || 3));
+      }
+    } catch (e) {
+      setMessage(e?.message || "Backend not reachable.");
+    }
+  };
+  const loadRuns = async () => {
+    try {
+      const data = await api.get("/schedule/runs?limit=50", 15000);
+      setRuns(data.runs || []);
+    } catch {
+      /* runs table is non-critical; status error already surfaces */
+    }
+  };
+
+  useEffect(() => {
+    loadStatus();
+    loadRuns();
+    // Poll while the tab is open so live progress and run history stay fresh.
+    pollRef.current = setInterval(() => {
+      loadStatus();
+      loadRuns();
+    }, 5000);
+    return () => clearInterval(pollRef.current);
+  }, []);
+
+  const config = status?.config || {};
+  const state = status?.state || {};
+  const lastByTask = status?.last_success_by_task || {};
+
+  const patchConfig = async (patch) => {
+    setSaveBusy(true);
+    setMessage("");
+    try {
+      const data = await api.post("/schedule/config", patch);
+      setStatus(data);
+      notify("Schedule updated");
+    } catch (e) {
+      setMessage(e?.message || "Failed to update schedule.");
+    } finally {
+      setSaveBusy(false);
+    }
+  };
+
+  const runNow = async (task) => {
+    setRunBusy(true);
+    setMessage("");
+    try {
+      const res = await api.post("/schedule/run-now", { task });
+      if (res?.status === "busy") {
+        setMessage(res.detail || "A run is already in progress.");
+      } else if (res?.status === "error") {
+        setMessage(res.detail || "Failed to start run.");
+      } else {
+        notify(`Started: ${(res.tasks || [task]).join(", ")}`);
+      }
+      loadStatus();
+    } catch (e) {
+      setMessage(e?.message || "Failed to start run.");
+    } finally {
+      setRunBusy(false);
+    }
+  };
+
+  const fmtTs = (ts) => (Number(ts) > 0 ? new Date(Number(ts) * 1000).toLocaleString() : "Never");
+
+  return (
+    <div className="stack">
+      <Section title="Nightly Data Refresh">
+        <p className="muted">
+          The always-on backend refreshes data automatically each night, so the Database pages don't need manual
+          imports. Tasks run in sequence (they share one scraping browser). Requires the backend auto-start install
+          (scripts\install-autostart.ps1) for refreshes to happen with the app closed.
+        </p>
+        <div className="grid three">
+          <div className="field">
+            <span>Scheduler</span>
+            <label className="checkbox-inline">
+              <input
+                type="checkbox"
+                checked={Boolean(config.enabled)}
+                onChange={(e) => patchConfig({ enabled: e.target.checked })}
+                disabled={saveBusy}
+              />
+              <span>{config.enabled ? "Enabled" : "Disabled"}</span>
+            </label>
+          </div>
+          <div className="field">
+            <span>Run time (daily)</span>
+            <input
+              type="time"
+              value={runTime}
+              onChange={(e) => setRunTime(e.target.value)}
+              onBlur={() => patchConfig({ run_time: runTime })}
+              disabled={saveBusy}
+            />
+          </div>
+          <div className="field">
+            <span>Next scheduled run</span>
+            <div className="pill">{status?.next_run_at ? new Date(status.next_run_at * 1000).toLocaleString() : "-"}</div>
+          </div>
+        </div>
+        {message && <p className="muted">{message}</p>}
+      </Section>
+
+      <Section title="Tasks">
+        <table>
+          <thead>
+            <tr>
+              <th>Task</th>
+              <th>Enabled</th>
+              <th>Last successful run</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {["events", "rankings", "matches", "ratings"].map((task) => {
+              const flagKey = `do_${task}`;
+              return (
+                <tr key={task}>
+                  <td>
+                    {TASK_LABELS[task]}
+                    {task === "events" && (
+                      <div className="muted" style={{ fontSize: 12 }}>
+                        Checks hltv.org/fantasy and imports any fantasy events not in the database; the active
+                        event is never switched automatically.
+                      </div>
+                    )}
+                    {task === "matches" && (
+                      <div className="muted" style={{ fontSize: 12 }}>
+                        Imports results back{" "}
+                        <input
+                          type="number"
+                          min={1}
+                          max={30}
+                          value={lookbackDays}
+                          onChange={(e) => setLookbackDays(Number(e.target.value))}
+                          onBlur={() => patchConfig({ matches_lookback_days: lookbackDays })}
+                          disabled={saveBusy}
+                          style={{ width: 52 }}
+                        />{" "}
+                        day(s); already-imported matches are skipped.
+                      </div>
+                    )}
+                    {task === "ratings" && (
+                      <div className="muted" style={{ fontSize: 12 }}>
+                        All players in the database, using the active timeframe window.
+                      </div>
+                    )}
+                  </td>
+                  <td>
+                    <input
+                      type="checkbox"
+                      checked={Boolean(config[flagKey])}
+                      onChange={(e) => patchConfig({ [flagKey]: e.target.checked })}
+                      disabled={saveBusy}
+                    />
+                  </td>
+                  <td>{fmtTs(lastByTask[task])}</td>
+                  <td>
+                    <button className="secondary" onClick={() => runNow(task)} disabled={runBusy || state.running}>
+                      Run now
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        <div className="actions">
+          <button className="primary" onClick={() => runNow("all")} disabled={runBusy || state.running}>
+            {state.running ? "Refresh in progress..." : "Run All Now"}
+          </button>
+          {state.running && (
+            <span className="muted">
+              Running {TASK_LABELS[state.current_task] || state.current_task}
+              {state.total > 0 ? ` — ${state.processed}/${state.total}` : ""}
+              {state.trigger ? ` (${state.trigger})` : ""}
+            </span>
+          )}
+        </div>
+      </Section>
+
+      <TopxImportPanel players={players} notify={notify} refresh={refresh} />
+
+      <Section title="Matches Import">
+        <MatchesDataPanel notify={notify} mode="import" />
+      </Section>
+
+      {mapStats && (
+        <Section title="Map Stats Import">
+          <p className="muted">
+            Scrapes each team's HLTV map page (last 3 months). Pausable and resumable; safe to leave running.
+          </p>
+          <MapStatsJobControls job={mapStats} teamsAvailable={(teams || []).length > 0} />
+          <MapStatsJobProgress job={mapStats} />
+        </Section>
+      )}
+
+      <Section title="Run History">
+        {runs.length === 0 && <p className="muted">No runs recorded yet.</p>}
+        {runs.length > 0 && (
+          <table>
+            <thead>
+              <tr>
+                <th>Task</th>
+                <th>Trigger</th>
+                <th>Status</th>
+                <th>Started</th>
+                <th>Duration</th>
+                <th>Details</th>
+              </tr>
+            </thead>
+            <tbody>
+              {runs.map((run) => {
+                const dur =
+                  run.finished_at && run.started_at
+                    ? `${Math.max(0, Math.round(run.finished_at - run.started_at))}s`
+                    : "-";
+                return (
+                  <tr key={run.id}>
+                    <td>{TASK_LABELS[run.task] || run.task}</td>
+                    <td>{run.trigger}</td>
+                    <td>
+                      <span className={run.status === "success" ? "pill" : "pill warn"}>{run.status}</span>
+                    </td>
+                    <td>{fmtTs(run.started_at)}</td>
+                    <td>{dur}</td>
+                    <td className="muted" style={{ maxWidth: 420, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {run.message || ""}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </Section>
+    </div>
+  );
+}
 
 function RatingLabTab({ players }) {
   const [stats, setStats] = useState({
@@ -8774,32 +9596,32 @@ function RatingLabTab({ players }) {
               <div className="value-chart-wrap">
                 <ResponsiveContainer width="100%" height={340}>
                   <ComposedChart data={predictedRows} margin={{ top: 12, right: 18, left: 6, bottom: 12 }}>
-                    <CartesianGrid stroke="#284061" strokeDasharray="3 3" />
+                    <CartesianGrid stroke="#232a34" strokeDasharray="3 3" />
                     <XAxis
                       type="number"
                       dataKey="rank"
                       domain={[1, 50]}
                       ticks={[1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50]}
                       interval={0}
-                      tick={{ fill: "#9fc5ff", fontSize: 12 }}
-                      axisLine={{ stroke: "#365a89" }}
-                      tickLine={{ stroke: "#365a89" }}
+                      tick={{ fill: "#9fb2c9", fontSize: 12 }}
+                      axisLine={{ stroke: "#3a4452" }}
+                      tickLine={{ stroke: "#3a4452" }}
                       label={{ value: "Opponent HLTV rank", position: "insideBottom", offset: -4, fill: "#7f97bd", fontSize: 11 }}
                     />
                     <YAxis
-                      tick={{ fill: "#9fc5ff", fontSize: 12 }}
-                      axisLine={{ stroke: "#365a89" }}
-                      tickLine={{ stroke: "#365a89" }}
+                      tick={{ fill: "#9fb2c9", fontSize: 12 }}
+                      axisLine={{ stroke: "#3a4452" }}
+                      tickLine={{ stroke: "#3a4452" }}
                       domain={predictedAxis.domain}
                       ticks={predictedAxis.ticks}
                       tickFormatter={(v) => Number(v).toFixed(2)}
                     />
                     <Tooltip
-                      contentStyle={{ background: "#0e1f3f", border: "1px solid #2f5ca5", borderRadius: 10, color: "#dcecff" }}
+                      contentStyle={{ background: "#14181f", border: "1px solid #3a4452", borderRadius: 10, color: "#e9edf3" }}
                       formatter={(value, name) => [value == null ? "—" : Number(value).toFixed(3), name]}
                       labelFormatter={(v) => `Rank ${v}`}
                     />
-                    <Legend wrapperStyle={{ color: "#9fc5ff" }} />
+                    <Legend wrapperStyle={{ color: "#9fb2c9" }} />
                     <Line
                       type="linear"
                       data={predictedRows}
@@ -8880,29 +9702,29 @@ function RatingLabTab({ players }) {
               <div className="value-chart-wrap">
                 <ResponsiveContainer width="100%" height={360}>
                   <ComposedChart margin={{ top: 12, right: 18, left: 6, bottom: 12 }}>
-                    <CartesianGrid stroke="#284061" strokeDasharray="3 3" />
+                    <CartesianGrid stroke="#232a34" strokeDasharray="3 3" />
                     <XAxis
                       type="number"
                       dataKey="rank"
                       domain={[1, 50]}
                       ticks={[1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50]}
                       interval={0}
-                      tick={{ fill: "#9fc5ff", fontSize: 12 }}
-                      axisLine={{ stroke: "#365a89" }}
-                      tickLine={{ stroke: "#365a89" }}
+                      tick={{ fill: "#9fb2c9", fontSize: 12 }}
+                      axisLine={{ stroke: "#3a4452" }}
+                      tickLine={{ stroke: "#3a4452" }}
                       label={{ value: "Opponent HLTV rank (tier midpoint)", position: "insideBottom", offset: -4, fill: "#7f97bd", fontSize: 11 }}
                     />
                     <YAxis
                       type="number"
                       dataKey="pct"
-                      tick={{ fill: "#9fc5ff", fontSize: 12 }}
-                      axisLine={{ stroke: "#365a89" }}
-                      tickLine={{ stroke: "#365a89" }}
+                      tick={{ fill: "#9fb2c9", fontSize: 12 }}
+                      axisLine={{ stroke: "#3a4452" }}
+                      tickLine={{ stroke: "#3a4452" }}
                       tickFormatter={(v) => `${Number(v).toFixed(0)}%`}
                       label={{ value: "% deviation vs overall", angle: -90, position: "insideLeft", fill: "#7f97bd", fontSize: 11 }}
                     />
                     <Tooltip
-                      cursor={{ stroke: "#2f5ca5", strokeDasharray: "3 3" }}
+                      cursor={{ stroke: "#3a4452", strokeDasharray: "3 3" }}
                       content={({ active, payload }) => {
                         if (!active || !payload || payload.length === 0) return null;
                         // Every dot in a tier shares one x (the tier midpoint), so
@@ -8915,10 +9737,10 @@ function RatingLabTab({ players }) {
                         return (
                           <div
                             style={{
-                              background: "#0e1f3f",
-                              border: "1px solid #2f5ca5",
+                              background: "#14181f",
+                              border: "1px solid #3a4452",
                               borderRadius: 10,
-                              color: "#dcecff",
+                              color: "#e9edf3",
                               padding: "8px 11px",
                               fontSize: 13,
                               lineHeight: 1.6,
@@ -8934,7 +9756,7 @@ function RatingLabTab({ players }) {
                         );
                       }}
                     />
-                    <Legend wrapperStyle={{ color: "#9fc5ff" }} />
+                    <Legend wrapperStyle={{ color: "#9fb2c9" }} />
                     {RATING_LAB_TIERS.map(({ tier, label }) => (
                       <Scatter
                         key={`sc-${tier}`}
@@ -9031,6 +9853,18 @@ function ModelLabTab() {
     }
   };
   vetoJob.onSettledRef.current = loadVetoCoverage;
+
+  const [mapSbCoverage, setMapSbCoverage] = useState(null);
+  const mapSbJob = useBackfillJob("/events/hltv-results/map-scoreboards", "map scoreboards backfill");
+  const loadMapSbCoverage = async () => {
+    try {
+      const cov = await api.get("/events/hltv-results/map-scoreboards/coverage");
+      if (cov && cov.status === "ok") setMapSbCoverage(cov);
+    } catch {
+      // Coverage is informational; the lab still works without it.
+    }
+  };
+  mapSbJob.onSettledRef.current = loadMapSbCoverage;
 
   const applyHistJobStatus = (status, jobIdOverride = "") => {
     const jobId = String(jobIdOverride || status?.job_id || "");
@@ -9165,6 +9999,8 @@ function ModelLabTab() {
     hydrateHistJob();
     loadVetoCoverage();
     vetoJob.hydrate();
+    loadMapSbCoverage();
+    mapSbJob.hydrate();
     return () => {
       cancelled = true;
     };
@@ -9431,6 +10267,58 @@ function ModelLabTab() {
             <p className="muted">Backfill complete: {vetoJob.ok} fetched, {vetoJob.failed} failed.</p>
           )}
         </div>
+        <div className="card sub">
+          <h3>Per-Map Scoreboard Backfill</h3>
+          <p className="muted">
+            Fills each stored match's per-map player scoreboards (the map tabs in the match view). Most matches
+            are re-parsed from the archived page copy with no scraping; only matches with no archived page are
+            fetched live. Safe to pause, cancel, and resume; already-scanned matches are always skipped.
+          </p>
+          {mapSbCoverage && (
+            <p className="muted">
+              Coverage: {Number(mapSbCoverage.with_map_scoreboards || 0).toLocaleString()} of{" "}
+              {Number(mapSbCoverage.total_matches || 0).toLocaleString()} matches scanned |{" "}
+              {Number(mapSbCoverage.missing_map_scoreboards || 0).toLocaleString()} missing
+            </p>
+          )}
+          <div className="actions" style={{ marginTop: 0 }}>
+            <button className="secondary" onClick={mapSbJob.start} disabled={mapSbJob.active}>
+              {mapSbJob.active ? `Scanning ${mapSbJob.processed}/${mapSbJob.total}` : "Fetch Map Scoreboards"}
+            </button>
+            {mapSbJob.active && mapSbJob.jobId && (
+              <button className="secondary" onClick={mapSbJob.pause} disabled={["pausing", "canceling"].includes(mapSbJob.status)}>
+                {mapSbJob.status === "pausing" ? "Pausing..." : "Pause"}
+              </button>
+            )}
+            {mapSbJob.resumable && mapSbJob.jobId && (
+              <button className="secondary" onClick={mapSbJob.resume}>
+                Resume
+              </button>
+            )}
+            {(mapSbJob.active || mapSbJob.resumable) && mapSbJob.jobId && (
+              <button className="danger" onClick={mapSbJob.cancel} disabled={mapSbJob.status === "canceling"}>
+                {mapSbJob.status === "canceling" ? "Canceling..." : "Cancel"}
+              </button>
+            )}
+          </div>
+          {mapSbJob.status !== "idle" && mapSbJob.status !== "completed" && (
+            <>
+              <p className="muted">
+                Progress: {mapSbJob.processed.toLocaleString()} / {mapSbJob.total.toLocaleString()} | ok {mapSbJob.ok} |{" "}
+                failed {mapSbJob.failed}
+                {mapSbJob.active && mapSbJob.total > mapSbJob.processed ? ` | ETA: ${formatBatchEta(mapSbJob.etaSeconds)}` : ""}
+              </p>
+              <div className="progress">
+                <div className="progress-bar determinate" style={{ width: `${mapSbJob.pctDone}%` }} />
+              </div>
+              {mapSbJob.current && <p className="muted">Current: {mapSbJob.current}</p>}
+              {mapSbJob.lastError && <p className="muted">Last error: {mapSbJob.lastError}</p>}
+            </>
+          )}
+          {mapSbJob.status === "completed" && (
+            <p className="muted">Backfill complete: {mapSbJob.ok} scanned, {mapSbJob.failed} failed.</p>
+          )}
+        </div>
         <div className="model-slice-card">
           <div className="model-slice-head">
             <div>
@@ -9618,7 +10506,7 @@ function ModelLabTab() {
               <tbody>
                 {(result.rows || []).map((row, idx) => (
                   <tr key={`${row.match_url || idx}-${row.map}`} onClick={() => setSelectedBreakdownRow(row)}>
-                    <td>{row.match_date || "-"}</td>
+                    <td>{formatDMY(row.match_date)}</td>
                     <td>{row.team1} vs {row.team2}</td>
                     <td>{row.map}</td>
                     <td>
@@ -9897,6 +10785,33 @@ function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
   const [simCount, setSimCount] = useState("200");
   const [simResults, setSimResults] = useState(null);
   const [simUpdatedAt, setSimUpdatedAt] = useState("");
+  // Structured swiss context from the event page: official seed order + Bo
+  // mode detected from the stage's format rules.
+  const [eventSwiss, setEventSwiss] = useState(null);
+  useEffect(() => {
+    if (!selectedEventId) {
+      setEventSwiss(null);
+      return undefined;
+    }
+    let cancelled = false;
+    api
+      .get(`/events/${selectedEventId}/swiss-context`, 60000)
+      .then((d) => {
+        if (cancelled || d?.status !== "ok") {
+          if (!cancelled) setEventSwiss(null);
+          return;
+        }
+        setEventSwiss(d);
+        // Sensible default: with no manual selection yet, take the stage roster.
+        setSelectedTeamIds((prev) => (prev.length === 0 ? (d.team_ids || []).map(Number) : prev));
+      })
+      .catch(() => {
+        if (!cancelled) setEventSwiss(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedEventId]);
 
   const normalizeTeamName = (name) => String(name || "").trim().toLowerCase();
 
@@ -10042,8 +10957,10 @@ function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
           teamLookup={teamLookup}
           selected={selectedTeamIds}
           setSelected={setSelectedTeamIds}
-          bo="elim_qual"
+          bo={eventSwiss?.bo3_mode || "elim_qual"}
           setBo={setBoMode}
+          eventSeeds={eventSwiss?.seed_by_team_id || null}
+          eventSwissInfo={eventSwiss}
           sims={simCount}
           setSims={setSimCount}
           results={simResults}
@@ -10060,7 +10977,7 @@ function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
         <TopTeamsTab
           teamLookup={teamLookup}
           selected={selectedTeamIds}
-          bo="elim_qual"
+          bo={eventSwiss?.bo3_mode || "elim_qual"}
           sims={simCount}
           results={simResults}
           onOpenPlayer={onOpenPlayer}
@@ -10079,15 +10996,15 @@ function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
   );
 }
 
-function GroupsTab({ teams, teamLookup, players, refresh }) {
+function GroupsTab({ teams, teamLookup, players, refresh, groupVariant = null }) {
   const [groupsTab, setGroupsTab] = useState("stage");
   const [events, setEvents] = useState([]);
   const [selectedEventId, setSelectedEventId] = useState("");
   const [eventTeamNames, setEventTeamNames] = useState(new Set());
   const [groupCount, setGroupCount] = useState(2);
   const [groupFormat, setGroupFormat] = useState("gsl4");
-  const seedsPerGroup = groupFormat === "de8" ? 8 : 4;
-  const qualsPerGroup = groupFormat === "de8" ? 4 : 2;
+  const seedsPerGroup = groupFormat.startsWith("de8") ? 8 : 4;
+  const qualsPerGroup = { gsl4: 2, de8: 4, de8_top3: 3 }[groupFormat] || 2;
   const [combinedPlayoffs, setCombinedPlayoffs] = useState(false);
   const [playoffSims, setPlayoffSims] = useState("2000");
   const [playoffStopTeams, setPlayoffStopTeams] = useState("1");
@@ -10130,7 +11047,7 @@ function GroupsTab({ teams, teamLookup, players, refresh }) {
     const base = [
       { value: "", label: "Select team" },
       { value: "unknown", label: "Unknown team (rank 250)" },
-      ...filteredTeams.map((t) => ({ value: String(t.team_id), label: `${t.name} (${t.team_id})` })),
+      ...filteredTeams.map((t) => ({ value: String(t.team_id), label: t.name || `Team ${t.team_id}` })),
     ];
     // Slots restored from a stored run may reference materialized Unknown-N
     // teams (or other non-event teams); keep them displayable.
@@ -10151,23 +11068,6 @@ function GroupsTab({ teams, teamLookup, players, refresh }) {
       return next;
     });
   };
-  const setGroupCountSafe = (n) => {
-    const count = Math.max(1, Math.min(16, Number(n) || 1));
-    setGroupCount(count);
-    setSlots((prev) => {
-      const next = Array(count * seedsPerGroup).fill("");
-      prev.slice(0, count * seedsPerGroup).forEach((v, i) => (next[i] = v));
-      return next;
-    });
-  };
-  const changeGroupFormat = (fmt) => {
-    setGroupFormat(fmt);
-    const size = fmt === "de8" ? 8 : 4;
-    setSlots(Array(groupCount * size).fill(""));
-    setCombinedPlayoffs(false);
-    setCompletedPicks({});
-    setCompletedResult(null);
-  };
   const groupSlots = useMemo(() => {
     const out = [];
     for (let g = 0; g < groupCount; g++) out.push(slots.slice(g * seedsPerGroup, g * seedsPerGroup + seedsPerGroup));
@@ -10178,7 +11078,11 @@ function GroupsTab({ teams, teamLookup, players, refresh }) {
     setAutofillBusy(true);
     setAutofillMessage("");
     try {
-      const data = await api.post("/groups/autofill-from-hltv-event", { group_format: groupFormat }, 90000);
+      const data = await api.post(
+        "/groups/autofill-from-hltv-event",
+        { group_format: groupFormat === "de8_top3" ? "de8" : groupFormat },
+        90000
+      );
       if (data?.detail) {
         setAutofillMessage(String(data.detail));
         return;
@@ -10238,7 +11142,9 @@ function GroupsTab({ teams, teamLookup, players, refresh }) {
     const data = await api.get("/groups/latest", 120000);
     if (!data?.exists) return false;
     const payload = data.payload || {};
-    if (payload.group_format) setGroupFormat(payload.group_format === "de8" ? "de8" : "gsl4");
+    if (payload.group_format) {
+      setGroupFormat(["de8", "de8_top3"].includes(payload.group_format) ? payload.group_format : "gsl4");
+    }
     const savedGroups = payload.groups || [];
     if (savedGroups.length > 0) {
       setGroupCount(savedGroups.length);
@@ -10260,7 +11166,8 @@ function GroupsTab({ teams, teamLookup, players, refresh }) {
       if (data?.status !== "ok") return;
       const groups = data.groups || [];
       if (groups.length === 0) return;
-      const fmt = data.group_format === "de8" ? "de8" : "gsl4";
+      const fmt =
+        data.group_format === "de8" ? (groupVariant === "de8_top3" ? "de8_top3" : "de8") : "gsl4";
       const nextSlots = groups.flatMap((grp) =>
         (grp.team_ids || []).map((id) => (id > 0 ? String(id) : "unknown"))
       );
@@ -10311,7 +11218,7 @@ function GroupsTab({ teams, teamLookup, players, refresh }) {
         group_format: groupFormat,
         combined_playoffs: combinedPlayoffs,
         n_playoff_sims: Math.max(200, Math.min(20000, Number(playoffSims) || 2000)),
-        playoff_stop_teams: Number(playoffStopTeams) || 1,
+        playoff_stop_teams: groupFormat === "de8_top3" ? 1 : Number(playoffStopTeams) || 1,
       });
       if (start?.detail) {
         setRunMessage(String(start.detail));
@@ -10708,43 +11615,6 @@ function GroupsTab({ teams, teamLookup, players, refresh }) {
   return (
     <Section title="Double-Elimination Groups (BO3)">
       <div className="stack">
-        <div className="grid three">
-          <Select
-            label="Event"
-            value={selectedEventId}
-            onChange={setSelectedEventId}
-            options={
-              events.length > 0
-                ? events.map((e) => ({
-                    value: String(e.event_id),
-                    label: e.hltv_event_id ? `Fantasy ${e.event_id} -> HLTV ${e.hltv_event_id}` : `Fantasy ${e.event_id}`,
-                  }))
-                : [{ value: "", label: "No events imported" }]
-            }
-          />
-          <Select
-            label="Format"
-            value={groupFormat}
-            onChange={changeGroupFormat}
-            options={[
-              { value: "gsl4", label: "GSL (4 teams, 2 qualify)" },
-              { value: "de8", label: "Double-elim (8 teams, 4 qualify)" },
-            ]}
-          />
-          <Select
-            label="Groups"
-            value={String(groupCount)}
-            onChange={setGroupCountSafe}
-            options={Array.from({ length: 16 }, (_, i) => i + 1).map((n) => ({
-              value: String(n),
-              label: `${n} group${n > 1 ? "s" : ""} (${n * seedsPerGroup} teams)`,
-            }))}
-          />
-          <div className="field">
-            <span>Stored Valuations</span>
-            <div className="pill">{results ? "Loaded" : "None"}</div>
-          </div>
-        </div>
         <div className="tab-bar small">
           <button className={groupsTab === "stage" ? "tab active" : "tab"} onClick={() => setGroupsTab("stage")}>
             Group Stage
@@ -11144,7 +12014,13 @@ function GroupsTab({ teams, teamLookup, players, refresh }) {
           </>
         )}
 
-        {groupsTab === "completed" && (
+        {groupsTab === "completed" && groupFormat === "de8_top3" && (
+          <p className="muted">
+            Completed-bracket scoring for the top-3 double-elim variant isn't supported yet — use the Group
+            Stage simulation.
+          </p>
+        )}
+        {groupsTab === "completed" && groupFormat !== "de8_top3" && (
           <>
             {!results && (
               <div className="card sub">
@@ -11299,6 +12175,66 @@ function BountyTab(props) {
   );
 }
 
+function TournamentTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpenPlayer, refresh, notify }) {
+  // One adaptive page: the active fantasy event's kind (per-stage, e.g. a
+  // "Cologne Groups" event shows only the group stage) picks which tournament
+  // UI renders. Auto-detected on the backend; a manual override is stored on
+  // the event for the rare ambiguous case (and to reach Bounty mode).
+  const [kindInfo, setKindInfo] = useState(null);
+  const [message, setMessage] = useState("");
+
+  const loadKind = async () => {
+    setMessage("");
+    try {
+      const evs = await api.get("/events/");
+      const active = evs?.active_event_id ?? null;
+      if (active == null) {
+        setKindInfo(null);
+        setMessage("No active fantasy event. Set one active in the Events tab.");
+        return;
+      }
+      const info = await api.get(`/events/${active}/kind`);
+      if (info?.detail) {
+        setKindInfo(null);
+        setMessage(`Format detection failed for event ${active}: ${info.detail}`);
+        return;
+      }
+      if (!info?.kind || info.kind === "unknown") {
+        setKindInfo(null);
+        setMessage(`Event ${active} has no detectable tournament format (no structured data on its event page).`);
+        return;
+      }
+      setKindInfo(info);
+    } catch (e) {
+      setMessage(e?.message || "Could not detect the event's tournament kind.");
+    }
+  };
+
+  useEffect(() => {
+    loadKind();
+  }, []);
+
+  const kind = kindInfo?.kind || null;
+  const sharedProps = { teams, teamLookup, players, sortTeams, applyFilters, onOpenPlayer };
+  return (
+    <div className="stack">
+      {message && <p className="muted">{message}</p>}
+      {kind === "swiss" && <SwissTab {...sharedProps} />}
+      {kind === "groups" && (
+        <GroupsTab
+          teams={teams}
+          teamLookup={teamLookup}
+          players={players}
+          refresh={refresh}
+          groupVariant={kindInfo?.group_variant}
+        />
+      )}
+      {kind === "playoff" && <PlayoffTab {...sharedProps} />}
+      {kind === "bounty" && <BountyTab {...sharedProps} />}
+    </div>
+  );
+}
+
 export default function App() {
   const [active, setActive] = useState("view");
   const [openPlayerId, setOpenPlayerId] = useState(null);
@@ -11411,32 +12347,21 @@ export default function App() {
         mapStatsModalRefreshRef={mapStatsModalRefreshRef}
       />
     ),
-    events: <EventsTab refreshData={load} notify={notify} players={players} />,
-    ratingLab: <RatingLabTab players={players} />,
-    modelLab: <ModelLabTab />,
-    sim: <SwissTab teams={teams} teamLookup={teamLookup} players={players} onOpenPlayer={handleOpenPlayerFromAnywhere} />,
-    playoff: (
-      <PlayoffTab
+    events: <EventsTab refreshData={load} notify={notify} players={players} teams={teams} />,
+    devlab: <DevLabTab players={players} />,
+    tournament: (
+      <TournamentTab
         teams={teams}
         teamLookup={teamLookup}
         players={players}
         sortTeams={sortTeams}
         applyFilters={applyFilters}
         onOpenPlayer={handleOpenPlayerFromAnywhere}
+        refresh={load}
+        notify={notify}
       />
     ),
-    bounty: (
-      <BountyTab
-        teams={teams}
-        teamLookup={teamLookup}
-        players={players}
-        sortTeams={sortTeams}
-        applyFilters={applyFilters}
-        onOpenPlayer={handleOpenPlayerFromAnywhere}
-      />
-    ),
-    groups: <GroupsTab teams={teams} teamLookup={teamLookup} players={players} refresh={load} />,
-    admin: <AdminTab refresh={load} notify={notify} />,
+    scheduling: <SchedulingTab notify={notify} players={players} refresh={load} mapStats={mapStatsJob} teams={teams} />,
   };
 
   return (

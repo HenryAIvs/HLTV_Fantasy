@@ -487,7 +487,41 @@ def _extract_match_player_stats(html: str) -> List[Dict[str, object]]:
     )
     if all_content:
         source = all_content.group(0)
+    return _parse_scoreboard_tables(source)
 
+
+# The scoreboard's map tabs: <div class="{statsid} dynamic-map-name-full"
+# id="{statsid}">Dust2</div>, with the matching table set in <div
+# id="{statsid}-content">. "all" (non-numeric id) is the all-maps tab.
+_MAP_TAB_NAME_RE = re.compile(
+    r'class=["\'][^"\']*dynamic-map-name-full[^"\']*["\'][^>]*id=["\'](?P<sid>\d+)["\'][^>]*>(?P<name>[^<]{1,30})<',
+    re.IGNORECASE,
+)
+
+
+def _extract_match_map_player_stats(html: str) -> Dict[str, List[Dict[str, object]]]:
+    """Per-map player scoreboards, keyed by map name."""
+    source = html or ""
+    out: Dict[str, List[Dict[str, object]]] = {}
+    for tab in _MAP_TAB_NAME_RE.finditer(source):
+        map_name = _strip_html(tab.group("name")).strip()
+        if not map_name or map_name in out:
+            continue
+        content = re.search(
+            rf'<div[^>]*id=["\']{tab.group("sid")}-content["\'].*?(?=<div[^>]*id=["\'][^"\']*-content["\']|$)',
+            source,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not content:
+            continue
+        entries = _parse_scoreboard_tables(content.group(0))
+        if entries:
+            out[map_name] = entries
+    return out
+
+
+def _parse_scoreboard_tables(source: str) -> List[Dict[str, object]]:
+    """Parse every totalstats scoreboard table in an HTML fragment."""
     players: List[Dict[str, object]] = []
     seen_ids: set[int] = set()
     for table_match in re.finditer(
@@ -574,8 +608,22 @@ def _parse_team_map_block(map_name: str, block: str) -> dict | None:
     rounds = _int_from_block(block, "Total rounds")
     pick_rate = _pct_from_block(block, "Pick")
     ban_rate = _pct_from_block(block, "Ban")
-    if not wdl or not win_rate_match or rounds is None or pick_rate is None or ban_rate is None:
+    if pick_rate is None or ban_rate is None:
         return None
+    if not wdl or not win_rate_match or rounds is None:
+        # A map the team never played in the window still carries veto rates
+        # (a permaban is exactly the map with played=0 and a high ban rate).
+        return {
+            "map": map_name,
+            "wins": 0,
+            "draws": 0,
+            "losses": 0,
+            "played": 0,
+            "win_rate": 0.0,
+            "total_rounds": 0,
+            "pick_rate": pick_rate,
+            "ban_rate": ban_rate,
+        }
     wins = int(wdl.group(1))
     draws = int(wdl.group(2))
     losses = int(wdl.group(3))
@@ -618,9 +666,9 @@ def _parse_team_map_stats_text(text: str) -> List[Dict[str, object]]:
         )
         seen.add(key)
 
-    if rows:
-        return rows
-
+    # No early return when the primary pattern matched: it only captures maps
+    # with full played-stats, so the block scan below must still run to pick up
+    # never-played maps that carry only pick/ban rates.
     overview_start = text.lower().find("map overview")
     team_context_start = text.lower().find("team context")
     scan = text[overview_start if overview_start >= 0 else 0 : team_context_start if team_context_start > overview_start else len(text)]
@@ -893,11 +941,13 @@ def parse_hltv_match_details_html(html: str, match_url: str = "") -> Dict[str, o
     _attach_half_scores_to_maps(html or "", maps)
     veto = _extract_match_veto(html or "")
     player_stats = _extract_match_player_stats(html or "")
+    map_player_stats = _extract_match_map_player_stats(html or "")
     return {
         "match_url": str(match_url or ""),
         "maps": maps,
         "veto": veto,
         "player_stats": player_stats,
+        "map_player_stats": map_player_stats,
     }
 
 

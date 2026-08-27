@@ -317,6 +317,36 @@ def _quit_driver(driver: Any) -> None:
         pass
 
 
+def _kill_orphan_chrome() -> None:
+    """Force-kill Chrome processes orphaned by a dead driver session.
+
+    When the webdriver connection dies, driver.quit() cannot reach Chrome and
+    the orphaned process tree keeps the UC profile locked — every subsequent
+    launch then fails with 'session not created'. Only processes whose command
+    line references this app's profile directory are touched, never the
+    user's own browser."""
+    try:
+        import subprocess
+
+        profile = str(_resolve_profile_dir())
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "$m = [regex]::Escape('" + profile.replace("'", "''") + "'); "
+                "Get-CimInstance Win32_Process -Filter \"Name = 'chrome.exe'\" | "
+                "Where-Object { $_.CommandLine -match $m } | "
+                "ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {} }",
+            ],
+            timeout=30,
+            capture_output=True,
+        )
+        logger.info("Killed orphaned Chrome processes for profile %s", profile)
+    except Exception:
+        logger.exception("Could not clean up orphaned Chrome processes")
+
+
 def _shared_driver_alive(driver: Any) -> bool:
     if driver is None:
         return False
@@ -444,6 +474,7 @@ def fetch_hltv_html(
                     # call) starts a fresh warm driver.
                     if _is_dead_webdriver_error(exc):
                         _close_shared_driver_locked()
+                        _kill_orphan_chrome()
                     if attempt == 0 and _is_dead_webdriver_error(exc):
                         logger.warning("HLTV UC driver died while fetching %s; retrying with a fresh driver: %s", url, exc)
                         time.sleep(1.0)
@@ -488,6 +519,7 @@ def run_hltv_browser_session(
                     last_error = exc
                     if _is_dead_webdriver_error(exc):
                         _close_shared_driver_locked()
+                        _kill_orphan_chrome()
                     if attempt == 0 and _is_dead_webdriver_error(exc):
                         logger.warning("HLTV UC driver died while running session for %s; retrying: %s", url, exc)
                         time.sleep(1.0)
@@ -544,6 +576,7 @@ def fetch_hltv_json(url: str, *, timeout_ms: int = 45000) -> dict[str, Any]:
                     last_error = exc
                     if _is_dead_webdriver_error(exc):
                         _close_shared_driver_locked()
+                        _kill_orphan_chrome()
                     if attempt == 0 and _is_dead_webdriver_error(exc):
                         logger.warning("HLTV UC driver died while fetching JSON %s; retrying with a fresh driver: %s", url, exc)
                         time.sleep(1.0)

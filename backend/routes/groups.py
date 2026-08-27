@@ -101,9 +101,10 @@ def _normalize_groups_payload(payload: dict) -> dict:
     groups_raw = payload.get("groups") or []
     if not groups_raw or not isinstance(groups_raw, list):
         raise HTTPException(status_code=400, detail="groups must be a non-empty list of team lists")
-    group_format = "de8" if str(payload.get("group_format") or "").strip().lower() == "de8" else "gsl4"
-    size = 8 if group_format == "de8" else 4
-    quals_per_group = 4 if group_format == "de8" else 2
+    gf_raw = str(payload.get("group_format") or "").strip().lower()
+    group_format = gf_raw if gf_raw in ("de8", "de8_top3") else "gsl4"
+    size = 8 if group_format.startswith("de8") else 4
+    quals_per_group = {"gsl4": 2, "de8": 4, "de8_top3": 3}[group_format]
     groups: List[List[int]] = []
     seen: set = set()
     unknown_counter = 0
@@ -126,7 +127,20 @@ def _normalize_groups_payload(payload: dict) -> dict:
         groups.append(ids)
     combined = bool(payload.get("combined_playoffs"))
     stop_teams = int(payload.get("playoff_stop_teams") or 1)
-    if combined:
+    if combined and group_format == "de8_top3":
+        # Porto/Cologne shape: 2 groups of 8, top 3 each -> 6-team bracket with
+        # the two group winners seeded straight into the semi-finals.
+        if len(groups) != 2:
+            raise HTTPException(
+                status_code=400,
+                detail="Top-3 double-elim groups with combined playoffs support exactly 2 groups.",
+            )
+        if stop_teams != 1:
+            raise HTTPException(
+                status_code=400,
+                detail="The top-3 combined playoff plays the full 6-team bracket (playoff_stop_teams must be 1).",
+            )
+    elif combined:
         bracket_size = quals_per_group * len(groups)
         if bracket_size & (bracket_size - 1) != 0:
             raise HTTPException(
@@ -355,6 +369,147 @@ def _enumerate_group8_outcomes(
     return outcomes
 
 
+def _enumerate_group8_top3_outcomes(
+    team_ids: List[int],
+    group_index: int,
+    player_rows_by_id: Dict[int, dict],
+    team_rank_by_id: Dict[int, int],
+    prob_cache: Dict,
+    extra_rounds: int = 0,
+) -> List[Dict[str, Any]]:
+    """All 4096 exact outcomes of the Porto/Cologne 8-team double-elim group
+    (top 3 qualify). Unlike the EWC variant the upper bracket plays its final:
+    the winner tops the group (straight to the playoff semis), the loser still
+    qualifies; the lower bracket runs to a lower final whose winner takes the
+    last spot and whose loser goes home. qualified = [1st, 2nd, 3rd]."""
+    base_states = initialize_teams(team_ids, {tid: 999 for tid in team_ids})
+    s = team_ids
+    outcomes: List[Dict[str, Any]] = []
+
+    def play(states, a, b, winner, remaining_after):
+        return _play_match_deterministic(
+            states, a, b, winner, remaining_rounds_after=remaining_after, prob_cache=prob_cache,
+            player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id,
+        )
+
+    def rowd(key, result, teams):
+        w, l, p_win_a, _b = result
+        return {"key": key, "winner": w, "loser": l, "p_win_a": p_win_a, "teams": list(teams)}
+
+    # Opening round: 4 matches from consecutive seed pairs. Losers drop, not out.
+    for wo1 in (s[0], s[1]):
+        sa = _clone_team_states(base_states); ro1 = play(sa, s[0], s[1], wo1, 0); mo1 = rowd("opening_1", ro1, [s[0], s[1]])
+        for wo2 in (s[2], s[3]):
+            sb = _clone_team_states(sa); ro2 = play(sb, s[2], s[3], wo2, 0); mo2 = rowd("opening_2", ro2, [s[2], s[3]])
+            for wo3 in (s[4], s[5]):
+                sc = _clone_team_states(sb); ro3 = play(sc, s[4], s[5], wo3, 0); mo3 = rowd("opening_3", ro3, [s[4], s[5]])
+                for wo4 in (s[6], s[7]):
+                    sd = _clone_team_states(sc); ro4 = play(sd, s[6], s[7], wo4, 0); mo4 = rowd("opening_4", ro4, [s[6], s[7]])
+                    W1, L1 = mo1["winner"], mo1["loser"]
+                    W2, L2 = mo2["winner"], mo2["loser"]
+                    W3, L3 = mo3["winner"], mo3["loser"]
+                    W4, L4 = mo4["winner"], mo4["loser"]
+                    # Upper semis: winners meet in the upper final; losers drop.
+                    for wu1 in (W1, W2):
+                        se = _clone_team_states(sd); ru1 = play(se, W1, W2, wu1, 0); mu1 = rowd("upper_sf_1", ru1, [W1, W2])
+                        for wu2 in (W3, W4):
+                            sf = _clone_team_states(se); ru2 = play(sf, W3, W4, wu2, 0); mu2 = rowd("upper_sf_2", ru2, [W3, W4])
+                            UW1, UL1 = mu1["winner"], mu1["loser"]
+                            UW2, UL2 = mu2["winner"], mu2["loser"]
+                            # The upper-final pair's padding derives from their
+                            # players' FIRST TWO games only — the upper final
+                            # itself doesn't feed the pad value. Snapshot their
+                            # totals now, before the final is played.
+                            pad_snapshot: Dict[int, Dict[int, Dict[str, float]]] = {}
+                            for pad_tid in (UW1, UW2):
+                                pad_ts = sf.get(int(pad_tid))
+                                if not pad_ts:
+                                    continue
+                                pad_snapshot[int(pad_tid)] = {
+                                    pid: {
+                                        "rating": float(p.rating_points_total),
+                                        "win": float(p.win_points_total),
+                                        "role": float(p.role_points_total),
+                                    }
+                                    for pid, p in pad_ts.players.items()
+                                }
+                            # Upper final: winner 1st (playoff semis), loser 2nd.
+                            for wf in (UW1, UW2):
+                                sg0 = _clone_team_states(sf); rf = play(sg0, UW1, UW2, wf, 0); mf = rowd("upper_final", rf, [UW1, UW2])
+                                first, second = mf["winner"], mf["loser"]
+                                # Lower round 1: opening losers; loser eliminated
+                                # (misses lower semis + lower final).
+                                for wl1 in (L1, L2):
+                                    sg = _clone_team_states(sg0); rl1 = play(sg, L1, L2, wl1, 2 + extra_rounds); ml1 = rowd("lower_r1_1", rl1, [L1, L2])
+                                    for wl2 in (L3, L4):
+                                        sh = _clone_team_states(sg); rl2 = play(sh, L3, L4, wl2, 2 + extra_rounds); ml2 = rowd("lower_r1_2", rl2, [L3, L4])
+                                        LW1, LW2 = ml1["winner"], ml2["winner"]
+                                        # Lower semis, crossed: loser eliminated (misses lower final).
+                                        for wls1 in (LW1, UL2):
+                                            si = _clone_team_states(sh); rls1 = play(si, LW1, UL2, wls1, 1 + extra_rounds); mls1 = rowd("lower_sf_1", rls1, [LW1, UL2])
+                                            for wls2 in (LW2, UL1):
+                                                sj = _clone_team_states(si); rls2 = play(sj, LW2, UL1, wls2, 1 + extra_rounds); mls2 = rowd("lower_sf_2", rls2, [LW2, UL1])
+                                                LF1, LF2 = mls1["winner"], mls2["winner"]
+                                                # Lower final: winner takes 3rd, loser is out.
+                                                for wlf in (LF1, LF2):
+                                                    sk = _clone_team_states(sj); rlf = play(sk, LF1, LF2, wlf, extra_rounds); mlf = rowd("lower_final", rlf, [LF1, LF2])
+                                                    third = mlf["winner"]
+                                                    prob = (
+                                                        ro1[3] * ro2[3] * ro3[3] * ro4[3] * ru1[3] * ru2[3]
+                                                        * rf[3] * rl1[3] * rl2[3] * rls1[3] * rls2[3] * rlf[3]
+                                                    )
+                                                    # Upper-final teams finish in 3 matches; the
+                                                    # lower-final pair plays 4 — pad the missing round
+                                                    # with each player's per-game average over their
+                                                    # first two games (no booster in padding).
+                                                    for uw in (first, second):
+                                                        wt = sk.get(int(uw))
+                                                        snap = pad_snapshot.get(int(uw)) or {}
+                                                        if not wt:
+                                                            continue
+                                                        missing = 4 - 3
+                                                        for pid, p in wt.players.items():
+                                                            base = snap.get(pid)
+                                                            if base is None:
+                                                                continue
+                                                            pad_rating = base["rating"] / 2.0
+                                                            pad_win = base["win"] / 2.0
+                                                            pad_role = base["role"] / 2.0
+                                                            p.rating_points_total += pad_rating * missing
+                                                            p.win_points_total += pad_win * missing
+                                                            p.role_points_total += pad_role * missing
+                                                            p.total_points += (pad_rating + pad_win + pad_role) * missing
+                                                    player_points: Dict[str, float] = {}
+                                                    player_components: Dict[str, Dict[str, float]] = {}
+                                                    for ts in sk.values():
+                                                        for pid, p in ts.players.items():
+                                                            player_points[str(pid)] = float(p.total_points)
+                                                            player_components[str(pid)] = {
+                                                                "total": float(p.total_points),
+                                                                "total_without_booster": float(
+                                                                    p.rating_points_total + p.win_points_total + p.role_points_total
+                                                                ),
+                                                                "rating": float(p.rating_points_total),
+                                                                "win": float(p.win_points_total),
+                                                                "role": float(p.role_points_total),
+                                                                "booster": float(p.booster_points_total),
+                                                            }
+                                                    outcomes.append(
+                                                        {
+                                                            "group": group_index,
+                                                            "probability": float(prob),
+                                                            "matches": [mo1, mo2, mo3, mo4, mu1, mu2, mf, ml1, ml2, mls1, mls2, mlf],
+                                                            # Ordered: 1st (playoff-semi seed), 2nd, 3rd.
+                                                            "qualified": [first, second, third],
+                                                            "eliminated": [ml1["loser"], ml2["loser"], mls1["loser"], mls2["loser"], mlf["loser"]],
+                                                            "players": player_points,
+                                                            "player_components": player_components,
+                                                            "player_breakdown": {},
+                                                        }
+                                                    )
+    return outcomes
+
+
 def _simulate_combined_playoffs(
     groups: List[List[int]],
     outcomes: List[Dict[str, Any]],
@@ -375,9 +530,19 @@ def _simulate_combined_playoffs(
     without playing on (e.g. a qualifier feeding a main event).
     """
     x = len(groups)
-    bracket_size = quals_per_group * x
     stop_teams = max(1, int(stop_teams))
-    rounds_total = max(1, int(math.log2(bracket_size)) - int(math.log2(stop_teams)))
+    byes_to_semis = quals_per_group == 3
+    if byes_to_semis:
+        # Porto/Cologne 6-team bracket: group winners bye to the semis.
+        if x != 2:
+            raise ValueError("The top-3 combined playoff supports exactly 2 groups (6-team bracket)")
+        if stop_teams != 1:
+            raise ValueError("The top-3 combined playoff plays the full bracket (stop_teams must be 1)")
+        bracket_size = 6
+        rounds_total = 3
+    else:
+        bracket_size = quals_per_group * x
+        rounds_total = max(1, int(math.log2(bracket_size)) - int(math.log2(stop_teams)))
     rng = random.Random(1234567)
 
     # Per-group sampling tables over the 32 exact outcomes.
@@ -426,35 +591,57 @@ def _simulate_combined_playoffs(
 
     for sim in range(n_sims):
         sampled = [sample_group(g) for g in range(x)]
-        # Flatten qualifiers seed-major (all group winners, then all seed-2, ...)
-        # then standard i vs (N-1-i) seeding, which puts same-group teams on
-        # opposite ends of the bracket.
-        seeded: List[int] = []
-        for seed_idx in range(quals_per_group):
-            for g in range(x):
-                q = sampled[g]["qualified"]
-                if seed_idx < len(q):
-                    seeded.append(int(q[seed_idx]))
-        n_seeded = len(seeded)
-        pairs: List[tuple] = [(seeded[i], seeded[n_seeded - 1 - i]) for i in range(n_seeded // 2)]
-        playoff_team_ids = [tid for pair in pairs for tid in pair]
-        states = _clone_team_states({tid: base_states[tid] for tid in playoff_team_ids})
-        current = pairs
-        final_winners: List[int] = []
-        for round_idx in range(rounds_total):
-            remaining_after = rounds_total - round_idx - 1
-            winners: List[int] = []
-            for a, b in current:
+        if byes_to_semis:
+            # qualified is ordered [1st, 2nd, 3rd]; 1sts skip the quarters.
+            qa = [int(t) for t in sampled[0]["qualified"]]
+            qb = [int(t) for t in sampled[1]["qualified"]]
+            playoff_team_ids = qa + qb
+            states = _clone_team_states({tid: base_states[tid] for tid in playoff_team_ids})
+
+            def play_po(a, b, remaining_after):
                 p = match_prob(a, b)
                 winner = a if rng.random() < p else b
                 _play_match_deterministic(
                     states, a, b, winner, remaining_rounds_after=remaining_after, prob_cache=prob_cache,
                     player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id,
                 )
-                winners.append(winner)
-            final_winners = winners
-            if len(winners) > 1:
-                current = [(winners[i], winners[i + 1]) for i in range(0, len(winners), 2)]
+                return winner
+
+            wq1 = play_po(qa[1], qb[2], 2)  # QF1: A-2nd vs B-3rd
+            wq2 = play_po(qb[1], qa[2], 2)  # QF2: B-2nd vs A-3rd
+            ws1 = play_po(qa[0], wq2, 1)    # SF1: A-1st vs QF2 winner
+            ws2 = play_po(qb[0], wq1, 1)    # SF2: B-1st vs QF1 winner
+            final_winners = [play_po(ws1, ws2, 0)]
+        else:
+            # Flatten qualifiers seed-major (all group winners, then all seed-2, ...)
+            # then standard i vs (N-1-i) seeding, which puts same-group teams on
+            # opposite ends of the bracket.
+            seeded: List[int] = []
+            for seed_idx in range(quals_per_group):
+                for g in range(x):
+                    q = sampled[g]["qualified"]
+                    if seed_idx < len(q):
+                        seeded.append(int(q[seed_idx]))
+            n_seeded = len(seeded)
+            pairs: List[tuple] = [(seeded[i], seeded[n_seeded - 1 - i]) for i in range(n_seeded // 2)]
+            playoff_team_ids = [tid for pair in pairs for tid in pair]
+            states = _clone_team_states({tid: base_states[tid] for tid in playoff_team_ids})
+            current = pairs
+            final_winners = []
+            for round_idx in range(rounds_total):
+                remaining_after = rounds_total - round_idx - 1
+                winners: List[int] = []
+                for a, b in current:
+                    p = match_prob(a, b)
+                    winner = a if rng.random() < p else b
+                    _play_match_deterministic(
+                        states, a, b, winner, remaining_rounds_after=remaining_after, prob_cache=prob_cache,
+                        player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id,
+                    )
+                    winners.append(winner)
+                final_winners = winners
+                if len(winners) > 1:
+                    current = [(winners[i], winners[i + 1]) for i in range(0, len(winners), 2)]
         for tid in final_winners:
             champion_counts[tid] = champion_counts.get(tid, 0) + 1
         for ts in states.values():
@@ -489,9 +676,14 @@ def _simulate_combined_playoffs(
 
 def _compute_groups_result(payload: dict, progress_callback=None) -> dict:
     groups = payload["groups"]
-    group_format = "de8" if str(payload.get("group_format") or "").strip().lower() == "de8" else "gsl4"
-    quals_per_group = 4 if group_format == "de8" else 2
-    enumerate_group = _enumerate_group8_outcomes if group_format == "de8" else _enumerate_group_outcomes
+    gf_raw = str(payload.get("group_format") or "").strip().lower()
+    group_format = gf_raw if gf_raw in ("de8", "de8_top3") else "gsl4"
+    quals_per_group = {"gsl4": 2, "de8": 4, "de8_top3": 3}[group_format]
+    enumerate_group = {
+        "gsl4": _enumerate_group_outcomes,
+        "de8": _enumerate_group8_outcomes,
+        "de8_top3": _enumerate_group8_top3_outcomes,
+    }[group_format]
     combined = bool(payload.get("combined_playoffs"))
     n_playoff_sims = int(payload.get("n_playoff_sims") or 2000)
     all_team_ids = [tid for group in groups for tid in group]
@@ -503,7 +695,10 @@ def _compute_groups_result(payload: dict, progress_callback=None) -> dict:
     playoff_rounds = 0
     if combined:
         stop_teams = max(1, int(payload.get("playoff_stop_teams") or 1))
-        playoff_rounds = max(1, int(math.log2(quals_per_group * len(groups))) - int(math.log2(stop_teams)))
+        if group_format == "de8_top3":
+            playoff_rounds = 3  # 6-team bracket: quarters, semis, final
+        else:
+            playoff_rounds = max(1, int(math.log2(quals_per_group * len(groups))) - int(math.log2(stop_teams)))
     for g_idx, group in enumerate(groups):
         group_outcomes = enumerate_group(
             group, g_idx, player_rows_by_id, team_rank_by_id, prob_cache, extra_rounds=playoff_rounds
@@ -807,6 +1002,163 @@ def store_event_groups_autofill(
         return None
     set_event_groups_autofill(int(fantasy_event_id), result["group_format"], result["groups"])
     return result
+
+
+def _parse_event_playoff_bracket(html: str) -> Dict[str, Any]:
+    """Parse the first-round seeds (bracket order) of an HLTV event's main
+    single-elimination playoff bracket.
+
+    HLTV embeds it as a Bracket.SingleElimination named 'Single Elimination
+    Bracket' (distinct from the single-slot '3rd Place Decider Match' bracket).
+    The first round's type — Round8 / Round4 / Round2 — gives the field size
+    (16 / 8 / 4: RoundN has N matches), and each slot's team1/team2 lists the
+    seeded matchups in bracket order. Returns
+    {bracket_size, seeds:[{id,name,ranking}|None,...]}, or bracket_size 0 with
+    no seeds when the page has no such bracket (Swiss-only or not yet seeded).
+    """
+    import html as _htmlmod
+    import re
+
+    un = _htmlmod.unescape(html or "")
+    ranking_by_id: Dict[int, int] = {}
+    for rm in re.finditer(r'"team":\{"id":(\d+),"name":"[^"]+".{0,700}?"ranking":(\d+)', un):
+        ranking_by_id.setdefault(int(rm.group(1)), int(rm.group(2)))
+
+    m = re.search(r'SingleElimination","name":"Single Elimination Bracket"', un)
+    if not m:
+        return {"bracket_size": 0, "seeds": []}
+    seg = un[m.start():]
+    rt = re.search(r"Bracket\.Round\.Round(\d+)", seg)
+    if not rt:
+        return {"bracket_size": 0, "seeds": []}
+    field_size = int(rt.group(1)) * 2
+    if field_size not in (2, 4, 8, 16, 32):
+        return {"bracket_size": 0, "seeds": []}
+
+    seeds: List[Optional[Dict[str, Any]]] = []
+    for tm in re.finditer(
+        r'"team[12]":\{"type":"[^"]*\.(FixedTeam|Placeholder|TBD|Bye|Seed|Winner|Loser)[^"]*"'
+        r'(?:,"team":\{"id":(\d+),"name":"([^"]+)")?',
+        seg,
+    ):
+        kind, tid, tname = tm.group(1), tm.group(2), tm.group(3)
+        if kind == "FixedTeam" and tid and tname:
+            seeds.append({"id": int(tid), "name": tname, "ranking": ranking_by_id.get(int(tid))})
+        else:
+            seeds.append(None)
+        if len(seeds) == field_size:
+            break
+    return {"bracket_size": field_size, "seeds": seeds}
+
+
+def _resolve_playoff_seed_team_id(
+    seed: Optional[Dict[str, Any]],
+    by_hltv_id: Dict[int, int],
+    by_name: Dict[str, int],
+) -> int:
+    """Map a parsed playoff seed to this app's team id. Playoff qualifiers are
+    already event teams in the DB, so match by HLTV team id first (robust to name
+    differences), then by normalised name. Unlike the groups seed resolver this
+    never creates a phantom team — an unmatched seed becomes 0 (an empty slot the
+    user can fill) rather than an off-event team with no lineup."""
+    if not seed:
+        return 0
+    hid = int(seed.get("id") or 0)
+    if hid and hid in by_hltv_id:
+        return by_hltv_id[hid]
+    name_key = _normalize_team_name(str(seed.get("name") or ""))
+    return by_name.get(name_key, 0)
+
+
+def _normalize_team_name(name: str) -> str:
+    return " ".join(str(name or "").strip().lower().split())
+
+
+def _find_event_snapshot_html(hltv_event_id) -> Optional[str]:
+    """Reuse the event page archived at import (page_snapshots) so autofill is
+    instant when the page is already stored; returns None to fall back to a live
+    fetch. Snapshot URLs carry the event slug, so match on the /events/{id}/
+    prefix rather than an exact URL, and prefer the canonical event page over the
+    interactive '#simulator' variant, whose embedded bracket can hold user
+    predictions rather than the official draw."""
+    if not hltv_event_id:
+        return None
+    try:
+        from backend.data.page_snapshots import list_snapshot_urls, get_page_snapshot
+
+        needle = f"/events/{int(hltv_event_id)}/"
+        matches = [u for u in list_snapshot_urls() if needle in u]
+        matches.sort(key=lambda u: ("#" in u or "simulator" in u.lower(), u))
+        for url in matches:
+            snap = get_page_snapshot(url)
+            if snap and snap.get("html"):
+                return snap["html"]
+    except Exception:
+        return None
+    return None
+
+
+def autofill_event_playoff(
+    hltv_event_url: str = "",
+    hltv_event_id=None,
+    fantasy_event_id=None,
+    html: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Fetch (or reuse) the event page and return the playoff bracket seeding as
+    {bracket_size, team_ids, team_names} with seeds resolved to app team ids.
+    Prefers the stored page snapshot before a slow live fetch. Raises
+    HTTPException on missing link / fetch failure / no playoff bracket."""
+    from backend.services.hltv_browser import fetch_hltv_html, HLTVBrowserError
+    from backend.data.event_db import get_active_event_id, get_event_detail
+    from backend.data.team_db import get_all_teams
+
+    if html is None:
+        hid = hltv_event_id
+        url = str(hltv_event_url or "").strip()
+        if not hid or not url:
+            fid = fantasy_event_id or get_active_event_id()
+            event = get_event_detail(int(fid)) if fid else None
+            if event:
+                hid = hid or event.get("hltv_event_id")
+                url = url or str(event.get("hltv_event_url") or "").strip()
+        if not url and hid:
+            url = f"https://www.hltv.org/events/{int(hid)}/-"
+        # Prefer the stored snapshot, but only trust it if it actually contains a
+        # seeded single-elim bracket (an import-time snapshot may predate the
+        # draw); otherwise fall back to a live fetch of the canonical page.
+        snap_html = _find_event_snapshot_html(hid)
+        if snap_html and int(_parse_event_playoff_bracket(snap_html).get("bracket_size") or 0) in (2, 4, 8, 16):
+            html = snap_html
+        if html is None:
+            if not url:
+                raise HTTPException(status_code=400, detail="No HLTV event link found. Import the event first or pass hltv_event_id.")
+            try:
+                html = fetch_hltv_html(url, wait_text=None, timeout_ms=45000)
+            except HLTVBrowserError as exc:
+                raise HTTPException(status_code=502, detail=f"Failed to fetch HLTV event page: {exc}") from exc
+
+    parsed = _parse_event_playoff_bracket(html)
+    size = int(parsed.get("bracket_size") or 0)
+    seeds = list(parsed.get("seeds") or [])
+    if size not in (2, 4, 8, 16) or not seeds:
+        raise HTTPException(status_code=404, detail="No single-elimination playoff bracket found on that event page.")
+    seeds = (seeds + [None] * size)[:size]
+
+    all_teams = get_all_teams()
+    by_hltv_id: Dict[int, int] = {}
+    by_name: Dict[str, int] = {}
+    for t in all_teams:
+        tid = int(t.get("team_id") or 0)
+        hltv = t.get("hltv_team_id")
+        if hltv:
+            by_hltv_id[int(hltv)] = tid
+        by_name.setdefault(_normalize_team_name(str(t.get("name") or "")), tid)
+
+    return {
+        "bracket_size": size,
+        "team_ids": [_resolve_playoff_seed_team_id(s, by_hltv_id, by_name) for s in seeds],
+        "team_names": [(s["name"] if s else "TBD") for s in seeds],
+    }
 
 
 @router.post("/autofill-from-hltv-event")

@@ -1106,6 +1106,182 @@ def resume_map_stats_import_job(job_id: str):
     return _map_stats_job_response(_get_map_stats_job_for_response(job_id))
 
 
+@router.get("/{team_id}/veto-profile")
+def team_veto_profile(team_id: int, months: int = 3):
+    """Pick/ban rates per map computed from OUR stored match vetoes. Covers
+    maps the team never plays — HLTV's team-maps page omits those entirely,
+    yet a permaban (played 0, banned every match) is exactly what a fantasy
+    picker needs to see."""
+    import json as _json
+    from datetime import date, timedelta
+
+    from backend.data.db import connect as _connect
+
+    team = get_team_by_id(team_id)
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found")
+    name = str(team.get("name") or "").strip()
+    months = max(1, min(24, int(months)))
+    cutoff = (date.today() - timedelta(days=months * 30)).isoformat()
+
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT veto_json FROM hltv_results
+            WHERE (LOWER(TRIM(team1)) = ? OR LOWER(TRIM(team2)) = ?)
+              AND match_date >= ?
+              AND veto_json IS NOT NULL AND veto_json != ''
+            """,
+            (name.lower(), name.lower(), cutoff),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    counts: dict = {}
+    matches = 0
+    for r in rows:
+        try:
+            veto = _json.loads(r["veto_json"])
+        except Exception:
+            continue
+        if not isinstance(veto, list) or not veto:
+            continue
+        matches += 1
+        for step in veto:
+            if str(step.get("team") or "").strip().lower() != name.lower():
+                continue
+            map_name = str(step.get("map") or "").strip()
+            action = str(step.get("action") or "").strip().lower()
+            if not map_name or action not in ("picked", "removed"):
+                continue
+            slot = counts.setdefault(map_name, {"picks": 0, "bans": 0})
+            slot["picks" if action == "picked" else "bans"] += 1
+
+    maps = {
+        m: {
+            "picks": c["picks"],
+            "bans": c["bans"],
+            "pick_rate": c["picks"] / matches if matches else 0.0,
+            "ban_rate": c["bans"] / matches if matches else 0.0,
+        }
+        for m, c in counts.items()
+    }
+    return {"team_id": int(team_id), "team_name": name, "months": months, "matches": matches, "maps": maps}
+
+
+@router.get("/{team_id}/map-profile")
+def team_map_profile(team_id: int, months: int = 3):
+    """Per-map record computed from OUR stored matches over an adjustable
+    window: wins/losses/rounds from the stored map scores, pick/ban rates from
+    the stored vetoes. Powers the Maps page team panel (the old fixed 3-month
+    HLTV team-page scrape couldn't change timeframe)."""
+    import json as _json
+    from datetime import date, timedelta
+
+    from backend.data.db import connect as _connect
+
+    team = get_team_by_id(team_id)
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found")
+    name = str(team.get("name") or "").strip()
+    lname = name.lower()
+    months = max(1, min(24, int(months)))
+    cutoff = (date.today() - timedelta(days=months * 30)).isoformat()
+
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT team1, team2, maps_json, veto_json FROM hltv_results
+            WHERE (LOWER(TRIM(team1)) = ? OR LOWER(TRIM(team2)) = ?)
+              AND match_date >= ?
+            """,
+            (lname, lname, cutoff),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    def _slot(stats, map_name):
+        return stats.setdefault(
+            map_name,
+            {"played": 0, "wins": 0, "losses": 0, "rounds": 0, "picks": 0, "bans": 0},
+        )
+
+    stats: dict = {}
+    matches = 0
+    veto_matches = 0
+    for r in rows:
+        is_team1 = str(r["team1"] or "").strip().lower() == lname
+        try:
+            maps = _json.loads(r["maps_json"] or "[]")
+        except Exception:
+            maps = []
+        counted = False
+        for m in maps if isinstance(maps, list) else []:
+            map_name = str((m or {}).get("map") or "").strip()
+            if not map_name:
+                continue
+            try:
+                s1 = int(m.get("score1"))
+                s2 = int(m.get("score2"))
+            except (TypeError, ValueError):
+                continue
+            own, opp = (s1, s2) if is_team1 else (s2, s1)
+            slot = _slot(stats, map_name)
+            slot["played"] += 1
+            if own > opp:
+                slot["wins"] += 1
+            elif opp > own:
+                slot["losses"] += 1
+            slot["rounds"] += own + opp
+            counted = True
+        if counted:
+            matches += 1
+        try:
+            veto = _json.loads(r["veto_json"] or "[]")
+        except Exception:
+            veto = []
+        if isinstance(veto, list) and veto:
+            veto_matches += 1
+            for step in veto:
+                if str(step.get("team") or "").strip().lower() != lname:
+                    continue
+                map_name = str(step.get("map") or "").strip()
+                action = str(step.get("action") or "").strip().lower()
+                if not map_name or action not in ("picked", "removed"):
+                    continue
+                slot = _slot(stats, map_name)
+                slot["picks" if action == "picked" else "bans"] += 1
+
+    out = []
+    for m, s in stats.items():
+        out.append(
+            {
+                "map": m,
+                "played": s["played"],
+                "wins": s["wins"],
+                "losses": s["losses"],
+                "win_rate": (s["wins"] / s["played"]) if s["played"] else None,
+                "total_rounds": s["rounds"],
+                "picks": s["picks"],
+                "bans": s["bans"],
+                "pick_rate": (s["picks"] / veto_matches) if veto_matches else None,
+                "ban_rate": (s["bans"] / veto_matches) if veto_matches else None,
+            }
+        )
+    out.sort(key=lambda r: (-r["played"], r["map"]))
+    return {
+        "status": "ok",
+        "team_id": int(team_id),
+        "team_name": name,
+        "months": months,
+        "matches": matches,
+        "veto_matches": veto_matches,
+        "maps": out,
+    }
+
+
 @router.get("/{team_id}")
 def fetch_team(team_id: int):
     team = get_team_by_id(team_id)

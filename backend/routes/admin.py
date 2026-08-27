@@ -1092,6 +1092,21 @@ def wipe():
     return {"status": "ok"}
 
 
+@router.post("/fetch-page")
+def fetch_page(payload: Dict[str, Any]):
+    """Dev helper: fetch one HLTV page through the shared browser — which
+    archives it as a page snapshot — so format-detection work can inspect the
+    stored HTML without a second browser fighting over the Chrome profile."""
+    url = str((payload or {}).get("url") or "").strip()
+    if not url.startswith("https://www.hltv.org/"):
+        raise HTTPException(status_code=400, detail="Only hltv.org URLs are allowed")
+    try:
+        html = fetch_hltv_html(url)
+    except HLTVBrowserError as exc:
+        raise HTTPException(status_code=502, detail=f"Fetch failed: {exc}")
+    return {"status": "ok", "url": url, "length": len(html or "")}
+
+
 @router.post("/import-trigger-rates")
 def import_trigger_rates(payload: Dict[str, Any]):
     """
@@ -1567,6 +1582,60 @@ def _collect_trigger_requests(driver, settle_seconds: float = 20.0) -> List[Dict
     return found
 
 
+@router.post("/fantasy-recon")
+def fantasy_recon(payload: Dict[str, Any] | None = None):
+    """Recon for trigger-rates automation: log in as the app account, open the
+    event's gameredirect, and report where it lands (does the account already
+    have a team? do league/team/draft ids appear without human interaction?).
+    Read-only — navigates and inspects, saves nothing."""
+    from backend.data.event_db import get_active_event_id
+
+    fantasy_id = int((payload or {}).get("event_id") or get_active_event_id() or 0)
+    if not fantasy_id:
+        raise HTTPException(status_code=400, detail="No event id")
+
+    recon_path = str((payload or {}).get("path") or "").strip()
+
+    def recon(driver):
+        _ensure_app_login(driver)
+        target = f"https://www.hltv.org{recon_path}" if recon_path else f"https://www.hltv.org/fantasy/{fantasy_id}/gameredirect"
+        driver.get(target)
+        time.sleep(6)
+        current = str(getattr(driver, "current_url", "") or "")
+        buttons = driver.execute_script(
+            "return Array.from(document.querySelectorAll('button, a.button, [class*=join], [class*=create]'))"
+            ".map(function(b){return (b.tagName + ':' + (b.textContent||'').trim().slice(0,40) + ':' + (b.getAttribute('href')||''));})"
+            ".filter(function(s){return s.length > 8;}).slice(0, 30);"
+        ) or []
+        hrefs = driver.execute_script(
+            "return Array.from(document.querySelectorAll('a[href*=\"/fantasy/\"]'))"
+            ".map(function(a){return a.getAttribute('href');}).slice(0, 40);"
+        ) or []
+        body_ids = driver.execute_script(
+            "var m = document.documentElement.outerHTML.match(/league\\/(\\d+)[^\"']*?(?:team|overview)\\/(\\d+)/);"
+            "return m ? m.slice(1) : null;"
+        )
+        draft_hits = driver.execute_script(
+            "var mm = document.documentElement.outerHTML.match(/draft\\/(\\d+)/g);"
+            "return mm ? mm.slice(0, 5) : null;"
+        )
+        return {
+            "landed_url": current,
+            "buttons": buttons,
+            "fantasy_links": [h for h in hrefs if h],
+            "league_team_in_dom": body_ids,
+            "draft_ids_in_dom": draft_hits,
+        }
+
+    try:
+        result = run_hltv_browser_session(
+            "https://www.hltv.org", recon, timeout_ms=180000, wait_text=None
+        )
+    except HLTVBrowserError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"status": "ok", "event_id": fantasy_id, **(result or {})}
+
+
 @router.post("/capture-trigger-endpoint")
 def capture_trigger_endpoint(payload: Dict[str, Any] | None = None):
     """One-time interactive capture: open the draft builder in a visible window,
@@ -1932,22 +2001,15 @@ def get_trigger_backfill_coverage(event_id: Optional[int] = None):
 @router.post("/trigger-rates-backfill/start")
 def start_trigger_backfill(payload: Dict[str, Any] | None = None):
     template = _load_trigger_template()
-    if not template and not _load_hltv_credentials():
-        raise HTTPException(
-            status_code=400,
-            detail="Save the HLTV app login first — the job logs in and discovers the endpoint by itself.",
-        )
     event_id = (payload or {}).get("event_id")
-    if template and not _template_matches_event(template, event_id):
-        tpl_fid = _template_fantasy_id(template)
-        from backend.data.event_db import get_active_event_id
-
-        target_fid = int(event_id or get_active_event_id() or 0)
+    # A template for another event is fine when credentials exist — the worker
+    # auto-provisions a team + endpoint for the target event itself.
+    if not _template_matches_event(template, event_id) and not _load_hltv_credentials():
         raise HTTPException(
             status_code=400,
             detail=(
-                f"The captured endpoint is for event {tpl_fid}, but this is event {target_fid}. "
-                f"Run Capture again on event {target_fid} (add any 5 players to your team and save) before importing."
+                "No captured endpoint for this event and no saved HLTV login to auto-provision one. "
+                "Save the HLTV app login (or run Capture on this event) first."
             ),
         )
     latest = _get_latest_trigger_job()
@@ -1977,7 +2039,7 @@ def start_trigger_backfill(payload: Dict[str, Any] | None = None):
         "finished_at": None,
     }
     _publish_trigger_job(job)
-    _start_trigger_worker(job_id, (payload or {}).get("event_id"))
+    _start_trigger_worker(job_id, (payload or {}).get("event_id"), bool((payload or {}).get("refresh_all")))
     return {"job_id": job_id, "status": "queued"}
 
 
@@ -2049,14 +2111,145 @@ def resume_trigger_backfill_job(job_id: str):
     return _trigger_job_response(_get_trigger_job_for_response(job_id))
 
 
-def _start_trigger_worker(job_id: str, event_id) -> None:
+def _start_trigger_worker(job_id: str, event_id, refresh_all: bool = False) -> None:
     with TRIGGER_JOBS_LOCK:
         worker = TRIGGER_WORKERS.get(job_id)
         if worker and worker.is_alive():
             return
-        worker = threading.Thread(target=_run_trigger_backfill_job, args=(job_id, event_id), daemon=True)
+        worker = threading.Thread(
+            target=_run_trigger_backfill_job, args=(job_id, event_id, refresh_all), daemon=True
+        )
         TRIGGER_WORKERS[job_id] = worker
         worker.start()
+
+
+def _cheapest_event_players(fantasy_id: int, count: int = 5) -> List[int]:
+    from backend.data.event_db import get_event_detail
+
+    detail = get_event_detail(int(fantasy_id)) or {}
+    players = sorted(
+        (p for p in (detail.get("players") or []) if p.get("player_id")),
+        key=lambda p: int(p.get("price") or 0),
+    )
+    return [int(p["player_id"]) for p in players[:count]]
+
+
+def _auto_provision_template(driver, fantasy_id: int) -> Dict[str, Any]:
+    """Create the app account's fantasy team for an event with no human in the
+    loop, replaying the SPA's own join flow (recorded from real capture
+    sessions in trigger_capture_debug.json): POST leagues/join into the
+    event's featured public league with a minimal 5-player lineup, resolve the
+    created team via gameredirect, and build the trigger-rates URL — the
+    draft id equals the fantasy event id (verified on events 642/644).
+    Raises loudly at any deviation from the recorded flow."""
+    fantasy_id = int(fantasy_id)
+    base = f"https://www.hltv.org/fantasy/{fantasy_id}"
+
+    def _team_from_gameredirect():
+        driver.get(f"{base}/gameredirect")
+        time.sleep(5)
+        landed = str(getattr(driver, "current_url", "") or "")
+        m = re.search(rf"/fantasy/{fantasy_id}/league/(\d+)/team/(\d+)", landed)
+        return (int(m.group(1)), int(m.group(2))) if m else (None, landed)
+
+    league_id, team_or_landed = _team_from_gameredirect()
+    if league_id is None:
+        # No team yet: join the featured public league (first league link on
+        # the overview page — gameredirect lands there when teamless).
+        league_href = driver.execute_script(
+            f"var a = document.querySelector('a[href^=\"/fantasy/{fantasy_id}/league/\"]');"
+            "return a ? a.getAttribute('href') : null;"
+        )
+        lm = re.search(rf"/fantasy/{fantasy_id}/league/(\d+)", str(league_href or ""))
+        if not lm:
+            raise RuntimeError(f"No public league link on the fantasy overview for event {fantasy_id}")
+        join_league_id = int(lm.group(1))
+        lineup = _cheapest_event_players(fantasy_id, 5)
+        if len(lineup) < 5:
+            raise RuntimeError(f"Event {fantasy_id} has fewer than 5 priced players stored — import it first")
+        join_body = json.dumps(
+            {
+                "leagueId": {"id": join_league_id},
+                "leagueSecret": None,
+                "teamName": "wrenchtest",
+                "lineup": [{"playerId": pid} for pid in lineup],
+            }
+        )
+        join_script = """
+            var url = arguments[0], body = arguments[1];
+            var done = arguments[arguments.length - 1];
+            (async function(){
+                try {
+                    var r = await fetch(url, {method:"POST", headers:{"content-type":"application/json"}, credentials:"include", body: body});
+                    var t = await r.text();
+                    done({ok: r.ok, status: r.status, text: t.slice(0, 400)});
+                } catch (e) { done({ok:false, error:String(e)}); }
+            })();
+        """
+        res = driver.execute_async_script(join_script, f"{base}/leagues/join", join_body)
+        if not (res or {}).get("ok"):
+            raise RuntimeError(f"leagues/join failed for event {fantasy_id}: {json.dumps(res)[:300]}")
+        try:
+            join_data = json.loads((res or {}).get("text") or "{}")
+        except Exception:
+            join_data = {}
+        if join_data.get("error"):
+            # HLTV's own refusal (e.g. "Game for league has already started") —
+            # surface it verbatim; there is nothing to retry.
+            raise RuntimeError(f"HLTV refused the league join for event {fantasy_id}: {join_data['error']}")
+        created = join_data.get("createdTeamId")
+        created_id = created.get("id") if isinstance(created, dict) else created
+        if created_id:
+            league_id, team_or_landed = join_league_id, int(created_id)
+        else:
+            league_id, team_or_landed = _team_from_gameredirect()
+        if league_id is None:
+            # gameredirect can land on the overview even with a team; the nav
+            # dropdown lists the account's own teams — check there too.
+            own_href = driver.execute_script(
+                f"var a = document.querySelector('a.dropdown-link[href*=\"/fantasy/{fantasy_id}/league/\"][href*=\"/team/\"]');"
+                "return a ? a.getAttribute('href') : null;"
+            )
+            m2 = re.search(rf"/fantasy/{fantasy_id}/league/(\d+)/team/(\d+)", str(own_href or ""))
+            if m2:
+                league_id, team_or_landed = int(m2.group(1)), int(m2.group(2))
+            else:
+                raise RuntimeError(
+                    f"Joined league {join_league_id} for event {fantasy_id} (response: "
+                    f"{json.dumps(res)[:300]}) but no team page found — gameredirect landed on "
+                    f"{team_or_landed!r} and the nav dropdown has no own-team link"
+                )
+    team_id = int(team_or_landed)
+
+    trig_url = (
+        f"https://www.hltv.org/fantasy/{fantasy_id}/league/{league_id}"
+        f"/overview/{team_id}/draft/{fantasy_id}/triggerrates/json"
+    )
+    verify = driver.execute_async_script(
+        """
+        var url = arguments[0]; var done = arguments[arguments.length - 1];
+        fetch(url, {credentials:"include", headers:{accept:"application/json"}})
+          .then(function(r){ return r.text(); })
+          .then(function(t){ done({ok: t.indexOf("playerTriggerRates") !== -1, text: t.slice(0, 200)}); })
+          .catch(function(e){ done({ok:false, error:String(e)}); });
+        """,
+        trig_url,
+    )
+    if not (verify or {}).get("ok"):
+        raise RuntimeError(
+            f"Auto-provisioned trigger endpoint returned no playerTriggerRates: {json.dumps(verify)[:300]}"
+        )
+    template = {
+        "url": trig_url,
+        "method": "GET",
+        "post_data": None,
+        "captured_player_ids": [],
+        "page_url": f"https://www.hltv.org/fantasy/{fantasy_id}/league/{league_id}/team/{team_id}",
+        "captured_at": time.time(),
+        "auto_provisioned": True,
+    }
+    _save_trigger_template(template)
+    return template
 
 
 def _auto_discover_template(driver, event_id, wait_seconds: int = 200) -> Dict[str, Any]:
@@ -2113,7 +2306,7 @@ def _auto_discover_template(driver, event_id, wait_seconds: int = 200) -> Dict[s
     )
 
 
-def _run_trigger_backfill_job(job_id: str, event_id) -> None:
+def _run_trigger_backfill_job(job_id: str, event_id, refresh_all: bool = False) -> None:
     job = _get_stored_trigger_job(job_id)
     if not job:
         return
@@ -2144,7 +2337,10 @@ def _run_trigger_backfill_job(job_id: str, event_id) -> None:
         price_map, missing, _cov = _missing_trigger_players(event_id)
         if not price_map:
             raise RuntimeError("No event player prices found. Import the event first.")
-        batches = _build_trigger_batches(price_map, _player_teams_map(), 1_000_000, cover=set(missing))
+        # refresh_all re-reads every priced player (rates drift over time —
+        # a new event wants everyone current, not just the never-fetched).
+        cover = set(price_map.keys()) if refresh_all else set(missing)
+        batches = _build_trigger_batches(price_map, _player_teams_map(), 1_000_000, cover=cover)
         total = len(batches)
         job["total_items"] = total
         job["processed_items"] = 0
@@ -2169,30 +2365,27 @@ def _run_trigger_backfill_job(job_id: str, event_id) -> None:
             _publish_trigger_job(job)
             _ensure_app_login(driver)
 
-            # Stage 2: need the captured trigger-rates GET (from Capture). The
-            # endpoint reads whatever lineup is saved on the team, so covering
-            # every player means saving each batch as the lineup, then reading
-            # its rates. IDs come from the captured URL's path.
-            template = _load_trigger_template()
-            trig_url = str((template or {}).get("url") or "")
-            m = re.search(r"/fantasy/(\d+)/league/(\d+)/overview/(\d+)/draft/(\d+)/triggerrates", trig_url)
-            if not m:
-                raise RuntimeError(
-                    "No usable captured endpoint. Run Capture once (add any 5 players to your team and save)."
-                )
-            fantasy_id, league_id, team_id, draft_id = (int(x) for x in m.groups())
-            # The captured endpoint is event-specific. If it was taken on a
-            # different event, saving/reading here would hit that event's team
-            # (the previous event's fantasy page), so refuse and ask for a fresh
-            # capture rather than silently importing the wrong lineup's rates.
+            # Stage 2: need the trigger-rates GET endpoint. The endpoint reads
+            # whatever lineup is saved on the team, so covering every player
+            # means saving each batch as the lineup, then reading its rates.
+            # When no endpoint matches this event (new event, no capture),
+            # auto-provision one: join a public league as the app account,
+            # which creates the team the endpoint needs.
             from backend.data.event_db import get_active_event_id
 
             target_fid = int(event_id or get_active_event_id() or 0)
-            if target_fid and fantasy_id != target_fid:
-                raise RuntimeError(
-                    f"Captured endpoint is for event {fantasy_id}, but you're importing event {target_fid}. "
-                    f"Run Capture again on event {target_fid} (add any 5 players to your team and save)."
-                )
+            template = _load_trigger_template()
+            if not _template_matches_event(template, target_fid):
+                if not target_fid:
+                    raise RuntimeError("No target event for the trigger backfill")
+                job["current_item"] = f"Creating fantasy team for event {target_fid}"
+                _publish_trigger_job(job)
+                template = _auto_provision_template(driver, target_fid)
+            trig_url = str((template or {}).get("url") or "")
+            m = re.search(r"/fantasy/(\d+)/league/(\d+)/overview/(\d+)/draft/(\d+)/triggerrates", trig_url)
+            if not m:
+                raise RuntimeError(f"Trigger endpoint URL has an unexpected shape: {trig_url!r}")
+            fantasy_id, league_id, team_id, draft_id = (int(x) for x in m.groups())
             save_url = f"https://www.hltv.org/fantasy/{fantasy_id}/teams/edit"
             try:
                 driver.get(str((template or {}).get("page_url") or f"https://www.hltv.org/fantasy/{fantasy_id}/overview"))

@@ -32,6 +32,9 @@ from backend.data.event_db import (
     get_cached_vrs_rankings_on_or_before_date,
     get_active_event_id,
     get_event_detail,
+    get_event_tournament_kind,
+    get_player_latest_teams,
+    set_event_tournament_kind,
     get_hltv_result_by_url,
     get_imported_match_ids,
     get_all_historical_team_map_stats_json,
@@ -41,6 +44,7 @@ from backend.data.event_db import (
     set_hltv_result_maps,
     list_events,
     set_active_event,
+    set_event_name,
     upsert_historical_team_map_stats,
     upsert_hltv_rankings_snapshot,
     upsert_vrs_rankings_snapshot,
@@ -302,8 +306,76 @@ def _build_current_points_maps() -> Tuple[Dict[str, int], Dict[str, int]]:
     return hltv_map, vrs_map
 
 
+_EVENT_NAME_ACRONYMS = {
+    "iem", "esl", "pgl", "blast", "ewc", "cct", "cs2", "csgo", "rmr", "vrs",
+    "eu", "na", "sa", "apac", "mena", "esea", "wesg", "lan",
+}
+
+
+def _event_name_from_url(url: str) -> str:
+    """Readable event name from an HLTV event URL slug
+    (…/events/7148/iem-cologne-2026 → 'IEM Cologne 2026')."""
+    m = re.search(r"/events/\d+/([a-z0-9-]+)", str(url or "").lower())
+    if not m:
+        return ""
+    words = [w for w in m.group(1).split("-") if w]
+    return " ".join(
+        w.upper() if w in _EVENT_NAME_ACRONYMS else (w if w.isdigit() else w.capitalize())
+        for w in words
+    )
+
+
+_EVENT_NAMES_BACKFILLED = False
+
+
+def _backfill_event_names() -> None:
+    """One-shot per process: derive names for events missing one — from the
+    stored HLTV event URL slug, or by re-parsing archived fantasy-page
+    snapshots for events imported before the ref was captured. No scraping."""
+    global _EVENT_NAMES_BACKFILLED
+    if _EVENT_NAMES_BACKFILLED:
+        return
+    _EVENT_NAMES_BACKFILLED = True
+    from backend.data.page_snapshots import get_page_snapshot
+    from backend.routes.admin import _extract_hltv_event_ref
+
+    for ev in list_events():
+        if ev.get("name"):
+            continue
+        eid = int(ev["event_id"])
+        name = _event_name_from_url(str(ev.get("hltv_event_url") or ""))
+        ref: Dict[str, Any] = {}
+        if not name:
+            for candidate in (
+                f"https://www.hltv.org/fantasy/{eid}",
+                f"https://www.hltv.org/fantasy/{eid}/overview",
+                f"https://www.hltv.org/fantasy/{eid}/leagues/create",
+            ):
+                snap = get_page_snapshot(candidate)
+                if not snap:
+                    continue
+                try:
+                    ref = _extract_hltv_event_ref(snap["html"]) or {}
+                except Exception:
+                    ref = {}
+                name = _event_name_from_url(str(ref.get("hltv_event_url") or ""))
+                if name:
+                    break
+        if name:
+            set_event_name(
+                eid,
+                name,
+                hltv_event_id=ref.get("hltv_event_id"),
+                hltv_event_url=ref.get("hltv_event_url"),
+            )
+
+
 @router.get("/")
 def list_all_events():
+    try:
+        _backfill_event_names()
+    except Exception:
+        logger.info("Event name backfill failed", exc_info=True)
     return {
         "active_event_id": get_active_event_id(),
         "events": list_events(),
@@ -767,6 +839,8 @@ def _import_hltv_results_work(
                         r["veto_json"] = str(stored.get("veto_json"))
                     if stored.get("player_stats_json"):
                         r["player_stats_json"] = str(stored.get("player_stats_json"))
+                    if stored.get("map_player_stats_json"):
+                        r["map_player_stats_json"] = str(stored.get("map_player_stats_json"))
                 else:
                     md = get_hltv_match_details(url)
                     maps = md.get("maps") or []
@@ -778,6 +852,9 @@ def _import_hltv_results_work(
                     player_stats = md.get("player_stats") or []
                     if player_stats:
                         r["player_stats_json"] = json.dumps(player_stats)
+                    map_player_stats = md.get("map_player_stats") or {}
+                    if map_player_stats:
+                        r["map_player_stats_json"] = json.dumps(map_player_stats)
             except Exception:
                 pass
         processed_units += 1
@@ -1079,14 +1156,86 @@ def cancel_hltv_results_import_job(job_id: str):
 
 
 @router.get("/hltv-results")
-def get_hltv_results(limit: int = 100, offset: int = 0):
-    rows = list_hltv_results(limit=limit, offset=offset)
+def get_hltv_results(
+    limit: int = 100,
+    offset: int = 0,
+    search: str = "",
+    sort: str = "",
+    vrs_rank: int = 0,
+    vrs_scope: str = "",
+    vrs_dir: str = "",
+):
+    rows = list_hltv_results(
+        limit=limit, offset=offset, search=search, sort=sort,
+        vrs_rank=vrs_rank, vrs_scope=vrs_scope, vrs_dir=vrs_dir,
+    )
     return {
         "count": len(rows),
         "total": int(count_hltv_results()),
         "limit": int(limit),
         "offset": int(offset),
         "results": rows,
+    }
+
+
+@router.get("/map-play-distribution")
+def get_map_play_distribution(months: int = 3, vrs_rank: int = 0, vrs_scope: str = "both", vrs_dir: str = "within"):
+    """How often each map was played across stored matches in the window,
+    with the same VRS-rank filter as the Matches browser (inside/outside top N,
+    both teams or at least one; unranked counts as outside). Feeds the Maps
+    page pie chart."""
+    months = max(1, min(24, int(months or 3)))
+    rank_n = max(0, int(vrs_rank or 0))
+    scope = str(vrs_scope or "both").strip().lower()
+    direction = str(vrs_dir or "within").strip().lower()
+    cutoff = (date.today() - relativedelta(months=months)).isoformat()
+    rows = list_hltv_results(limit=max(1, count_hltv_results()), offset=0)
+    counts: Dict[str, int] = {}
+    matches = 0
+    for r in rows:
+        md = str(r.get("match_date") or "")
+        if not md or md < cutoff:
+            continue
+        if rank_n > 0:
+            try:
+                r1 = int(r.get("vrs_rank_1") or 0)
+            except (TypeError, ValueError):
+                r1 = 0
+            try:
+                r2 = int(r.get("vrs_rank_2") or 0)
+            except (TypeError, ValueError):
+                r2 = 0
+            in1 = 0 < r1 <= rank_n
+            in2 = 0 < r2 <= rank_n
+            hit1 = in1 if direction == "within" else not in1
+            hit2 = in2 if direction == "within" else not in2
+            if not (hit1 and hit2 if scope == "both" else hit1 or hit2):
+                continue
+        try:
+            maps = json.loads(str(r.get("maps_json") or "[]"))
+        except Exception:
+            maps = []
+        counted = False
+        for m in maps if isinstance(maps, list) else []:
+            name = str((m or {}).get("map") or "").strip()
+            if not name:
+                continue
+            counts[name] = counts.get(name, 0) + 1
+            counted = True
+        if counted:
+            matches += 1
+    return {
+        "status": "ok",
+        "months": months,
+        "vrs_rank": rank_n,
+        "vrs_scope": scope,
+        "vrs_dir": direction,
+        "matches": matches,
+        "total_maps": sum(counts.values()),
+        "maps": [
+            {"map": k, "played": v}
+            for k, v in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        ],
     }
 
 
@@ -2403,11 +2552,13 @@ def _run_veto_backfill_job(job_id: str) -> None:
                 veto = md.get("veto") or []
                 player_stats = md.get("player_stats") or []
                 maps = md.get("maps") or []
+                map_player_stats = md.get("map_player_stats") or {}
                 update_hltv_result_details(
                     item["match_url"],
                     veto_json=json.dumps(veto),
                     player_stats_json=json.dumps(player_stats) if player_stats and not item["has_player_stats"] else None,
                     maps_json=json.dumps(maps) if maps and not item["has_maps"] else None,
+                    map_player_stats_json=json.dumps(map_player_stats) if map_player_stats else None,
                 )
                 ok += 1
             except Exception as exc:
@@ -2500,13 +2651,15 @@ def reparse_match_details_from_snapshots(limit: int = 0):
         maps = details.get("maps") or []
         veto = details.get("veto") or []
         player_stats = details.get("player_stats") or []
+        map_player_stats = details.get("map_player_stats") or {}
         update_hltv_result_details(
             url,
             maps_json=json.dumps(maps) if maps else None,
             veto_json=json.dumps(veto) if veto else None,
             player_stats_json=json.dumps(player_stats) if player_stats else None,
+            map_player_stats_json=json.dumps(map_player_stats) if map_player_stats else None,
         )
-        if maps or veto or player_stats:
+        if maps or veto or player_stats or map_player_stats:
             updated += 1
     return {
         "status": "ok",
@@ -2607,6 +2760,397 @@ def resume_veto_backfill_job(job_id: str):
     _publish_veto_job(job)
     _start_veto_backfill_worker(job_id)
     return _veto_job_response(_get_veto_job_for_response(job_id))
+
+
+# ---- per-map scoreboard backfill job ----------------------------------------
+# Fills hltv_results.map_player_stats_json (per-map player scoreboards). Most
+# rows are covered by re-parsing the archived page snapshot — no scraping —
+# and only matches with no snapshot fall back to a live fetch. Same pause /
+# cancel / resume contract as the veto backfill; the scheduler auto-resumes it
+# after backend restarts.
+
+MAP_SB_JOBS: Dict[str, Dict[str, Any]] = {}
+MAP_SB_WORKERS: Dict[str, threading.Thread] = {}
+MAP_SB_JOBS_LOCK = threading.Lock()
+
+
+def ensure_map_sb_job_schema() -> None:
+    conn = event_db_connect()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS map_scoreboard_backfill_jobs (
+                job_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                error TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                progress REAL NOT NULL DEFAULT 0,
+                processed_items INTEGER NOT NULL DEFAULT 0,
+                total_items INTEGER NOT NULL DEFAULT 0,
+                ok INTEGER NOT NULL DEFAULT 0,
+                failed INTEGER NOT NULL DEFAULT 0,
+                current_item TEXT NOT NULL DEFAULT '',
+                pause_requested INTEGER NOT NULL DEFAULT 0,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                started_at REAL,
+                finished_at REAL
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _get_stored_map_sb_job(job_id: str) -> Dict[str, Any] | None:
+    conn = event_db_connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM map_scoreboard_backfill_jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        return _veto_job_from_row(row) if row else None
+    finally:
+        conn.close()
+
+
+def _save_map_sb_job(job: Dict[str, Any]) -> None:
+    now = time.time()
+    job["updated_at"] = now
+    conn = event_db_connect()
+    try:
+        conn.execute(
+            """
+            INSERT INTO map_scoreboard_backfill_jobs (
+                job_id, status, error, last_error, progress, processed_items, total_items,
+                ok, failed, current_item, pause_requested, cancel_requested,
+                created_at, updated_at, started_at, finished_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                status = excluded.status,
+                error = excluded.error,
+                last_error = excluded.last_error,
+                progress = excluded.progress,
+                processed_items = excluded.processed_items,
+                total_items = excluded.total_items,
+                ok = excluded.ok,
+                failed = excluded.failed,
+                current_item = excluded.current_item,
+                pause_requested = excluded.pause_requested,
+                cancel_requested = excluded.cancel_requested,
+                updated_at = excluded.updated_at,
+                started_at = COALESCE(excluded.started_at, map_scoreboard_backfill_jobs.started_at),
+                finished_at = excluded.finished_at
+            """,
+            (
+                str(job["job_id"]),
+                str(job.get("status") or "queued"),
+                str(job.get("error") or ""),
+                str(job.get("last_error") or ""),
+                float(job.get("progress") or 0.0),
+                int(job.get("processed_items") or 0),
+                int(job.get("total_items") or 0),
+                int(job.get("ok") or 0),
+                int(job.get("failed") or 0),
+                str(job.get("current_item") or ""),
+                1 if job.get("pause_requested") else 0,
+                1 if job.get("cancel_requested") else 0,
+                float(job.get("created_at") or now),
+                now,
+                job.get("started_at"),
+                job.get("finished_at"),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _publish_map_sb_job(job: Dict[str, Any]) -> None:
+    with MAP_SB_JOBS_LOCK:
+        MAP_SB_JOBS[str(job["job_id"])] = dict(job)
+    _save_map_sb_job(job)
+
+
+def _map_sb_worker_is_active(job_id: str) -> bool:
+    with MAP_SB_JOBS_LOCK:
+        worker = MAP_SB_WORKERS.get(job_id)
+        return bool(worker and worker.is_alive())
+
+
+def _get_map_sb_job_for_response(job_id: str) -> Dict[str, Any]:
+    with MAP_SB_JOBS_LOCK:
+        cached = MAP_SB_JOBS.get(job_id)
+        job = dict(cached) if cached else None
+    if not job:
+        job = _get_stored_map_sb_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job_id not found")
+    if job.get("status") in {"queued", "running", "pausing", "canceling"} and not _map_sb_worker_is_active(job_id):
+        job["status"] = "canceled" if job.get("cancel_requested") else "paused"
+        job["last_error"] = job.get("last_error") or "Job was interrupted before completion. Resume to continue."
+        job["error"] = ""
+        job["pause_requested"] = False
+        job["cancel_requested"] = False
+        _publish_map_sb_job(job)
+    return job
+
+
+def _map_sb_missing_items() -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    rows = list_hltv_results(limit=max(1, count_hltv_results()), offset=0)
+    missing: List[Dict[str, Any]] = []
+    have = 0
+    for r in rows:
+        url = str(r.get("match_url") or "").strip()
+        if not url:
+            continue
+        # Stored "{}" means the page was scanned and has no per-map tabs
+        # (forfeit / no scoreboard) — counted as covered, never revisited.
+        if r.get("map_player_stats_json"):
+            have += 1
+            continue
+        missing.append(
+            {
+                "match_url": url,
+                "match_date": str(r.get("match_date") or ""),
+                "label": f"{r.get('team1')} vs {r.get('team2')} ({r.get('match_date')})",
+                "has_maps": bool(r.get("maps_json")),
+                "has_veto": bool(r.get("veto_json")),
+                "has_player_stats": bool(r.get("player_stats_json")),
+            }
+        )
+    missing.sort(key=lambda it: it["match_date"], reverse=True)
+    coverage = {
+        "total_matches": len(rows),
+        "with_map_scoreboards": have,
+        "missing_map_scoreboards": len(missing),
+    }
+    return missing, coverage
+
+
+def _run_map_sb_job(job_id: str) -> None:
+    from backend.data.page_snapshots import get_page_snapshot
+    from backend.services.hltv_rankings import parse_hltv_match_details_html
+
+    job = _get_stored_map_sb_job(job_id)
+    if not job:
+        return
+
+    def stop_requested() -> str:
+        with MAP_SB_JOBS_LOCK:
+            live = MAP_SB_JOBS.get(job_id) or {}
+        if live.get("cancel_requested"):
+            return "canceled"
+        if live.get("pause_requested"):
+            return "paused"
+        return ""
+
+    job["status"] = "running"
+    job["pause_requested"] = False
+    job["cancel_requested"] = False
+    job["error"] = ""
+    if job.get("last_error") in _INTERRUPTION_BOILERPLATE:
+        job["last_error"] = ""
+    job["started_at"] = job.get("started_at") or time.time()
+    job["finished_at"] = None
+    job["current_item"] = "Scanning stored matches for missing per-map scoreboards"
+    _publish_map_sb_job(job)
+
+    try:
+        missing, _coverage = _map_sb_missing_items()
+        total = len(missing)
+        processed = 0
+        ok = int(job.get("ok") or 0)
+        failed = int(job.get("failed") or 0)
+        job["total_items"] = total
+        job["processed_items"] = 0
+        job["progress"] = 0.0 if total else 1.0
+        _publish_map_sb_job(job)
+
+        for item in missing:
+            stopped = stop_requested()
+            if stopped:
+                job["status"] = stopped
+                job["pause_requested"] = False
+                job["cancel_requested"] = False
+                job["last_error"] = "Canceled" if stopped == "canceled" else "Paused"
+                job["finished_at"] = time.time()
+                _publish_map_sb_job(job)
+                return
+            job["current_item"] = item["label"]
+            try:
+                snap = get_page_snapshot(item["match_url"])
+                if snap:
+                    details = parse_hltv_match_details_html(snap["html"], item["match_url"])
+                else:
+                    # No archived page — live fetch (which archives the page).
+                    details = get_hltv_match_details(item["match_url"])
+                map_player_stats = details.get("map_player_stats") or {}
+                maps = details.get("maps") or []
+                veto = details.get("veto") or []
+                player_stats = details.get("player_stats") or []
+                # Always store the per-map result ("{}" marks pages with no
+                # per-map tabs as scanned); the page was parsed anyway, so also
+                # fill any other details the row is missing.
+                update_hltv_result_details(
+                    item["match_url"],
+                    map_player_stats_json=json.dumps(map_player_stats),
+                    maps_json=json.dumps(maps) if maps and not item["has_maps"] else None,
+                    veto_json=json.dumps(veto) if veto and not item["has_veto"] else None,
+                    player_stats_json=json.dumps(player_stats) if player_stats and not item["has_player_stats"] else None,
+                )
+                ok += 1
+            except Exception as exc:
+                failed += 1
+                job["last_error"] = f"{item['label']}: {exc}"
+            processed += 1
+            job["processed_items"] = processed
+            job["ok"] = ok
+            job["failed"] = failed
+            job["progress"] = processed / float(total) if total else 1.0
+            with MAP_SB_JOBS_LOCK:
+                live = MAP_SB_JOBS.get(job_id) or {}
+            job["pause_requested"] = bool(live.get("pause_requested"))
+            job["cancel_requested"] = bool(live.get("cancel_requested"))
+            if job["cancel_requested"]:
+                job["status"] = "canceling"
+            elif job["pause_requested"]:
+                job["status"] = "pausing"
+            else:
+                job["status"] = "running"
+            _publish_map_sb_job(job)
+
+        job["status"] = "completed"
+        job["current_item"] = ""
+        job["finished_at"] = time.time()
+        _publish_map_sb_job(job)
+    except Exception as exc:
+        job["status"] = "failed"
+        job["error"] = str(exc)
+        job["finished_at"] = time.time()
+        _publish_map_sb_job(job)
+    finally:
+        with MAP_SB_JOBS_LOCK:
+            MAP_SB_WORKERS.pop(job_id, None)
+
+
+def _start_map_sb_worker(job_id: str) -> None:
+    with MAP_SB_JOBS_LOCK:
+        worker = MAP_SB_WORKERS.get(job_id)
+        if worker and worker.is_alive():
+            return
+        worker = threading.Thread(target=_run_map_sb_job, args=(job_id,), daemon=True)
+        MAP_SB_WORKERS[job_id] = worker
+        worker.start()
+
+
+def _get_latest_map_sb_job() -> Dict[str, Any] | None:
+    ensure_map_sb_job_schema()
+    conn = event_db_connect()
+    try:
+        row = conn.execute(
+            "SELECT job_id FROM map_scoreboard_backfill_jobs ORDER BY updated_at DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    return _get_map_sb_job_for_response(str(row["job_id"])) if row else None
+
+
+@router.get("/hltv-results/map-scoreboards/coverage")
+def get_map_scoreboards_coverage():
+    _missing, coverage = _map_sb_missing_items()
+    return {"status": "ok", **coverage}
+
+
+@router.post("/hltv-results/map-scoreboards/start")
+def start_map_scoreboards_job():
+    ensure_map_sb_job_schema()
+    latest = _get_latest_map_sb_job()
+    if latest and latest.get("status") in {"queued", "running", "pausing", "canceling"}:
+        return {"job_id": latest["job_id"], "status": latest.get("status"), "reused": True}
+    now = time.time()
+    job_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "error": "",
+        "last_error": "",
+        "progress": 0.0,
+        "processed_items": 0,
+        "total_items": 0,
+        "ok": 0,
+        "failed": 0,
+        "current_item": "",
+        "pause_requested": False,
+        "cancel_requested": False,
+        "created_at": now,
+        "updated_at": now,
+        "started_at": None,
+        "finished_at": None,
+    }
+    _publish_map_sb_job(job)
+    _start_map_sb_worker(job_id)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@router.get("/hltv-results/map-scoreboards/latest")
+def get_latest_map_scoreboards_job():
+    ensure_map_sb_job_schema()
+    job = _get_latest_map_sb_job()
+    if not job:
+        return {"exists": False}
+    return {"exists": True, **_veto_job_response(job)}
+
+
+@router.get("/hltv-results/map-scoreboards/job/{job_id}")
+def get_map_scoreboards_job(job_id: str):
+    return _veto_job_response(_get_map_sb_job_for_response(job_id))
+
+
+@router.post("/hltv-results/map-scoreboards/job/{job_id}/pause")
+def pause_map_scoreboards_job(job_id: str):
+    job = _get_map_sb_job_for_response(job_id)
+    if job.get("status") in {"completed", "canceled", "failed", "paused"}:
+        return _veto_job_response(job)
+    job["pause_requested"] = True
+    job["status"] = "pausing" if _map_sb_worker_is_active(job_id) else "paused"
+    _publish_map_sb_job(job)
+    return _veto_job_response(job)
+
+
+@router.post("/hltv-results/map-scoreboards/job/{job_id}/cancel")
+def cancel_map_scoreboards_job(job_id: str):
+    job = _get_map_sb_job_for_response(job_id)
+    if job.get("status") in {"completed", "canceled", "failed"}:
+        return _veto_job_response(job)
+    job["cancel_requested"] = True
+    job["status"] = "canceling" if _map_sb_worker_is_active(job_id) else "canceled"
+    if job["status"] == "canceled":
+        job["cancel_requested"] = False
+        job["finished_at"] = time.time()
+    _publish_map_sb_job(job)
+    return _veto_job_response(job)
+
+
+@router.post("/hltv-results/map-scoreboards/job/{job_id}/resume")
+def resume_map_scoreboards_job(job_id: str):
+    job = _get_map_sb_job_for_response(job_id)
+    if job.get("status") in {"completed", "canceled"}:
+        return _veto_job_response(job)
+    if job.get("status") == "running" and _map_sb_worker_is_active(job_id):
+        return _veto_job_response(job)
+    job["status"] = "queued"
+    job["pause_requested"] = False
+    job["cancel_requested"] = False
+    job["error"] = ""
+    if job.get("last_error") in _INTERRUPTION_BOILERPLATE:
+        job["last_error"] = ""
+    job["finished_at"] = None
+    _publish_map_sb_job(job)
+    _start_map_sb_worker(job_id)
+    return _veto_job_response(_get_map_sb_job_for_response(job_id))
 
 
 def _map_stat_features(
@@ -3659,6 +4203,268 @@ def get_map_model_lab(
     }
 
 
+def _detect_event_tournament_kind(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Classify what stage THIS fantasy event covers, from the typed JSON
+    HLTV embeds in its event pages (swiss simulator, slotted brackets, formats
+    table) — see services/event_format.py.
+
+    One tournament often has separate fantasy events per stage (groups +
+    playoff pointing at the same HLTV event), so the stage is chosen by
+    matching the fantasy event's PRICED TEAM ROSTER against each detected
+    stage's roster, discounted by how far the stage size is from the priced
+    team count (bracket rosters can still be TBD, so size proximity breaks
+    those ties). Pages without structured data return kind "unknown" — use
+    the manual override there; old archived events are not supported.
+    """
+    # Lazy import: groups.py must not be imported at module load here (cycle).
+    from backend.routes.groups import _find_event_snapshot_html
+    from backend.services.event_format import detect_event_structure
+
+    teams = event.get("teams") or []
+    team_count = len(teams) or int(event.get("team_count") or 0)
+    fantasy_names = {_norm_team_name(t.get("team_name") or "") for t in teams}
+    fantasy_names.discard("")
+
+    html = _find_event_snapshot_html(event.get("hltv_event_id")) or ""
+    structure = detect_event_structure(html)
+
+    candidates: List[Dict[str, Any]] = []
+    for sw in structure["swiss"]:
+        roster = {_norm_team_name(n) for n in sw["teams"].values()}
+        stage_name = str(sw.get("stage_name") or "").strip()
+        label = f"Swiss{f' {stage_name}' if stage_name else ''} ({sw['team_count']} teams" + (
+            f", top {sw['advance_count']})" if sw["advance_count"] else ")"
+        )
+        rules = sw.get("bo_rules")
+        if rules:
+            if rules["default"] == rules["progression"] == rules["elimination"]:
+                label += f" — Bo{rules['default']}"
+            else:
+                label += f" — Bo{rules['default']}, deciders Bo{max(rules['progression'], rules['elimination'])}"
+        candidates.append(
+            {"kind": "swiss", "label": label, "group_format": None, "playoff_size": 0,
+             "roster": roster, "size": int(sw["team_count"] or len(roster))}
+        )
+    group_brackets = [b for b in structure["brackets"] if b["bracket"] == "double_elim"]
+    if group_brackets:
+        group_size = max((int(b["size"] or 0) for b in group_brackets), default=0)
+        roster: set = set()
+        for b in group_brackets:
+            roster |= {_norm_team_name(n) for n in b["teams"].values()}
+        style = "GSL Groups" if group_size == 4 else "Double-Elim Groups"
+        label = f"{style} ({len(group_brackets)} groups of {group_size}"
+        advance = (group_brackets[0].get("advance") or {})
+        if advance.get("count"):
+            label += f", top {advance['count']}"
+            if advance.get("winner_to_semis"):
+                label += ", winner → semis"
+        label += ")"
+        group_rules = structure.get("group_bo_rules")
+        if group_rules:
+            label += f" — Bo{group_rules['default']}"
+            if group_rules.get("upperRound1") and group_rules["upperRound1"] != group_rules["default"]:
+                label += f", openers Bo{group_rules['upperRound1']}"
+        candidates.append(
+            {
+                "kind": "groups",
+                "label": label,
+                "group_format": "gsl4" if group_size == 4 else f"de{group_size}",
+                "group_variant": group_brackets[0].get("variant"),
+                "playoff_size": 0,
+                "roster": roster,
+                "size": len(roster) or len(group_brackets) * group_size,
+            }
+        )
+    playoff_brackets = [b for b in structure["brackets"] if b["bracket"] == "single_elim" and not b["aux"]]
+    if playoff_brackets:
+        main_po = max(playoff_brackets, key=lambda b: int(b["size"] or 0))
+        po_size = int(main_po["size"] or 0)
+        byes = int(main_po.get("byes") or 0)
+        roster = set()
+        for b in playoff_brackets:
+            roster |= {_norm_team_name(n) for n in b["teams"].values()}
+        label = f"Playoff ({po_size} teams" + (f", {byes} byes to semis)" if byes else ")")
+        po_rules = structure.get("playoff_bo_rules")
+        if po_rules:
+            label += f" — Bo{po_rules['default']}"
+            if po_rules.get("grandFinal") and po_rules["grandFinal"] != po_rules["default"]:
+                label += f", final Bo{po_rules['grandFinal']}"
+        candidates.append(
+            {"kind": "playoff", "label": label, "group_format": None,
+             "playoff_size": po_size, "roster": roster, "size": po_size}
+        )
+
+    def _score(c: Dict[str, Any]):
+        matched = (
+            len(fantasy_names & c["roster"]) / len(fantasy_names)
+            if fantasy_names and c["roster"]
+            else 0.0
+        )
+        size_diff = abs(int(c["size"] or 0) - team_count) if team_count else 0
+        ratio = (size_diff / team_count) if team_count else 0.0
+        return (matched - ratio, -size_diff)
+
+    chosen = max(candidates, key=_score) if candidates else None
+    kind = chosen["kind"] if chosen else "unknown"
+    label = chosen["label"] if chosen else "Unknown format"
+    if "bounty" in str(event.get("hltv_event_url") or "").lower() and kind in ("playoff", "unknown"):
+        kind = "bounty"
+        label = "Bounty Draft"
+
+    return {
+        "kind": kind,
+        "label": label,
+        "group_format": (chosen or {}).get("group_format"),
+        "group_variant": (chosen or {}).get("group_variant"),
+        "playoff_size": int((chosen or {}).get("playoff_size") or 0),
+        "team_count": team_count,
+        "stages": [
+            {"kind": c["kind"], "label": c["label"], "size": c["size"], "roster_size": len(c["roster"])}
+            for c in candidates
+        ],
+        "formats_table": structure["formats_table"],
+        "swiss_bo_rules": structure["swiss_bo_rules"],
+        "group_bo_rules": structure["group_bo_rules"],
+        "playoff_bo_rules": structure["playoff_bo_rules"],
+    }
+
+
+@router.get("/player-latest-teams")
+def player_latest_teams():
+    """Each player's current team = the team they were rostered on in the most
+    recent event (event_teams, highest event_id). Used by the players table so
+    a player who moved shows only where they play now."""
+    latest = get_player_latest_teams()
+    return {"teams": {str(pid): row for pid, row in latest.items()}}
+
+
+@router.get("/{event_id}/swiss-context")
+def get_event_swiss_context(event_id: int):
+    """Everything the swiss simulator needs, from the event page's structured
+    data: the official seed order mapped to OUR team ids, and the Bo mode
+    derived from the stage's format rules. 404s when the fantasy event has no
+    detectable swiss stage."""
+    from backend.routes.groups import _find_event_snapshot_html
+    from backend.services.event_format import detect_event_structure
+
+    event = get_event_detail(int(event_id))
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    html = _find_event_snapshot_html(event.get("hltv_event_id")) or ""
+    structure = detect_event_structure(html)
+    if not structure["swiss"]:
+        raise HTTPException(status_code=404, detail="No swiss stage detected for this event")
+
+    fantasy_names = {_norm_team_name(t.get("team_name") or "") for t in (event.get("teams") or [])}
+    fantasy_names.discard("")
+
+    def _overlap(stage) -> float:
+        roster = {_norm_team_name(n) for n in stage["teams"].values()}
+        if not fantasy_names or not roster:
+            return 0.0
+        return len(fantasy_names & roster) / len(fantasy_names)
+
+    stage = max(structure["swiss"], key=_overlap)
+
+    # Map HLTV team ids (seed order) -> our team ids by normalized name.
+    ours_by_name = {}
+    for t in get_all_teams():
+        ours_by_name[_norm_team_name(str(t.get("name") or ""))] = int(t["team_id"])
+    seeds = []
+    unmatched = []
+    order = stage.get("seedings") or list(stage["teams"].keys())
+    for ordinal, hltv_tid in enumerate(order, start=1):
+        name = stage["teams"].get(hltv_tid) or ""
+        our_id = ours_by_name.get(_norm_team_name(name))
+        seeds.append({"seed": ordinal, "hltv_team_id": hltv_tid, "name": name, "team_id": our_id})
+        if not our_id:
+            unmatched.append(name)
+
+    rules = stage.get("bo_rules")
+    bo3_mode = None
+    if rules:
+        values = (rules["default"], rules["progression"], rules["elimination"])
+        if values == (3, 3, 3):
+            bo3_mode = "all"
+        elif values == (1, 3, 3):
+            bo3_mode = "elim_qual"
+        elif values == (1, 1, 1):
+            bo3_mode = "none"
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Swiss Bo rules {rules} do not map to a simulator mode",
+            )
+
+    return {
+        "status": "ok",
+        "event_id": int(event_id),
+        "stage_name": stage.get("stage_name") or stage.get("variant") or "",
+        "team_count": stage["team_count"],
+        "advance_count": stage["advance_count"],
+        "first_round_rule": stage["first_round_rule"],
+        "successor_rule": stage["successor_rule"],
+        "bo3_mode": bo3_mode,
+        "bo_rules": rules,
+        "seeds": seeds,
+        "team_ids": [s["team_id"] for s in seeds if s["team_id"]],
+        "seed_by_team_id": {str(s["team_id"]): s["seed"] for s in seeds if s["team_id"]},
+        "unmatched": unmatched,
+    }
+
+
+@router.get("/{event_id}/kind")
+def get_event_kind(event_id: int):
+    """Tournament kind for a fantasy event: auto-detected, with any manual
+    override applied. The single Tournament page uses this to pick its UI."""
+    event = get_event_detail(int(event_id))
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    detected = _detect_event_tournament_kind(event)
+    override = get_event_tournament_kind(int(event_id))
+    kind = override or detected["kind"]
+    if override and override != detected["kind"]:
+        label = {
+            "swiss": "Swiss Stage",
+            "groups": "Group Stage",
+            "playoff": "Playoff",
+            "bounty": "Bounty Draft",
+        }.get(override, override)
+    else:
+        label = detected["label"]
+    return {
+        "event_id": int(event_id),
+        "kind": kind,
+        "label": label,
+        "detected": detected["kind"],
+        "override": override,
+        "group_format": detected["group_format"],
+        "group_variant": detected.get("group_variant"),
+        "playoff_size": detected["playoff_size"],
+        "team_count": detected["team_count"],
+        "stages": detected["stages"],
+        "formats_table": detected["formats_table"],
+        "swiss_bo_rules": detected.get("swiss_bo_rules"),
+        "group_bo_rules": detected.get("group_bo_rules"),
+        "playoff_bo_rules": detected.get("playoff_bo_rules"),
+    }
+
+
+@router.post("/{event_id}/kind")
+def set_event_kind(event_id: int, payload: Dict[str, Any] | None = None):
+    """Set (or clear with kind=null/'auto') the manual tournament-kind override."""
+    event = get_event_detail(int(event_id))
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    kind = (payload or {}).get("kind")
+    if isinstance(kind, str) and kind.strip().lower() in ("", "auto"):
+        kind = None
+    if kind is not None and str(kind).strip().lower() not in ("swiss", "groups", "playoff", "bounty"):
+        raise HTTPException(status_code=400, detail="kind must be swiss, groups, playoff, bounty, or auto")
+    set_event_tournament_kind(int(event_id), kind)
+    return get_event_kind(int(event_id))
+
+
 @router.get("/{event_id}")
 def fetch_event(event_id: int):
     event = get_event_detail(int(event_id))
@@ -3682,6 +4488,25 @@ def activate_event(payload: Dict[str, Any]):
 
     set_active_event(event_id)
     return {"status": "ok", "active_event_id": event_id}
+
+
+@router.get("/hltv-results/stored")
+def get_stored_hltv_result(match_url: str):
+    """The stored result row for one match, straight from the DB — no live
+    fetch. Used by the player card's Recent Matches click-through."""
+    url = str(match_url or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="match_url is required")
+    stored = get_hltv_result_by_url(url)
+    if stored is None:
+        m = re.search(r"/matches/(\d+)/", url)
+        if m:
+            mid = int(m.group(1))
+            rows = list_hltv_results(limit=1000, offset=0)
+            stored = next((r for r in rows if int(r.get("match_id") or 0) == mid), None)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="No stored result for that match")
+    return stored
 
 
 @router.get("/hltv-results/match-details")
@@ -3729,6 +4554,50 @@ def get_hltv_result_match_details(match_url: str):
     }
 
 
+def discover_and_import_new_fantasy_events() -> Dict[str, Any]:
+    """Pull https://www.hltv.org/fantasy and import any fantasy events not in
+    the database yet (the front page links every open event as /fantasy/{id}).
+    The normal import activates what it imports, so the previously active
+    event is restored afterwards — an unattended nightly pull must not switch
+    the user's active event. Raises when the page shows no fantasy links at
+    all (layout change should fail loudly, not read as 'no new events')."""
+    from backend.services.hltv_browser import fetch_hltv_html
+
+    html = fetch_hltv_html("https://www.hltv.org/fantasy")
+    found = sorted({int(m) for m in re.findall(r"/fantasy/(\d+)", html or "")})
+    if not found:
+        raise ValueError("No fantasy event links found on hltv.org/fantasy")
+    existing = {int(e["event_id"]) for e in list_events()}
+    new_ids = [fid for fid in found if fid not in existing]
+    prev_active = get_active_event_id()
+    imported: List[int] = []
+    failed: List[Dict[str, Any]] = []
+    for fid in new_ids:
+        try:
+            import_hltv_event({"event_id": str(fid)})
+            imported.append(fid)
+        except Exception as exc:  # noqa: BLE001 — one bad event must not stop the rest
+            failed.append({"event_id": fid, "error": str(exc)[:200]})
+    if prev_active is not None and imported:
+        try:
+            set_active_event(int(prev_active))
+        except Exception:
+            logger.exception("Could not restore active event %s after auto-import", prev_active)
+    return {
+        "status": "ok",
+        "found": len(found),
+        "new": new_ids,
+        "imported": imported,
+        "failed": failed,
+    }
+
+
+@router.post("/pull-new")
+def pull_new_fantasy_events():
+    """Manual trigger for the nightly fantasy-event discovery."""
+    return discover_and_import_new_fantasy_events()
+
+
 @router.post("/import-hltv-event")
 def import_hltv_event(payload: Dict[str, Any]):
     event_id = str(payload.get("event_id", "")).strip()
@@ -3752,6 +4621,9 @@ def import_hltv_event(payload: Dict[str, Any]):
         hltv_event_id=ref.get("hltv_event_id"),
         hltv_event_url=ref.get("hltv_event_url"),
     )
+    derived_name = _event_name_from_url(str(ref.get("hltv_event_url") or ""))
+    if derived_name:
+        set_event_name(int(event_id), derived_name)
 
     # Best-effort: fetch the HLTV event page (which is snapshotted by the
     # browser fetch), detect the group format, and prefill the group seeds so

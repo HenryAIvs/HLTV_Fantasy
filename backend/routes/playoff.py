@@ -1,3 +1,5 @@
+import heapq
+import itertools
 import json
 import math
 import random
@@ -85,6 +87,10 @@ def _best_team_meta_summary(result: dict) -> dict:
         "total_teams": len(result.get("all_teams") or []),
         "processed_combinations": result.get("processed_combinations"),
         "total_combinations": result.get("total_combinations"),
+        # True when the pool was too large to store every roster and only the
+        # strongest candidates were kept (16-team two-phase).
+        "approximate": bool(result.get("approximate")),
+        "candidate_count": result.get("candidate_count"),
     }
 
 
@@ -643,15 +649,228 @@ def _exact_weighted_player_totals(
     return results, best_bracket, total_outcomes, outcomes
 
 
+# --- General N-team single-elimination bracket (Monte-Carlo for large sizes) ---
+
+_ROUND_NAME_BY_TEAMS = {2: "final", 4: "semis", 8: "quarters", 16: "round_of_16", 32: "round_of_32"}
+# Fields with more than this many exact outcomes (2^(teams-1)) are sampled.
+# 8 teams = 128 outcomes (exact); 16 teams = 32768 (Monte-Carlo).
+_BRACKET_EXACT_OUTCOME_LIMIT = 1024
+_BRACKET_MC_SIMS = 5000
+# Bounds for a user-supplied Monte-Carlo sample count (large fields only).
+_BRACKET_MC_SIMS_MIN = 500
+_BRACKET_MC_SIMS_MAX = 200000
+# Valid single-elim field sizes the UI/back-end accept.
+_ALLOWED_BRACKET_SIZES = (2, 4, 8, 16)
+
+
+def _clamp_mc_sims(value) -> int | None:
+    """Clamp a requested Monte-Carlo sample count to a sane range, or None to use
+    the default. More sims = smoother EVs but longer runs (~5000 ≈ 18s)."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    return max(_BRACKET_MC_SIMS_MIN, min(_BRACKET_MC_SIMS_MAX, n))
+
+
+def _round_name_for(teams_in_round: int) -> str:
+    return _ROUND_NAME_BY_TEAMS.get(int(teams_in_round), f"round_of_{int(teams_in_round)}")
+
+
+def _reset_states_inplace(states: Dict[int, TeamState]) -> None:
+    """Zero the accumulated points and records so the same state objects can be
+    reused across Monte-Carlo sims (far cheaper than deep-cloning per sim)."""
+    for ts in states.values():
+        ts.wins = 0
+        ts.losses = 0
+        ts.opponents_played = set()
+        for p in ts.players.values():
+            p.total_points = 0.0
+            p.rating_points_total = 0.0
+            p.win_points_total = 0.0
+            p.role_points_total = 0.0
+            p.booster_points_total = 0.0
+            p.point_breakdown = []
+
+
+def _simulate_bracket_n(
+    team_slots: List[int],
+    team_states: Dict[int, TeamState],
+    player_rows_by_id: Dict[int, dict],
+    team_rank_by_id: Dict[int, int],
+    has_third_place_decider: bool,
+    rng,
+) -> tuple[Dict[int, TeamState], Dict[str, List[dict]]]:
+    """One random single-elim bracket for any power-of-two field. Round names
+    generalise by size (round_of_16 → quarters → semis → final). The two
+    semi-final losers play the optional third-place decider. The caller resets
+    and reuses the same state objects across sims (a DB reload or deep clone per
+    sim is far too slow)."""
+    n = len(team_slots)
+    total_rounds = int(round(math.log2(n)))
+    match_results: Dict[str, List[dict]] = {}
+    rand_fn = (rng or random).random
+
+    def play(a_id: int, b_id: int, remaining_after: int):
+        A, B = team_states[a_id], team_states[b_id]
+        mna, mnb = A.matches_played + 1, B.matches_played + 1
+        result = simulate_match_outcome(A, B, "bo3", rng=rand_fn)
+        if result.winner_id == A.team_id:
+            winner, loser, dwa, dwb = A, B, True, False
+        else:
+            winner, loser, dwa, dwb = B, A, False, True
+        winner.record_win(loser.team_id)
+        loser.record_loss(winner.team_id)
+        apply_fantasy_points_for_team(A, B.team_id, result.win_probability, dwa, mna, "bo3", player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id)
+        apply_fantasy_points_for_team(B, A.team_id, 1.0 - result.win_probability, dwb, mnb, "bo3", player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id)
+        _apply_elimination_penalty(loser, remaining_after)
+        return winner.team_id, loser.team_id, result.win_probability
+
+    current = list(team_slots)
+    round_idx = 0
+    semi_losers: List[int] = []
+    while len(current) > 1:
+        teams_in_round = len(current)
+        rname = _round_name_for(teams_in_round)
+        remaining_after = total_rounds - round_idx - 1
+        winners, matches = [], []
+        for i in range(0, len(current), 2):
+            a, b = current[i], current[i + 1]
+            w, l, p = play(a, b, remaining_after)
+            winners.append(w)
+            matches.append({"winner": w, "loser": l, "p_win_a": p, "teams": [a, b]})
+            if teams_in_round == 4:
+                semi_losers.append(l)
+        match_results[rname] = matches
+        current = winners
+        round_idx += 1
+
+    if has_third_place_decider and len(semi_losers) == 2:
+        w, l, p = play(semi_losers[0], semi_losers[1], 0)
+        match_results["third_place"] = [{"winner": w, "loser": l, "p_win_a": p, "teams": list(semi_losers)}]
+    return team_states, match_results
+
+
+def _monte_carlo_bracket_totals(
+    team_slots: List[int],
+    vrs_ranks: Dict[int, int],
+    has_third_place_decider: bool = False,
+    n_sims: int = _BRACKET_MC_SIMS,
+    store_outcomes: bool = True,
+    progress_callback=None,
+) -> tuple[Dict[int, Dict], Dict, int, List[Dict]]:
+    """Monte-Carlo player EVs for a large bracket, matching the exact function's
+    return contract. Each sampled bracket is one 'outcome' with probability
+    1/n_sims (used by the ceiling / most-likely modes); average EV is the sample
+    mean. Per-match breakdowns are dropped to keep the sample set light."""
+    accum: Dict[int, Dict[int, Dict[str, float]]] = {tid: {} for tid in team_slots}
+    outcomes: List[Dict] = []
+    # Build player states + lookup context ONCE; reset & reuse them per sim.
+    states = initialize_teams(team_slots, vrs_ranks)
+    player_rows_by_id, team_rank_by_id = _build_playoff_lookup_context(team_slots)
+    if progress_callback:
+        progress_callback(0, n_sims)
+    for s in range(n_sims):
+        _reset_states_inplace(states)
+        _, mr = _simulate_bracket_n(
+            team_slots, states, player_rows_by_id, team_rank_by_id, has_third_place_decider, rng=random
+        )
+        player_points: Dict[str, float] = {}
+        player_components: Dict[str, Dict[str, float]] = {}
+        for ts in states.values():
+            for pid, p in ts.players.items():
+                b = accum[ts.team_id].setdefault(pid, {"total": 0.0, "rating": 0.0, "win": 0.0, "role": 0.0, "booster": 0.0})
+                b["total"] += p.total_points
+                b["rating"] += p.rating_points_total
+                b["win"] += p.win_points_total
+                b["role"] += p.role_points_total
+                b["booster"] += p.booster_points_total
+                if store_outcomes:
+                    player_points[str(pid)] = float(p.total_points)
+                    player_components[str(pid)] = {
+                        "total": float(p.total_points),
+                        "total_without_booster": float(p.rating_points_total + p.win_points_total + p.role_points_total),
+                        "rating": float(p.rating_points_total),
+                        "win": float(p.win_points_total),
+                        "role": float(p.role_points_total),
+                        "booster": float(p.booster_points_total),
+                    }
+        if store_outcomes:
+            outcomes.append({
+                "probability": 1.0 / n_sims,
+                "bracket": mr,
+                "players": player_points,
+                "player_components": player_components,
+                "player_breakdown": {},
+            })
+        if progress_callback and (s + 1) % 500 == 0:
+            progress_callback(s + 1, n_sims)
+
+    denom = float(n_sims) if n_sims > 0 else 1.0
+    results: Dict[int, Dict] = {}
+    for tid in team_slots:
+        players_out: Dict[int, Dict[str, float]] = {}
+        for pid, sums in accum[tid].items():
+            players_out[pid] = {
+                "total_points": sums["total"] / denom,
+                "rating_points_total": sums["rating"] / denom,
+                "win_points_total": sums["win"] / denom,
+                "role_points_total": sums["role"] / denom,
+                "booster_points_total": sums["booster"] / denom,
+                "total_points_without_booster": (sums["rating"] + sums["win"] + sums["role"]) / denom,
+            }
+        results[tid] = {"team_id": tid, "wins": 0, "losses": 0, "players": players_out}
+
+    best_bracket = outcomes[0]["bracket"] if outcomes else {}
+    return results, best_bracket, n_sims, outcomes
+
+
+def _bracket_player_totals(
+    team_slots: List[int],
+    vrs_ranks: Dict[int, int],
+    has_third_place_decider: bool = False,
+    store_outcomes: bool = True,
+    progress_callback=None,
+    quarters_override: List[tuple] | None = None,
+    sf_pairs_resolver=None,
+    mc_sims: int | None = None,
+) -> tuple[Dict[int, Dict], Dict, int, List[Dict]]:
+    """Route a bracket to exact enumeration (small fields + the 8-team bounty
+    variant) or Monte-Carlo (large fields like 16-team). `mc_sims` overrides the
+    Monte-Carlo sample count (ignored by the exact path, which is deterministic)."""
+    n = len(team_slots)
+    exact_outcomes = 2 ** max(0, n - 1)
+    if quarters_override or sf_pairs_resolver or exact_outcomes <= _BRACKET_EXACT_OUTCOME_LIMIT:
+        return _exact_weighted_player_totals(
+            team_slots, vrs_ranks,
+            has_third_place_decider=has_third_place_decider,
+            progress_callback=progress_callback,
+            quarters_override=quarters_override,
+            sf_pairs_resolver=sf_pairs_resolver,
+        )
+    return _monte_carlo_bracket_totals(
+        team_slots, vrs_ranks,
+        has_third_place_decider=has_third_place_decider,
+        n_sims=int(mc_sims) if mc_sims else _BRACKET_MC_SIMS,
+        store_outcomes=store_outcomes,
+        progress_callback=progress_callback,
+    )
+
+
 def _normalize_playoff_payload(payload: dict) -> dict:
     slots: List[int] = payload.get("team_slots") or []
-    if len(slots) != 8:
-        raise HTTPException(status_code=400, detail="team_slots must contain 8 team IDs")
+    if len(slots) not in _ALLOWED_BRACKET_SIZES:
+        raise HTTPException(status_code=400, detail="team_slots must contain 2, 4, 8, or 16 team IDs")
     has_third_place_decider = bool(payload.get("has_third_place_decider", False))
     normalized = {
         "team_slots": [int(x) for x in slots],
         "has_third_place_decider": has_third_place_decider,
     }
+    mc_sims = _clamp_mc_sims(payload.get("mc_sims"))
+    if mc_sims:
+        normalized["mc_sims"] = mc_sims
     if _variant(payload.get("variant")) == "bounty":
         qf_pairs_raw = payload.get("qf_pairs") or []
         qf_pairs = [[int(a), int(b)] for a, b in qf_pairs_raw] if len(qf_pairs_raw) == 4 else []
@@ -702,13 +921,14 @@ def _compute_playoff_result(payload: dict, progress_callback=None) -> dict:
         quarters_override = [tuple(pair) for pair in payload.get("qf_pairs") or []]
         sf_pairs_resolver = _bounty_sf_pairs_resolver(slots, payload.get("sf_picks") or {})
 
-    exact_players, best_bracket, outcomes_count, outcomes = _exact_weighted_player_totals(
+    exact_players, best_bracket, outcomes_count, outcomes = _bracket_player_totals(
         slots,
         vrs_ranks,
         has_third_place_decider=has_third_place_decider,
         progress_callback=progress_callback,
         quarters_override=quarters_override,
         sf_pairs_resolver=sf_pairs_resolver,
+        mc_sims=_clamp_mc_sims(payload.get("mc_sims")),
     )
     return {
         "bracket": best_bracket,
@@ -718,6 +938,25 @@ def _compute_playoff_result(payload: dict, progress_callback=None) -> dict:
         "outcomes": outcomes,
         "has_third_place_decider": has_third_place_decider,
     }
+
+
+@router.post("/autofill-from-hltv-event")
+def autofill_playoff_from_hltv_event(payload: dict | None = None):
+    """Scrape (or reuse the stored snapshot of) the linked HLTV event page and
+    return the single-elimination playoff bracket seeding as this app's team IDs
+    in bracket order, plus the field size (16/8/4). The frontend fills the seed
+    slots and bracket-size selector from it."""
+    # Lazy import: groups.py imports from this module at load time, so importing
+    # it at module top here would be a circular import.
+    from backend.routes.groups import autofill_event_playoff
+
+    body = payload or {}
+    result = autofill_event_playoff(
+        hltv_event_url=str(body.get("hltv_event_url") or "").strip(),
+        hltv_event_id=body.get("hltv_event_id"),
+        fantasy_event_id=body.get("fantasy_event_id") or body.get("event_id"),
+    )
+    return {"status": "ok", **result}
 
 
 @router.post("/run")
@@ -780,7 +1019,12 @@ def _run_playoff_job(job_id: str, payload: dict) -> None:
 @router.post("/start")
 def start_playoff(payload: dict):
     normalized = _normalize_playoff_payload(payload)
-    total_outcomes = 256 if normalized.get("has_third_place_decider") else 128
+    n_slots = len(normalized.get("team_slots") or [])
+    if 2 ** max(0, n_slots - 1) <= _BRACKET_EXACT_OUTCOME_LIMIT:
+        total_outcomes = (2 ** max(0, n_slots - 1)) * (2 if normalized.get("has_third_place_decider") else 1)
+    else:
+        # Monte-Carlo sample count for large fields (user-configurable).
+        total_outcomes = int(normalized.get("mc_sims") or _BRACKET_MC_SIMS)
     job_id = str(int(time.time() * 1000000))
     with PLAYOFF_JOBS_LOCK:
         PLAYOFF_JOBS[job_id] = {
@@ -821,7 +1065,7 @@ def simulate_playoff_fantasy(team_slots: List[int], n_sims: int = 1, return_runs
     if n_sims <= 0:
         raise HTTPException(status_code=400, detail="n_sims must be positive")
     vrs_ranks = {tid: 999 for tid in team_slots}
-    exact_results, _, _, _ = _exact_weighted_player_totals(team_slots, vrs_ranks, has_third_place_decider=False)
+    exact_results, _, _, _ = _bracket_player_totals(team_slots, vrs_ranks, has_third_place_decider=False, store_outcomes=False)
 
     results: Dict[int, Dict] = {}
     for tid in team_slots:
@@ -889,6 +1133,190 @@ def _optimize_playoff_teams(
     )
 
 
+# A pool with more rosters than this triggers the two-phase optimiser instead
+# of the exhaustive per-outcome scan. 8-team = C(40,5) = 658k (stays exact);
+# 16-team = C(80,5) = 24M (would be billions of roster×outcome scores).
+_PLAYOFF_EXACT_ROSTER_LIMIT = 2_000_000
+# Candidates deep-scored (ceiling / most-likely) in phase 2 of the two-phase run.
+_PLAYOFF_TWO_PHASE_TOPK = 12000
+
+
+def _optimize_playoff_teams_two_phase(
+    players_info: list[dict],
+    outcomes: List[Dict],
+    include: set[int],
+    budget: int,
+    max_per_team: int,
+    mode: str,
+    progress_callback=None,
+    topk: int = _PLAYOFF_TWO_PHASE_TOPK,
+):
+    """Scalable optimiser for very large pools (e.g. 16-team playoffs: ~80
+    players → C(80,5) = 24M rosters, which the exhaustive per-outcome scan would
+    score against thousands of outcomes = hundreds of billions of ops).
+
+    Phase 1 ranks EVERY valid roster by its exact additive expected score — the
+    sum of each player's expected points including their raw booster, which
+    equals the probability-weighted roster total over the outcome table — and
+    keeps the top `topk` in a bounded heap. Phase 2 computes the per-outcome
+    metrics (ceiling, most-likely-winner) only on those candidates. So Average
+    Value is exact top-K, while ceiling / most-likely are exact among the
+    strongest candidates (their true best is virtually always a strong-average
+    roster). Smaller fields keep the exact enumerator for full precision.
+    """
+    from backend.services.role_assignment import best_role_assignment_for_team, extract_role_scores_for_player
+
+    include = {int(x) for x in (include or set())}
+    if len(players_info) < 5:
+        return {"error": "Not enough players after exclusions"}
+    players_meta = {str(p["player_id"]): p for p in players_info}
+    n = len(players_info)
+    total_combinations = math.comb(n, 5)
+
+    # Sort by full per-player value (expected points incl. raw booster) so the
+    # heap warms up with strong rosters quickly.
+    players_sorted = sorted(
+        players_info,
+        key=lambda p: -(float(p.get("total_ev", 0.0)) + float(p.get("raw_booster_ev", 0.0))),
+    )
+    pid_arr = [int(p["player_id"]) for p in players_sorted]
+    price_arr = [int(p.get("price") or 0) for p in players_sorted]
+    team_arr = [int(p.get("team_id") or 0) for p in players_sorted]
+    ev_arr = [float(p.get("total_ev") or 0.0) for p in players_sorted]  # excl. booster (roster total_ev)
+    val_arr = [ev_arr[i] + float(players_sorted[i].get("raw_booster_ev") or 0.0) for i in range(n)]  # E[total_points]
+    idx_by_pid = {pid_arr[i]: i for i in range(n)}
+    include_idx = [idx_by_pid[p] for p in include if p in idx_by_pid]
+    if len(include_idx) != len(include):
+        missing = [p for p in include if p not in idx_by_pid]
+        return {"error": f"Included players not available in bracket teams: {missing}"}
+    include_idx = tuple(include_idx)
+
+    # ---- Phase 1: exact top-K rosters by additive expected score. ----
+    heap: list = []  # (value, counter, combo_idx_tuple, cost)
+    counter = 0
+    processed = 0
+    heappush, heapreplace = heapq.heappush, heapq.heapreplace
+    for c in itertools.combinations(range(n), 5):
+        processed += 1
+        if progress_callback and (processed & 0x3FFFF) == 0:  # ~every 262k
+            progress_callback(processed, total_combinations)
+        i0, i1, i2, i3, i4 = c
+        cost = price_arr[i0] + price_arr[i1] + price_arr[i2] + price_arr[i3] + price_arr[i4]
+        if cost > budget:
+            continue
+        over = False
+        tc: Dict[int, int] = {}
+        for t in (team_arr[i0], team_arr[i1], team_arr[i2], team_arr[i3], team_arr[i4]):
+            v = tc.get(t, 0) + 1
+            if v > max_per_team:
+                over = True
+                break
+            tc[t] = v
+        if over:
+            continue
+        if include_idx and not all(ii in c for ii in include_idx):
+            continue
+        val = val_arr[i0] + val_arr[i1] + val_arr[i2] + val_arr[i3] + val_arr[i4]
+        if len(heap) < topk:
+            heappush(heap, (val, counter, c, cost))
+            counter += 1
+        elif val > heap[0][0]:
+            heapreplace(heap, (val, counter, c, cost))
+            counter += 1
+    if progress_callback:
+        progress_callback(total_combinations, total_combinations)
+
+    # ---- Phase 2: exact per-outcome metrics on the candidate set. ----
+    top = list(heap)
+    N = len(outcomes)
+    probs = [float(o.get("probability") or 0.0) for o in outcomes]
+    outcome_players = [o.get("players") or {} for o in outcomes]
+    used = set()
+    for _, _, c, _ in top:
+        used.update(c)
+    # Per-candidate-player score across outcomes (string pid keys as stored).
+    out_arr: Dict[int, list] = {i: [float(op.get(str(pid_arr[i]), 0.0)) for op in outcome_players] for i in used}
+    role_scores_by_player = {pid_arr[i]: extract_role_scores_for_player(get_player(pid_arr[i]) or {}) for i in used}
+
+    best_scores = [-1e18] * N
+    best_pos: List[List[int]] = [[] for _ in range(N)]
+    teams_out: list = []
+    for pos, (val, _, c, cost) in enumerate(top):
+        a0, a1, a2, a3, a4 = out_arr[c[0]], out_arr[c[1]], out_arr[c[2]], out_arr[c[3]], out_arr[c[4]]
+        max_s = -1e18
+        cnt = 0
+        argmax = 0
+        for o in range(N):
+            s = a0[o] + a1[o] + a2[o] + a3[o] + a4[o]
+            if s > max_s + 1e-9:
+                max_s = s
+                cnt = 1
+                argmax = o
+            elif s >= max_s - 1e-9:
+                cnt += 1
+            bs = best_scores[o]
+            if s > bs + 1e-9:
+                best_scores[o] = s
+                best_pos[o] = [pos]
+            elif s >= bs - 1e-9:
+                best_pos[o].append(pos)
+        pids = [pid_arr[i] for i in c]
+        assignment, _ = best_role_assignment_for_team(pids, role_scores_by_player)
+        roles = [str((assignment or {}).get(pid, "-")) for pid in pids]
+        ev_no_booster = ev_arr[c[0]] + ev_arr[c[1]] + ev_arr[c[2]] + ev_arr[c[3]] + ev_arr[c[4]]
+        serialized = serialize_roster(players_meta, pids, roles, ev_no_booster, cost)
+        ceiling_scores = outcome_players[argmax] if N else {}
+        for player in serialized.get("players") or []:
+            pid = int(player.get("player_id") or 0)
+            if mode == "single_outcome":
+                player["mode_score"] = float(ceiling_scores.get(str(pid), 0.0))
+            else:
+                player["mode_score"] = float(player.get("total_ev") or 0.0)
+            player["ceiling_score"] = float(ceiling_scores.get(str(pid), 0.0))
+        serialized["average_ev"] = float(val)
+        serialized["ceiling_points"] = float(max_s if N else val)
+        serialized["ceiling_probability"] = float(cnt) * (probs[argmax] if N else 0.0)
+        serialized["outcome_wins"] = 0.0
+        serialized["outcome_win_probability"] = 0.0
+        serialized["mode"] = mode
+        teams_out.append(serialized)
+
+    for o, winners in enumerate(best_pos):
+        if not winners:
+            continue
+        share = 1.0 / float(len(winners))
+        pshare = probs[o] * share
+        for pos in winners:
+            teams_out[pos]["outcome_wins"] += share
+            teams_out[pos]["outcome_win_probability"] += pshare
+            teams_out[pos].setdefault("winning_outcome_indexes", []).append(o)
+
+    if mode == "single_outcome":
+        teams_out.sort(key=lambda t: (float(t.get("ceiling_points", 0.0)), float(t.get("average_ev", 0.0))), reverse=True)
+    elif mode == "most_outcomes":
+        teams_out.sort(
+            key=lambda t: (
+                float(t.get("outcome_win_probability", 0.0)),
+                float(t.get("outcome_wins", 0.0)),
+                float(t.get("average_ev", 0.0)),
+            ),
+            reverse=True,
+        )
+    else:
+        teams_out.sort(key=lambda t: float(t.get("average_ev", 0.0)), reverse=True)
+
+    return {
+        "top_teams": teams_out[:10],
+        "all_teams": teams_out,
+        "player_count": n,
+        "processed_combinations": int(total_combinations),
+        "total_combinations": int(total_combinations),
+        "candidate_count": len(teams_out),
+        "approximate": True,
+        "mode": mode,
+    }
+
+
 def _optimize_playoff_teams_by_outcomes(
     players_info: list[dict],
     outcomes: List[Dict],
@@ -898,6 +1326,12 @@ def _optimize_playoff_teams_by_outcomes(
     mode: str,
     progress_callback=None,
 ):
+    # Very large pools (16-team playoffs) are intractable to enumerate exactly
+    # against every outcome, so fall back to the two-phase candidate optimiser.
+    if len(players_info) >= 5 and math.comb(len(players_info), 5) > _PLAYOFF_EXACT_ROSTER_LIMIT:
+        return _optimize_playoff_teams_two_phase(
+            players_info, outcomes or [], include, budget, max_per_team, mode, progress_callback
+        )
     if mode == "average":
         return _optimize_playoff_teams(players_info, include, budget, max_per_team, progress_callback=progress_callback)
     if len(players_info) < 5:
@@ -1073,8 +1507,8 @@ def best_team_playoff(payload: dict):
     Optimise a fantasy roster of 5 for the playoff bracket (Monte Carlo over the bracket).
     """
     slots: List[int] = payload.get("team_slots") or []
-    if len(slots) != 8:
-        raise HTTPException(status_code=400, detail="team_slots must contain 8 team IDs")
+    if len(slots) not in _ALLOWED_BRACKET_SIZES:
+        raise HTTPException(status_code=400, detail="team_slots must contain 2, 4, 8, or 16 team IDs")
 
     options = parse_optimizer_payload(payload)
     budget = options["budget"]
@@ -1089,7 +1523,7 @@ def best_team_playoff(payload: dict):
         sim_results = simulate_playoff_fantasy(slots, return_runs=False)
         players_info = _build_players_info_from_sim_results(sim_results, exclude)
         return _optimize_playoff_teams_by_outcomes(players_info, [], include, budget, max_per_team, mode)
-    exact_players, _best_bracket, _outcomes_count, outcomes = _exact_weighted_player_totals(
+    exact_players, _best_bracket, _outcomes_count, outcomes = _bracket_player_totals(
         slots,
         {tid: 999 for tid in slots},
         has_third_place_decider=bool(payload.get("has_third_place_decider", False)),
@@ -1126,6 +1560,140 @@ def best_team_playoff_from_latest(payload: dict | None = None):
     )
 
 
+def _completed_bracket_round_winners(payload: dict, team_slots: List[int]) -> tuple[List[List[int]], int]:
+    """Normalise the completed-bracket picks into per-round winner lists in
+    bracket order (round 0 first, final last). Accepts either a general
+    ``round_winners`` field (list-of-lists, used by every field size) or the
+    legacy 8-team ``qf_winners``/``sf_winners``/``final_winner`` fields.
+    Returns ``(round_winners, third_place_winner)``."""
+    n = len(team_slots)
+    total_rounds = int(round(math.log2(n)))
+    third_place_winner = int(payload.get("third_place_winner") or 0)
+
+    raw_rounds = payload.get("round_winners")
+    if raw_rounds:
+        rounds = [[int(x) for x in (r or [])] for r in raw_rounds]
+    else:
+        rounds = []
+        for key in ("r16_winners", "qf_winners", "sf_winners"):
+            vals = payload.get(key)
+            if vals:
+                rounds.append([int(x) for x in vals])
+        final_winner = int(payload.get("final_winner") or 0)
+        if final_winner > 0:
+            rounds.append([final_winner])
+
+    if len(rounds) != total_rounds:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Completed bracket needs winners for all {total_rounds} rounds; got {len(rounds)}.",
+        )
+    expected = n // 2
+    for idx, round_win in enumerate(rounds):
+        if len(round_win) != expected:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Round {idx + 1} needs {expected} winner(s); got {len(round_win)}.",
+            )
+        expected //= 2
+    return rounds, third_place_winner
+
+
+def _deterministic_completed_outcome(
+    team_slots: List[int],
+    vrs_ranks: Dict[int, int],
+    round_winners: List[List[int]],
+    has_third_place_decider: bool,
+    third_place_winner: int,
+) -> Dict:
+    """Play the single bracket implied by the user's picks and return one outcome
+    dict in the same shape as a stored exact/Monte-Carlo outcome. Because it
+    computes the picked bracket directly (rather than looking it up in the
+    sampled outcome table), the Completed Bracket picker works for any field
+    size — essential for Monte-Carlo 16-team runs, where the exact bracket is
+    almost never among the samples. For 8-team fields this reuses the same
+    ``_play_match_deterministic`` path as the exact enumerator, so the scores are
+    byte-identical to the old lookup."""
+    states = initialize_teams(team_slots, vrs_ranks)
+    player_rows_by_id, team_rank_by_id = _build_playoff_lookup_context(team_slots)
+    prob_cache: Dict[tuple[int, int], float] = {}
+    n = len(team_slots)
+    total_rounds = int(round(math.log2(n)))
+
+    match_results: Dict[str, List[dict]] = {}
+    path_prob = 1.0
+    current = list(team_slots)
+    semi_losers: List[int] = []
+    for round_idx in range(total_rounds):
+        teams_in_round = len(current)
+        rname = _round_name_for(teams_in_round)
+        remaining_after = total_rounds - round_idx - 1
+        winners_this_round = round_winners[round_idx]
+        winners, matches = [], []
+        for i in range(0, len(current), 2):
+            a, b = current[i], current[i + 1]
+            picked = int(winners_this_round[i // 2])
+            if picked not in (a, b):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{rname}: winner {picked} is not in match ({a} vs {b}).",
+                )
+            w, l, p_win_a, branch_p = _play_match_deterministic(
+                states, a, b, picked, remaining_rounds_after=remaining_after,
+                prob_cache=prob_cache, player_rows_by_id=player_rows_by_id,
+                team_rank_by_id=team_rank_by_id,
+            )
+            path_prob *= branch_p
+            winners.append(w)
+            matches.append({"winner": w, "loser": l, "p_win_a": p_win_a, "teams": [a, b]})
+            if teams_in_round == 4:
+                semi_losers.append(l)
+        match_results[rname] = matches
+        current = winners
+
+    if has_third_place_decider and len(semi_losers) == 2:
+        if third_place_winner not in semi_losers:
+            raise HTTPException(
+                status_code=400,
+                detail="Third-place winner must be one of the two semi-final losers.",
+            )
+        w, l, p_win_a, branch_p = _play_match_deterministic(
+            states, semi_losers[0], semi_losers[1], third_place_winner,
+            remaining_rounds_after=0, prob_cache=prob_cache,
+            player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id,
+        )
+        path_prob *= branch_p
+        match_results["third_place"] = [
+            {"winner": w, "loser": l, "p_win_a": p_win_a, "teams": list(semi_losers)}
+        ]
+
+    player_points: Dict[str, float] = {}
+    player_components: Dict[str, Dict[str, float]] = {}
+    player_breakdown: Dict[str, List[dict]] = {}
+    for ts in states.values():
+        for pid, p in ts.players.items():
+            player_points[str(pid)] = float(p.total_points)
+            player_components[str(pid)] = {
+                "total": float(p.total_points),
+                "total_without_booster": float(
+                    p.rating_points_total + p.win_points_total + p.role_points_total
+                ),
+                "rating": float(p.rating_points_total),
+                "win": float(p.win_points_total),
+                "role": float(p.role_points_total),
+                "booster": float(p.booster_points_total),
+            }
+            player_breakdown[str(pid)] = [dict(row) for row in p.point_breakdown]
+
+    return {
+        "probability": float(path_prob),
+        "bracket": match_results,
+        "players": player_points,
+        "player_components": player_components,
+        "player_breakdown": player_breakdown,
+    }
+
+
 def _outcome_matches_completed_bracket(outcome: Dict, picks: Dict[str, object]) -> bool:
     bracket = outcome.get("bracket") or {}
     qf_winners = [int(x) for x in (picks.get("qf_winners") or [])]
@@ -1155,15 +1723,35 @@ def _selected_completed_outcome_from_latest(payload: dict | None = None) -> tupl
     latest = load_latest_playoff((payload or {}).get("variant"))
     if not latest:
         raise HTTPException(status_code=404, detail="No stored playoff simulation found. Run Playoff Bracket first.")
-    latest_results = latest.get("results", {}) or {}
-    outcomes = list(latest_results.get("outcomes") or [])
-    if not outcomes:
-        raise HTTPException(status_code=400, detail="Stored playoff run has no exact outcome table.")
     body = payload or {}
-    for outcome in outcomes:
-        if _outcome_matches_completed_bracket(outcome, body):
-            return latest, outcome
-    raise HTTPException(status_code=404, detail="No stored outcome matches that completed bracket.")
+
+    # Bounty brackets use a bespoke QF pairing + SF re-draft, so the picked
+    # bracket is looked up among the stored exact outcomes (which were generated
+    # with that pairing). Every other variant computes the picked bracket
+    # deterministically — that works for any field size and, crucially, for the
+    # Monte-Carlo 16-team runs whose sampled table almost never contains the
+    # exact bracket the user selected.
+    if _variant(body.get("variant")) == "bounty":
+        latest_results = latest.get("results", {}) or {}
+        outcomes = list(latest_results.get("outcomes") or [])
+        if not outcomes:
+            raise HTTPException(status_code=400, detail="Stored playoff run has no exact outcome table.")
+        for outcome in outcomes:
+            if _outcome_matches_completed_bracket(outcome, body):
+                return latest, outcome
+        raise HTTPException(status_code=404, detail="No stored outcome matches that completed bracket.")
+
+    latest_payload = latest.get("payload", {}) or {}
+    team_slots = [int(x) for x in (latest_payload.get("team_slots") or [])]
+    if not team_slots:
+        raise HTTPException(status_code=400, detail="Stored playoff run is missing its team slots.")
+    has_third_place = bool(latest_payload.get("has_third_place_decider", False))
+    round_winners, third_place_winner = _completed_bracket_round_winners(body, team_slots)
+    vrs_ranks = {tid: 999 for tid in team_slots}
+    outcome = _deterministic_completed_outcome(
+        team_slots, vrs_ranks, round_winners, has_third_place, third_place_winner
+    )
+    return latest, outcome
 
 
 def _player_team_map_from_latest(latest_results: Dict, latest_payload: Dict) -> Dict[int, int]:
@@ -1486,6 +2074,8 @@ def get_latest_best_team_playoff_from_latest(variant: str = "main"):
             "total_teams": summary.get("total_teams"),
             "processed_combinations": summary.get("processed_combinations"),
             "total_combinations": summary.get("total_combinations"),
+            "approximate": bool(summary.get("approximate")),
+            "candidate_count": summary.get("candidate_count"),
             "updated_at": meta["updated_at"],
         }
 
@@ -1570,6 +2160,8 @@ def query_latest_best_team_playoff(payload: dict | None = None):
         "page_teams": _page_items(sorted_teams, page, page_size),
         "page": max(0, page),
         "page_size": max(1, min(500, page_size)),
+        "approximate": bool(result.get("approximate")),
+        "total_combinations": result.get("total_combinations"),
     }
 
 

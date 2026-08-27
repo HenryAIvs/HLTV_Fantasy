@@ -73,8 +73,8 @@ def add_or_update_team(
     conn.execute(
         """
         INSERT INTO teams (
-            hltv_team_id, name, hltv_rank, hltv_points, vrs_rank, win_rate,
-            vrs_points,
+            hltv_team_id, name, hltv_rank, hltv_points, vrs_rank,
+            vrs_points, win_rate,
             player1_id, player2_id, player3_id, player4_id, player5_id
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
