@@ -1803,6 +1803,7 @@ tbody tr { cursor: pointer; }
 }
 
 .value-chart-wrap {
+  position: relative;
   width: 100%;
   height: 380px;
   border: 1px solid #2c3441;
@@ -2377,6 +2378,65 @@ button:disabled {
 /* Player Top-X tab: size the chart box to its content and compact the bucket
    table so the whole tab fits the fixed player card without scrolling */
 .value-chart-wrap.topx-chart { height: auto; }
+/* Price-vs-points scatter: the chart (with axis titles) sets its own height —
+   a fixed wrap height clips the x-axis title past the border */
+.value-chart-wrap.value-scatter { height: auto; }
+
+/* Price-vs-points chart: display-only surface (no focus ring on click), the
+   trend line never intercepts the mouse, and the fit equation sits inside the
+   plot as an overlay chip. */
+.value-chart-wrap :focus,
+.value-chart-wrap :focus-visible {
+  outline: none;
+}
+.value-chart-wrap .recharts-wrapper,
+.value-chart-wrap .recharts-surface {
+  outline: none;
+}
+.value-chart-wrap .recharts-line,
+.value-chart-wrap .recharts-line-curve {
+  pointer-events: none;
+}
+.value-trend-label {
+  position: absolute;
+  top: 14px;
+  right: 26px;
+  z-index: 2;
+  background: rgba(18, 22, 29, 0.88);
+  border: 1px solid #2c3441;
+  color: #9fb2c9;
+  font-size: 12px;
+  padding: 4px 10px;
+  pointer-events: none;
+  font-variant-numeric: tabular-nums;
+}
+/* Player value table: photo + name in one cell */
+.table-player-cell {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.table-player-cell span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Custom hover tooltip, anchored beside the nearest dot */
+.value-point-tooltip {
+  position: absolute;
+  z-index: 3;
+  background: #14181f;
+  border: 1px solid #3a4452;
+  border-radius: 10px;
+  color: #e9edf3;
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 9px 12px;
+  pointer-events: none;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
 .topx-bucket-table th, .topx-bucket-table td { padding: 6px 12px; }
 
 /* Matches page VRS rank filter: number + direction + scope side by side */
@@ -2625,4 +2685,274 @@ button:disabled {
   font-weight: 700;
   color: #e9edf3;
   font-variant-numeric: tabular-nums;
+}
+
+/* Event roster strips: click a player card or the team head to open its card */
+.event-player-card.clickable { cursor: pointer; }
+.event-player-card.clickable:hover { border-color: #ff6b1a; }
+.event-team-head.clickable { cursor: pointer; }
+.event-team-head.clickable:hover .event-team-name { color: #ff8a47; }
+
+/* Playoff EV strips: compact component stats under the big total */
+.event-player-stats.ev-mini { gap: 12px; }
+.event-player-mini {
+  font-family: var(--display);
+  font-stretch: condensed;
+  font-size: 14.5px;
+  font-weight: 700;
+  color: #c6d0dc;
+  font-variant-numeric: tabular-nums;
+}
+/* Assigned role chip on the EV cards */
+.event-player-role {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #8fa3bf;
+  white-space: nowrap;
+}
+.event-player-role .role-badge {
+  margin: 0;
+  flex: none;
+  filter: brightness(1.05) saturate(1);
+}
+/* Center every text row of the EV card as a full-width block — shrink-to-fit
+   flex children drift a few px depending on glyph widths */
+.event-player-card .event-player-name {
+  width: 100%;
+  max-width: 100%;
+  text-align: center;
+}
+.event-player-card .event-player-rating {
+  width: 100%;
+  text-align: center;
+}
+.event-player-card .event-player-role {
+  width: 100%;
+  justify-content: center;
+}
+/* Round-reach odds under the team name in the strip head */
+.event-team-reach {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 6px;
+}
+/* Scoring-breakdown modal: broadcast-style summary strip + round cards */
+.modal.player-sources-modal {
+  max-width: 1480px;
+  width: 94%;
+  padding: 20px 26px;
+}
+.breakdown-hero {
+  display: flex;
+  align-items: stretch;
+  justify-content: space-between;
+  gap: 18px;
+  flex-wrap: wrap;
+  background: #171c24;
+  border: 1px solid #2c3441;
+  border-left: 3px solid #ff6b1a;
+  padding: 18px 34px;
+  margin-bottom: 16px;
+}
+.breakdown-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+}
+.breakdown-stat-value {
+  font-family: var(--display);
+  font-stretch: condensed;
+  font-size: 32px;
+  font-weight: 700;
+  color: #e9edf3;
+  font-variant-numeric: tabular-nums;
+}
+.breakdown-stat.total .breakdown-stat-value { color: #ff6b1a; }
+.breakdown-stat-label {
+  color: #8fa3bf;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
+.breakdown-stat.role .role-badge { margin: 0; }
+.round-cards {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.round-card {
+  flex: 1 1 320px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  background: #171c24;
+  border: 1px solid #2c3441;
+  border-top: 2px solid #ff6b1a;
+  padding: 16px 22px;
+}
+.round-card .event-player-rating {
+  font-size: 32px;
+  line-height: 1.1;
+}
+.round-card .event-player-stats.ev-mini {
+  width: 100%;
+  justify-content: space-between;
+  padding: 0 10px;
+}
+.round-card .event-player-mini { font-size: 17px; }
+.round-card .event-player-stat-label { font-size: 10.5px; }
+.round-card-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  width: 100%;
+  margin-bottom: 2px;
+}
+.round-card-play {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  line-height: 1.15;
+}
+.round-card-name {
+  font-family: var(--display);
+  font-stretch: condensed;
+  text-transform: uppercase;
+  font-weight: 700;
+  font-size: 17px;
+  color: #e9edf3;
+}
+.round-card-chance {
+  font-family: var(--display);
+  font-stretch: condensed;
+  text-transform: uppercase;
+  font-weight: 700;
+  font-size: 17px;
+  color: #ff8a47;
+  font-variant-numeric: tabular-nums;
+}
+/* The round's booster, inline in its round card */
+.round-card-boost {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid #242b35;
+  font-size: 12.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #c6d0dc;
+}
+.round-card-boost .role-badge { margin: 0; flex: none; }
+.round-card-boost-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.round-card-boost-rate {
+  font-family: var(--display);
+  font-stretch: condensed;
+  font-weight: 700;
+  font-size: 16px;
+  color: #ff8a47;
+  font-variant-numeric: tabular-nums;
+}
+.round-card-boost-edge {
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: #8fa3bf;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+/* Per-opponent matchup rows inside a round card: unconditional matchup odds +
+   the points expected in that match if it happens */
+.round-opps {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-top: 10px;
+  border-top: 1px solid #242b35;
+  padding-top: 10px;
+}
+.round-opp {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 14px;
+  color: #c6d0dc;
+}
+.round-opp-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.round-opp-prob {
+  color: #8fa3bf;
+  font-variant-numeric: tabular-nums;
+  width: 48px;
+  text-align: right;
+}
+.round-opp-win {
+  color: #c6d0dc;
+  font-variant-numeric: tabular-nums;
+  width: 48px;
+  text-align: right;
+}
+.round-opp-pts {
+  font-family: var(--display);
+  font-stretch: condensed;
+  font-weight: 700;
+  font-size: 15.5px;
+  color: #ff8a47;
+  font-variant-numeric: tabular-nums;
+  width: 64px;
+  text-align: right;
+}
+.round-opp.head {
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: #8fa3bf;
+}
+.round-opp.miss { color: #8fa3bf; }
+.round-opp.miss .round-opp-pts {
+  color: #8fa3bf;
+  font-family: inherit;
+  font-stretch: normal;
+  font-weight: 600;
+  font-size: 14px;
+}
+.round-opp.total {
+  border-top: 1px solid #242b35;
+  padding-top: 5px;
+  margin-top: 2px;
+  font-weight: 600;
+  color: #e9edf3;
+}
+.round-opp.total .round-opp-prob,
+.round-opp.total .round-opp-win {
+  color: #e9edf3;
+}
+.round-opp.head .round-opp-pts {
+  color: #8fa3bf;
+  font-family: inherit;
+  font-stretch: normal;
+  font-weight: 600;
 }

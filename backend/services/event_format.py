@@ -196,6 +196,26 @@ def _classify_de_group(data: Dict[str, Any], type_name: str, name: str, size: in
     upper_final = _de_section_state(data, "upperFinal")
     grand_final = _de_section_state(data, "grandFinal")
     lower_round2 = _de_section_state(data, "lowerRound2")
+    # Qualifier brackets route their deciding matches with an explicit
+    # 'Qualifies' winner type (e.g. DE16 closed qualifier: upper final +
+    # consolidation final qualify, grand final never played).
+    qualify_count = 0
+    for section in data.values():
+        if not isinstance(section, dict) or "slots" not in section:
+            continue
+        for slot in section.get("slots") or []:
+            if slot.get("hidden"):
+                continue
+            if (slot.get("winnerType") or {}).get("type") == "Qualifies":
+                qualify_count += 1
+            if (slot.get("loserType") or {}).get("type") == "Qualifies":
+                qualify_count += 1
+    if qualify_count:
+        return f"de{size}_qual{qualify_count}", {"count": qualify_count, "winner_to_semis": False}
+    # A visible grand final = a FULL double-elimination bracket (a whole
+    # qualifier/event played to its end), not a truncated group stage.
+    if grand_final and grand_final["visible"]:
+        return f"de{size}_full", {"count": 1, "winner_to_semis": False}
     if size == 8:
         if upper_final and upper_final["visible"]:
             if upper_final["winner_types"] != ["ToPlayoffsSemis"] or upper_final["loser_types"] != ["ToPlayoffsQuarters"]:

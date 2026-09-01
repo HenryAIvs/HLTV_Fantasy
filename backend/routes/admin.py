@@ -114,27 +114,38 @@ def _extract_hltv_event_ref(value: Any) -> Dict[str, Any]:
     return {}
 
 
+# The fantasy overview's masthead names its event as a link INSIDE the header
+# h1 — a deterministic element, unlike the nav dropdown's links to whatever
+# events the page shell advertises (grabbing "the first /events/ link" once
+# mislinked the Beijing qualifiers to BLAST Porto).
+_FANTASY_MASTHEAD_EVENT_RE = re.compile(
+    r'<h1 class="text-ellipsis">\s*<a[^>]*href="(/events/(\d+)/[^"]+)"'
+)
+
+
+def _extract_event_ref_from_fantasy_overview(html: str) -> Dict[str, Any]:
+    m = _FANTASY_MASTHEAD_EVENT_RE.search(html or "")
+    if not m:
+        return {}
+    return {
+        "hltv_event_id": int(m.group(2)),
+        "hltv_event_url": f"https://www.hltv.org{m.group(1)}",
+    }
+
+
 def _extract_hltv_event_ref_from_fantasy(fantasy_event_id: int, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """HLTV event ref: from the fantasy JSON when present, else from the
+    fantasy overview page's masthead link (strict element match — never a
+    scan for arbitrary /events/ links)."""
     if data:
         ref = _extract_hltv_event_ref(data)
         if ref.get("hltv_event_id"):
             return ref
-
-    html_urls = [
-        f"https://www.hltv.org/fantasy/{fantasy_event_id}",
-        f"https://www.hltv.org/fantasy/{fantasy_event_id}/overview",
-        f"https://www.hltv.org/fantasy/{fantasy_event_id}/league",
-        f"https://www.hltv.org/fantasy/{fantasy_event_id}/leagues/create",
-    ]
-    for url in html_urls:
-        try:
-            html = fetch_hltv_html(url)
-        except HLTVBrowserError:
-            continue
-        ref = _extract_hltv_event_ref(html)
-        if ref.get("hltv_event_id"):
-            return ref
-    return {}
+    try:
+        html = fetch_hltv_html(f"https://www.hltv.org/fantasy/{int(fantasy_event_id)}/overview")
+    except HLTVBrowserError:
+        return {}
+    return _extract_event_ref_from_fantasy_overview(html)
 
 
 def _ordered_unique(values: List[str]) -> List[str]:
@@ -2043,6 +2054,24 @@ def start_trigger_backfill(payload: Dict[str, Any] | None = None):
     return {"job_id": job_id, "status": "queued"}
 
 
+def run_trigger_backfill_blocking(event_id: int, refresh_all: bool = True, timeout_seconds: int = 2400) -> str:
+    """Start a trigger backfill for one event and wait for its terminal state —
+    the nightly events task fetches rates for EACH new event in sequence."""
+    started = start_trigger_backfill({"event_id": int(event_id), "refresh_all": bool(refresh_all)})
+    job_id = str(started.get("job_id") or "")
+    deadline = time.time() + int(timeout_seconds)
+    while time.time() < deadline:
+        job = _get_trigger_job_for_response(job_id)
+        status = str(job.get("status") or "")
+        if status in ("completed", "failed", "canceled", "paused"):
+            err = str(job.get("error") or job.get("last_error") or "")
+            if status == "completed":
+                return f"completed ({job.get('ok')} players)"
+            return f"{status}: {err[:140]}"
+        time.sleep(5)
+    return "timeout"
+
+
 def _get_latest_trigger_job() -> Optional[Dict[str, Any]]:
     from backend.data.db import connect as _db_connect
 
@@ -2124,6 +2153,8 @@ def _start_trigger_worker(job_id: str, event_id, refresh_all: bool = False) -> N
 
 
 def _cheapest_event_players(fantasy_id: int, count: int = 5) -> List[int]:
+    """Cheapest valid lineup: HLTV rejects lineups with more than 2 players
+    from the same team, so cap picks per team while walking prices upward."""
     from backend.data.event_db import get_event_detail
 
     detail = get_event_detail(int(fantasy_id)) or {}
@@ -2131,7 +2162,17 @@ def _cheapest_event_players(fantasy_id: int, count: int = 5) -> List[int]:
         (p for p in (detail.get("players") or []) if p.get("player_id")),
         key=lambda p: int(p.get("price") or 0),
     )
-    return [int(p["player_id"]) for p in players[:count]]
+    picked: List[int] = []
+    per_team: Dict[str, int] = {}
+    for p in players:
+        team = str(p.get("team_name") or "")
+        if per_team.get(team, 0) >= 2:
+            continue
+        picked.append(int(p["player_id"]))
+        per_team[team] = per_team.get(team, 0) + 1
+        if len(picked) >= count:
+            break
+    return picked
 
 
 def _auto_provision_template(driver, fantasy_id: int) -> Dict[str, Any]:

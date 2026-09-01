@@ -55,6 +55,39 @@ const RoleBadge = ({ roleId, size = 68 }) => (
   <SpriteBadge url={roleBadgesUrl} cols={4} rows={3} index={Number(roleId)} size={size} className="role-badge" />
 );
 
+const ROLE_NAMES = {
+  0: "Main AWP",
+  1: "Support",
+  2: "Attacker",
+  3: "Leader",
+  4: "Stathunter",
+  5: "Entry Fragger",
+  6: "Camper",
+  7: "Defender",
+  8: "HS Machine",
+  9: "Noob",
+  10: "Multi Fragger",
+  11: "Eco Friendly",
+};
+
+// Short round labels for the playoff EV per-round splits / reach odds.
+const STAGE_SHORT = {
+  round_of_32: "R32",
+  round_of_16: "R16",
+  quarters: "QF",
+  semis: "SF",
+  final: "Final",
+  third_place: "3rd",
+};
+const STAGE_FULL = {
+  round_of_32: "Round of 32",
+  round_of_16: "Round of 16",
+  quarters: "Quarter-final",
+  semis: "Semi-final",
+  final: "Final",
+  third_place: "3rd place",
+};
+
 // booster_sprites.png — 5x4 (18 icons, last two cells empty), booster-id order
 // EXCEPT cells 14/15: the sheet draws shot-in-the-back at cell 14 and the
 // arms-raised hero at 15, which semantically are Cannon fodder (15) and
@@ -417,11 +450,13 @@ const buildPlayerValueRowsFromSimulation = (simResults, players) => {
       if (!Number.isFinite(pid) || pid <= 0) return;
       const player = playerById.get(pid) || {};
       const pointsCandidates = [
-        Number(comps?.total_points_without_booster),
-        Number(comps?.rating_points_total) + Number(comps?.win_points_total) + Number(comps?.role_points_total),
         Number(comps?.total_points),
         Number(comps?.total),
         Number(comps?.expected_total_points),
+        Number(comps?.rating_points_total) +
+          Number(comps?.win_points_total) +
+          Number(comps?.role_points_total) +
+          Number(comps?.booster_points_total),
       ];
       const points = pointsCandidates.find((v) => Number.isFinite(v));
       if (!Number.isFinite(points)) return;
@@ -659,6 +694,12 @@ const aggregatePlayoffBoosterUsage = (player, rosterPlayers, outcomes) => {
 function PriceVsPointsPanel({ title, rows, slope, intercept, showTable = true, onPointClick = null }) {
   const [search, setSearch] = useState("");
   const [sortBy, setSortBy] = useState("distance_desc");
+  // 2D nearest-dot hover: the scatter shapes record their pixel positions and
+  // mouse-move picks the closest dot in BOTH axes (the built-in tooltip only
+  // matches on x, which picks the wrong player when prices tie).
+  const [hover, setHover] = useState(null);
+  const wrapRef = useRef(null);
+  const dotPosRef = useRef(new Map());
   const minPrice = useMemo(() => Math.min(...rows.map((r) => Number(r.price))), [rows]);
   const maxPrice = useMemo(() => Math.max(...rows.map((r) => Number(r.price))), [rows]);
   const chartRows = useMemo(
@@ -727,20 +768,48 @@ function PriceVsPointsPanel({ title, rows, slope, intercept, showTable = true, o
     return out;
   }, [rows, search, sortBy]);
 
-  const PlayerValueTooltip = ({ active, payload }) => {
-    if (!active || !payload || payload.length === 0) return null;
-    const scatterEntry = payload.find((p) => p?.dataKey === "points") || payload[0];
-    const d = scatterEntry?.payload;
-    if (!d) return null;
-    return (
-      <div style={{ background: "#14181f", border: "1px solid #3a4452", borderRadius: 10, color: "#e9edf3", padding: 10 }}>
-        <div style={{ fontWeight: 700 }}>{d.name}</div>
-        <div>Points: {Number(d.points).toFixed(2)}</div>
-        <div>Average line: {Number(d.trend).toFixed(2)}</div>
-        <div>Distance: {Number(d.distance) >= 0 ? "+" : ""}{Number(d.distance).toFixed(2)}</div>
-        <div>Price: {d.price}</div>
-      </div>
-    );
+  // Reset the dot-position map during render (before the scatter shapes
+  // re-register) whenever the data changes; an effect would wipe it AFTER the
+  // shapes ran and leave it empty until the next re-render.
+  const lastChartRowsRef = useRef(null);
+  if (lastChartRowsRef.current !== chartRows) {
+    lastChartRowsRef.current = chartRows;
+    dotPosRef.current = new Map();
+  }
+  useEffect(() => {
+    setHover(null);
+  }, [chartRows]);
+
+  // Plain DOM mouse tracking on the wrapper: independent of recharts' event
+  // plumbing, matched against the dots' recorded svg positions (the svg sits
+  // at the wrapper's 6px padding offset).
+  const handleWrapMove = (e) => {
+    const rect = wrapRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const x = e.clientX - rect.left - 6;
+    const y = e.clientY - rect.top - 6;
+    let bestId = null;
+    let bestPos = null;
+    let bestD2 = Infinity;
+    dotPosRef.current.forEach((pos, id) => {
+      const dx = pos.cx - x;
+      const dy = pos.cy - y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bestD2) {
+        bestD2 = d2;
+        bestId = id;
+        bestPos = pos;
+      }
+    });
+    if (bestId != null && bestD2 <= 28 * 28) {
+      setHover((prev) => {
+        if (prev?.id === bestId) return prev;
+        const row = chartRows.find((r) => Number(r.player_id) === Number(bestId));
+        return row ? { id: bestId, cx: bestPos.cx, cy: bestPos.cy, row } : null;
+      });
+    } else {
+      setHover(null);
+    }
   };
 
   return (
@@ -750,33 +819,76 @@ function PriceVsPointsPanel({ title, rows, slope, intercept, showTable = true, o
         <p className="muted">Generate player valuation data first to view price vs points.</p>
       ) : (
         <div className="stack">
-          <div className="value-chart-wrap">
+          <div
+            className="value-chart-wrap value-scatter"
+            ref={wrapRef}
+            onMouseMove={handleWrapMove}
+            onMouseLeave={() => setHover(null)}
+            onClick={() => {
+              if (hover?.row && onPointClick) onPointClick(hover.row);
+            }}
+          >
+            <div className="value-trend-label">
+              Average line: points = {intercept.toFixed(2)} + {(slope * 1000).toFixed(3)} per $1k of price
+            </div>
+            {hover && (
+              <div
+                className="value-point-tooltip"
+                style={{
+                  left: (wrapRef.current?.clientWidth || 9999) - hover.cx < 250 ? hover.cx - 14 : hover.cx + 14,
+                  top: Math.max(8, hover.cy - 24),
+                  transform:
+                    (wrapRef.current?.clientWidth || 9999) - hover.cx < 250 ? "translateX(-100%)" : "none",
+                }}
+              >
+                <div style={{ fontWeight: 700 }}>{hover.row.name}</div>
+                <div>Points: {Number(hover.row.points).toFixed(2)}</div>
+                <div>Average line: {Number(hover.row.trend).toFixed(2)}</div>
+                <div>
+                  Distance: {Number(hover.row.distance) >= 0 ? "+" : ""}
+                  {Number(hover.row.distance).toFixed(2)}
+                </div>
+                <div>Price: ${Number(hover.row.price).toLocaleString()}</div>
+              </div>
+            )}
             <ResponsiveContainer width="100%" height={380}>
-              <ComposedChart data={chartRows} margin={{ top: 12, right: 18, left: 6, bottom: 12 }}>
+              <ComposedChart
+                data={chartRows}
+                margin={{ top: 12, right: 18, left: 14, bottom: 26 }}
+                accessibilityLayer={false}
+              >
                 <CartesianGrid stroke="#232a34" strokeDasharray="3 3" />
                 <XAxis
                   type="number"
                   dataKey="price"
                   domain={[minPrice, maxPrice]}
                   tick={{ fill: "#9fb2c9", fontSize: 12 }}
+                  tickMargin={8}
+                  tickFormatter={(v) => String(Math.round(Number(v) / 1000))}
                   axisLine={{ stroke: "#3a4452" }}
                   tickLine={{ stroke: "#3a4452" }}
                   name="Price"
+                  label={{ value: "Price ($k)", position: "insideBottom", offset: -18, fill: "#9fb2c9", fontSize: 12.5 }}
                 />
                 <YAxis
                   type="number"
                   dataKey="points"
                   tick={{ fill: "#9fb2c9", fontSize: 12 }}
+                  tickMargin={7}
                   axisLine={{ stroke: "#3a4452" }}
                   tickLine={{ stroke: "#3a4452" }}
                   name="Points"
+                  label={{
+                    value: "Expected points",
+                    angle: -90,
+                    position: "insideLeft",
+                    offset: 2,
+                    fill: "#9fb2c9",
+                    fontSize: 12.5,
+                    style: { textAnchor: "middle" },
+                  }}
                 />
-                <Tooltip
-                  shared={false}
-                  cursor={false}
-                  content={<PlayerValueTooltip />}
-                />
-                <Legend wrapperStyle={{ color: "#9fb2c9" }} />
+                <Legend verticalAlign="top" height={30} wrapperStyle={{ color: "#9fb2c9" }} />
                 <Line
                   type="linear"
                   dataKey="trend"
@@ -784,49 +896,59 @@ function PriceVsPointsPanel({ title, rows, slope, intercept, showTable = true, o
                   stroke="#35a2ff"
                   strokeWidth={2}
                   dot={false}
+                  activeDot={false}
                   isAnimationActive={false}
                 />
                 <Scatter
                   name="Players"
                   dataKey="points"
                   fill="#4fc3ff"
-                  onClick={(payload) => {
-                    const row = payload?.payload || payload;
-                    if (row && onPointClick) onPointClick(row);
+                  isAnimationActive={false}
+                  shape={(props) => {
+                    const { cx, cy, payload: pt } = props;
+                    if (!Number.isFinite(cx) || !Number.isFinite(cy)) return null;
+                    const pid = Number(pt?.player_id);
+                    if (Number.isFinite(pid)) dotPosRef.current.set(pid, { cx, cy });
+                    const active = hover != null && pid === Number(hover.id);
+                    return (
+                      <g>
+                        {active && <circle cx={cx} cy={cy} r={9.5} fill="none" stroke="#ff8a47" strokeWidth={2} />}
+                        <circle cx={cx} cy={cy} r={active ? 6 : 4.5} fill={active ? "#ff8a47" : "#4fc3ff"} />
+                      </g>
+                    );
                   }}
                 />
               </ComposedChart>
             </ResponsiveContainer>
           </div>
-          <p className="muted">Trend line (average): points = {intercept.toFixed(2)} + {slope.toFixed(4)} x price</p>
           {showTable && (
             <>
               <div className="grid two">
-                <Input label="Search Players" value={search} onChange={setSearch} placeholder="name, player id, or team id" />
+                <Input label="Search Players" value={search} onChange={setSearch} placeholder="Player name" />
               </div>
-              <p className="muted">
-                Showing {filteredRows.length} of {rows.length} players
-              </p>
               <table>
                 <thead>
                   <tr>
                     <SortHeader sortValue={sortBy} asc="name_asc" desc="name_desc" onChange={setSortBy}>Player</SortHeader>
-                    <SortHeader sortValue={sortBy} asc="player_id_asc" desc="player_id_desc" onChange={setSortBy}>Player ID</SortHeader>
                     <SortHeader sortValue={sortBy} asc="price_asc" desc="price_desc" onChange={setSortBy}>Price</SortHeader>
                     <SortHeader sortValue={sortBy} asc="points_asc" desc="points_desc" defaultDirection="desc" onChange={setSortBy}>Points</SortHeader>
-                    <SortHeader sortValue={sortBy} asc="on_line_asc" desc="on_line_desc" defaultDirection="desc" onChange={setSortBy}>On Line</SortHeader>
                     <SortHeader sortValue={sortBy} asc="distance_asc" desc="distance_desc" defaultDirection="desc" onChange={setSortBy}>Distance</SortHeader>
+                    <SortHeader sortValue={sortBy} asc="on_line_asc" desc="on_line_desc" defaultDirection="desc" onChange={setSortBy}>Expected Points</SortHeader>
                   </tr>
                 </thead>
                 <tbody>
                   {filteredRows.map((r) => (
                     <tr key={`dist-${r.player_id}`}>
-                      <td>{r.name}</td>
-                      <td>{r.player_id}</td>
-                      <td>{r.price}</td>
+                      <td>
+                        <div className="table-player-cell">
+                          <PlayerPhoto playerId={Number(r.player_id)} name={r.name} size={28} />
+                          <span>{r.name}</span>
+                        </div>
+                      </td>
+                      <td>${Number(r.price).toLocaleString()}</td>
                       <td>{r.points.toFixed(2)}</td>
-                      <td>{r.on_line.toFixed(2)}</td>
                       <td>{r.distance >= 0 ? "+" : ""}{r.distance.toFixed(2)}</td>
+                      <td>{r.on_line.toFixed(2)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -3219,7 +3341,7 @@ function MapsTab({ teams }) {
   );
 }
 
-function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpenPlayer, variant = "main" }) {
+function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpenPlayer, variant = "main", detectedBracketSize = null }) {
   const isBounty = variant === "bounty";
   const [playoffTab, setPlayoffTab] = useState("stage");
   const [events, setEvents] = useState([]);
@@ -3229,19 +3351,24 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   const [updatedAt, setUpdatedAt] = useState("");
   const [slots, setSlots] = useState(Array(8).fill(""));
   const [bracketSize, setBracketSize] = useState(8); // 8 = exact, 16 = Monte-Carlo
+  // null = stored-sim hydration pending, 0 = no stored sim, else its size.
+  const [storedSize, setStoredSize] = useState(null);
   const [mcSims, setMcSims] = useState(5000); // Monte-Carlo samples for large (16-team) fields
-  const changeBracketSize = (n) => {
-    const size = Number(n) || 8;
-    setBracketSize(size);
-    setSlots(Array(size).fill(""));
-    setResults(null);
-    setTopTeams(null);
-    setAllTeams(null);
-    setBaseTeams(null);
-    setCompletedBracket({ rounds: emptyCompletedRounds(size), third: "" });
-    setCompletedBracketResult(null);
-    setCompletedBracketMessage("");
-  };
+  // Self-loading bracket: once the stored-sim hydration has resolved, seed
+  // the page from the event automatically whenever the stored sim doesn't
+  // match the detected format (or there is none).
+  const autoSeededRef = useRef(false);
+  useEffect(() => {
+    if (isBounty || autoSeededRef.current) return;
+    if (storedSize === null) return; // hydration still pending
+    const size = Number(detectedBracketSize);
+    if (![2, 4, 6, 8, 16].includes(size)) return;
+    if (storedSize === size) return; // stored sim already fits this format
+    autoSeededRef.current = true;
+    autofillPlayoffFromEvent();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storedSize, detectedBracketSize]);
+
   // Fill the seed slots + bracket size straight from the linked HLTV event's
   // single-elimination playoff bracket (16/8/4), in bracket order.
   const autofillPlayoffFromEvent = async () => {
@@ -3260,7 +3387,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       const ids = (data.team_ids || []).map((x) => String(x || ""));
       const names = data.team_names || [];
       const size = Number(data.bracket_size || ids.length);
-      if (![2, 4, 8, 16].includes(size)) {
+      if (![2, 4, 6, 8, 16].includes(size)) {
         setPlayoffAutofillMessage(`Unsupported bracket size (${size}).`);
         return;
       }
@@ -3472,20 +3599,15 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     for (let r = 0; r < total; r++) rounds.push(Array(n >> (r + 1)).fill(""));
     return rounds;
   };
+  // Display-only: seeds load from the event automatically, no manual picking.
   const BracketTeamRow = ({ slotIndex, placeholder, muted = false }) => {
     const selectedTeamId = slotIndex !== null && slotIndex !== undefined ? slots[slotIndex] : "";
     const hasTeam = Boolean(selectedTeamId);
     return (
       <div className={`playoff-team-row ${muted ? "muted" : ""}`}>
         <TeamBadge teamId={hasTeam ? selectedTeamId : 0} />
-        {slotIndex !== null && slotIndex !== undefined ? (
-          <select value={selectedTeamId} onChange={(e) => setSlot(slotIndex, e.target.value)} disabled={busy}>
-            {playoffTeamOptions.map((option) => (
-              <option key={option.value || "empty"} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
+        {hasTeam ? (
+          <span>{teamLookup[Number(selectedTeamId)] || `Team ${selectedTeamId}`}</span>
         ) : (
           <span className="playoff-team-tbd">{placeholder || "TBD"}</span>
         )}
@@ -3522,6 +3644,88 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   // muted winner placeholders. Auto-distributed via .pb-bracket for any size.
   const renderSeedingBracket = () => {
     const n = bracketSize;
+    if (n === 6) {
+      // Byes bracket: slots [SF bye 1, QF1a, QF1b, QF2a, QF2b, SF bye 2].
+      return (
+        <div className="pb-bracket">
+          <div className="pb-round">
+            <div className="pb-round-title">Quarter-finals</div>
+            <div className="pb-matches">
+              <div className="pb-match-wrap">
+                <BracketMatchCard
+                  title="QF 1"
+                  meta="BO3"
+                  rows={
+                    <>
+                      <BracketTeamRow slotIndex={1} />
+                      <BracketTeamRow slotIndex={2} />
+                    </>
+                  }
+                />
+              </div>
+              <div className="pb-match-wrap">
+                <BracketMatchCard
+                  title="QF 2"
+                  meta="BO3"
+                  rows={
+                    <>
+                      <BracketTeamRow slotIndex={3} />
+                      <BracketTeamRow slotIndex={4} />
+                    </>
+                  }
+                />
+              </div>
+            </div>
+          </div>
+          <div className="pb-round">
+            <div className="pb-round-title">Semi-finals</div>
+            <div className="pb-matches">
+              <div className="pb-match-wrap">
+                <BracketMatchCard
+                  title="SF 1"
+                  meta="BO3"
+                  rows={
+                    <>
+                      <BracketTeamRow slotIndex={0} />
+                      <BracketTeamRow placeholder="Winner QF 1" muted />
+                    </>
+                  }
+                />
+              </div>
+              <div className="pb-match-wrap">
+                <BracketMatchCard
+                  title="SF 2"
+                  meta="BO3"
+                  rows={
+                    <>
+                      <BracketTeamRow slotIndex={5} />
+                      <BracketTeamRow placeholder="Winner QF 2" muted />
+                    </>
+                  }
+                />
+              </div>
+            </div>
+          </div>
+          <div className="pb-round">
+            <div className="pb-round-title">Grand final</div>
+            <div className="pb-matches">
+              <div className="pb-match-wrap">
+                <BracketMatchCard
+                  title="FINAL"
+                  meta="BO5"
+                  rows={
+                    <>
+                      <BracketTeamRow placeholder="Winner SF 1" muted />
+                      <BracketTeamRow placeholder="Winner SF 2" muted />
+                    </>
+                  }
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
     const totalRounds = bracketTotalRounds(n);
     return (
       <div className="pb-bracket">
@@ -3968,9 +4172,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     const allEvents = Array.isArray(data.events) ? data.events : [];
     setEvents(allEvents);
     const active = data.active_event_id;
-    const fallback = allEvents.length > 0 ? allEvents[0].event_id : "";
-    const nextSelected = active ?? fallback;
-    setSelectedEventId(nextSelected === "" ? "" : String(nextSelected));
+    setSelectedEventId(active == null ? "" : String(active));
   };
 
   const loadEventTeams = async (eventId) => {
@@ -3989,12 +4191,15 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       setLatestPayload(null);
       setResults(null);
       setUpdatedAt("");
+      setStoredSize(0);
       return;
     }
     const payload = data.payload || {};
     setLatestPayload(payload);
     setSlots((payload.team_slots || []).map((x) => String(x)));
-    setBracketSize((payload.team_slots || []).length >= 16 ? 16 : 8);
+    const loadedSize = (payload.team_slots || []).length;
+    setBracketSize([2, 4, 6, 8, 16].includes(loadedSize) ? loadedSize : 8);
+    setStoredSize(loadedSize);
     setMcSims(Number(payload.mc_sims) || 5000);
     setHasThirdPlaceDecider(Boolean(payload.has_third_place_decider));
     if (isBounty) {
@@ -4010,7 +4215,10 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       setSfPicks(restored);
     }
     setResults(data.results || null);
-    hydrateCompletedBracketFromBracket(data.results?.bracket, (payload.team_slots || []).length || bracketSize);
+    if (loadedSize !== 6) {
+      // The completed-bracket picker doesn't model the 6-team byes shape.
+      hydrateCompletedBracketFromBracket(data.results?.bracket, loadedSize || bracketSize);
+    }
     setUpdatedAt(data.updated_at ? new Date(Number(data.updated_at) * 1000).toISOString() : "");
   };
 
@@ -4141,6 +4349,34 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       setBusy(false);
     }
   };
+
+  // Self-running valuations: recompute automatically once the bracket is
+  // seeded, and again whenever the seeds or the third-place rule change.
+  // Stored valuations that already cover the exact same bracket are reused
+  // as-is — no recompute on every visit to the tab.
+  const lastAutoRunRef = useRef("");
+  useEffect(() => {
+    if (isBounty || busy) return;
+    if (storedSize === null) return; // stored-sim hydration pending
+    const ids = slots.map((s) => Number(s));
+    if (ids.length === 0 || ids.some((id) => !id)) return;
+    const sig = ids.join("-") + (hasThirdPlaceDecider ? ":3rd" : "");
+    if (lastAutoRunRef.current === sig) return;
+    const storedIds = (latestPayload?.team_slots || []).map((x) => Number(x));
+    const storedSig =
+      storedIds.length > 0 && storedIds.every(Boolean)
+        ? storedIds.join("-") + (latestPayload?.has_third_place_decider ? ":3rd" : "")
+        : null;
+    // stage_stats gate: stored results from before the round-source feature
+    // are recomputed once so the popup has its data.
+    if (results?.stage_stats && storedSig === sig) {
+      lastAutoRunRef.current = sig;
+      return;
+    }
+    lastAutoRunRef.current = sig;
+    run();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slots, hasThirdPlaceDecider, busy, storedSize, isBounty, results, latestPayload]);
 
   const runSharedCombinations = async () => {
     setBusy(true);
@@ -4389,7 +4625,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   }, [activeCompletedBracketResult?.player_values]);
   const completedBreakdownValue = (row, key) => {
     if (key === "total") {
-      const total = ["rating", "win", "role"].reduce((sum, part) => sum + completedBreakdownValue(row, part), 0);
+      const total = ["rating", "win", "role", "booster"].reduce((sum, part) => sum + completedBreakdownValue(row, part), 0);
       if (row?.components_available === false && Number.isFinite(Number(row?.points))) return Number(row.points);
       return total;
     }
@@ -4417,39 +4653,15 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   return (
     <Section title={isBounty ? "Bounty Playoffs (BO3)" : "Playoff Bracket (BO3)"}>
       <div className="stack">
-        <div className="grid three">
-          <Select
-            label="Event"
-            value={selectedEventId}
-            onChange={setSelectedEventId}
-            options={
-              events.length > 0
-                ? events.map((e) => ({
-                    value: String(e.event_id),
-                    label: e.hltv_event_id ? `Fantasy ${e.event_id} -> HLTV ${e.hltv_event_id}` : `Fantasy ${e.event_id}`,
-                  }))
-                : [{ value: "", label: "No events imported" }]
-            }
-          />
-          <div className="field">
-            <span>Teams In Event</span>
-            <div className="pill">{filteredTeams.length}</div>
-          </div>
-          <div className="field">
-            <span>Stored Valuations</span>
-            <div className="pill">{results ? "Loaded" : "None"}</div>
-          </div>
-        </div>
-
         <div className="tab-bar small">
           <button className={playoffTab === "stage" ? "tab active" : "tab"} onClick={() => setPlayoffTab("stage")}>
             Bracket Stage
           </button>
-          <button className={playoffTab === "top5" ? "tab active" : "tab"} onClick={() => setPlayoffTab("top5")}>
-            Top 5 Teams
-          </button>
           <button className={playoffTab === "value" ? "tab active" : "tab"} onClick={() => setPlayoffTab("value")}>
             Player Value
+          </button>
+          <button className={playoffTab === "top5" ? "tab active" : "tab"} onClick={() => setPlayoffTab("top5")}>
+            Top 5 Teams
           </button>
         </div>
 
@@ -4612,74 +4824,21 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
         )}
         {playoffTab === "stage" && !isBounty && (
           <>
-            <div className="card sub">
-              <div className="grid two">
-                <Select
-                  label="Bracket size"
-                  value={String(bracketSize)}
-                  onChange={changeBracketSize}
-                  options={[
-                    { value: "8", label: "8 teams (exact enumeration)" },
-                    { value: "16", label: "16 teams (Monte-Carlo)" },
-                  ]}
-                />
-                <div className="field">
-                  <span>Seeding</span>
-                  <div className="actions">
-                    <button
-                      className="secondary"
-                      onClick={autofillPlayoffFromEvent}
-                      disabled={busy || playoffAutofillBusy}
-                    >
-                      {playoffAutofillBusy ? "Fetching event..." : "Autofill bracket from HLTV event"}
-                    </button>
-                  </div>
-                </div>
-              </div>
-              {playoffAutofillMessage && <p className="muted">{playoffAutofillMessage}</p>}
-              {bracketSize === 16 && (
-                <div className="field" style={{ maxWidth: 340, marginTop: 12 }}>
-                  <span>Monte-Carlo simulations</span>
+            {playoffAutofillMessage && <p className="muted">{playoffAutofillMessage}</p>}
+            {renderSeedingBracket()}
+            {bracketSize !== 6 && (
+              <div className="actions">
+                <label className="checkbox-inline">
                   <input
-                    type="number"
-                    min={500}
-                    max={200000}
-                    step={1000}
-                    value={mcSims}
-                    onChange={(e) => setMcSims(Number(e.target.value))}
+                    type="checkbox"
+                    checked={hasThirdPlaceDecider}
+                    onChange={(e) => setHasThirdPlaceDecider(e.target.checked)}
                     disabled={busy}
                   />
-                  <span className="muted">
-                    More simulations = smoother estimates but longer runs (~5,000 ≈ 18s). Clamped to 500–200,000.
-                  </span>
-                </div>
-              )}
-            </div>
-            {bracketSize === 16 && (
-              <p className="muted">
-                Pick the 16 seeds in bracket order — seed 1 plays seed 2, seed 3 plays seed 4, and so on. 16-team
-                results are Monte-Carlo estimated rather than exact.
-              </p>
+                  <span>Third-place decider match</span>
+                </label>
+              </div>
             )}
-            {renderSeedingBracket()}
-            <div className="actions">
-              <label className="checkbox-inline">
-                <input
-                  type="checkbox"
-                  checked={hasThirdPlaceDecider}
-                  onChange={(e) => setHasThirdPlaceDecider(e.target.checked)}
-                  disabled={busy}
-                />
-                <span>Third-place decider match</span>
-              </label>
-              <button className="primary" onClick={run} disabled={busy || slots.some((s) => !s)}>
-                {busy ? "Running..." : "Run Playoff And Store Valuations"}
-              </button>
-              <button className="danger" onClick={resetStoredPlayoff} disabled={busy || !results}>
-                Reset Stored Valuations
-              </button>
-              {updatedAt && <p className="muted">Stored: {new Date(updatedAt).toLocaleString()}</p>}
-            </div>
           </>
         )}
 
@@ -4939,7 +5098,13 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
             )}
             {results && (
               <>
-                {renderCompletedPicker()}
+                {slots.length === 6 ? (
+                  <p className="muted">
+                    Completed-bracket scoring isn't supported for the 6-team byes bracket yet.
+                  </p>
+                ) : (
+                  renderCompletedPicker()
+                )}
                 <div className="actions">
                   {!baseTeams && <p className="muted">Run Combinations once above to score this bracket.</p>}
                   {baseTeams && !completedBracketDerived.complete && <p className="muted">Complete the bracket to score the saved combinations.</p>}
@@ -5147,56 +5312,100 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
           <div className="card sub">
             <h3>Player Expected Values</h3>
           </div>
-          <div className="grid two">
-            {Object.entries(results.teams).map(([tid, data]) => (
-              <div key={tid} className="card sub">
-                <h4>{teamLookup[Number(tid)] || `Team ${tid}`}</h4>
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Player</th>
-                      <th>Total</th>
-                      <th>Rating</th>
-                      <th>Win</th>
-                      <th>Role</th>
-                      <th>Booster</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {Object.entries(data.players || {}).map(([pid, comps]) => (
-                      <tr key={pid}>
-                        <td>
-                          <button
-                            className="inline-link-btn"
-                            onClick={() =>
-                              openScoringBreakdown({
-                                player_id: Number(pid),
-                                name: playerLookup[Number(pid)] || pid,
-                                team_id: Number(tid),
-                                points: Number(comps.total_points_without_booster ?? comps.total_points ?? 0),
-                                rating: Number(comps.rating_points_total || 0),
-                                win: Number(comps.win_points_total || 0),
-                                role: Number(comps.role_points_total || 0),
-                                booster: Number(comps.booster_points_total || 0),
-                                components_available: true,
-                                point_breakdown: comps.point_breakdown || [],
-                              })
-                            }
-                          >
-                            {playerLookup[Number(pid)] || pid}
-                          </button>
-                        </td>
-                        <td>{Number(comps.total_points_without_booster ?? comps.total_points ?? 0).toFixed(2)}</td>
-                        <td>{comps.rating_points_total.toFixed(2)}</td>
-                        <td>{comps.win_points_total.toFixed(2)}</td>
-                        <td>{comps.role_points_total.toFixed(2)}</td>
-                        <td>{comps.booster_points_total.toFixed(2)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            ))}
+          <div className="event-team-rows">
+            {Object.entries(results.teams).map(([tid, data]) => {
+              const info = (teams || []).find((t) => Number(t.team_id) === Number(tid));
+              const stageStats = results.stage_stats || null;
+              const stageList = stageStats?.stages || [];
+              const teamStage = stageStats?.teams?.[String(tid)] || null;
+              const rows = Object.entries(data.players || {}).sort(
+                (a, b) => Number(b[1].total_points ?? 0) - Number(a[1].total_points ?? 0)
+              );
+              return (
+                <div className="event-team-row" key={tid}>
+                  <div className="event-team-head">
+                    <TeamLogo hltvTeamId={info?.hltv_team_id} name={teamLookup[Number(tid)]} size={42} />
+                    <div className="event-team-headtext">
+                      <span className="event-team-name">{teamLookup[Number(tid)] || `Team ${tid}`}</span>
+                      {teamStage && (
+                        <div className="event-team-reach">
+                          {stageList
+                            .filter((s) => Number(teamStage.reach?.[s] || 0) > 0.0005)
+                            .map((s) => (
+                              <div className="event-player-stat" key={s}>
+                                <div className="event-player-mini">
+                                  {Math.round(Number(teamStage.reach[s]) * 100)}%
+                                </div>
+                                <div className="event-player-stat-label">{STAGE_SHORT[s] || s}</div>
+                              </div>
+                            ))}
+                          <div className="event-player-stat">
+                            <div className="event-player-mini">
+                              {Math.round(Number(teamStage.champion || 0) * 100)}%
+                            </div>
+                            <div className="event-player-stat-label">Title</div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                  <div className="event-team-players">
+                    {rows.map(([pid, comps]) => {
+                      const total = Number(comps.total_points ?? 0);
+                      const pStages = stageStats?.players?.[String(pid)] || null;
+                      return (
+                        <div
+                          className="event-player-card clickable"
+                          key={pid}
+                          onClick={() =>
+                            openScoringBreakdown({
+                              player_id: Number(pid),
+                              name: playerLookup[Number(pid)] || pid,
+                              team_id: Number(tid),
+                              points: total,
+                              rating: Number(comps.rating_points_total || 0),
+                              win: Number(comps.win_points_total || 0),
+                              role: Number(comps.role_points_total || 0),
+                              booster: Number(comps.booster_points_total || 0),
+                              role_id: comps.role_id,
+                              stage_ev: pStages,
+                              stage_list: stageList,
+                              team_reach: teamStage,
+                              booster_slots: comps.booster_slots,
+                              components_available: true,
+                              point_breakdown: comps.point_breakdown || [],
+                            })
+                          }
+                        >
+                          <PlayerPhoto playerId={Number(pid)} name={playerLookup[Number(pid)]} size={52} />
+                          <div className="event-player-name">{playerLookup[Number(pid)] || pid}</div>
+                          {comps.role_id != null && (
+                            <div className="event-player-role">
+                              <RoleBadge roleId={comps.role_id} size={16} />
+                              <span>{ROLE_NAMES[comps.role_id] || `Role ${comps.role_id}`}</span>
+                            </div>
+                          )}
+                          <div className="event-player-rating">{total.toFixed(2)}</div>
+                          <div className="event-player-stats ev-mini">
+                            {[
+                              ["Rating", comps.rating_points_total],
+                              ["Win", comps.win_points_total],
+                              ["Role", comps.role_points_total],
+                              ["Boost", comps.booster_points_total],
+                            ].map(([label, value]) => (
+                              <div className="event-player-stat" key={label}>
+                                <div className="event-player-mini">{Number(value || 0).toFixed(1)}</div>
+                                <div className="event-player-stat-label">{label}</div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
@@ -5450,7 +5659,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       )}
       {completedPlayerBreakdown && (
         <div className="modal-backdrop" onClick={() => setCompletedPlayerBreakdown(null)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
+          <div className="modal player-sources-modal" onClick={(e) => e.stopPropagation()}>
             <header className="modal-header">
               <h3>{completedPlayerBreakdown.name || `Player ${completedPlayerBreakdown.player_id}`} Point Sources</h3>
               <button className="close" onClick={() => setCompletedPlayerBreakdown(null)}>
@@ -5458,36 +5667,148 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
               </button>
             </header>
             <div className="modal-body">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Source</th>
-                    <th>Points</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr>
-                    <td>Rating</td>
-                    <td>{completedBreakdownValue(completedPlayerBreakdown, "rating").toFixed(2)}</td>
-                  </tr>
-                  <tr>
-                    <td>Win</td>
-                    <td>{completedBreakdownValue(completedPlayerBreakdown, "win").toFixed(2)}</td>
-                  </tr>
-                  <tr>
-                    <td>Role</td>
-                    <td>{completedBreakdownValue(completedPlayerBreakdown, "role").toFixed(2)}</td>
-                  </tr>
-                  <tr>
-                    <td>Booster</td>
-                    <td>{completedBreakdownValue(completedPlayerBreakdown, "booster").toFixed(2)}</td>
-                  </tr>
-                  <tr>
-                    <td><strong>Total</strong></td>
-                    <td><strong>{completedBreakdownValue(completedPlayerBreakdown, "total").toFixed(2)}</strong></td>
-                  </tr>
-                </tbody>
-              </table>
+              <div className="breakdown-hero">
+                {completedPlayerBreakdown.role_id != null && (
+                  <div className="breakdown-stat role">
+                    <RoleBadge roleId={completedPlayerBreakdown.role_id} size={42} />
+                    <div className="breakdown-stat-label">
+                      {ROLE_NAMES[completedPlayerBreakdown.role_id] || `Role ${completedPlayerBreakdown.role_id}`}
+                    </div>
+                  </div>
+                )}
+                {[
+                  ["Rating", "rating"],
+                  ["Win", "win"],
+                  ["Role", "role"],
+                  ["Booster", "booster"],
+                ].map(([label, key]) => (
+                  <div className="breakdown-stat" key={key}>
+                    <div className="breakdown-stat-value">
+                      {completedBreakdownValue(completedPlayerBreakdown, key).toFixed(2)}
+                    </div>
+                    <div className="breakdown-stat-label">{label}</div>
+                  </div>
+                ))}
+                <div className="breakdown-stat total">
+                  <div className="breakdown-stat-value">
+                    {completedBreakdownValue(completedPlayerBreakdown, "total").toFixed(2)}
+                  </div>
+                  <div className="breakdown-stat-label">Total</div>
+                </div>
+              </div>
+              {completedPlayerBreakdown.stage_ev &&
+                Array.isArray(completedPlayerBreakdown.stage_list) &&
+                completedPlayerBreakdown.stage_list.length > 0 && (
+                <div className="stack">
+                  <h4>Round Sources</h4>
+                  <div className="round-cards">
+                    {completedPlayerBreakdown.stage_list.map((s) => {
+                      const cell = completedPlayerBreakdown.stage_ev[s];
+                      if (!cell || typeof cell !== "object") return null;
+                      const reach = Number(completedPlayerBreakdown.team_reach?.reach?.[s] ?? NaN);
+                      const isBye = Number.isFinite(reach) && reach < 0.0005 && Math.abs(Number(cell.total || 0)) > 0.005;
+                      const slotInfo = (completedPlayerBreakdown.booster_slots || []).find(
+                        (b) => Number(b.booster_id) === Number(cell.booster_id)
+                      );
+                      const opps = Array.isArray(cell.opponents) ? cell.opponents : [];
+                      const playSum = opps.reduce((a, o) => a + Number(o.prob || 0), 0);
+                      const winUncond = opps.reduce(
+                        (a, o) => a + Number(o.prob || 0) * Number(o.win_chance || 0),
+                        0
+                      );
+                      const wWin = playSum > 0 ? winUncond / playSum : 0;
+                      const oppEV = opps.reduce((a, o) => a + Number(o.prob || 0) * Number(o.total || 0), 0);
+                      const elimContrib = Number(cell.total || 0) - oppEV;
+                      const missProb = Math.max(0, 1 - playSum);
+                      const showMiss = missProb > 0.0005 && Math.abs(elimContrib) > 0.005;
+                      const missPts = showMiss ? elimContrib / missProb : 0;
+                      return (
+                        <div className="round-card" key={s}>
+                          <div className="round-card-top">
+                            <span className="round-card-name">{STAGE_FULL[s] || s}</span>
+                            <span className="round-card-play">
+                              <span className="round-card-chance">
+                                {isBye ? "Bye" : opps.length > 0 ? `${Math.round(wWin * 100)}%` : "-"}
+                              </span>
+                              {!isBye && <span className="event-player-stat-label">Match win</span>}
+                            </span>
+                          </div>
+                          <div className="event-player-rating">{Number(cell.total || 0).toFixed(2)}</div>
+                          <div className="event-player-stats ev-mini">
+                            {[
+                              ["Rating", cell.rating],
+                              ["Win", cell.win],
+                              ["Role", cell.role],
+                              ["Boost", cell.booster],
+                            ].map(([label, value]) => (
+                              <div className="event-player-stat" key={label}>
+                                <div className="event-player-mini">{Number(value || 0).toFixed(1)}</div>
+                                <div className="event-player-stat-label">{label}</div>
+                              </div>
+                            ))}
+                          </div>
+                          {cell.booster_id != null && (
+                            <div className="round-card-boost">
+                              <BoosterBadge boosterId={cell.booster_id} size={20} />
+                              <span className="round-card-boost-name">{cell.booster_name || `Booster ${cell.booster_id}`}</span>
+                              <span className="round-card-boost-rate">
+                                {(Number(cell.booster_rate || 0) * 100).toFixed(0)}%
+                              </span>
+                              {slotInfo?.edge != null && (
+                                <span className="round-card-boost-edge">
+                                  {Number(slotInfo.edge) >= 0 ? "+" : ""}
+                                  {(Number(slotInfo.edge) * 100).toFixed(0)}% vs avg
+                                </span>
+                              )}
+                            </div>
+                          )}
+                          {Array.isArray(cell.opponents) && cell.opponents.length > 0 && (
+                            <div className="round-opps">
+                              <div className="round-opp head">
+                                <span className="round-opp-name">Opponent</span>
+                                <span className="round-opp-prob">Play</span>
+                                <span className="round-opp-win">Win</span>
+                                <span className="round-opp-pts">Pts</span>
+                              </div>
+                              {cell.opponents.map((o) => {
+                                const oinfo = (teams || []).find((t) => Number(t.team_id) === Number(o.team_id));
+                                return (
+                                  <div className="round-opp" key={o.team_id}>
+                                    <TeamLogo hltvTeamId={oinfo?.hltv_team_id} name={teamLookup[o.team_id]} size={16} />
+                                    <span className="round-opp-name">
+                                      {teamLookup[o.team_id] || o.team_id}
+                                      {o.rank ? ` (#${o.rank})` : ""}
+                                    </span>
+                                    <span className="round-opp-prob">{Math.round(Number(o.prob || 0) * 100)}%</span>
+                                    <span className="round-opp-win">{Math.round(Number(o.win_chance || 0) * 100)}%</span>
+                                    <span className="round-opp-pts">{Number(o.total || 0).toFixed(1)}</span>
+                                  </div>
+                                );
+                              })}
+                              {showMiss && (
+                                <div className="round-opp miss">
+                                  <span className="round-opp-name">Eliminated earlier</span>
+                                  <span className="round-opp-prob">{Math.round(missProb * 100)}%</span>
+                                  <span className="round-opp-win">—</span>
+                                  <span className="round-opp-pts">{missPts.toFixed(1)}</span>
+                                </div>
+                              )}
+                              <div className="round-opp total">
+                                <span className="round-opp-name">Total</span>
+                                <span className="round-opp-prob">
+                                  {Math.round((playSum + (showMiss ? missProb : 0)) * 100)}%
+                                </span>
+                                <span className="round-opp-win">{Math.round(wWin * 100)}%</span>
+                                <span className="round-opp-pts">{Number(cell.total || 0).toFixed(1)}</span>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
               {Array.isArray(completedPlayerBreakdown.point_breakdown) && completedPlayerBreakdown.point_breakdown.length > 0 && (
                 <div className="stack">
                   <h4>Match Sources</h4>
@@ -5884,7 +6205,7 @@ function DevLabTab({ players }) {
   );
 }
 
-function EventsTab({ refreshData, notify, players, teams = [] }) {
+function EventsTab({ refreshData, notify, players, teams = [], onOpenPlayer, onOpenTeam }) {
   const [events, setEvents] = useState([]);
   const [activeEventId, setActiveEventId] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -6045,7 +6366,10 @@ function EventsTab({ refreshData, notify, players, teams = [] }) {
               <div className="event-team-rows">
                 {eventTeamGroups.map((g) => (
                   <div className="event-team-row" key={g.teamName}>
-                    <div className="event-team-head">
+                    <div
+                      className={`event-team-head ${g.info?.team_id && onOpenTeam ? "clickable" : ""}`}
+                      onClick={() => g.info?.team_id && onOpenTeam && onOpenTeam(g.info.team_id)}
+                    >
                       <TeamLogo hltvTeamId={g.info?.hltv_team_id} name={g.teamName} size={42} />
                       <div className="event-team-headtext">
                         <span className="event-team-name">{g.teamName}</span>
@@ -6054,7 +6378,11 @@ function EventsTab({ refreshData, notify, players, teams = [] }) {
                     </div>
                     <div className="event-team-players">
                       {g.players.map((p) => (
-                        <div className="event-player-card" key={`${g.teamName}-${p.player_id}`}>
+                        <div
+                          className={`event-player-card ${onOpenPlayer ? "clickable" : ""}`}
+                          key={`${g.teamName}-${p.player_id}`}
+                          onClick={() => onOpenPlayer && onOpenPlayer(p.player_id)}
+                        >
                           <PlayerPhoto playerId={p.player_id} name={p.player_name} size={56} />
                           <div className="event-player-name">{p.player_name || `Player ${p.player_id}`}</div>
                           <div className="event-player-stats">
@@ -7097,7 +7425,7 @@ function MatchDetailModal({ row, onClose, teams = [], players = [], onOpenPlayer
   );
 }
 
-function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlayerId, onOpenPlayerHandled, mapStats, mapStatsModalRefreshRef }) {
+function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlayerId, onOpenPlayerHandled, openTeamId, onOpenTeamHandled, mapStats, mapStatsModalRefreshRef }) {
   const [dbTab, setDbTab] = useState("players");
   const [playerSearch, setPlayerSearch] = useState("");
   const [playerSort, setPlayerSort] = useState("name_asc");
@@ -7390,6 +7718,17 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     setPlayerTab("info");
     if (onOpenPlayerHandled) onOpenPlayerHandled();
   }, [openPlayerId, onOpenPlayerHandled]);
+
+  useEffect(() => {
+    if (!openTeamId) return;
+    const tid = Number(openTeamId);
+    if (Number.isFinite(tid) && tid > 0) {
+      setDbTab("teams");
+      setSelectedTeam(tid);
+      setShowTeamModal(true);
+    }
+    if (onOpenTeamHandled) onOpenTeamHandled();
+  }, [openTeamId, onOpenTeamHandled]);
 
   useEffect(() => {
     const pid = Number(selectedPlayer);
@@ -7962,16 +8301,49 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                               tickFormatter={(v) => Number(v).toFixed(2)}
                             />
                             <Tooltip
-                              contentStyle={{ background: "#14181f", border: "1px solid #3a4452", borderRadius: 10, color: "#e9edf3" }}
-                              formatter={(value, name, props) => {
-                                if (value == null) return ["—", name];
-                                if (name === "Actual (observed)") {
-                                  const m = props?.payload?.maps;
-                                  return [`${Number(value).toFixed(3)}${m ? ` (${Math.round(m)} maps)` : ""}`, name];
-                                }
-                                return [Number(value).toFixed(3), name];
+                              content={({ active, payload, label }) => {
+                                if (!active || !payload || payload.length === 0) return null;
+                                const rows = payload.filter(
+                                  (p) => p && p.value != null && p.dataKey !== "rank" && p.name !== "rank"
+                                );
+                                if (rows.length === 0) return null;
+                                return (
+                                  <div
+                                    style={{
+                                      background: "#14181f",
+                                      border: "1px solid #3a4452",
+                                      borderRadius: 10,
+                                      padding: "9px 13px",
+                                      color: "#e9edf3",
+                                      fontSize: 13,
+                                      lineHeight: 1.55,
+                                    }}
+                                  >
+                                    <div style={{ fontWeight: 700, marginBottom: 4 }}>Rank {label}</div>
+                                    {rows.map((p, i) => {
+                                      const maps = p.name === "Actual (observed)" ? p.payload?.maps : null;
+                                      return (
+                                        <div key={i} style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                                          <span
+                                            style={{
+                                              width: 8,
+                                              height: 8,
+                                              borderRadius: "50%",
+                                              background: p.color || p.stroke || "#9fb2c9",
+                                              flex: "none",
+                                            }}
+                                          />
+                                          <span style={{ color: "#9fb2c9" }}>{p.name}:</span>
+                                          <span style={{ fontWeight: 600 }}>
+                                            {Number(p.value).toFixed(3)}
+                                            {maps ? ` (${Math.round(maps)} maps)` : ""}
+                                          </span>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                );
                               }}
-                              labelFormatter={(v) => `Rank ${v}`}
                             />
                             <Legend wrapperStyle={{ color: "#9fb2c9" }} />
                             <Line
@@ -9418,6 +9790,15 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
   );
 }
 
+const RATING_LAB_TIERS = [
+  { tier: 5, label: "Top 5" },
+  { tier: 10, label: "Top 10" },
+  { tier: 20, label: "Top 20" },
+  { tier: 30, label: "Top 30" },
+  { tier: 50, label: "Top 50" },
+];
+const TIER_COLORS = { 5: "#f97316", 10: "#eab308", 20: "#22d3ee", 30: "#a78bfa", 50: "#34d399" };
+
 function RatingLabTab({ players }) {
   const [stats, setStats] = useState({
     rating: "1.10",
@@ -10840,9 +11221,7 @@ function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
     setEvents(allEvents);
 
     const active = data.active_event_id;
-    const fallback = allEvents.length > 0 ? allEvents[0].event_id : "";
-    const nextSelected = active ?? fallback;
-    setSelectedEventId(nextSelected === "" ? "" : String(nextSelected));
+    setSelectedEventId(active == null ? "" : String(active));
   };
 
   const loadEventTeams = async (eventId) => {
@@ -10905,35 +11284,6 @@ function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
 
   return (
     <div className="stack">
-      <Section title="Swiss Event">
-        <div className="grid three">
-          <Select
-            label="Event"
-            value={selectedEventId}
-            onChange={setSelectedEventId}
-            options={
-              events.length > 0
-                ? events.map((e) => ({
-                    value: String(e.event_id),
-                    label: e.hltv_event_id ? `Fantasy ${e.event_id} -> HLTV ${e.hltv_event_id}` : `Fantasy ${e.event_id}`,
-                  }))
-                : [{ value: "", label: "No events imported" }]
-            }
-          />
-          <div className="field">
-            <span>Teams In Event</span>
-            <div className="pill">{filteredTeams.length}</div>
-          </div>
-          <div className="field">
-            <span>Selection</span>
-            <div className="pill">{selectedTeamIds.length} selected</div>
-          </div>
-        </div>
-        {events.length === 0 && (
-          <p className="muted">Import an event in the Events tab first.</p>
-        )}
-      </Section>
-
       <div className="tab-bar small">
         <button className={swissTab === "group" ? "tab active" : "tab"} onClick={() => setSwissTab("group")}>
           Group Stage
@@ -11125,9 +11475,7 @@ function GroupsTab({ teams, teamLookup, players, refresh, groupVariant = null })
     const allEvents = Array.isArray(data.events) ? data.events : [];
     setEvents(allEvents);
     const active = data.active_event_id;
-    const fallback = allEvents.length > 0 ? allEvents[0].event_id : "";
-    const nextSelected = active ?? fallback;
-    setSelectedEventId(nextSelected === "" ? "" : String(nextSelected));
+    setSelectedEventId(active == null ? "" : String(active));
   };
   const loadEventTeams = async (eventId) => {
     if (!eventId) {
@@ -12219,6 +12567,11 @@ function TournamentTab({ teams, teamLookup, players, sortTeams, applyFilters, on
   return (
     <div className="stack">
       {message && <p className="muted">{message}</p>}
+      {kind && !["swiss", "groups", "playoff", "bounty"].includes(kind) && (
+        <p className="muted">
+          Detected format: {kindInfo?.label || kind} — no simulator supports this format yet.
+        </p>
+      )}
       {kind === "swiss" && <SwissTab {...sharedProps} />}
       {kind === "groups" && (
         <GroupsTab
@@ -12229,7 +12582,7 @@ function TournamentTab({ teams, teamLookup, players, sortTeams, applyFilters, on
           groupVariant={kindInfo?.group_variant}
         />
       )}
-      {kind === "playoff" && <PlayoffTab {...sharedProps} />}
+      {kind === "playoff" && <PlayoffTab {...sharedProps} detectedBracketSize={kindInfo?.playoff_size} />}
       {kind === "bounty" && <BountyTab {...sharedProps} />}
     </div>
   );
@@ -12242,8 +12595,6 @@ export default function App() {
   const [teams, setTeams] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [toast, setToast] = useState("");
-
   const load = async () => {
     setLoading(true);
     setError("");
@@ -12274,10 +12625,9 @@ export default function App() {
     return map;
   }, [players]);
 
-  const notify = (msg) => {
-    setToast(msg);
-    setTimeout(() => setToast(""), 2000);
-  };
+  // Toast popups removed by request — components still call notify(), it just
+  // no longer surfaces anything.
+  const notify = () => {};
 
   const mapStatsModalRefreshRef = useRef(null);
   const mapStatsJob = useMapStatsJob({ refresh: load, notify, modalRefreshRef: mapStatsModalRefreshRef });
@@ -12287,6 +12637,14 @@ export default function App() {
     if (!Number.isFinite(pid) || pid <= 0) return;
     setActive("view");
     setOpenPlayerId(pid);
+  };
+
+  const [openTeamId, setOpenTeamId] = useState(null);
+  const handleOpenTeamFromAnywhere = (teamId) => {
+    const tid = Number(teamId);
+    if (!Number.isFinite(tid) || tid <= 0) return;
+    setActive("view");
+    setOpenTeamId(tid);
   };
 
   const sortTeams = (list, key) => {
@@ -12343,11 +12701,22 @@ export default function App() {
         notify={notify}
         openPlayerId={openPlayerId}
         onOpenPlayerHandled={() => setOpenPlayerId(null)}
+        openTeamId={openTeamId}
+        onOpenTeamHandled={() => setOpenTeamId(null)}
         mapStats={mapStatsJob}
         mapStatsModalRefreshRef={mapStatsModalRefreshRef}
       />
     ),
-    events: <EventsTab refreshData={load} notify={notify} players={players} teams={teams} />,
+    events: (
+      <EventsTab
+        refreshData={load}
+        notify={notify}
+        players={players}
+        teams={teams}
+        onOpenPlayer={handleOpenPlayerFromAnywhere}
+        onOpenTeam={handleOpenTeamFromAnywhere}
+      />
+    ),
     devlab: <DevLabTab players={players} />,
     tournament: (
       <TournamentTab
@@ -12374,7 +12743,6 @@ export default function App() {
         ))}
       </nav>
 
-      {toast && <div className="toast">{toast}</div>}
       <main className="content">{contentMap[active]}</main>
     </div>
   );

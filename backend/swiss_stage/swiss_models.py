@@ -12,6 +12,8 @@ class PlayerState:
     role_id: int | None = None
     booster_ids: List[int] = field(default_factory=list)
     booster_rates: Dict[int, float] = field(default_factory=dict)
+    # Per-slot edge over the field-average trigger rate (drives slot order).
+    booster_edges: List[float] = field(default_factory=list)
 
     # Aggregated fantasy points over the whole Swiss sim:
     total_points: float = 0.0

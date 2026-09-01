@@ -233,12 +233,14 @@ class DataScheduler:
         # team for events with no captured endpoint yet).
         try:
             if result.get("imported"):
-                # A new event refreshes EVERY priced player's rates — data
-                # drifts between events, so coverage alone isn't enough.
-                target = max(result["imported"])
-                started = admin.start_trigger_backfill({"event_id": target, "refresh_all": True})
-                result["trigger_backfill"] = f"refresh-all started for event {target}"
-                result["trigger_job"] = started.get("job_id")
+                # EVERY new event gets a full rates refresh, one at a time —
+                # data drifts between events, and per-stage events (playoffs +
+                # two qualifiers in one night) each need their own fetch.
+                notes = []
+                for fid in sorted(result["imported"]):
+                    outcome = admin.run_trigger_backfill_blocking(int(fid), refresh_all=True)
+                    notes.append(f"{fid}: {outcome}")
+                result["trigger_backfill"] = "; ".join(notes)
             else:
                 _prices, missing, _cov = admin._missing_trigger_players(None)
                 if missing:

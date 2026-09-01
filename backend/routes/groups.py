@@ -7,6 +7,7 @@ per group (average EV, ceiling) stay exact for any number of groups.
 """
 
 import heapq
+import re
 import math
 import random
 import threading
@@ -612,6 +613,14 @@ def _simulate_combined_playoffs(
             ws1 = play_po(qa[0], wq2, 1)    # SF1: A-1st vs QF2 winner
             ws2 = play_po(qb[0], wq1, 1)    # SF2: B-1st vs QF1 winner
             final_winners = [play_po(ws1, ws2, 0)]
+            # Bye teams get 6 padding points per player for the QF they skip.
+            for bye_tid in (qa[0], qb[0]):
+                bye_ts = states.get(bye_tid)
+                if not bye_ts:
+                    continue
+                for p in bye_ts.players.values():
+                    p.win_points_total += 6.0
+                    p.total_points += 6.0
         else:
             # Flatten qualifiers seed-major (all group winners, then all seed-2, ...)
             # then standard i vs (N-1-i) seeding, which puts same-group teams on
@@ -1098,6 +1107,74 @@ def _find_event_snapshot_html(hltv_event_id) -> Optional[str]:
     return None
 
 
+def _parse_bracket6_from_structure(html: str):
+    """The 6-team byes playoff (two hidden first-round slots) from the page's
+    slotted-bracket JSON, as ordered team names in the simulator's slot
+    convention [bye1, qf1a, qf1b, qf2a, qf2b, bye2]. None when the page has no
+    such bracket. Bye sides are identified structurally: a semi-final side
+    whose source quarter-final slot is hidden."""
+    import html as _htmllib
+    import json as _json
+
+    def side_name(matchup, i):
+        side = (matchup or {}).get(f"team{i}") or {}
+        name = side.get("name")
+        return str(name) if name else None
+
+    for raw in re.findall(r'data-slotted-bracket-json="([^"]+)"', html or ""):
+        try:
+            data = _json.loads(_htmllib.unescape(raw))
+        except Exception:
+            continue
+        if not str(data.get("type", "")).endswith("SingleElimination"):
+            continue
+        bracket_name = str(data.get("name") or "")
+        if re.search(r"3rd|third|decider", bracket_name, re.IGNORECASE):
+            continue
+        rounds = data.get("rounds") or []
+        if len(rounds) < 2:
+            continue
+        first = rounds[0].get("slots") or []
+        if len(first) != 4 or sum(1 for s in first if s.get("hidden")) != 2:
+            continue
+        qf_by_id = {((s.get("slotId") or {}).get("id")): s for s in first}
+        semis = rounds[1].get("slots") or []
+        if len(semis) != 2:
+            continue
+        layout: list = [None] * 6
+        qf_positions = [(1, 2), (3, 4)]
+        ok = True
+        for si, sf in enumerate(semis):
+            matchup = sf.get("matchup") or {}
+            bye_name = None
+            qf_pair = None
+            for i in (1, 2):
+                entry = sf.get(f"slotEntry{i}") or {}
+                src_id = (entry.get("slotId") or {}).get("id")
+                qf = qf_by_id.get(src_id)
+                if qf is None:
+                    ok = False
+                    break
+                if qf.get("hidden"):
+                    bye_name = (
+                        side_name(matchup, i)
+                        or side_name(qf.get("matchup"), 1)
+                        or side_name(qf.get("matchup"), 2)
+                    )
+                else:
+                    qm = qf.get("matchup") or {}
+                    qf_pair = (side_name(qm, 1), side_name(qm, 2))
+            if not ok or qf_pair is None:
+                ok = False
+                break
+            layout[0 if si == 0 else 5] = bye_name
+            a, b = qf_positions[si]
+            layout[a], layout[b] = qf_pair
+        if ok:
+            return layout
+    return None
+
+
 def autofill_event_playoff(
     hltv_event_url: str = "",
     hltv_event_id=None,
@@ -1136,6 +1213,20 @@ def autofill_event_playoff(
                 html = fetch_hltv_html(url, wait_text=None, timeout_ms=45000)
             except HLTVBrowserError as exc:
                 raise HTTPException(status_code=502, detail=f"Failed to fetch HLTV event page: {exc}") from exc
+
+    # Byes bracket (Porto/Cologne playoffs): resolved from the structured JSON
+    # into the 6-slot convention [bye1, qf1a, qf1b, qf2a, qf2b, bye2].
+    byes_layout = _parse_bracket6_from_structure(html)
+    if byes_layout is not None:
+        all_teams = get_all_teams()
+        by_name: Dict[str, int] = {}
+        for t in all_teams:
+            by_name.setdefault(_normalize_team_name(str(t.get("name") or "")), int(t.get("team_id") or 0))
+        return {
+            "bracket_size": 6,
+            "team_ids": [by_name.get(_normalize_team_name(n or ""), 0) if n else 0 for n in byes_layout],
+            "team_names": [n or "TBD" for n in byes_layout],
+        }
 
     parsed = _parse_event_playoff_bracket(html)
     size = int(parsed.get("bracket_size") or 0)

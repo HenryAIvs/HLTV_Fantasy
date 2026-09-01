@@ -546,20 +546,25 @@ def set_event_name(
     name: Optional[str] = None,
     hltv_event_id: Optional[int] = None,
     hltv_event_url: Optional[str] = None,
+    overwrite_name: bool = False,
 ) -> None:
-    """Fill in the event name (and any newly recovered HLTV event ref) without
-    overwriting values that already exist."""
+    """Fill in the event name (and any newly recovered HLTV event ref).
+    Refs never overwrite existing values; the name does when overwrite_name is
+    set (the fantasy page's own nav name is more authoritative than a name
+    derived from an event-URL slug)."""
+    clean_name = (str(name).strip() or None) if name else None
     conn = connect()
     try:
+        name_sql = "?" if overwrite_name and clean_name else "COALESCE(?, name)"
         conn.execute(
-            """
+            f"""
             UPDATE events SET
-                name = COALESCE(?, name),
+                name = {name_sql},
                 hltv_event_id = COALESCE(?, hltv_event_id),
                 hltv_event_url = COALESCE(?, hltv_event_url)
             WHERE event_id = ?
             """,
-            (str(name).strip() or None if name else None, hltv_event_id, str(hltv_event_url or "").strip() or None, int(event_id)),
+            (clean_name, hltv_event_id, str(hltv_event_url or "").strip() or None, int(event_id)),
         )
         conn.commit()
     finally:

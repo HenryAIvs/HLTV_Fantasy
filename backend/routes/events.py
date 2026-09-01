@@ -4245,7 +4245,30 @@ def _detect_event_tournament_kind(event: Dict[str, Any]) -> Dict[str, Any]:
             {"kind": "swiss", "label": label, "group_format": None, "playoff_size": 0,
              "roster": roster, "size": int(sw["team_count"] or len(roster))}
         )
-    group_brackets = [b for b in structure["brackets"] if b["bracket"] == "double_elim"]
+    all_de = [b for b in structure["brackets"] if b["bracket"] == "double_elim"]
+    full_de = [
+        b for b in all_de
+        if str(b.get("variant") or "").endswith("_full") or "_qual" in str(b.get("variant") or "")
+    ]
+    group_brackets = [b for b in all_de if b not in full_de]
+    for b in full_de:
+        roster = {_norm_team_name(n) for n in b["teams"].values()}
+        advance = b.get("advance") or {}
+        label = f"Double-Elimination Bracket ({b['size']} teams"
+        if "_qual" in str(b.get("variant") or "") and advance.get("count"):
+            label += f", top {advance['count']} qualify"
+        label += ")"
+        candidates.append(
+            {
+                "kind": "double_elim",
+                "label": label,
+                "group_format": None,
+                "group_variant": b.get("variant"),
+                "playoff_size": 0,
+                "roster": roster,
+                "size": int(b["size"] or len(roster)),
+            }
+        )
     if group_brackets:
         group_size = max((int(b["size"] or 0) for b in group_brackets), default=0)
         roster: set = set()
@@ -4567,6 +4590,12 @@ def discover_and_import_new_fantasy_events() -> Dict[str, Any]:
     found = sorted({int(m) for m in re.findall(r"/fantasy/(\d+)", html or "")})
     if not found:
         raise ValueError("No fantasy event links found on hltv.org/fantasy")
+    # The nav dropdown carries each fantasy event's OFFICIAL name
+    # ("Playoffs - BLAST Open Porto 2026") — the authoritative label, and the
+    # only reliable one for events whose fantasy JSON has no HLTV event ref.
+    nav_names: Dict[int, str] = {}
+    for m in re.finditer(r'href="/fantasy/(\d+)/gameredirect"[^>]*>.*?text-ellipsis">([^<]+)<', html or ""):
+        nav_names.setdefault(int(m.group(1)), m.group(2).strip())
     existing = {int(e["event_id"]) for e in list_events()}
     new_ids = [fid for fid in found if fid not in existing]
     prev_active = get_active_event_id()
@@ -4583,12 +4612,23 @@ def discover_and_import_new_fantasy_events() -> Dict[str, Any]:
             set_active_event(int(prev_active))
         except Exception:
             logger.exception("Could not restore active event %s after auto-import", prev_active)
+    # Sync names from the fantasy page nav for every event we hold — it names
+    # per-stage events unambiguously where URL slugs cannot.
+    renamed = []
+    for fid, nav_name in nav_names.items():
+        if fid in existing or fid in imported:
+            try:
+                set_event_name(fid, nav_name, overwrite_name=True)
+                renamed.append(fid)
+            except Exception:
+                logger.exception("Could not sync name for fantasy event %s", fid)
     return {
         "status": "ok",
         "found": len(found),
         "new": new_ids,
         "imported": imported,
         "failed": failed,
+        "renamed": renamed,
     }
 
 
