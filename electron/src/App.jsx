@@ -4459,6 +4459,26 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     }
   };
 
+  // Self-running combinations: kick off whenever the stored valuations are
+  // newer than the stored combination set (or no combinations exist yet).
+  const combosLaunchRef = useRef(false);
+  useEffect(() => {
+    if (busy || !results) return;
+    if (storedSize === null) return; // stored-sim hydration pending
+    if (
+      sharedCombosUpdatedAt &&
+      updatedAt &&
+      new Date(sharedCombosUpdatedAt).getTime() >= new Date(updatedAt).getTime()
+    )
+      return;
+    if (combosLaunchRef.current) return;
+    combosLaunchRef.current = true;
+    runSharedCombinations().finally(() => {
+      combosLaunchRef.current = false;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [busy, results, updatedAt, sharedCombosUpdatedAt, storedSize]);
+
   const resetStoredPlayoff = async () => {
     await api.delete(`/playoff/latest?variant=${variant}`);
     setLatestPayload(null);
@@ -4851,12 +4871,6 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
             )}
             {results && (
               <>
-                <div className="actions">
-                  <button className="primary" onClick={runSharedCombinations} disabled={busy || !results}>
-                    {busy ? "Running Combinations..." : "Run Combinations"}
-                  </button>
-                  {sharedCombosUpdatedAt && <p className="muted">Combinations stored: {new Date(sharedCombosUpdatedAt).toLocaleString()}</p>}
-                </div>
                 {combosApproximate && (
                   <p className="muted">
                     16-team field: too large to score every roster exactly, so the strongest {sharedComboCount.toLocaleString()} candidate

@@ -1674,6 +1674,111 @@ _PLAYOFF_EXACT_ROSTER_LIMIT = 2_000_000
 _PLAYOFF_TWO_PHASE_TOPK = 12000
 
 
+def _two_phase_scan_chunk(
+    price_arr: list,
+    team_arr: list,
+    val_arr: list,
+    include_idx: tuple,
+    budget: int,
+    max_per_team: int,
+    topk: int,
+    i0_list: list,
+    n: int,
+) -> list:
+    """Phase-1 roster scan for a slice of first-player indexes, run in a worker
+    process. Returns the slice's local top-K (val, counter, combo, cost) heap
+    entries; the parent merges slices into the global top-K."""
+    heap: list = []
+    counter = 0
+    heappush, heapreplace = heapq.heappush, heapq.heapreplace
+    for i0 in i0_list:
+        p0, t0, v0 = price_arr[i0], team_arr[i0], val_arr[i0]
+        for i1, i2, i3, i4 in itertools.combinations(range(i0 + 1, n), 4):
+            cost = p0 + price_arr[i1] + price_arr[i2] + price_arr[i3] + price_arr[i4]
+            if cost > budget:
+                continue
+            over = False
+            tc: Dict[int, int] = {}
+            for t in (t0, team_arr[i1], team_arr[i2], team_arr[i3], team_arr[i4]):
+                v = tc.get(t, 0) + 1
+                if v > max_per_team:
+                    over = True
+                    break
+                tc[t] = v
+            if over:
+                continue
+            c = (i0, i1, i2, i3, i4)
+            if include_idx and not all(ii in c for ii in include_idx):
+                continue
+            val = v0 + val_arr[i1] + val_arr[i2] + val_arr[i3] + val_arr[i4]
+            if len(heap) < topk:
+                heappush(heap, (val, counter, c, cost))
+                counter += 1
+            elif val > heap[0][0]:
+                heapreplace(heap, (val, counter, c, cost))
+                counter += 1
+    return list(heap)
+
+
+def _two_phase_score_chunk(
+    top_slice: list,
+    offset: int,
+    pid_arr: list,
+    ev_arr: list,
+    out_arr: dict,
+    players_meta: dict,
+    role_scores_by_player: dict,
+    probs: list,
+    mode: str,
+    N: int,
+) -> tuple:
+    """Phase-2 per-outcome scoring for a slice of candidate rosters, run in a
+    worker process. Returns the slice's serialized teams (player-level ceiling
+    fields filled by the parent, which holds the outcome tables), each
+    candidate's ceiling outcome index, and the slice-local best-per-outcome
+    tracking (with GLOBAL candidate positions) for the parent to merge."""
+    from backend.services.role_assignment import best_role_assignment_for_team
+
+    best_scores = [-1e18] * N
+    best_pos: List[List[int]] = [[] for _ in range(N)]
+    teams_out: list = []
+    argmaxes: list = []
+    for local_pos, (val, _, c, cost) in enumerate(top_slice):
+        pos = offset + local_pos
+        a0, a1, a2, a3, a4 = out_arr[c[0]], out_arr[c[1]], out_arr[c[2]], out_arr[c[3]], out_arr[c[4]]
+        max_s = -1e18
+        cnt = 0
+        argmax = 0
+        for o in range(N):
+            s = a0[o] + a1[o] + a2[o] + a3[o] + a4[o]
+            if s > max_s + 1e-9:
+                max_s = s
+                cnt = 1
+                argmax = o
+            elif s >= max_s - 1e-9:
+                cnt += 1
+            bs = best_scores[o]
+            if s > bs + 1e-9:
+                best_scores[o] = s
+                best_pos[o] = [pos]
+            elif s >= bs - 1e-9:
+                best_pos[o].append(pos)
+        pids = [pid_arr[i] for i in c]
+        assignment, _ = best_role_assignment_for_team(pids, role_scores_by_player)
+        roles = [str((assignment or {}).get(pid, "-")) for pid in pids]
+        ev_no_booster = ev_arr[c[0]] + ev_arr[c[1]] + ev_arr[c[2]] + ev_arr[c[3]] + ev_arr[c[4]]
+        serialized = serialize_roster(players_meta, pids, roles, ev_no_booster, cost)
+        serialized["average_ev"] = float(val)
+        serialized["ceiling_points"] = float(max_s if N else val)
+        serialized["ceiling_probability"] = float(cnt) * (probs[argmax] if N else 0.0)
+        serialized["outcome_wins"] = 0.0
+        serialized["outcome_win_probability"] = 0.0
+        serialized["mode"] = mode
+        teams_out.append(serialized)
+        argmaxes.append(argmax)
+    return teams_out, argmaxes, best_scores, best_pos
+
+
 def _optimize_playoff_teams_two_phase(
     players_info: list[dict],
     outcomes: List[Dict],
@@ -1725,37 +1830,80 @@ def _optimize_playoff_teams_two_phase(
     include_idx = tuple(include_idx)
 
     # ---- Phase 1: exact top-K rosters by additive expected score. ----
+    # The scan is pure arithmetic over C(n,5) index tuples, so it fans out over
+    # a process pool: each worker sweeps a balanced slice of first-player
+    # indexes and returns its local top-K, which merge exactly into the global
+    # top-K (Python threads would gain nothing on this CPU-bound loop).
+    workers = max(1, min(8, (os.cpu_count() or 2) - 1))
     heap: list = []  # (value, counter, combo_idx_tuple, cost)
-    counter = 0
-    processed = 0
-    heappush, heapreplace = heapq.heappush, heapq.heapreplace
-    for c in itertools.combinations(range(n), 5):
-        processed += 1
-        if progress_callback and (processed & 0x3FFFF) == 0:  # ~every 262k
-            progress_callback(processed, total_combinations)
-        i0, i1, i2, i3, i4 = c
-        cost = price_arr[i0] + price_arr[i1] + price_arr[i2] + price_arr[i3] + price_arr[i4]
-        if cost > budget:
-            continue
-        over = False
-        tc: Dict[int, int] = {}
-        for t in (team_arr[i0], team_arr[i1], team_arr[i2], team_arr[i3], team_arr[i4]):
-            v = tc.get(t, 0) + 1
-            if v > max_per_team:
-                over = True
-                break
-            tc[t] = v
-        if over:
-            continue
-        if include_idx and not all(ii in c for ii in include_idx):
-            continue
-        val = val_arr[i0] + val_arr[i1] + val_arr[i2] + val_arr[i3] + val_arr[i4]
-        if len(heap) < topk:
-            heappush(heap, (val, counter, c, cost))
-            counter += 1
-        elif val > heap[0][0]:
-            heapreplace(heap, (val, counter, c, cost))
-            counter += 1
+    if workers > 1 and n > 5:
+        chunk_weights = [math.comb(n - 1 - i0, 4) for i0 in range(n - 4)]
+        target = sum(chunk_weights) / workers
+        slices: list[list[int]] = [[]]
+        acc = 0.0
+        for i0, w in enumerate(chunk_weights):
+            if acc >= target and len(slices) < workers:
+                slices.append([])
+                acc = 0.0
+            slices[-1].append(i0)
+            acc += w
+        slices = [s for s in slices if s]
+        if progress_callback:
+            progress_callback(0, total_combinations)
+        done_weight = 0
+        with ProcessPoolExecutor(max_workers=len(slices)) as ex:
+            fut_weight = {
+                ex.submit(
+                    _two_phase_scan_chunk,
+                    price_arr, team_arr, val_arr, include_idx,
+                    budget, max_per_team, topk, s, n,
+                ): sum(chunk_weights[i0] for i0 in s)
+                for s in slices
+            }
+            merge_counter = 0
+            heappush, heapreplace = heapq.heappush, heapq.heapreplace
+            for fut in as_completed(fut_weight):
+                for val, _, c, cost in fut.result():
+                    if len(heap) < topk:
+                        heappush(heap, (val, merge_counter, c, cost))
+                        merge_counter += 1
+                    elif val > heap[0][0]:
+                        heapreplace(heap, (val, merge_counter, c, cost))
+                        merge_counter += 1
+                done_weight += fut_weight[fut]
+                if progress_callback:
+                    progress_callback(done_weight, total_combinations)
+    else:
+        counter = 0
+        processed = 0
+        heappush, heapreplace = heapq.heappush, heapq.heapreplace
+        for c in itertools.combinations(range(n), 5):
+            processed += 1
+            if progress_callback and (processed & 0x3FFFF) == 0:  # ~every 262k
+                progress_callback(processed, total_combinations)
+            i0, i1, i2, i3, i4 = c
+            cost = price_arr[i0] + price_arr[i1] + price_arr[i2] + price_arr[i3] + price_arr[i4]
+            if cost > budget:
+                continue
+            over = False
+            tc: Dict[int, int] = {}
+            for t in (team_arr[i0], team_arr[i1], team_arr[i2], team_arr[i3], team_arr[i4]):
+                v = tc.get(t, 0) + 1
+                if v > max_per_team:
+                    over = True
+                    break
+                tc[t] = v
+            if over:
+                continue
+            if include_idx and not all(ii in c for ii in include_idx):
+                continue
+            val = val_arr[i0] + val_arr[i1] + val_arr[i2] + val_arr[i3] + val_arr[i4]
+            if len(heap) < topk:
+                heappush(heap, (val, counter, c, cost))
+                counter += 1
+            elif val > heap[0][0]:
+                heapreplace(heap, (val, counter, c, cost))
+                counter += 1
     if progress_callback:
         progress_callback(total_combinations, total_combinations)
 
@@ -1774,45 +1922,88 @@ def _optimize_playoff_teams_two_phase(
     best_scores = [-1e18] * N
     best_pos: List[List[int]] = [[] for _ in range(N)]
     teams_out: list = []
-    for pos, (val, _, c, cost) in enumerate(top):
-        a0, a1, a2, a3, a4 = out_arr[c[0]], out_arr[c[1]], out_arr[c[2]], out_arr[c[3]], out_arr[c[4]]
-        max_s = -1e18
-        cnt = 0
-        argmax = 0
-        for o in range(N):
-            s = a0[o] + a1[o] + a2[o] + a3[o] + a4[o]
-            if s > max_s + 1e-9:
-                max_s = s
-                cnt = 1
-                argmax = o
-            elif s >= max_s - 1e-9:
-                cnt += 1
-            bs = best_scores[o]
-            if s > bs + 1e-9:
-                best_scores[o] = s
-                best_pos[o] = [pos]
-            elif s >= bs - 1e-9:
-                best_pos[o].append(pos)
-        pids = [pid_arr[i] for i in c]
-        assignment, _ = best_role_assignment_for_team(pids, role_scores_by_player)
-        roles = [str((assignment or {}).get(pid, "-")) for pid in pids]
-        ev_no_booster = ev_arr[c[0]] + ev_arr[c[1]] + ev_arr[c[2]] + ev_arr[c[3]] + ev_arr[c[4]]
-        serialized = serialize_roster(players_meta, pids, roles, ev_no_booster, cost)
-        ceiling_scores = outcome_players[argmax] if N else {}
-        for player in serialized.get("players") or []:
-            pid = int(player.get("player_id") or 0)
-            if mode == "single_outcome":
-                player["mode_score"] = float(ceiling_scores.get(str(pid), 0.0))
-            else:
-                player["mode_score"] = float(player.get("total_ev") or 0.0)
-            player["ceiling_score"] = float(ceiling_scores.get(str(pid), 0.0))
-        serialized["average_ev"] = float(val)
-        serialized["ceiling_points"] = float(max_s if N else val)
-        serialized["ceiling_probability"] = float(cnt) * (probs[argmax] if N else 0.0)
-        serialized["outcome_wins"] = 0.0
-        serialized["outcome_win_probability"] = 0.0
-        serialized["mode"] = mode
-        teams_out.append(serialized)
+    if workers > 1 and len(top) * max(1, N) >= 2_000_000:
+        # Fan the candidate scoring out over the pool and merge the
+        # best-per-outcome tracking (tie-tolerant) in the parent.
+        chunk = math.ceil(len(top) / workers)
+        slices2 = [(i, top[i : i + chunk]) for i in range(0, len(top), chunk)]
+        teams_by_pos: list = [None] * len(top)
+        argmax_by_pos: list = [0] * len(top)
+        with ProcessPoolExecutor(max_workers=len(slices2)) as ex:
+            futs = [
+                ex.submit(
+                    _two_phase_score_chunk,
+                    t_slice, offset, pid_arr, ev_arr, out_arr,
+                    players_meta, role_scores_by_player, probs, mode, N,
+                )
+                for offset, t_slice in slices2
+            ]
+            offsets = {futs[i]: slices2[i][0] for i in range(len(futs))}
+            for fut in as_completed(futs):
+                s_teams, s_argmax, s_best_scores, s_best_pos = fut.result()
+                off = offsets[fut]
+                for j, team in enumerate(s_teams):
+                    teams_by_pos[off + j] = team
+                    argmax_by_pos[off + j] = s_argmax[j]
+                for o in range(N):
+                    s = s_best_scores[o]
+                    if s > best_scores[o] + 1e-9:
+                        best_scores[o] = s
+                        best_pos[o] = list(s_best_pos[o])
+                    elif s >= best_scores[o] - 1e-9:
+                        best_pos[o].extend(s_best_pos[o])
+        teams_out = teams_by_pos
+        # Player-level ceiling fields need the outcome tables, which stay in
+        # the parent instead of being shipped to every worker.
+        for pos, serialized in enumerate(teams_out):
+            ceiling_scores = outcome_players[argmax_by_pos[pos]] if N else {}
+            for player in serialized.get("players") or []:
+                pid = int(player.get("player_id") or 0)
+                if mode == "single_outcome":
+                    player["mode_score"] = float(ceiling_scores.get(str(pid), 0.0))
+                else:
+                    player["mode_score"] = float(player.get("total_ev") or 0.0)
+                player["ceiling_score"] = float(ceiling_scores.get(str(pid), 0.0))
+    else:
+        for pos, (val, _, c, cost) in enumerate(top):
+            a0, a1, a2, a3, a4 = out_arr[c[0]], out_arr[c[1]], out_arr[c[2]], out_arr[c[3]], out_arr[c[4]]
+            max_s = -1e18
+            cnt = 0
+            argmax = 0
+            for o in range(N):
+                s = a0[o] + a1[o] + a2[o] + a3[o] + a4[o]
+                if s > max_s + 1e-9:
+                    max_s = s
+                    cnt = 1
+                    argmax = o
+                elif s >= max_s - 1e-9:
+                    cnt += 1
+                bs = best_scores[o]
+                if s > bs + 1e-9:
+                    best_scores[o] = s
+                    best_pos[o] = [pos]
+                elif s >= bs - 1e-9:
+                    best_pos[o].append(pos)
+            pids = [pid_arr[i] for i in c]
+            assignment, _ = best_role_assignment_for_team(pids, role_scores_by_player)
+            roles = [str((assignment or {}).get(pid, "-")) for pid in pids]
+            ev_no_booster = ev_arr[c[0]] + ev_arr[c[1]] + ev_arr[c[2]] + ev_arr[c[3]] + ev_arr[c[4]]
+            serialized = serialize_roster(players_meta, pids, roles, ev_no_booster, cost)
+            ceiling_scores = outcome_players[argmax] if N else {}
+            for player in serialized.get("players") or []:
+                pid = int(player.get("player_id") or 0)
+                if mode == "single_outcome":
+                    player["mode_score"] = float(ceiling_scores.get(str(pid), 0.0))
+                else:
+                    player["mode_score"] = float(player.get("total_ev") or 0.0)
+                player["ceiling_score"] = float(ceiling_scores.get(str(pid), 0.0))
+            serialized["average_ev"] = float(val)
+            serialized["ceiling_points"] = float(max_s if N else val)
+            serialized["ceiling_probability"] = float(cnt) * (probs[argmax] if N else 0.0)
+            serialized["outcome_wins"] = 0.0
+            serialized["outcome_win_probability"] = 0.0
+            serialized["mode"] = mode
+            teams_out.append(serialized)
 
     for o, winners in enumerate(best_pos):
         if not winners:
