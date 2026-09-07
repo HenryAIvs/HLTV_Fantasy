@@ -13053,17 +13053,81 @@ function GroupsTab({
                 {topTeams && topTeams.length > 0 && (
                   <div className="card sub">
                     <h3>Top Teams</h3>
-                    {topTeams.map((team, idx) => (
-                      <div key={idx} className="card sub">
-                        <h4>
-                          #{idx + 1} {metricLabel(team)} | Cost {team.cost}
-                          {comboMode !== "single_outcome" && Number(team?.booster_ev) > 0 ? (
-                            <span className="muted"> (incl. booster {Number(team.booster_ev).toFixed(1)})</span>
-                          ) : null}
-                        </h4>
-                        <p className="muted">{renderPlayerLinks(team.players)}</p>
-                      </div>
-                    ))}
+                    {/* Same roster strips as the Playoff tab's Top Teams: rank,
+                        metric, cost, then one card per player with the EV split.
+                        The roster's booster assignment (when the query returns
+                        one) is folded into each player's Boost. */}
+                    <div className="event-team-rows">
+                      {topTeams.map((team, idx) => {
+                        const boostByPid = {};
+                        (team.booster_assignments || []).forEach((a) => {
+                          const pid = Number(a.player_id);
+                          boostByPid[pid] = (boostByPid[pid] || 0) + Number(a.expected_points || 0);
+                        });
+                        return (
+                          <div key={idx} className="stack combo-team">
+                            <div className="event-team-row">
+                              <div className="event-team-head">
+                                <div className="combo-rank">#{idx + 1}</div>
+                                <div className="event-team-headtext">
+                                  <span className="event-team-name">{metricLabel(team)}</span>
+                                  <span className="combo-cost">
+                                    Cost ${Number(team.cost || 0).toLocaleString()}
+                                    {comboMode !== "single_outcome" && Number(team?.booster_ev) > 0
+                                      ? ` · incl. booster ${Number(team.booster_ev).toFixed(1)}`
+                                      : ""}
+                                  </span>
+                                </div>
+                              </div>
+                              <div className="event-team-players">
+                                {(team.players || []).map((p) => {
+                                  const roleNum = Number(p.role_name);
+                                  const roleId =
+                                    p.role_name != null && p.role_name !== "" && Number.isFinite(roleNum)
+                                      ? roleNum
+                                      : roleIdFromName(p.role_name);
+                                  const assigned = boostByPid[Number(p.player_id)];
+                                  const boost = assigned != null ? assigned : Number(p.booster_ev || 0);
+                                  const score = Number(p.mode_score ?? p.total_ev ?? 0) + (assigned || 0);
+                                  return (
+                                    <div
+                                      className="event-player-card clickable"
+                                      key={p.player_id}
+                                      onClick={() => openGroupPlayer(p)}
+                                    >
+                                      <PlayerPhoto playerId={Number(p.player_id)} name={p.name} size={52} />
+                                      <div className="event-player-name">{p.name}</div>
+                                      <div className="event-player-team">{teamLookup[p.team_id] || p.team_id}</div>
+                                      <div className="event-player-role">
+                                        {roleId != null && <RoleBadge roleId={roleId} size={16} />}
+                                        <span>{roleLabel(p.role_name)}</span>
+                                      </div>
+                                      <div className="event-player-rating">{score.toFixed(2)}</div>
+                                      <div className="event-player-stats ev-mini">
+                                        {[
+                                          ["Rating", p.rating_ev],
+                                          ["Win", p.win_ev],
+                                          ["Role", p.role_ev],
+                                          ["Boost", boost],
+                                        ].map(([label, value]) => (
+                                          <div className="event-player-stat" key={label}>
+                                            <div className="event-player-mini">{Number(value || 0).toFixed(1)}</div>
+                                            <div className="event-player-stat-label">{label}</div>
+                                          </div>
+                                        ))}
+                                      </div>
+                                      <div className="event-player-price combo-price">
+                                        ${Math.round(Number(p.price || 0) / 1000)}k
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
                   </div>
                 )}
                 {allTeams && allTeams.length > 0 && (
