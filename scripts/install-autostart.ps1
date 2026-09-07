@@ -9,6 +9,7 @@ $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $root = Split-Path -Parent $scriptDir
+. (Join-Path $scriptDir "backend-port.ps1")
 
 # --- Ensure the venv + backend deps exist so autostart works from a clean box.
 $venvPath = Join-Path $root ".venv"
@@ -45,12 +46,15 @@ Write-Host "Installed autostart launcher: $vbsPath"
 Write-Host "Starting the backend now..."
 Start-Process -FilePath "wscript.exe" -ArgumentList "`"$vbsPath`""
 
-Start-Sleep -Seconds 4
-try {
-    $resp = Invoke-WebRequest -Uri "http://127.0.0.1:8000/health" -TimeoutSec 3 -UseBasicParsing
-    if ($resp.StatusCode -eq 200) {
-        Write-Host "Backend is up (http://127.0.0.1:8000). It will now start automatically every time you log in." -ForegroundColor Green
-    }
-} catch {
-    Write-Host "Backend not responding yet; it may still be starting. Check .runtime\backend.log if it doesn't come up." -ForegroundColor Yellow
+# The backend picks a free port and memorizes it in .runtime\backend-port.json;
+# poll that file (up to ~20s) instead of assuming 8000.
+$up = $false
+for ($i = 0; $i -lt 40; $i++) {
+    Start-Sleep -Milliseconds 500
+    if (Test-BackendAlive) { $up = $true; break }
+}
+if ($up) {
+    Write-Host "Backend is up ($(Get-BackendUrl)). It will now start automatically every time you log in." -ForegroundColor Green
+} else {
+    Write-Host "Backend not responding yet; it may still be starting. Logs: $env:LOCALAPPDATA\HLTVFantasy\logs (backend-latest.txt names the active one)." -ForegroundColor Yellow
 }

@@ -4,12 +4,14 @@ Run with: `python backend/main.py`
 """
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.routes import players, teams, simulation, bracket, best_team, playoff, groups, admin, events, schedule, assets
+from backend.services.backend_port import APP_ID, HOST, PORT_FILE, select_port, write_port_info
 from backend.data.event_db import ensure_event_schema
 from backend.data.player_db import ensure_schema, ensure_topx_windows_schema
 from backend.data.team_db import ensure_team_schema
@@ -70,6 +72,15 @@ async def _lifespan(app: FastAPI):
         scheduler.start()
     except Exception:
         logging.getLogger(__name__).warning("Could not start data scheduler", exc_info=True)
+    # Warm the heavy in-process caches off the request path: the stored groups
+    # run (~1 s blob parse) and every event's format detection (~1 s burst).
+    import threading
+
+    def _warm() -> None:
+        groups.warm_caches()
+        events.warm_kind_cache()
+
+    threading.Thread(target=_warm, name="cache-warmup", daemon=True).start()
     yield
     scheduler.stop()
 
@@ -88,10 +99,15 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     def health() -> dict:
-        # Cheap liveness probe: the Electron launcher hits this to decide whether
-        # a backend is already running (so it connects instead of spawning a
-        # second one), and the auto-start watchdog uses it too.
-        return {"status": "ok"}
+        # Liveness + identity probe: the Electron launcher, the autostart
+        # watchdog and a second backend launch all use `app` to tell one of OUR
+        # backends apart from some other program that happens to own the port.
+        return {
+            "status": "ok",
+            "app": APP_ID,
+            "port": getattr(app.state, "port", None),
+            "pid": os.getpid(),
+        }
 
     return app
 
@@ -102,4 +118,10 @@ app = create_app()
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    # Bind first (memorized port, else the next free one), memorize the result,
+    # then serve on that exact socket. See backend/services/backend_port.py.
+    sock, port = select_port()
+    app.state.port = port
+    info = write_port_info(port, os.getpid())
+    logging.getLogger(__name__).info("Backend listening on %s (memorized in %s)", info["url"], PORT_FILE)
+    uvicorn.Server(uvicorn.Config(app, host=HOST, port=port)).run(sockets=[sock])

@@ -7,6 +7,8 @@ per group (average EV, ceiling) stay exact for any number of groups.
 """
 
 import heapq
+import itertools
+import json
 import re
 import math
 import random
@@ -23,6 +25,7 @@ from backend.data.singleton_state import SingletonState
 from backend.routes.playoff import (
     _build_playoff_lookup_context,
     _clone_team_states,
+    cached_win_prob,
     _filter_saved_combo_teams,
     _page_items,
     _play_match_deterministic,
@@ -38,6 +41,7 @@ from backend.services.swiss_booster_assignment import (
 )
 from backend.services.team_optimizer import iter_valid_rosters, parse_optimizer_payload, serialize_roster
 from backend.swiss_stage.fantasy_scoring import compute_padding_components
+from backend.swiss_stage.swiss_models import TeamState
 from backend.swiss_stage.team_initialization import initialize_teams
 
 # A group plays at most 3 matches (opening + winners'/elimination + decider).
@@ -56,9 +60,34 @@ GROUPS_JOBS_LOCK = threading.Lock()
 GROUPS_BEST_TEAM_JOBS: Dict[str, Dict[str, Any]] = {}
 GROUPS_BEST_TEAM_JOBS_LOCK = threading.Lock()
 
-_GROUPS_STATE = SingletonState("groups_simulation_state", result_column="results_json", result_key="results")
-_GROUPS_BEST_STATE = SingletonState("groups_best_team_state")
-_GROUPS_BEST_META = SingletonState("groups_best_team_meta")
+# Keyed by fantasy event: the stored simulation and its best-team combos belong
+# to ONE tournament, so switching the active event must never surface another
+# event's run (the FISSURE Playground tab was showing Porto's stored groups).
+_GROUPS_STATE = SingletonState("groups_simulation_state", result_column="results_json", result_key="results", keyed=True)
+_GROUPS_BEST_STATE = SingletonState("groups_best_team_state", keyed=True)
+_GROUPS_BEST_META = SingletonState("groups_best_team_meta", keyed=True)
+
+
+def _state_key() -> int:
+    """Row key for the stored groups state: the active fantasy event id."""
+    from backend.data.event_db import get_active_event_id
+
+    return int(get_active_event_id() or 1)
+
+
+# Live best-team queries memoized per (event, stored-run stamp, body).
+_LIVE_QUERY_CACHE: Dict[tuple, dict] = {}
+_LIVE_QUERY_CACHE_LOCK = threading.Lock()
+
+
+def warm_caches() -> None:
+    """Parse the active event's stored groups run into the state cache at
+    startup (in a background thread) so the first Tournament open after a
+    restart does not pay the ~1 s blob parse itself."""
+    try:
+        _GROUPS_STATE.load(key=_state_key())
+    except Exception:
+        pass
 
 GROUP_MATCH_KEYS = ["opening_1", "opening_2", "winners", "elimination", "decider"]
 GROUP_MATCH_LABELS = {
@@ -128,6 +157,11 @@ def _normalize_groups_payload(payload: dict) -> dict:
         groups.append(ids)
     combined = bool(payload.get("combined_playoffs"))
     stop_teams = int(payload.get("playoff_stop_teams") or 1)
+    if combined and not combined_shape_supported(group_format, len(groups)):
+        raise HTTPException(
+            status_code=400,
+            detail=reject_unsupported_combined_shape(group_format, len(groups), payload.get("event_id")),
+        )
     if combined and group_format == "de8_top3":
         # Porto/Cologne shape: 2 groups of 8, top 3 each -> 6-team bracket with
         # the two group winners seeded straight into the semi-finals.
@@ -153,13 +187,13 @@ def _normalize_groups_payload(payload: dict) -> dict:
                 status_code=400,
                 detail="playoff_stop_teams must be a power of two smaller than the bracket size (1 = play out the full bracket).",
             )
-    n_sims = int(payload.get("n_playoff_sims") or 2000)
     return {
         "groups": groups,
         "group_format": group_format,
         "combined_playoffs": combined,
-        "n_playoff_sims": max(200, min(20000, n_sims)),
         "playoff_stop_teams": stop_teams,
+        # The stored run is keyed by this event (see _state_key).
+        "event_id": _state_key(),
     }
 
 
@@ -511,30 +545,101 @@ def _enumerate_group8_top3_outcomes(
     return outcomes
 
 
-def _simulate_combined_playoffs(
+_PLAYOFF_BYE_PADDING_POINTS = 6.0
+
+# Combined groups→playoff shapes whose bracket structure (how qualifiers are
+# seeded into the playoff) has been verified against real HLTV event pages.
+# Anything else is REJECTED and flagged for development rather than run under
+# a guessed seeding: a bracket seeded the wrong way yields confident, wrong
+# valuations. Key = (group_format, group_count).
+_SUPPORTED_COMBINED_SHAPES: Dict[tuple, str] = {
+    ("de8_top3", 2): "2 groups of 8, top 3 → 6-team bracket, group winners bye to the semis "
+                     "(verified on FISSURE Playground 3 and BLAST Open Porto 2026)",
+}
+
+
+def combined_shape_key(group_format: str, group_count: int) -> tuple:
+    return (str(group_format or "").strip().lower(), int(group_count or 0))
+
+
+def combined_shape_label(group_format: str, group_count: int) -> str:
+    fmt, count = combined_shape_key(group_format, group_count)
+    quals = {"gsl4": 2, "de8": 4, "de8_top3": 3}.get(fmt, 0)
+    return f"{count} × {fmt} groups (top {quals} each, {quals * count} qualifiers) → combined playoff"
+
+
+def combined_shape_supported(group_format: str, group_count: int) -> bool:
+    return combined_shape_key(group_format, group_count) in _SUPPORTED_COMBINED_SHAPES
+
+
+def reject_unsupported_combined_shape(group_format: str, group_count: int, event_id: int | None = None) -> str:
+    """Flag the shape for development and return the user-facing reason."""
+    from backend.services import dev_flags
+
+    fmt, count = combined_shape_key(group_format, group_count)
+    label = combined_shape_label(fmt, count)
+    dev_flags.flag(
+        key=f"combined:{fmt}x{count}",
+        kind="combined_playoff_shape",
+        detail=f"{label}: playoff seeding for this shape has not been verified against an HLTV bracket, so the "
+               "simulator refuses it. To support it, confirm the bracket on the event page and add the shape to "
+               "_SUPPORTED_COMBINED_SHAPES.",
+        event_id=event_id,
+    )
+    return (
+        f"Combined playoffs are not supported yet for {label}. The shape has been flagged for development; "
+        "run the group stage without combined playoffs meanwhile."
+    )
+
+
+def _fresh_bracket_state(base_states: Dict[int, TeamState], tid: int, prior_matches: int) -> TeamState:
+    """A team state as it stands when it plays its (prior_matches + 1)-th
+    playoff match: zero points, and — alive in a single-elimination bracket —
+    every earlier match was a win. That is all the scorer reads (the match
+    number picks the booster slot), so this pins the per-match points down."""
+    ts = _clone_team_states({tid: base_states[tid]})[tid]
+    ts.wins = int(prior_matches)
+    ts.losses = 0
+    return ts
+
+
+def _exact_combined_playoffs(
     groups: List[List[int]],
     outcomes: List[Dict[str, Any]],
-    n_sims: int,
     player_rows_by_id: Dict[int, dict],
     team_rank_by_id: Dict[int, int],
     prob_cache: Dict,
     stop_teams: int = 1,
     quals_per_group: int = 2,
     progress_callback=None,
+    workers: int | None = None,
 ) -> Dict[str, Any]:
-    """Monte Carlo playoff stage: sample each group's exact outcome, seed the
-    qualifiers into a single-elimination bracket (standard 1-vs-N seeding that
-    spreads same-group teams apart), and average per-player playoff points.
+    """Exact expected playoff points for every player.
 
-    stop_teams ends the bracket early: with 32 teams and stop_teams=4, the
-    quarter-finals are the last matches played and the 4 winners qualify
-    without playing on (e.g. a qualifier feeding a main event).
+    The exact group outcomes are marginalised onto ordered qualifier tuples
+    per group, then services/bracket_exact contracts the bracket: each
+    sub-bracket is a winner table over the teams in its slots, each match's
+    participant distribution is the contraction of its feeders with the group
+    tuple distributions restricted to the slots involved, and the final is
+    folded group by group — no seedings are enumerated, and a match that
+    depends on a few slots is computed once. Points are linear in the matches
+    played and a match's points depend only on (team, opponent, winner, each
+    side's match number, rounds remaining), so the pairing weights are
+    multiplied through a memoised per-pairing points table at the end.
+
+    Bracket shapes mirror the previous simulator exactly: quals_per_group == 3
+    is the 6-team byes bracket (QF1 = A2 v B3, QF2 = B2 v A3, SF1 = A1 v QF2
+    winner, SF2 = B1 v QF1 winner, bye teams get 6 padding win points for the
+    quarter-final they skip); otherwise qualifiers are flattened seed-major
+    and paired i vs N-1-i, with stop_teams ending the bracket early (which
+    splits it into independent sub-brackets).
     """
+    from backend.services import bracket_exact
+
     x = len(groups)
     stop_teams = max(1, int(stop_teams))
     byes_to_semis = quals_per_group == 3
     if byes_to_semis:
-        # Porto/Cologne 6-team bracket: group winners bye to the semis.
         if x != 2:
             raise ValueError("The top-3 combined playoff supports exactly 2 groups (6-team bracket)")
         if stop_teams != 1:
@@ -544,142 +649,195 @@ def _simulate_combined_playoffs(
     else:
         bracket_size = quals_per_group * x
         rounds_total = max(1, int(math.log2(bracket_size)) - int(math.log2(stop_teams)))
-    rng = random.Random(1234567)
 
-    # Per-group sampling tables over the 32 exact outcomes.
-    per_group: List[List[Dict[str, Any]]] = [[] for _ in range(x)]
+    # 1. Ordered-qualifier tuple distribution per group (probabilities sum to 1).
+    tuple_probs: List[Dict[tuple, float]] = [{} for _ in range(x)]
     for outcome in outcomes:
-        per_group[int(outcome["group"])].append(outcome)
-    cumulative: List[List[float]] = []
-    for g in range(x):
-        acc = 0.0
-        cums = []
-        for outcome in per_group[g]:
-            acc += float(outcome["probability"])
-            cums.append(acc)
-        cumulative.append(cums)
+        g = int(outcome["group"])
+        key = tuple(int(t) for t in outcome["qualified"])
+        tuple_probs[g][key] = tuple_probs[g].get(key, 0.0) + float(outcome["probability"])
+    specs = [bracket_exact.GroupSpec(groups[g], quals_per_group, tuple_probs[g]) for g in range(x)]
 
+    # 2. Bracket template (feeders are ("seed", group, rank) or ("win", round, match)).
+    if byes_to_semis:
+        rounds = [
+            [(("seed", 0, 1), ("seed", 1, 2)), (("seed", 1, 1), ("seed", 0, 2))],  # QF1: A2 v B3, QF2: B2 v A3
+            [(("seed", 0, 0), ("win", 0, 1)), (("seed", 1, 0), ("win", 0, 0))],    # SF1: A1 v QF2 W, SF2: B1 v QF1 W
+            [(("win", 1, 0), ("win", 1, 1))],
+        ]
+        entry_round = {(0, 0): 1, (1, 0): 1}
+    else:
+        seeded = [(g, r) for r in range(quals_per_group) for g in range(x)]  # seed-major, like the old sim
+        n = len(seeded)
+        rounds = [[(("seed",) + seeded[i], ("seed",) + seeded[n - 1 - i]) for i in range(n // 2)]]
+        for r in range(1, rounds_total):
+            prev = len(rounds[-1])
+            rounds.append([(("win", r - 1, 2 * m), ("win", r - 1, 2 * m + 1)) for m in range(prev // 2)])
+        entry_round = {}
+    roots = bracket_exact.build_tree(rounds, entry_round)
+
+    # 3. Win-probability matrices between groups, from the shared cache
+    #    (canonical direction, see playoff.cached_win_prob).
+    def match_prob(a: int, b: int) -> float:
+        return cached_win_prob(prob_cache, a, b)  # a == b only ever meets a zero-probability context
+
+    pwin_cache: Dict[tuple, Any] = {}
+
+    def pwin(g: int, h: int):
+        key = (g, h)
+        if key not in pwin_cache:
+            import numpy as np
+
+            m = np.array([[match_prob(a, b) for b in specs[h].teams] for a in specs[g].teams], dtype=np.float64)
+            pwin_cache[key] = m
+        return pwin_cache[key]
+
+    weights, advance, bye_weight = bracket_exact.compute_pairing_weights(specs, roots, rounds_total, pwin)
+
+    # 4. Per-pairing points (memoised: only a few hundred distinct pairings).
     all_team_ids = [tid for group in groups for tid in group]
     base_states = initialize_teams(all_team_ids, {tid: 999 for tid in all_team_ids})
 
-    accum: Dict[int, Dict[str, float]] = {}
-    champion_counts: Dict[int, int] = {}
-
-    def sample_group(g: int) -> Dict[str, Any]:
-        draw = rng.random() * (cumulative[g][-1] if cumulative[g] else 1.0)
-        idx = 0
-        cums = cumulative[g]
-        lo, hi = 0, len(cums) - 1
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if cums[mid] < draw:
-                lo = mid + 1
-            else:
-                hi = mid
-        idx = lo
-        return per_group[g][idx]
-
-    def match_prob(a: int, b: int) -> float:
-        key = (a, b)
-        if key in prob_cache:
-            return prob_cache[key]
-        from backend.services.match_engine import calculate_win_probability
-
-        p = calculate_win_probability(a, b, "bo3")
-        prob_cache[key] = p
-        prob_cache[(b, a)] = 1.0 - p
-        return p
-
-    for sim in range(n_sims):
-        sampled = [sample_group(g) for g in range(x)]
-        if byes_to_semis:
-            # qualified is ordered [1st, 2nd, 3rd]; 1sts skip the quarters.
-            qa = [int(t) for t in sampled[0]["qualified"]]
-            qb = [int(t) for t in sampled[1]["qualified"]]
-            playoff_team_ids = qa + qb
-            states = _clone_team_states({tid: base_states[tid] for tid in playoff_team_ids})
-
-            def play_po(a, b, remaining_after):
-                p = match_prob(a, b)
-                winner = a if rng.random() < p else b
-                _play_match_deterministic(
-                    states, a, b, winner, remaining_rounds_after=remaining_after, prob_cache=prob_cache,
-                    player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id,
-                )
-                return winner
-
-            wq1 = play_po(qa[1], qb[2], 2)  # QF1: A-2nd vs B-3rd
-            wq2 = play_po(qb[1], qa[2], 2)  # QF2: B-2nd vs A-3rd
-            ws1 = play_po(qa[0], wq2, 1)    # SF1: A-1st vs QF2 winner
-            ws2 = play_po(qb[0], wq1, 1)    # SF2: B-1st vs QF1 winner
-            final_winners = [play_po(ws1, ws2, 0)]
-            # Bye teams get 6 padding points per player for the QF they skip.
-            for bye_tid in (qa[0], qb[0]):
-                bye_ts = states.get(bye_tid)
-                if not bye_ts:
-                    continue
-                for p in bye_ts.players.values():
-                    p.win_points_total += 6.0
-                    p.total_points += 6.0
-        else:
-            # Flatten qualifiers seed-major (all group winners, then all seed-2, ...)
-            # then standard i vs (N-1-i) seeding, which puts same-group teams on
-            # opposite ends of the bracket.
-            seeded: List[int] = []
-            for seed_idx in range(quals_per_group):
-                for g in range(x):
-                    q = sampled[g]["qualified"]
-                    if seed_idx < len(q):
-                        seeded.append(int(q[seed_idx]))
-            n_seeded = len(seeded)
-            pairs: List[tuple] = [(seeded[i], seeded[n_seeded - 1 - i]) for i in range(n_seeded // 2)]
-            playoff_team_ids = [tid for pair in pairs for tid in pair]
-            states = _clone_team_states({tid: base_states[tid] for tid in playoff_team_ids})
-            current = pairs
-            final_winners = []
-            for round_idx in range(rounds_total):
-                remaining_after = rounds_total - round_idx - 1
-                winners: List[int] = []
-                for a, b in current:
-                    p = match_prob(a, b)
-                    winner = a if rng.random() < p else b
-                    _play_match_deterministic(
-                        states, a, b, winner, remaining_rounds_after=remaining_after, prob_cache=prob_cache,
-                        player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id,
-                    )
-                    winners.append(winner)
-                final_winners = winners
-                if len(winners) > 1:
-                    current = [(winners[i], winners[i + 1]) for i in range(0, len(winners), 2)]
-        for tid in final_winners:
-            champion_counts[tid] = champion_counts.get(tid, 0) + 1
+    def pairing_points(key: tuple) -> Dict[int, tuple]:
+        a, b, winner, num_a, num_b, rem = key
+        states = {
+            a: _fresh_bracket_state(base_states, a, num_a - 1),
+            b: _fresh_bracket_state(base_states, b, num_b - 1),
+        }
+        _play_match_deterministic(
+            states, a, b, winner, remaining_rounds_after=rem, prob_cache=prob_cache,
+            player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id,
+        )
+        out: Dict[int, tuple] = {}
         for ts in states.values():
             for pid, p in ts.players.items():
-                bucket = accum.setdefault(
-                    int(pid), {"total": 0.0, "rating": 0.0, "win": 0.0, "role": 0.0, "booster": 0.0}
+                out[int(pid)] = (
+                    float(p.total_points), float(p.rating_points_total), float(p.win_points_total),
+                    float(p.role_points_total), float(p.booster_points_total),
                 )
-                bucket["total"] += float(p.total_points)
-                bucket["rating"] += float(p.rating_points_total)
-                bucket["win"] += float(p.win_points_total)
-                bucket["role"] += float(p.role_points_total)
-                bucket["booster"] += float(p.booster_points_total)
-        if progress_callback and (sim + 1) % 100 == 0:
-            progress_callback(sim + 1)
+        return out
 
-    playoff_ev = {
-        pid: {key: value / float(n_sims) for key, value in sums.items()} for pid, sums in accum.items()
+    accum: Dict[int, List[float]] = {}
+    for key, w in weights.items():
+        for pid, comps in pairing_points(key).items():
+            bucket = accum.setdefault(pid, [0.0, 0.0, 0.0, 0.0, 0.0])
+            for i in range(5):
+                bucket[i] += w * comps[i]
+    for tid, w in bye_weight.items():
+        pad = _PLAYOFF_BYE_PADDING_POINTS * w
+        for pid in base_states[tid].players:
+            bucket = accum.setdefault(int(pid), [0.0, 0.0, 0.0, 0.0, 0.0])
+            bucket[0] += pad
+            bucket[2] += pad
+    if progress_callback:
+        progress_callback(1, 1)
+
+    player_ev = {
+        pid: {"total": b[0], "rating": b[1], "win": b[2], "role": b[3], "booster": b[4]}
+        for pid, b in accum.items()
     }
+    # P(team plays a match in round r) — both results of a pairing sum to the
+    # pairing's probability. Bye teams enter at the semis, so their QF reach
+    # is 0 while their SF reach includes the bye.
+    round_reach: Dict[int, List[float]] = {}
+    for (a, b, _winner, _na, _nb, rem), w in weights.items():
+        r = rounds_total - rem - 1
+        for tid in (a, b):
+            row = round_reach.setdefault(tid, [0.0] * rounds_total)
+            row[r] += w * 0.5  # each pairing appears twice (winner a / winner b)
+    if byes_to_semis:
+        round_labels = ["QF", "SF", "Final"]
+    else:
+        round_labels = []
+        for r in range(rounds_total):
+            teams_in_round = bracket_size >> r
+            round_labels.append({2: "Final", 4: "SF", 8: "QF", 16: "R16", 32: "R32"}.get(teams_in_round, f"R{teams_in_round}"))
     return {
-        "n_sims": int(n_sims),
+        "method": "exact_contraction",
+        "pairings": len(weights),
         "bracket_size": bracket_size,
         "rounds": rounds_total,
+        "round_labels": round_labels,
+        "round_reach": {str(tid): row for tid, row in round_reach.items()},
         "stop_teams": stop_teams,
-        "player_ev": playoff_ev,
+        "player_ev": player_ev,
         # P(team wins the last played round) — with stop_teams > 1 this is the
         # chance of qualifying onward rather than winning the whole bracket.
-        "advance_rate": {
-            str(tid): count / float(n_sims) for tid, count in sorted(champion_counts.items(), key=lambda kv: -kv[1])
-        },
+        "advance_rate": {str(tid): v for tid, v in sorted(advance.items(), key=lambda kv: -kv[1])},
+    }
+
+
+
+def bake_event_valuations(event_id: int, trigger: str = "nightly") -> Dict[str, Any]:
+    """Run and store the groups valuation for one fantasy event off the request
+    path (nightly, and right after a new event is imported), so opening the
+    Tournament tab never computes anything. Uses the detected format, the
+    detected combined-playoff flag and the HLTV draw (re-fetched live once when
+    the stored draw still has TBD slots). Returns a short status dict; never
+    raises — the scheduler records the message."""
+    from backend.data.event_db import get_event_detail, get_event_groups_autofill, get_event_tournament_kind, set_event_groups_autofill
+    from backend.routes import events as events_routes
+
+    started = time.time()
+    event_id = int(event_id)
+    event = get_event_detail(event_id)
+    if not event:
+        return {"status": "skipped", "event_id": event_id, "reason": "event not found"}
+    try:
+        detected = events_routes._detect_event_tournament_kind_cached(event)
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "skipped", "event_id": event_id, "reason": f"kind detection failed: {exc}"}
+    kind = get_event_tournament_kind(event_id) or detected.get("kind")
+    if kind != "groups":
+        return {"status": "skipped", "event_id": event_id, "reason": f"not a groups event ({kind})"}
+
+    def _draw_ids(stored) -> List[List[int]]:
+        return [[int(t or 0) for t in (g.get("team_ids") or [])] for g in ((stored or {}).get("groups") or [])]
+
+    stored = get_event_groups_autofill(event_id)
+    groups_ids = _draw_ids(stored)
+    if not groups_ids or any(t <= 0 for g in groups_ids for t in g):
+        try:
+            fresh = autofill_event_groups(hltv_event_id=event.get("hltv_event_id"), fantasy_event_id=event_id)
+            set_event_groups_autofill(event_id, fresh["group_format"], fresh["groups"])
+            stored = get_event_groups_autofill(event_id)
+            groups_ids = _draw_ids(stored)
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "skipped", "event_id": event_id, "reason": f"draw unavailable: {exc}"}
+        if not groups_ids or any(t <= 0 for g in groups_ids for t in g):
+            return {"status": "skipped", "event_id": event_id, "reason": "draw not published yet (TBD slots)"}
+
+    fmt = str(detected.get("group_format") or (stored or {}).get("group_format") or "gsl4")
+    if fmt == "de8" and detected.get("group_variant") == "de8_top3":
+        fmt = "de8_top3"
+    combined = bool(detected.get("combined_playoffs"))
+    if combined and not combined_shape_supported(fmt, len(groups_ids)):
+        # One fantasy game scores the playoffs too, but the simulator has no
+        # verified bracket for this shape: refuse (a groups-only run would
+        # store misleading valuations) and leave the flag for development.
+        reason = reject_unsupported_combined_shape(fmt, len(groups_ids), event_id)
+        return {"status": "unsupported", "event_id": event_id, "reason": reason}
+    try:
+        payload = _normalize_groups_payload(
+            {"groups": groups_ids, "group_format": fmt, "combined_playoffs": combined, "playoff_stop_teams": 1}
+        )
+    except HTTPException as exc:
+        return {"status": "skipped", "event_id": event_id, "reason": f"invalid shape: {exc.detail}"}
+    payload["event_id"] = event_id
+    payload["baked"] = {"trigger": trigger, "at": started}
+    try:
+        result = _compute_groups_result(payload)
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "event_id": event_id, "reason": str(exc)[:300]}
+    _GROUPS_STATE.save(payload, result, key=event_id)
+    playoff = result.get("playoff") or {}
+    return {
+        "status": "ok",
+        "event_id": event_id,
+        "group_format": fmt,
+        "combined_playoffs": combined,
+        "pairings": playoff.get("pairings"),
+        "seconds": round(time.time() - started, 1),
     }
 
 
@@ -694,13 +852,12 @@ def _compute_groups_result(payload: dict, progress_callback=None) -> dict:
         "de8_top3": _enumerate_group8_top3_outcomes,
     }[group_format]
     combined = bool(payload.get("combined_playoffs"))
-    n_playoff_sims = int(payload.get("n_playoff_sims") or 2000)
     all_team_ids = [tid for group in groups for tid in group]
     player_rows_by_id, team_rank_by_id = _build_playoff_lookup_context(all_team_ids)
     prob_cache: Dict = {}
     outcomes: List[Dict[str, Any]] = []
     teams_out: Dict[int, Dict[str, Any]] = {}
-    total_units = len(groups) + (n_playoff_sims if combined else 0)
+    total_units = len(groups) + (1 if combined else 0)
     playoff_rounds = 0
     if combined:
         stop_teams = max(1, int(payload.get("playoff_stop_teams") or 1))
@@ -750,17 +907,16 @@ def _compute_groups_result(payload: dict, progress_callback=None) -> dict:
 
     playoff_summary = None
     if combined:
-        playoff_summary = _simulate_combined_playoffs(
+        playoff_summary = _exact_combined_playoffs(
             groups,
             outcomes,
-            n_playoff_sims,
             player_rows_by_id,
             team_rank_by_id,
             prob_cache,
             stop_teams=int(payload.get("playoff_stop_teams") or 1),
             quals_per_group=quals_per_group,
             progress_callback=(
-                (lambda sims_done: progress_callback(len(groups) + sims_done, total_units))
+                (lambda done, total: progress_callback(len(groups) + (1 if done >= total else 0), total_units))
                 if progress_callback
                 else None
             ),
@@ -780,6 +936,24 @@ def _compute_groups_result(payload: dict, progress_callback=None) -> dict:
                 comps["booster_points_total"] += extra["booster"]
                 comps["total_points_without_booster"] += extra["rating"] + extra["win"] + extra["role"]
 
+    # Where each team finishes in its group: P(rank r) over the exact outcomes
+    # (ranks are 1-based, only qualifying places are known by rank).
+    place_odds: Dict[str, Dict[str, float]] = {}
+    for outcome in outcomes:
+        prob = float(outcome["probability"])
+        for rank, tid in enumerate(outcome.get("qualified") or [], start=1):
+            row = place_odds.setdefault(str(int(tid)), {})
+            row[str(rank)] = row.get(str(rank), 0.0) + prob
+    # The role each player was scored with (drives the role badge in the UI).
+    try:
+        for tid, ts in initialize_teams(all_team_ids, {tid: 999 for tid in all_team_ids}).items():
+            players_out = (teams_out.get(int(tid)) or {}).get("players") or {}
+            for pid, p in ts.players.items():
+                if int(pid) in players_out:
+                    players_out[int(pid)]["role_id"] = p.role_id
+    except Exception:
+        pass
+
     return {
         "teams": teams_out,
         "outcomes": outcomes,
@@ -788,9 +962,10 @@ def _compute_groups_result(payload: dict, progress_callback=None) -> dict:
         "group_count": len(groups),
         "group_format": group_format,
         "quals_per_group": quals_per_group,
+        "place_odds": place_odds,
         "combined_playoffs": combined,
         "playoff": playoff_summary,
-        "method": "exact_enumeration_per_group" + ("_plus_mc_playoffs" if combined else ""),
+        "method": "exact_enumeration_per_group" + ("_plus_exact_playoffs" if combined else ""),
     }
 
 
@@ -813,7 +988,7 @@ def _run_groups_job(job_id: str, payload: dict) -> None:
         job["updated_at"] = time.time()
     try:
         result = _compute_groups_result(payload, progress_callback=_update)
-        _GROUPS_STATE.save(payload, result)
+        _GROUPS_STATE.save(payload, result, key=int(payload.get("event_id") or _state_key()))
         with GROUPS_JOBS_LOCK:
             job = GROUPS_JOBS.get(job_id)
             if not job:
@@ -876,6 +1051,44 @@ def _parse_event_groups(html: str, group_format: str = "gsl4") -> List[Dict[str,
             if len(seeds) == seed_count:
                 break
         groups.append({"name": name, "seeds": seeds})
+    return groups
+
+
+def _parse_event_groups_structured(html: str, group_format: str = "gsl4") -> List[Dict[str, Any]]:
+    """Same output as _parse_event_groups, but from the typed slotted-bracket
+    JSON via services/event_format. Each group bracket lists its teams in
+    upperRound1 slot order (verified on FISSURE Playground 3: 9z v 5star,
+    MongolZ v MIBR, ...), which is exactly the seed order the simulator wants."""
+    import html as _htmlmod
+
+    from backend.services.event_format import detect_event_structure
+
+    try:
+        structure = detect_event_structure(html or "")
+    except Exception:
+        return []
+    seed_count = 8 if str(group_format).strip().lower() == "de8" else 4
+    un = _htmlmod.unescape(html or "")
+    ranking_by_id: Dict[int, int] = {}
+    for rm in re.finditer(r'"team":\{"id":(\d+),"name":"[^"]+".{0,700}?"ranking":(\d+)', un):
+        ranking_by_id.setdefault(int(rm.group(1)), int(rm.group(2)))
+
+    groups: List[Dict[str, Any]] = []
+    for bracket in structure.get("brackets") or []:
+        if bracket.get("bracket") != "double_elim" or int(bracket.get("size") or 0) != seed_count:
+            continue
+        variant = str(bracket.get("variant") or "")
+        if variant.endswith("_full") or "_qual" in variant:
+            continue  # a whole-event DE bracket, not a group
+        seeds: List[Optional[Dict[str, Any]]] = []
+        for tid, name in list((bracket.get("teams") or {}).items())[:seed_count]:
+            try:
+                hltv_id = int(tid)
+            except Exception:
+                seeds.append(None)
+                continue
+            seeds.append({"id": hltv_id, "name": str(name), "ranking": ranking_by_id.get(hltv_id)})
+        groups.append({"name": str(bracket.get("name") or f"Group {len(groups) + 1}"), "seeds": seeds})
     return groups
 
 
@@ -972,7 +1185,12 @@ def autofill_event_groups(
         raise HTTPException(status_code=404, detail="No GSL or double-elim group brackets found on that event page.")
 
     seed_count = 8 if fmt == "de8" else 4
-    parsed = _parse_event_groups(html, fmt)
+    # Typed slotted-bracket JSON first (the maintained path; FISSURE Playground
+    # 3's page defeated the regex parser while the typed data listed all 16
+    # teams), regex parser as the fallback for pages it still understands.
+    parsed = _parse_event_groups_structured(html, fmt)
+    if not parsed or all(s is None for g in parsed for s in (g.get("seeds") or [])):
+        parsed = _parse_event_groups(html, fmt) or parsed
     if not parsed:
         raise HTTPException(status_code=404, detail="No group brackets found on that event page.")
 
@@ -1351,31 +1569,52 @@ def get_groups_job(job_id: str):
         return {"job_id": job_id, **{k: v for k, v in job.items() if k != "result"}}
 
 
+def _slim_groups_results(results: Dict[str, Any]) -> Dict[str, Any]:
+    """Everything the Groups tab reads, minus the enumerated outcomes.
+
+    The outcomes list is ~100% of a stored run (80 MB for two 8-team groups)
+    and the tab only ever used it to derive each team's qualify odds, so
+    those are folded in here as `qualify_odds` and the list itself stays
+    server-side (completed-group scoring already runs on the backend).
+    """
+    results = results or {}
+    slim = {k: v for k, v in results.items() if k != "outcomes"}
+    odds: Dict[str, Dict[str, float]] = {}
+    for outcome in results.get("outcomes") or []:
+        group = str(outcome.get("group", 0))
+        prob = float(outcome.get("probability") or 0.0)
+        bucket = odds.setdefault(group, {})
+        for tid in outcome.get("qualified") or []:
+            bucket[str(tid)] = bucket.get(str(tid), 0.0) + prob
+    slim["qualify_odds"] = odds
+    slim["outcomes_count"] = int(results.get("outcomes_count") or len(results.get("outcomes") or []))
+    return slim
+
+
 @router.get("/latest")
-def get_latest_groups():
-    latest = _GROUPS_STATE.load()
+def get_latest_groups(full: bool = False):
+    """Stored simulation for the active event. Slim by default (no outcomes
+    list; see _slim_groups_results) so the Groups tab opens instantly;
+    ?full=1 returns the raw stored blob."""
+    key = _state_key()
+    latest = _GROUPS_STATE.load(key=key)
     if not latest:
-        return {"exists": False}
+        return {"exists": False, "event_id": key}
     return {
         "exists": True,
+        "event_id": key,
         "payload": latest["payload"],
-        "results": latest["results"],
+        "results": latest["results"] if full else _slim_groups_results(latest["results"] or {}),
         "updated_at": latest["updated_at"],
     }
 
 
 @router.delete("/latest")
 def reset_latest_groups():
-    conn = _connect()
-    try:
-        for state in (_GROUPS_STATE, _GROUPS_BEST_STATE, _GROUPS_BEST_META):
-            conn.execute(f"DELETE FROM {state.table} WHERE singleton_id = 1")
-        conn.commit()
-    finally:
-        conn.close()
+    key = _state_key()
     for state in (_GROUPS_STATE, _GROUPS_BEST_STATE, _GROUPS_BEST_META):
-        state.invalidate()
-    return {"status": "ok"}
+        state.delete(key=key)
+    return {"status": "ok", "event_id": key}
 
 
 def _group_player_outcome_vectors(results: dict) -> Dict[int, Dict[int, List[float]]]:
@@ -1919,7 +2158,8 @@ def _run_groups_best_team_job(job_id: str, payload: dict) -> None:
         job["status"] = "running"
         job["updated_at"] = time.time()
     try:
-        latest = _GROUPS_STATE.load()
+        state_key = _state_key()
+        latest = _GROUPS_STATE.load(key=state_key)
         if not latest:
             raise HTTPException(status_code=404, detail="No stored group stage found. Run the groups simulation first.")
         results = latest["results"] or {}
@@ -2067,7 +2307,7 @@ def _run_groups_best_team_job(job_id: str, payload: dict) -> None:
             "pool_reduced_to": pool_reduced_to,
             "mode": "average",
         }
-        _GROUPS_BEST_STATE.save(payload or {}, result)
+        _GROUPS_BEST_STATE.save(payload or {}, result, key=state_key)
         _GROUPS_BEST_META.save(
             payload or {},
             {
@@ -2079,6 +2319,7 @@ def _run_groups_best_team_job(job_id: str, payload: dict) -> None:
                 "pool_reduced_from": pool_reduced_from,
                 "pool_reduced_to": pool_reduced_to,
             },
+            key=state_key,
         )
         result_slim = {k: v for k, v in result.items() if k != "all_teams"}
         with GROUPS_BEST_TEAM_JOBS_LOCK:
@@ -2110,7 +2351,7 @@ def _is_live_pool(results: dict) -> bool:
 @router.post("/best-team/start")
 def start_groups_best_team(payload: dict | None = None):
     body = payload or {}
-    latest = _GROUPS_STATE.load()
+    latest = _GROUPS_STATE.load(key=_state_key())
     if not latest:
         raise HTTPException(status_code=404, detail="No stored group stage found. Run the groups simulation first.")
     if _is_live_pool(latest["results"] or {}):
@@ -2157,10 +2398,11 @@ def get_groups_best_team_job(job_id: str):
 
 @router.get("/best-team/latest")
 def get_latest_groups_best_team():
-    latest_sim = _GROUPS_STATE.load()
+    key = _state_key()
+    latest_sim = _GROUPS_STATE.load(key=key)
     if latest_sim and _is_live_pool(latest_sim["results"] or {}):
         return {"exists": True, "live": True, "updated_at": latest_sim["updated_at"]}
-    meta = _GROUPS_BEST_META.load()
+    meta = _GROUPS_BEST_META.load(key=key)
     if not meta:
         return {"exists": False}
     summary = meta["result"] or {}
@@ -2233,12 +2475,24 @@ def query_groups_best_team(payload: dict | None = None):
     mode = str(body.get("mode") or "average").strip().lower()
     if mode not in {"average", "single_outcome", "most_outcomes"}:
         mode = "average"
-    latest_sim = _GROUPS_STATE.load()
+    key = _state_key()
+    latest_sim = _GROUPS_STATE.load(key=key)
     if latest_sim and _is_live_pool(latest_sim["results"] or {}):
+        # The live optimizer costs ~0.5 s per query; identical queries against
+        # the same stored run (tab re-opens, paging back) come from a small cache.
+        cache_key = (key, latest_sim["updated_at"], mode, json.dumps(body, sort_keys=True, default=str))
+        with _LIVE_QUERY_CACHE_LOCK:
+            cached = _LIVE_QUERY_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
         result = _live_groups_query(latest_sim["results"] or {}, body, mode)
         result["updated_at"] = latest_sim["updated_at"]
+        with _LIVE_QUERY_CACHE_LOCK:
+            if len(_LIVE_QUERY_CACHE) >= 32:
+                _LIVE_QUERY_CACHE.pop(next(iter(_LIVE_QUERY_CACHE)))
+            _LIVE_QUERY_CACHE[cache_key] = result
         return result
-    latest = _GROUPS_BEST_STATE.load()
+    latest = _GROUPS_BEST_STATE.load(key=key)
     if not latest:
         raise HTTPException(status_code=404, detail="No stored combinations found. Run Combinations first.")
     options = parse_optimizer_payload(body)
@@ -2287,12 +2541,13 @@ def _find_completed_group_outcomes(results: dict, picks_by_group: List[List[int]
 @router.post("/best-team/completed-query")
 def query_groups_best_team_completed(payload: dict | None = None):
     body = payload or {}
-    latest = _GROUPS_STATE.load()
+    key = _state_key()
+    latest = _GROUPS_STATE.load(key=key)
     if not latest:
         raise HTTPException(status_code=404, detail="No stored group stage found.")
     results = latest["results"] or {}
     live_pool = _is_live_pool(results)
-    latest_combos = None if live_pool else _GROUPS_BEST_STATE.load()
+    latest_combos = None if live_pool else _GROUPS_BEST_STATE.load(key=key)
     if not live_pool and not latest_combos:
         raise HTTPException(status_code=404, detail="No stored combinations found. Run Combinations first.")
     picks_by_group = body.get("group_winners") or []

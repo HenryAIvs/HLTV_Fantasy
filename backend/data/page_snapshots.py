@@ -31,6 +31,26 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def latest_snapshot_time(url_prefix: str) -> Optional[float]:
+    """Newest fetched_at among snapshots whose URL starts with the prefix,
+    without decompressing anything — a cheap change-signature for caches.
+
+    A range on the primary key (not LIKE '%...%', which scanned the whole
+    blob-heavy table at ~45 ms a call): snapshot URLs are saved from the
+    browser's canonical https://www.hltv.org/... address, so a prefix is exact.
+    """
+    ensure_snapshot_schema()
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT MAX(fetched_at) AS ts FROM page_snapshots WHERE url >= ? AND url < ?",
+            (url_prefix, url_prefix + "￿"),
+        ).fetchone()
+    finally:
+        conn.close()
+    return float(row["ts"]) if row and row["ts"] is not None else None
+
+
 def ensure_snapshot_schema() -> None:
     global _schema_ready
     if _schema_ready:

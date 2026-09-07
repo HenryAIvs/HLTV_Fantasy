@@ -59,6 +59,16 @@ def _resolve_profile_dir() -> Path:
 _STALE_UC_MAX_AGE = float(os.getenv("HLTV_STALE_UC_MAX_AGE", "600"))
 
 
+def _is_orphaned(proc) -> bool:
+    """True when the process that launched `proc` is gone (psutil guards
+    against pid reuse via create time)."""
+    try:
+        parent = proc.parent()
+        return parent is None or not parent.is_running()
+    except Exception:
+        return False
+
+
 def _kill_stale_uc_processes(profile_dir: Path) -> None:
     """Kill uc_driver/UC-Chrome leftovers from sessions that died mid-fetch.
 
@@ -66,6 +76,9 @@ def _kill_stale_uc_processes(profile_dir: Path) -> None:
     'session not created: cannot connect to chrome'. _FETCH_LOCK serializes
     fetches, so nothing of ours should be alive when a driver is created; the
     age guard only protects a second app instance scraping in parallel.
+    Only ORPHANED uc_driver.exe (launcher gone) are touched: when the backend
+    runs as the SYSTEM service it can see every user's processes, and a live
+    interactive scraping/login session must never be killed from here.
     """
     try:
         import psutil
@@ -77,16 +90,38 @@ def _kill_stale_uc_processes(profile_dir: Path) -> None:
         try:
             name = (proc.info.get("name") or "").lower()
             age = now - float(proc.info.get("create_time") or now)
+            if name == "uc_driver.exe":
+                # An orphaned driver is never legitimate (its launcher is
+                # gone), so no age guard: every restart/crash would otherwise
+                # leave one behind for ten minutes.
+                if not _is_orphaned(proc):
+                    continue
+                logger.warning("Killing orphaned uc_driver.exe (pid %s, age %.0fs)", proc.pid, age)
+                proc.kill()
+                continue
+            if name not in ("chrome.exe", "chrome"):
+                continue
+            cmdline = " ".join(proc.info.get("cmdline") or []).lower()
+            if not (profile_marker and profile_marker in cmdline):
+                continue
+            # SeleniumBase launches the browser process directly from this
+            # python, so a browser process (no --type=) whose parent is gone is
+            # a leftover from a dead backend holding our profile: kill its tree
+            # now instead of paying a 45s+ dead-driver retry on the next fetch.
+            is_browser_process = "--type=" not in cmdline
+            if is_browser_process and _is_orphaned(proc):
+                logger.warning("Killing orphaned UC Chrome (pid %s, age %.0fs) holding profile %s", proc.pid, age, profile_dir)
+                for child in proc.children(recursive=True):
+                    try:
+                        child.kill()
+                    except Exception:
+                        pass
+                proc.kill()
+                continue
             if age < _STALE_UC_MAX_AGE:
                 continue
-            if name == "uc_driver.exe":
-                logger.warning("Killing stale uc_driver.exe (pid %s, age %.0fs)", proc.pid, age)
-                proc.kill()
-            elif name in ("chrome.exe", "chrome"):
-                cmdline = " ".join(proc.info.get("cmdline") or []).lower()
-                if profile_marker and profile_marker in cmdline:
-                    logger.warning("Killing stale UC Chrome (pid %s, age %.0fs)", proc.pid, age)
-                    proc.kill()
+            logger.warning("Killing stale UC Chrome (pid %s, age %.0fs)", proc.pid, age)
+            proc.kill()
         except Exception:
             continue
 
@@ -240,8 +275,18 @@ def _clear_cloudflare(driver, url: str, wait_text: str | None) -> None:
         if wait_text:
             _wait_for_text(driver, wait_text, 12.0)
     if _looks_like_challenge(driver):
-        _try_gui_captcha(driver)
-        time.sleep(3.0)
+        if _SHARED_HEADLESS:
+            # No desktop to click a Turnstile on (headless, possibly running as
+            # the SYSTEM service). An interactive session can hand over a
+            # fresh clearance instead: scripts\hltv-login-handoff.ps1 --include-cloudflare
+            logger.warning(
+                "Cloudflare challenge persists for %s and the browser is headless; "
+                "run scripts\\hltv-login-handoff.ps1 --include-cloudflare from a desktop session to hand over a clearance.",
+                url,
+            )
+        else:
+            _try_gui_captcha(driver)
+            time.sleep(3.0)
         if _looks_like_challenge(driver) and wait_text:
             _wait_for_text(driver, wait_text, 10.0)
 
@@ -345,6 +390,26 @@ def _kill_orphan_chrome() -> None:
         logger.info("Killed orphaned Chrome processes for profile %s", profile)
     except Exception:
         logger.exception("Could not clean up orphaned Chrome processes")
+
+
+def kill_own_uc_drivers() -> int:
+    """Kill uc_driver.exe processes launched by THIS process. Used right before
+    a deliberate hard exit (POST /admin/restart): if a fetch still holds the
+    lock, driver.quit() cannot run and the driver would be orphaned."""
+    try:
+        import psutil
+    except Exception:
+        return 0
+    killed = 0
+    me = os.getpid()
+    for proc in psutil.process_iter(["name", "ppid"]):
+        try:
+            if (proc.info.get("name") or "").lower() == "uc_driver.exe" and proc.info.get("ppid") == me:
+                proc.kill()
+                killed += 1
+        except Exception:
+            continue
+    return killed
 
 
 def _shared_driver_alive(driver: Any) -> bool:

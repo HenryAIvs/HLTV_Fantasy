@@ -1155,6 +1155,12 @@ def cancel_hltv_results_import_job(job_id: str):
     return get_hltv_results_import_job(job_id)
 
 
+# Per-match detail blobs (maps, veto, scoreboards) are ~8 KB a row and only
+# the match modal reads them; the list view fetches them on demand via
+# /hltv-results/stored, so the browser page drops from ~680 KB to ~70 KB.
+_RESULT_DETAIL_BLOBS = ("maps_json", "veto_json", "player_stats_json", "map_player_stats_json")
+
+
 @router.get("/hltv-results")
 def get_hltv_results(
     limit: int = 100,
@@ -1164,11 +1170,14 @@ def get_hltv_results(
     vrs_rank: int = 0,
     vrs_scope: str = "",
     vrs_dir: str = "",
+    details: bool = False,
 ):
     rows = list_hltv_results(
         limit=limit, offset=offset, search=search, sort=sort,
         vrs_rank=vrs_rank, vrs_scope=vrs_scope, vrs_dir=vrs_dir,
     )
+    if not details:
+        rows = [{k: v for k, v in row.items() if k not in _RESULT_DETAIL_BLOBS} for row in rows]
     return {
         "count": len(rows),
         "total": int(count_hltv_results()),
@@ -4203,6 +4212,38 @@ def get_map_model_lab(
     }
 
 
+# Fantasy games that cover only one stage of a tournament are named after it in
+# HLTV's fantasy nav ("Group Stage - BLAST Open Porto 2026", "Playoffs - ...",
+# Majors' "Stage 1 - ..."); a whole-tournament game just carries the event name.
+_STAGE_PREFIX_RE = re.compile(
+    r"^\s*(group\s*stage|groups?|playoffs?|play-?ins?|swiss(\s*stage)?|stage\s*\d+|"
+    r"quarter-?finals?|semi-?finals?|finals?|main\s*event)\s*[-–—:]",
+    re.IGNORECASE,
+)
+
+
+def _fantasy_stage_scope(event: Dict[str, Any]) -> tuple[bool, str]:
+    """Is this fantasy game scoped to ONE stage of its tournament (so a later
+    stage is a separate fantasy game), or does one lineup score the whole
+    event? Two independent signals: a stage prefix in the game's name, and
+    sibling fantasy games pointing at the same HLTV event."""
+    event_id = int(event.get("event_id") or 0)
+    hltv_id = int(event.get("hltv_event_id") or 0)
+    name = str(event.get("name") or "")
+    siblings: List[str] = []
+    for row in list_events():
+        if int(row.get("event_id") or 0) == event_id:
+            name = name or str(row.get("name") or "")
+        elif hltv_id and int(row.get("hltv_event_id") or 0) == hltv_id:
+            siblings.append(str(row.get("name") or row.get("event_id")))
+    match = _STAGE_PREFIX_RE.match(name)
+    if match:
+        return True, f"the fantasy game is named for one stage ({match.group(1).strip()!r})"
+    if siblings:
+        return True, f"other fantasy game(s) cover the same HLTV event: {', '.join(siblings[:3])}"
+    return False, "one fantasy game covers the whole tournament"
+
+
 def _detect_event_tournament_kind(event: Dict[str, Any]) -> Dict[str, Any]:
     """Classify what stage THIS fantasy event covers, from the typed JSON
     HLTV embeds in its event pages (swiss simulator, slotted brackets, formats
@@ -4314,7 +4355,7 @@ def _detect_event_tournament_kind(event: Dict[str, Any]) -> Dict[str, Any]:
                 label += f", final Bo{po_rules['grandFinal']}"
         candidates.append(
             {"kind": "playoff", "label": label, "group_format": None,
-             "playoff_size": po_size, "roster": roster, "size": po_size}
+             "playoff_size": po_size, "byes": byes, "roster": roster, "size": po_size}
         )
 
     def _score(c: Dict[str, Any]):
@@ -4334,12 +4375,62 @@ def _detect_event_tournament_kind(event: Dict[str, Any]) -> Dict[str, Any]:
         kind = "bounty"
         label = "Bounty Draft"
 
+    # Combined stages: the page also has a playoff bracket, and nothing says
+    # this fantasy game stops at the chosen stage (no stage-prefixed name, no
+    # sibling fantasy game on the same HLTV event) — so the same lineup scores
+    # the playoffs too. FISSURE Playground 3: 16-team top-3 groups + 6-team
+    # playoff in ONE game; BLAST Open Porto: separate "Group Stage - " and
+    # "Playoffs - " games.
+    playoff_stage = next((c for c in candidates if c["kind"] == "playoff"), None)
+    stage_scoped, scope_reason = _fantasy_stage_scope(event)
+    combined = bool(chosen and kind in ("groups", "swiss", "double_elim") and playoff_stage and not stage_scoped)
+    playoff_size = int((chosen or {}).get("playoff_size") or 0)
+    playoff_byes = int((chosen or {}).get("byes") or 0)
+    combined_supported = False
+    combined_shape = ""
+    if combined:
+        label = f"{label} + {playoff_stage['label']}"
+        playoff_size = int(playoff_stage["playoff_size"] or 0)
+        playoff_byes = int(playoff_stage.get("byes") or 0)
+        # Only shapes with a verified playoff seeding are simulated; the rest
+        # are refused and flagged for development (groups.py allowlist).
+        from backend.routes.groups import (
+            combined_shape_label,
+            combined_shape_supported,
+            reject_unsupported_combined_shape,
+        )
+
+        if kind == "groups":
+            fmt = str((chosen or {}).get("group_format") or "")
+            if fmt == "de8" and (chosen or {}).get("group_variant") == "de8_top3":
+                fmt = "de8_top3"
+            combined_shape = combined_shape_label(fmt, len(group_brackets))
+            combined_supported = combined_shape_supported(fmt, len(group_brackets))
+            if not combined_supported:
+                reject_unsupported_combined_shape(fmt, len(group_brackets), int(event.get("event_id") or 0) or None)
+        else:
+            combined_shape = f"{kind} + {playoff_stage['label']}"
+            from backend.services import dev_flags
+
+            dev_flags.flag(
+                key=f"combined:{kind}",
+                kind="combined_playoff_shape",
+                detail=f"{combined_shape}: one fantasy game scoring a {kind} stage plus its playoff is not modelled.",
+                event_id=int(event.get("event_id") or 0) or None,
+            )
+
     return {
         "kind": kind,
         "label": label,
         "group_format": (chosen or {}).get("group_format"),
         "group_variant": (chosen or {}).get("group_variant"),
-        "playoff_size": int((chosen or {}).get("playoff_size") or 0),
+        "playoff_size": playoff_size,
+        "playoff_byes": playoff_byes,
+        "combined_playoffs": combined,
+        "combined_supported": combined_supported,
+        "combined_shape": combined_shape,
+        "stage_scoped": stage_scoped,
+        "stage_scope_reason": scope_reason,
         "team_count": team_count,
         "stages": [
             {"kind": c["kind"], "label": c["label"], "size": c["size"], "roster_size": len(c["roster"])}
@@ -4436,6 +4527,56 @@ def get_event_swiss_context(event_id: int):
     }
 
 
+# Kind detection re-parses the archived event page (~600 KB of HTML + typed
+# JSON) on every call, and the Events page asks for every event at once — ten
+# concurrent parses took ~1.5 s each. The result is deterministic given the
+# snapshot, the priced roster and the sibling fantasy games' names, so cache it
+# on that signature (a new snapshot, roster or rename invalidates naturally).
+_KIND_CACHE: Dict[int, tuple] = {}
+_KIND_CACHE_LOCK = threading.Lock()
+
+
+def _kind_signature(event: Dict[str, Any]) -> tuple:
+    from backend.data.page_snapshots import latest_snapshot_time
+
+    hid = int(event.get("hltv_event_id") or 0)
+    snap_ts = latest_snapshot_time(f"https://www.hltv.org/events/{hid}/") if hid else None
+    siblings = tuple(
+        sorted(
+            (int(row.get("event_id") or 0), str(row.get("name") or ""))
+            for row in list_events()
+            if hid and int(row.get("hltv_event_id") or 0) == hid
+        )
+    )
+    roster = tuple(sorted(str(t.get("team_name") or "") for t in (event.get("teams") or [])))
+    return (hid, snap_ts, roster, siblings)
+
+
+def _detect_event_tournament_kind_cached(event: Dict[str, Any]) -> Dict[str, Any]:
+    event_id = int(event.get("event_id") or 0)
+    signature = _kind_signature(event)
+    with _KIND_CACHE_LOCK:
+        cached = _KIND_CACHE.get(event_id)
+    if cached and cached[0] == signature:
+        return cached[1]
+    detected = _detect_event_tournament_kind(event)
+    with _KIND_CACHE_LOCK:
+        _KIND_CACHE[event_id] = (signature, detected)
+    return detected
+
+
+def warm_kind_cache() -> None:
+    """Detect every event's kind once in the background at startup so the
+    Events page's burst of /kind calls never pays the cold parse (~1.2 s)."""
+    try:
+        for row in list_events():
+            event = get_event_detail(int(row.get("event_id") or 0))
+            if event:
+                _detect_event_tournament_kind_cached(event)
+    except Exception:
+        logger.debug("kind cache warm-up failed", exc_info=True)
+
+
 @router.get("/{event_id}/kind")
 def get_event_kind(event_id: int):
     """Tournament kind for a fantasy event: auto-detected, with any manual
@@ -4443,7 +4584,7 @@ def get_event_kind(event_id: int):
     event = get_event_detail(int(event_id))
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
-    detected = _detect_event_tournament_kind(event)
+    detected = _detect_event_tournament_kind_cached(event)
     override = get_event_tournament_kind(int(event_id))
     kind = override or detected["kind"]
     if override and override != detected["kind"]:
@@ -4464,6 +4605,12 @@ def get_event_kind(event_id: int):
         "group_format": detected["group_format"],
         "group_variant": detected.get("group_variant"),
         "playoff_size": detected["playoff_size"],
+        "playoff_byes": detected.get("playoff_byes", 0),
+        "combined_playoffs": detected.get("combined_playoffs", False),
+        "combined_supported": detected.get("combined_supported", False),
+        "combined_shape": detected.get("combined_shape", ""),
+        "stage_scoped": detected.get("stage_scoped", False),
+        "stage_scope_reason": detected.get("stage_scope_reason", ""),
         "team_count": detected["team_count"],
         "stages": detected["stages"],
         "formats_table": detected["formats_table"],

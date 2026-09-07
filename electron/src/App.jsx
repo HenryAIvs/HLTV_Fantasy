@@ -70,6 +70,16 @@ const ROLE_NAMES = {
   11: "Eco Friendly",
 };
 
+// Reverse lookup for role badges when only a role NAME is stored (normalized
+// to bare letters so "Entry Fragger" / "entry_fragger" both resolve).
+const ROLE_ID_BY_NAME = Object.fromEntries(
+  Object.entries(ROLE_NAMES).map(([id, name]) => [String(name).toLowerCase().replace(/[^a-z]/g, ""), Number(id)])
+);
+const roleIdFromName = (roleName) => {
+  const key = String(roleName || "").toLowerCase().replace(/[^a-z]/g, "");
+  return key in ROLE_ID_BY_NAME ? ROLE_ID_BY_NAME[key] : null;
+};
+
 // Short round labels for the playoff EV per-round splits / reach odds.
 const STAGE_SHORT = {
   round_of_32: "R32",
@@ -104,9 +114,15 @@ const BoosterBadge = ({ boosterId, size = 68 }) => {
   return <SpriteBadge url={boosterBadgesUrl} cols={5} rows={4} index={idx} size={size} className="role-badge booster-badge" />;
 };
 
+// The backend picks a free port at startup and memorizes it; inside Electron the
+// preload hands us the resolved base URL. The 8000 fallback only applies when
+// the renderer runs in a plain browser (Vite dev) with no preload.
+const API_BASE =
+  (typeof window !== "undefined" && window.api?.baseUrl) || import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
+
 // Cached HLTV images served by the backend (see backend/services/image_cache).
 // Both components fall back to an initials chip when the image isn't cached.
-const ASSETS_BASE = "http://127.0.0.1:8000/assets";
+const ASSETS_BASE = `${API_BASE}/assets`;
 
 const initialsOf = (name) => {
   const parts = String(name || "").trim().split(/\s+/).filter(Boolean);
@@ -211,7 +227,7 @@ const requestJson = async (path, init = {}, timeoutMs = 60000) => {
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   let res;
   try {
-    res = await fetch(`http://127.0.0.1:8000${path}`, { ...init, signal: controller.signal });
+    res = await fetch(`${API_BASE}${path}`, { ...init, signal: controller.signal });
   } catch (e) {
     if (e?.name === "AbortError") {
       throw new Error("Request timed out — the backend may still be working. Wait a moment and retry.");
@@ -265,12 +281,69 @@ const Section = ({ title, children }) => (
   </section>
 );
 
-const Input = ({ label, value, onChange, type = "text", placeholder = "" }) => (
-  <label className="field">
+const Input = ({ label, value, onChange, type = "text", placeholder = "", className = "" }) => (
+  <label className={`field${className ? ` ${className}` : ""}`}>
     <span>{label}</span>
     <input value={value} onChange={(e) => onChange(e.target.value)} type={type} placeholder={placeholder} />
   </label>
 );
+
+// Text input with a suggestion dropdown filtered by the typed value. Optional
+// `actions` add per-row buttons (e.g. Include/Exclude) that receive the name.
+const SuggestInput = ({ label, value, onChange, placeholder = "", suggestions = [], actions = null }) => {
+  const [open, setOpen] = useState(false);
+  const q = String(value || "").trim().toLowerCase();
+  const matches = q ? suggestions.filter((s) => s.toLowerCase().includes(q)).slice(0, 8) : [];
+  return (
+    <label className="field suggest-field">
+      <span>{label}</span>
+      <input
+        value={value}
+        onChange={(e) => {
+          onChange(e.target.value);
+          setOpen(true);
+        }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setOpen(false)}
+        type="text"
+        placeholder={placeholder}
+      />
+      {open && matches.length > 0 && (
+        <div className="suggest-list">
+          {matches.map((name) => (
+            <div key={name} className="suggest-row">
+              <button
+                type="button"
+                className="suggest-item"
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  onChange(name);
+                  setOpen(false);
+                }}
+              >
+                {name}
+              </button>
+              {(actions || []).map((a) => (
+                <button
+                  key={a.key}
+                  type="button"
+                  className={`suggest-action ${a.key}`}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    a.onPick(name);
+                    setOpen(false);
+                  }}
+                >
+                  {a.label}
+                </button>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+    </label>
+  );
+};
 
 const Select = ({ label, value, onChange, options }) => (
   <label className="field">
@@ -924,7 +997,7 @@ function PriceVsPointsPanel({ title, rows, slope, intercept, showTable = true, o
           {showTable && (
             <>
               <div className="grid two">
-                <Input label="Search Players" value={search} onChange={setSearch} placeholder="Player name" />
+                <Input label="Search Players" value={search} onChange={setSearch} placeholder="Player name" className="search-field" />
               </div>
               <table>
                 <thead>
@@ -2021,7 +2094,7 @@ function TopTeamsTab({ teamLookup, selected, bo, sims, results, onOpenPlayer }) 
                 </button>
               </div>
               <div className="grid two top5-controls">
-                <Input label="Search Combos" value={comboSearch} onChange={setComboSearch} placeholder="Player/team name or id" />
+                <Input label="Search Combos" value={comboSearch} onChange={setComboSearch} placeholder="Player name" className="search-field" />
                 <div className="field top5-counter">
                   <span>Filtered / Stored</span>
                   <p className="muted">{filteredCount} / {totalTeams}</p>
@@ -3532,6 +3605,47 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       .map((pid) => Number(pid))
       .filter((pid) => Number.isFinite(pid) && pid > 0);
   };
+  // Autocomplete pool for the combo search: names of everyone on a bracket team.
+  const comboSearchPidByName = useMemo(() => {
+    const m = {};
+    playoffTeamsForFilters.forEach((t) => {
+      teamPlayerIds(t.team_id).forEach((pid) => {
+        const nm = playerNameById[pid];
+        if (nm) m[String(nm)] = pid;
+      });
+    });
+    return m;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playoffTeamsForFilters, playerNameById, teams]);
+  const comboSearchNames = useMemo(
+    () => Object.keys(comboSearchPidByName).sort((a, b) => a.localeCompare(b)),
+    [comboSearchPidByName]
+  );
+  // Include/Exclude straight from the search dropdown — applied immediately,
+  // shown (and removable) in the Player Filters chip strip.
+  const addPlayerFilterByName = (name, kind) => {
+    const pid = comboSearchPidByName[name];
+    if (!pid) return;
+    const addTo = (setter) => setter((prev) => new Set(prev).add(pid));
+    const dropFrom = (setter) =>
+      setter((prev) => {
+        const next = new Set(prev);
+        next.delete(pid);
+        return next;
+      });
+    if (kind === "include") {
+      addTo(setIncludeSet);
+      addTo(setAppliedIncludeSet);
+      dropFrom(setExcludeSet);
+      dropFrom(setAppliedExcludeSet);
+    } else {
+      addTo(setExcludeSet);
+      addTo(setAppliedExcludeSet);
+      dropFrom(setIncludeSet);
+      dropFrom(setAppliedIncludeSet);
+    }
+    setComboSearch("");
+  };
   const buildEffectivePlayerFilters = (playerInclude, playerExclude, teamInclude, teamExclude) => {
     const include = new Set(playerInclude || []);
     const exclude = new Set(playerExclude || []);
@@ -4521,19 +4635,21 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     [effectiveAppliedFilters]
   );
 
+  // Only query rosters while the Top 5 tab is showing (the query used to run
+  // on every Tournament open, before the user had asked for it).
   useEffect(() => {
-    if (!baseTeams) return;
+    if (!baseTeams || playoffTab !== "top5") return;
     querySharedCombinations(page);
-  }, [baseTeams, effectiveFiltersSignature, comboSearch, sortKey, playoffBestMode]);
+  }, [baseTeams, effectiveFiltersSignature, comboSearch, sortKey, playoffBestMode, playoffTab]);
 
   useEffect(() => {
-    if (!baseTeams) return;
+    if (!baseTeams || playoffTab !== "top5") return;
     if (playoffTopSubtab === "completed" && !completedBracketDerived.complete) {
       setCompletedBracketResult(null);
       return;
     }
     querySharedCombinations(0);
-  }, [playoffTopSubtab, completedBracket, completedBracketDerived.complete, hasThirdPlaceDecider]);
+  }, [playoffTopSubtab, completedBracket, completedBracketDerived.complete, hasThirdPlaceDecider, playoffTab]);
 
   const querySharedCombinations = async (nextPage = 0) => {
     if (!baseTeams) return;
@@ -4580,19 +4696,9 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     let filtered = applyFilters(base, effectiveAppliedFilters.include, effectiveAppliedFilters.exclude);
     const q = comboSearch.trim().toLowerCase();
     if (q) {
-      filtered = filtered.filter((team) => {
-        if (String(team.cost ?? "").includes(q) || String(team.total_ev ?? "").includes(q)) return true;
-        return (team.players || []).some((p) => {
-          const name = String(p.name || "").toLowerCase();
-          const teamName = String(teamLookup[p.team_id] || "").toLowerCase();
-          return (
-            name.includes(q) ||
-            teamName.includes(q) ||
-            String(p.player_id).includes(q) ||
-            String(p.team_id).includes(q)
-          );
-        });
-      });
+      filtered = filtered.filter((team) =>
+        (team.players || []).some((p) => String(p.name || "").toLowerCase().includes(q))
+      );
     }
     const sorted = [...filtered].sort((a, b) => {
       if (sortKey === "cost_asc") return Number(a.cost || 0) - Number(b.cost || 0);
@@ -4904,196 +5010,147 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                     </div>
                   </div>
                 )}
-                <div className="tab-bar small">
-                  {playoffTopSubtabs.map((tab) => (
-                    <button
-                      key={tab.key}
-                      className={playoffTopSubtab === tab.key ? "tab active" : "tab"}
-                      onClick={() => setPlayoffTopMode(tab.key)}
-                    >
-                      {tab.label}
-                    </button>
-                  ))}
+                <div className="top5-mode-row">
+                  <div className="seg">
+                    {playoffTopSubtabs
+                      .filter((t) => t.key !== "completed")
+                      .map((t) => (
+                        <button
+                          key={t.key}
+                          className={`seg-btn${playoffTopSubtab !== "completed" && playoffBestMode === t.key ? " on" : ""}`}
+                          onClick={() => setPlayoffTopMode(t.key)}
+                        >
+                          {t.label}
+                        </button>
+                      ))}
+                  </div>
+                  <button
+                    className={`seg-standalone${playoffTopSubtab === "completed" ? " on" : ""}`}
+                    onClick={() => setPlayoffTopMode(playoffTopSubtab === "completed" ? playoffBestMode : "completed")}
+                  >
+                    Completed Bracket
+                  </button>
                 </div>
                 <div className="card sub">
-                  <h3>{playoffTopSubtab === "completed" ? "Completed Bracket Filters" : `Top Teams (Filtered) - ${playoffBestModeLabel}`}</h3>
+                  <h3>{playoffTopSubtab === "completed" ? "Completed Bracket Filters" : `Top Teams - ${playoffBestModeLabel}`}</h3>
                   <div className="top5-filters">
-                    <div className="grid two">
-                      <div className="field">
-                        <span>Included Players</span>
-                        <div className="chips">
-                          {Array.from(includeSet).length === 0 && <span className="muted">None</span>}
-                          {Array.from(includeSet).sort((a, b) => a - b).map((pid) => (
-                            <span key={`p-inc-${pid}`} className="chip active">
-                              {playerNameById[pid] || `Player ${pid}`}
-                              <button
-                                className="close"
-                                style={{ marginLeft: 8, padding: "2px 6px" }}
-                                onClick={() =>
-                                  setIncludeSet((prev) => {
-                                    const next = new Set(prev);
-                                    next.delete(pid);
-                                    return next;
-                                  })
-                                }
-                              >
-                                x
-                              </button>
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-                      <div className="field">
-                        <span>Excluded Players</span>
-                        <div className="chips">
-                          {Array.from(excludeSet).length === 0 && <span className="muted">None</span>}
-                          {Array.from(excludeSet).sort((a, b) => a - b).map((pid) => (
-                            <span key={`p-exc-${pid}`} className="chip active">
-                              {playerNameById[pid] || `Player ${pid}`}
-                              <button
-                                className="close"
-                                style={{ marginLeft: 8, padding: "2px 6px" }}
-                                onClick={() =>
-                                  setExcludeSet((prev) => {
-                                    const next = new Set(prev);
-                                    next.delete(pid);
-                                    return next;
-                                  })
-                                }
-                              >
-                                x
-                              </button>
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-                    </div>
-                    <div className="grid two">
-                      <div className="field">
-                        <span>Included Teams</span>
-                        <div className="chips">
-                          {Array.from(includeTeamSet).length === 0 && <span className="muted">None</span>}
-                          {Array.from(includeTeamSet).sort((a, b) => a - b).map((tid) => (
-                            <span key={`t-inc-${tid}`} className="chip active">
-                              {teamLookup[tid] || `Team ${tid}`}
-                              <button
-                                className="close"
-                                style={{ marginLeft: 8, padding: "2px 6px" }}
-                                onClick={() =>
-                                  setIncludeTeamSet((prev) => {
-                                    const next = new Set(prev);
-                                    next.delete(tid);
-                                    return next;
-                                  })
-                                }
-                              >
-                                x
-                              </button>
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-                      <div className="field">
-                        <span>Excluded Teams</span>
-                        <div className="chips">
-                          {Array.from(excludeTeamSet).length === 0 && <span className="muted">None</span>}
-                          {Array.from(excludeTeamSet).sort((a, b) => a - b).map((tid) => (
-                            <span key={`t-exc-${tid}`} className="chip active">
-                              {teamLookup[tid] || `Team ${tid}`}
-                              <button
-                                className="close"
-                                style={{ marginLeft: 8, padding: "2px 6px" }}
-                                onClick={() =>
-                                  setExcludeTeamSet((prev) => {
-                                    const next = new Set(prev);
-                                    next.delete(tid);
-                                    return next;
-                                  })
-                                }
-                              >
-                                x
-                              </button>
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-                    </div>
                     <div className="field">
                       <span>Bracket Teams</span>
-                      <div className="chips">
+                      <div className="filter-team-grid">
                         {playoffTeamsForFilters.length === 0 && <span className="muted">Select playoff slots first.</span>}
                         {playoffTeamsForFilters.map((t) => {
                           const tid = Number(t.team_id);
-                          const isIncluded = includeTeamSet.has(tid);
-                          const isExcluded = excludeTeamSet.has(tid);
+                          const pids = teamPlayerIds(tid);
+                          const isExcluded = pids.length > 0 && pids.every((pid) => excludeSet.has(pid));
                           return (
-                            <span key={`filter-team-${tid}`} className="chip" style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-                              <span>{t.name} ({tid})</span>
-                              <button
-                                className={isIncluded ? "chip active" : "chip"}
-                                style={{ padding: "2px 8px" }}
-                                onClick={() => {
-                                  setIncludeTeamSet((prev) => {
-                                    const next = new Set(prev);
-                                    if (next.has(tid)) next.delete(tid);
-                                    else next.add(tid);
-                                    return next;
-                                  });
-                                  setExcludeTeamSet((prev) => {
-                                    const next = new Set(prev);
-                                    next.delete(tid);
-                                    return next;
-                                  });
-                                }}
-                              >
-                                {isIncluded ? "Included" : "Include"}
-                              </button>
-                              <button
-                                className={isExcluded ? "chip active" : "chip"}
-                                style={{ padding: "2px 8px" }}
-                                onClick={() => {
-                                  setExcludeTeamSet((prev) => {
-                                    const next = new Set(prev);
-                                    if (next.has(tid)) next.delete(tid);
-                                    else next.add(tid);
-                                    return next;
-                                  });
-                                  setIncludeTeamSet((prev) => {
-                                    const next = new Set(prev);
-                                    next.delete(tid);
-                                    return next;
-                                  });
-                                }}
-                              >
-                                {isExcluded ? "Excluded" : "Exclude"}
-                              </button>
-                            </span>
+                            <div key={`filter-team-${tid}`} className={`filter-team-card${isExcluded ? " exc" : ""}`}>
+                              <TeamLogo hltvTeamId={t.hltv_team_id} name={t.name} size={26} />
+                              <span className="filter-team-name">{t.name}</span>
+                              <div className="filter-team-toggles">
+                                <button
+                                  className={`filter-toggle out${isExcluded ? " on" : ""}`}
+                                  onClick={() => {
+                                    // Toggle the team's five players in the shared
+                                    // exclude list (they show as chips like any other).
+                                    const update = (setter) =>
+                                      setter((prev) => {
+                                        const next = new Set(prev);
+                                        pids.forEach((pid) => (isExcluded ? next.delete(pid) : next.add(pid)));
+                                        return next;
+                                      });
+                                    update(setExcludeSet);
+                                    update(setAppliedExcludeSet);
+                                    if (!isExcluded) {
+                                      const dropInc = (setter) =>
+                                        setter((prev) => {
+                                          const next = new Set(prev);
+                                          pids.forEach((pid) => next.delete(pid));
+                                          return next;
+                                        });
+                                      dropInc(setIncludeSet);
+                                      dropInc(setAppliedIncludeSet);
+                                    }
+                                  }}
+                                >
+                                  {isExcluded ? "Excluded" : "Exclude"}
+                                </button>
+                              </div>
+                            </div>
                           );
                         })}
                       </div>
                     </div>
-                    <div className="actions top5-filter-actions">
-                      <button className="secondary" onClick={() => setShowFilterModal(true)} disabled={!latestPayload}>
-                        Include/Exclude by Name
-                      </button>
-                      <button
-                        className="primary"
-                        onClick={() => {
-                          setAppliedIncludeSet(new Set(Array.from(includeSet)));
-                          setAppliedExcludeSet(new Set(Array.from(excludeSet)));
-                          setAppliedIncludeTeamSet(new Set(Array.from(includeTeamSet)));
-                          setAppliedExcludeTeamSet(new Set(Array.from(excludeTeamSet)));
-                        }}
-                        disabled={!latestPayload}
-                      >
-                        Apply Filters
-                      </button>
-                    </div>
-                    <div className="grid two top5-controls">
-                      <Input label="Search Combos" value={comboSearch} onChange={setComboSearch} placeholder="Player/team name or id" />
-                      <div className="field top5-counter">
-                        <span>Filtered / Stored</span>
-                        <p className="muted">{filteredCount} / {sharedComboCount}</p>
+                    {(includeSet.size > 0 || excludeSet.size > 0) && (
+                      <div className="grid two">
+                        {includeSet.size > 0 && (
+                          <div className="filter-group in">
+                            <div className="filter-group-title">Included Players</div>
+                            <div className="chips">
+                              {Array.from(includeSet).sort((a, b) => a - b).map((pid) => (
+                                <button
+                                  key={`p-inc-${pid}`}
+                                  className="filter-chip in"
+                                  title="Remove filter"
+                                  onClick={() => {
+                                    const drop = (setter) =>
+                                      setter((prev) => {
+                                        const next = new Set(prev);
+                                        next.delete(pid);
+                                        return next;
+                                      });
+                                    drop(setIncludeSet);
+                                    drop(setAppliedIncludeSet);
+                                  }}
+                                >
+                                  <PlayerPhoto playerId={pid} name={playerNameById[pid]} size={20} />
+                                  {playerNameById[pid] || `Player ${pid}`} <span className="x">&times;</span>
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {excludeSet.size > 0 && (
+                          <div className="filter-group out">
+                            <div className="filter-group-title">Excluded Players</div>
+                            <div className="chips">
+                              {Array.from(excludeSet).sort((a, b) => a - b).map((pid) => (
+                                <button
+                                  key={`p-exc-${pid}`}
+                                  className="filter-chip out"
+                                  title="Remove filter"
+                                  onClick={() => {
+                                    const drop = (setter) =>
+                                      setter((prev) => {
+                                        const next = new Set(prev);
+                                        next.delete(pid);
+                                        return next;
+                                      });
+                                    drop(setExcludeSet);
+                                    drop(setAppliedExcludeSet);
+                                  }}
+                                >
+                                  <PlayerPhoto playerId={pid} name={playerNameById[pid]} size={20} />
+                                  {playerNameById[pid] || `Player ${pid}`} <span className="x">&times;</span>
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    <div className="top5-controls-row">
+                      <div className="top5-search">
+                        <SuggestInput
+                          label="Search / Filter Players"
+                          value={comboSearch}
+                          onChange={setComboSearch}
+                          placeholder="Player name"
+                          suggestions={comboSearchNames}
+                          actions={[
+                            { key: "in", label: "Include", onPick: (name) => addPlayerFilterByName(name, "include") },
+                            { key: "out", label: "Exclude", onPick: (name) => addPlayerFilterByName(name, "exclude") },
+                          ]}
+                        />
                       </div>
                     </div>
                   </div>
@@ -5426,78 +5483,82 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       {playoffTab === "top5" && playoffTopSubtab !== "completed" && topTeams && topTeams.length > 0 && (
         <div className="card sub">
           <h3>Top Teams</h3>
-          {topTeams.map((team, idx) => (
-            <div key={idx} className="card sub">
-              <h4>
-                #{idx + 1} {playoffTeamMetricLabel(team)} | Cost {team.cost}
-              </h4>
-              {playoffBestMode === "most_outcomes" &&
-                (Array.isArray(team.winning_outcome_indexes) &&
-                team.winning_outcome_indexes.length > 0 &&
-                (results?.outcomes || []).length > 0 ? (
-                  <div>
-                    <p className="muted">Bracket outcomes this roster wins ({team.winning_outcome_indexes.length}):</p>
-                    <ul className="muted">
-                      {team.winning_outcome_indexes
-                        .map((outcomeIdx) => playoffOutcomeDescriptor(outcomeIdx))
-                        .filter(Boolean)
-                        .sort((a, b) => b.probability - a.probability)
-                        .slice(0, 12)
-                        .map((o, i) => (
-                          <li key={i}>
-                            {(o.probability * 100).toFixed(2)}% — {o.champion} beats {o.runnerUp} in the final
-                            {o.third ? ` | 3rd: ${o.third}` : ""} | SF winners: {o.sfWinners} | QF winners: {o.qfWinners}
-                          </li>
-                        ))}
-                    </ul>
-                    {team.winning_outcome_indexes.length > 12 && (
-                      <p className="muted">+{team.winning_outcome_indexes.length - 12} more lower-probability outcomes</p>
-                    )}
+          <div className="event-team-rows">
+            {topTeams.map((team, idx) => (
+              <div key={idx} className="stack combo-team">
+                <div className="event-team-row">
+                  <div className="event-team-head">
+                    <div className="combo-rank">#{idx + 1}</div>
+                    <div className="event-team-headtext">
+                      <span className="event-team-name">{playoffTeamMetricLabel(team)}</span>
+                      <span className="combo-cost">Cost ${Number(team.cost || 0).toLocaleString()}</span>
+                    </div>
                   </div>
-                ) : (
-                  <p className="muted">Re-run Combinations to see which bracket outcomes this roster wins.</p>
-                ))}
-              <table>
-                <thead>
-                  <tr>
-                    <th>Player</th>
-                    <th>Team</th>
-                    <th>Assigned Role</th>
-                    <th>Cost</th>
-                    <th>Total EV</th>
-                    <th>Mode Score</th>
-                    <th>Rating</th>
-                    <th>Win</th>
-                    <th>Role</th>
-                    <th>Booster</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {team.players.map((p) => (
-                    <tr key={p.player_id}>
-                      <td>
-                        <button
-                          className="inline-link-btn"
+                  <div className="event-team-players">
+                    {team.players.map((p) => {
+                      const roleId = roleIdFromName(p.role_name);
+                      return (
+                        <div
+                          className="event-player-card clickable"
+                          key={p.player_id}
                           onClick={() => openProjectedRosterBreakdown(p, team.players || [])}
                         >
-                          {p.name}
-                        </button>
-                      </td>
-                      <td>{teamLookup[p.team_id] || p.team_id}</td>
-                      <td>{roleLabel(p.role_name)}</td>
-                      <td>{p.price}</td>
-                      <td>{p.total_ev.toFixed(2)}</td>
-                      <td>{playoffPlayerModeScore(p).toFixed(2)}</td>
-                      <td>{p.rating_ev.toFixed(2)}</td>
-                      <td>{p.win_ev.toFixed(2)}</td>
-                      <td>{p.role_ev.toFixed(2)}</td>
-                      <td>{p.booster_ev.toFixed(2)}</td>
-                    </tr>
+                          <PlayerPhoto playerId={Number(p.player_id)} name={p.name} size={52} />
+                          <div className="event-player-name">{p.name}</div>
+                          <div className="event-player-team">{teamLookup[p.team_id] || p.team_id}</div>
+                          <div className="event-player-role">
+                            {roleId != null && <RoleBadge roleId={roleId} size={16} />}
+                            <span>{roleLabel(p.role_name)}</span>
+                          </div>
+                          <div className="event-player-rating">{playoffPlayerModeScore(p).toFixed(2)}</div>
+                          <div className="event-player-stats ev-mini">
+                            {[
+                              ["Rating", p.rating_ev],
+                              ["Win", p.win_ev],
+                              ["Role", p.role_ev],
+                              ["Boost", p.booster_ev],
+                            ].map(([label, value]) => (
+                              <div className="event-player-stat" key={label}>
+                                <div className="event-player-mini">{Number(value || 0).toFixed(1)}</div>
+                                <div className="event-player-stat-label">{label}</div>
+                              </div>
+                            ))}
+                          </div>
+                          <div className="event-player-price combo-price">${Math.round(Number(p.price || 0) / 1000)}k</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+                {playoffBestMode === "most_outcomes" &&
+                  (Array.isArray(team.winning_outcome_indexes) &&
+                  team.winning_outcome_indexes.length > 0 &&
+                  (results?.outcomes || []).length > 0 ? (
+                    <div className="combo-outcomes">
+                      <p className="muted">Bracket outcomes this roster wins ({team.winning_outcome_indexes.length}):</p>
+                      <ul className="muted">
+                        {team.winning_outcome_indexes
+                          .map((outcomeIdx) => playoffOutcomeDescriptor(outcomeIdx))
+                          .filter(Boolean)
+                          .sort((a, b) => b.probability - a.probability)
+                          .slice(0, 12)
+                          .map((o, i) => (
+                            <li key={i}>
+                              {(o.probability * 100).toFixed(2)}% — {o.champion} beats {o.runnerUp} in the final
+                              {o.third ? ` | 3rd: ${o.third}` : ""} | SF winners: {o.sfWinners} | QF winners: {o.qfWinners}
+                            </li>
+                          ))}
+                      </ul>
+                      {team.winning_outcome_indexes.length > 12 && (
+                        <p className="muted">+{team.winning_outcome_indexes.length - 12} more lower-probability outcomes</p>
+                      )}
+                    </div>
+                  ) : (
+                    <p className="muted">Re-run Combinations to see which bracket outcomes this roster wins.</p>
                   ))}
-                </tbody>
-              </table>
-            </div>
-          ))}
+              </div>
+            ))}
+          </div>
         </div>
       )}
       {playoffTab === "top5" && playoffTopSubtab !== "completed" && allTeams && allTeams.length > 0 && (
@@ -7029,7 +7090,7 @@ function MatchesDataPanel({ notify, mode = "full", teams = [], players = [], onO
       {showTable && (
       <>
       <div className="grid two">
-        <Input label="Search Matches" value={matchSearch} onChange={changeMatchSearch} placeholder="Team or day/month/year" />
+        <Input label="Search Matches" value={matchSearch} onChange={changeMatchSearch} placeholder="Team or day/month/year" className="search-field" />
         <div className="match-rank-filter">
           <Input label="VRS Rank" value={matchRankValue} onChange={changeMatchRankValue} placeholder="e.g. 50" />
           <Select
@@ -7157,9 +7218,27 @@ function MatchesDataPanel({ notify, mode = "full", teams = [], players = [], onO
   );
 }
 
-function MatchDetailModal({ row, onClose, teams = [], players = [], onOpenPlayer, onOpenTeam }) {
+function MatchDetailModal({ row: listRow, onClose, teams = [], players = [], onOpenPlayer, onOpenTeam }) {
   // Stored-match detail view shared by the Matches browser and the player
-  // card's Recent Matches list.
+  // card's Recent Matches list. The Matches browser's list rows come without
+  // the detail blobs (they are ~8 KB a row and only this modal reads them),
+  // so fetch the full stored row on open when they are missing.
+  const [fullRow, setFullRow] = useState(null);
+  useEffect(() => {
+    setFullRow(null);
+    if (!listRow?.match_url || listRow.maps_json !== undefined) return;
+    let cancelled = false;
+    api
+      .get(`/events/hltv-results/stored?match_url=${encodeURIComponent(listRow.match_url)}`, 30000)
+      .then((data) => {
+        if (!cancelled && data && !data.detail) setFullRow(data);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [listRow?.match_url]);
+  const row = fullRow ? { ...listRow, ...fullRow } : listRow;
   let maps = [];
   try {
     const parsed = JSON.parse(String(row?.maps_json || "[]"));
@@ -8094,7 +8173,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
         ) : (
           <div className="players-panel">
             <div className="grid two">
-              <Input label="Search Players" value={playerSearch} onChange={setPlayerSearch} placeholder="Name or team" />
+              <Input label="Search Players" value={playerSearch} onChange={setPlayerSearch} placeholder="Name or team" className="search-field" />
             </div>
             <div className="players-table-wrap">
             <table className="players-table">
@@ -8708,7 +8787,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
           <>
             <div className="teams-controls">
               <div className="grid two teams-filters">
-                <Input label="Search Teams" value={teamSearch} onChange={setTeamSearch} placeholder="Name or player" />
+                <Input label="Search Teams" value={teamSearch} onChange={setTeamSearch} placeholder="Name or player" className="search-field" />
               </div>
             </div>
             <table>
@@ -9554,6 +9633,24 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
     rankings: "Team rankings (HLTV + VRS)",
     matches: "New matches played",
     ratings: "Player Top-X ratings",
+    valuations: "Event valuations (groups + playoff)",
+    hltv_session: "HLTV login check",
+  };
+  // The scraper browser's HLTV login rides on a remember-me cookie that dies on
+  // a fixed date (~400 days after the last real sign-in); the nightly run
+  // re-checks it and this button checks on demand (one page load, ~10-20s).
+  const [sessionBusy, setSessionBusy] = useState(false);
+  const checkSession = async () => {
+    setSessionBusy(true);
+    setMessage("");
+    try {
+      await api.get("/admin/hltv-session-status", 120000);
+      await loadStatus(); // the pill below re-renders from the persisted snapshot
+    } catch (e) {
+      setMessage(e?.message || "HLTV login check failed");
+    } finally {
+      setSessionBusy(false);
+    }
   };
 
   const loadStatus = async () => {
@@ -9664,6 +9761,39 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
             <div className="pill">{status?.next_run_at ? new Date(status.next_run_at * 1000).toLocaleString() : "-"}</div>
           </div>
         </div>
+        <div className="field" style={{ marginTop: 8 }}>
+          <span>HLTV login (scraper browser)</span>
+          <div className="pills">
+            <div className={status?.hltv_session && status.hltv_session.level !== "ok" ? "pill warn" : "pill"}>
+              {status?.hltv_session?.message || "Not checked yet"}
+            </div>
+            <button className="secondary" onClick={checkSession} disabled={sessionBusy || state.running}>
+              {sessionBusy ? "Checking..." : "Check now"}
+            </button>
+          </div>
+          {status?.hltv_session?.checked_at && (
+            <div className="muted" style={{ fontSize: 12 }}>
+              Last checked {new Date(status.hltv_session.checked_at * 1000).toLocaleString()}; re-checked after every nightly run,
+              warns 30 days before the login cookie expires.
+            </div>
+          )}
+        </div>
+        {Array.isArray(status?.dev_flags) && status.dev_flags.length > 0 && (
+          <div className="field" style={{ marginTop: 8 }}>
+            <span>Flagged for development</span>
+            <div className="pills" style={{ flexWrap: "wrap" }}>
+              {status.dev_flags.map((f) => (
+                <div className="pill warn" key={f.key} title={f.detail}>
+                  {f.key}
+                  {Array.isArray(f.event_ids) && f.event_ids.length > 0 ? ` (event ${f.event_ids.join(", ")})` : ""}
+                </div>
+              ))}
+            </div>
+            <div className="muted" style={{ fontSize: 12 }}>
+              Formats the app met but refuses to model until their bracket is verified. Hover a flag for details.
+            </div>
+          </div>
+        )}
         {message && <p className="muted">{message}</p>}
       </Section>
 
@@ -11299,14 +11429,15 @@ function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
   return (
     <div className="stack">
       <div className="tab-bar small">
+        {/* Same order as the Playoff tab: stage, player value, top 5. */}
         <button className={swissTab === "group" ? "tab active" : "tab"} onClick={() => setSwissTab("group")}>
-          Group Stage
-        </button>
-        <button className={swissTab === "top5" ? "tab active" : "tab"} onClick={() => setSwissTab("top5")}>
-          Top 5 Teams
+          Swiss Stage
         </button>
         <button className={swissTab === "value" ? "tab active" : "tab"} onClick={() => setSwissTab("value")}>
           Player Value
+        </button>
+        <button className={swissTab === "top5" ? "tab active" : "tab"} onClick={() => setSwissTab("top5")}>
+          Top 5 Teams
         </button>
         <button className={swissTab === "single" ? "tab active" : "tab"} onClick={() => setSwissTab("single")}>
           Bracket Simulator
@@ -11360,7 +11491,246 @@ function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
   );
 }
 
-function GroupsTab({ teams, teamLookup, players, refresh, groupVariant = null }) {
+// Display-only double-elimination group bracket drawn with the Playoff tab's
+// card + connector system (.pb-bracket): an upper bracket and a lower bracket,
+// each laid out exactly as the simulator plays it, with a footer on the
+// deciding cards saying where each place leads. slotIds = the group's seeds in
+// HLTV slot order (UB 1 = seeds 1 v 2, ...); "" or "unknown" = TBD.
+function GroupTeamRow({ teamId, name, placeholder, muted = false, hltvIdByTeamId }) {
+  const id = Number(teamId);
+  const known = Number.isFinite(id) && id > 0;
+  return (
+    <div className={`playoff-team-row${muted ? " muted" : ""}`}>
+      {known ? (
+        <TeamLogo hltvTeamId={hltvIdByTeamId[id]} name={name} size={24} />
+      ) : (
+        <span className="playoff-team-badge empty">?</span>
+      )}
+      {known ? <span>{name}</span> : <span className="playoff-team-tbd">{placeholder || "TBD"}</span>}
+    </div>
+  );
+}
+
+function GroupMatchCard({ title, meta, rows, places }) {
+  return (
+    <div className="playoff-match-card">
+      <div className="playoff-match-head">
+        <strong>{title}</strong>
+        <span>{meta}</span>
+      </div>
+      <div className="playoff-match-teams">{rows}</div>
+      {places && places.length > 0 && (
+        <div className="playoff-match-foot">
+          {places.map((p) => (
+            <span className={`playoff-place ${p.kind}`} key={p.text}>
+              {p.text}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function GroupBracketVisual({ format, slotIds, nameOf, hltvIdByTeamId, combined, bo = 3 }) {
+  const meta = `BO${bo}`;
+  const seed = (i, key) => {
+    const v = slotIds[i];
+    const id = v && v !== "unknown" ? Number(v) : 0;
+    return (
+      <GroupTeamRow
+        key={key}
+        teamId={id}
+        name={id ? nameOf(v) : ""}
+        placeholder={id ? undefined : v === "unknown" ? "Unknown team" : `Seed ${i + 1}`}
+        hltvIdByTeamId={hltvIdByTeamId}
+      />
+    );
+  };
+  const ph = (text, key) => <GroupTeamRow key={key} teamId={0} placeholder={text} muted hltvIdByTeamId={hltvIdByTeamId} />;
+  const win = (text) => ({ kind: "win", text });
+  const drop = (text) => ({ kind: "drop", text });
+  const lose = (text) => ({ kind: "lose", text });
+
+  let upper;
+  let lower;
+  if (format === "de8_top3" || format === "de8") {
+    const top3 = format === "de8_top3";
+    upper = [
+      {
+        title: "Round 1",
+        matches: [0, 1, 2, 3].map((m) => ({
+          key: `ub${m}`,
+          title: `UB ${m + 1}`,
+          rows: [seed(2 * m, "a"), seed(2 * m + 1, "b")],
+          places: [drop("loser → lower round 1")],
+        })),
+      },
+      {
+        title: "Upper semis",
+        matches: [0, 1].map((m) => ({
+          key: `us${m}`,
+          title: `UB SF ${m + 1}`,
+          rows: [ph(`Winner UB ${2 * m + 1}`, "a"), ph(`Winner UB ${2 * m + 2}`, "b")],
+          places: top3
+            ? [drop("loser → lower semis")]
+            : [win(combined ? "winner → playoffs (1st / 2nd)" : "winner qualifies (1st / 2nd)"), drop("loser → lower round 2")],
+        })),
+      },
+    ];
+    if (top3) {
+      upper.push({
+        title: "Upper final",
+        matches: [
+          {
+            key: "uf",
+            title: "UB Final",
+            rows: [ph("Winner UB SF 1", "a"), ph("Winner UB SF 2", "b")],
+            places: [
+              win(combined ? "1st · bye to the playoff semis" : "1st · qualifies"),
+              win(combined ? "2nd · playoff quarter-finals" : "2nd · qualifies"),
+            ],
+          },
+        ],
+      });
+    }
+    lower = [
+      {
+        title: "Lower round 1",
+        matches: [0, 1].map((m) => ({
+          key: `lb${m}`,
+          title: `LB ${m + 1}`,
+          rows: [ph(`Loser UB ${2 * m + 1}`, "a"), ph(`Loser UB ${2 * m + 2}`, "b")],
+          places: [lose("loser out")],
+        })),
+      },
+      {
+        // Cross-over: each upper-semi loser meets the OTHER side's lower-round
+        // winner. Rows are ordered so the straight connector from LB m lands
+        // on the card it actually feeds.
+        title: top3 ? "Lower semis" : "Lower round 2",
+        straight: true,
+        matches: [0, 1].map((m) => ({
+          key: `ls${m}`,
+          title: top3 ? `LB SF ${m + 1}` : `LB ${m + 3}`,
+          rows: [ph(`Loser UB SF ${2 - m}`, "a"), ph(`Winner LB ${m + 1}`, "b")],
+          places: top3
+            ? [lose("loser out")]
+            : [win(combined ? "winner → playoffs (3rd / 4th)" : "winner qualifies (3rd / 4th)"), lose("loser out")],
+        })),
+      },
+    ];
+    if (top3) {
+      lower.push({
+        title: "Lower final",
+        matches: [
+          {
+            key: "lf",
+            title: "LB Final",
+            rows: [ph("Winner LB SF 1", "a"), ph("Winner LB SF 2", "b")],
+            places: [win(combined ? "3rd · playoff quarter-finals" : "3rd · qualifies"), lose("loser out (4th)")],
+          },
+        ],
+      });
+    }
+  } else {
+    upper = [
+      {
+        title: "Opening",
+        matches: [0, 1].map((m) => ({
+          key: `ub${m}`,
+          title: `Opening ${m + 1}`,
+          rows: [seed(2 * m, "a"), seed(2 * m + 1, "b")],
+          places: [drop("loser → elimination match")],
+        })),
+      },
+      {
+        title: "Winners' match",
+        matches: [
+          {
+            key: "wm",
+            title: "Winners",
+            rows: [ph("Winner Opening 1", "a"), ph("Winner Opening 2", "b")],
+            places: [win(combined ? "1st · to the playoffs" : "1st · qualifies"), drop("loser → decider")],
+          },
+        ],
+      },
+    ];
+    lower = [
+      {
+        title: "Elimination match",
+        matches: [
+          {
+            key: "em",
+            title: "Elimination",
+            rows: [ph("Loser Opening 1", "a"), ph("Loser Opening 2", "b")],
+            places: [lose("loser out (4th)")],
+          },
+        ],
+      },
+      {
+        title: "Decider",
+        straight: true,
+        matches: [
+          {
+            key: "dc",
+            title: "Decider",
+            rows: [ph("Loser Winners' match", "a"), ph("Winner Elimination", "b")],
+            places: [win(combined ? "2nd · to the playoffs" : "2nd · qualifies"), lose("loser out (3rd)")],
+          },
+        ],
+      },
+    ];
+  }
+
+  const bracket = (rounds) => (
+    <div className="pb-bracket">
+      {rounds.map((round, r) => (
+        <div className={`pb-round${round.straight ? " straight" : ""}`} key={`${round.title}-${r}`}>
+          <div className="pb-round-title">{round.title}</div>
+          <div className="pb-matches">
+            {round.matches.map((m) => (
+              <div className="pb-match-wrap" key={m.key}>
+                <GroupMatchCard title={m.title} meta={meta} rows={m.rows} places={m.places} />
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+  return (
+    <div className="group-brackets">
+      <div>
+        <div className="group-bracket-title">Upper bracket</div>
+        {bracket(upper)}
+      </div>
+      <div>
+        <div className="group-bracket-title">Lower bracket</div>
+        {bracket(lower)}
+      </div>
+    </div>
+  );
+}
+
+function GroupsTab({
+  teams,
+  teamLookup,
+  players,
+  refresh,
+  groupVariant = null,
+  // From the kind detector: does this ONE fantasy game also score the playoff
+  // bracket on the same event page (no separate "Playoffs - ..." fantasy
+  // event)? null = unknown. playoffDetected = that bracket's size/byes.
+  combinedDetected = null,
+  playoffDetected = null,
+  // Whether the backend has a verified playoff seeding for this shape; when
+  // not, the shape is refused and flagged for development.
+  combinedSupported = false,
+  combinedShape = "",
+  // Best-of for group matches from the event's formats table (default Bo3).
+  groupBo = 3,
+}) {
   const [groupsTab, setGroupsTab] = useState("stage");
   const [events, setEvents] = useState([]);
   const [selectedEventId, setSelectedEventId] = useState("");
@@ -11370,17 +11740,51 @@ function GroupsTab({ teams, teamLookup, players, refresh, groupVariant = null })
   const seedsPerGroup = groupFormat.startsWith("de8") ? 8 : 4;
   const qualsPerGroup = { gsl4: 2, de8: 4, de8_top3: 3 }[groupFormat] || 2;
   const [combinedPlayoffs, setCombinedPlayoffs] = useState(false);
-  const [playoffSims, setPlayoffSims] = useState("2000");
   const [playoffStopTeams, setPlayoffStopTeams] = useState("1");
   const [slots, setSlots] = useState(Array(8).fill(""));
   const [results, setResults] = useState(null);
   const [updatedAt, setUpdatedAt] = useState("");
+  // Combined playoffs run only for shapes whose playoff seeding has been
+  // verified against a real HLTV bracket (backend allowlist): today that is
+  // 2 groups of 8 with top 3 -> 6-team bracket. Anything else is refused and
+  // flagged for development rather than simulated under a guessed seeding.
+  const combinedAllowed = groupFormat === "de8_top3" && groupCount === 2;
+  // Detection says this one fantasy game scores the playoffs too: default the
+  // toggle on, unless a stored simulation already made a choice (loadLatest
+  // overwrites it from the saved payload right after).
+  useEffect(() => {
+    if (combinedDetected && combinedSupported && !results) {
+      setCombinedPlayoffs(true);
+      if (groupFormat === "de8_top3") setPlayoffStopTeams("1");
+    }
+  }, [combinedDetected, combinedSupported, results, groupFormat]);
   const [busy, setBusy] = useState(false);
   const [runMessage, setRunMessage] = useState("");
   const [runProgress, setRunProgress] = useState({ done: 0, total: 0 });
   const [autofillBusy, setAutofillBusy] = useState(false);
   const [autofillMessage, setAutofillMessage] = useState("");
   const [comboMode, setComboMode] = useState("average");
+  // Top 5 sub-tabs mirror the Playoff tab: the three combo modes plus the
+  // completed-bracket picker (which used to be its own top-level tab).
+  const [groupsTopSubtab, setGroupsTopSubtab] = useState("average");
+  const groupsTopSubtabs = [
+    { key: "average", label: "Average Player Value" },
+    { key: "single_outcome", label: "Best Single Outcome" },
+    { key: "most_outcomes", label: "Most Likely Winner" },
+    { key: "completed", label: "Completed Groups" },
+  ];
+  const setGroupsTopMode = (key) => {
+    setGroupsTopSubtab(key);
+    if (key !== "completed") setComboMode(key);
+  };
+  // Team logos for the bracket cards (same lookup the Playoff tab uses).
+  const hltvIdByTeamId = useMemo(() => {
+    const m = {};
+    (teams || []).forEach((t) => {
+      if (t.hltv_team_id) m[Number(t.team_id)] = Number(t.hltv_team_id);
+    });
+    return m;
+  }, [teams]);
   const [comboSearch, setComboSearch] = useState("");
   const [sortKey, setSortKey] = useState("ev_desc");
   const [topTeams, setTopTeams] = useState(null);
@@ -11513,7 +11917,7 @@ function GroupsTab({ teams, teamLookup, players, refresh, groupVariant = null })
       setSlots(savedGroups.flat().map((x) => String(x)));
     }
     setCombinedPlayoffs(Boolean(payload.combined_playoffs));
-    if (payload.n_playoff_sims) setPlayoffSims(String(payload.n_playoff_sims));
+    setBakedInfo(payload.baked || null);
     if (payload.playoff_stop_teams) setPlayoffStopTeams(String(payload.playoff_stop_teams));
     setResults(data.results || null);
     setUpdatedAt(data.updated_at ? new Date(Number(data.updated_at) * 1000).toISOString() : "");
@@ -11525,9 +11929,14 @@ function GroupsTab({ teams, teamLookup, players, refresh, groupVariant = null })
   const loadEventAutofill = async () => {
     try {
       const data = await api.get("/groups/event-autofill", 60000);
-      if (data?.status !== "ok") return;
-      const groups = data.groups || [];
-      if (groups.length === 0) return;
+      const groups = data?.status === "ok" ? data.groups || [] : [];
+      // Nothing stored, or a draw captured before HLTV published it (TBD
+      // slots): fetch the live event page instead. This replaces the old
+      // manual "Autofill from HLTV" button.
+      if (groups.length === 0 || groups.some((grp) => (grp.team_ids || []).some((id) => !(Number(id) > 0)))) {
+        await autofillFromHltv();
+        return;
+      }
       const fmt =
         data.group_format === "de8" ? (groupVariant === "de8_top3" ? "de8_top3" : "de8") : "gsl4";
       const nextSlots = groups.flatMap((grp) =>
@@ -11557,12 +11966,19 @@ function GroupsTab({ teams, teamLookup, players, refresh, groupVariant = null })
     }
   };
 
+  // Nothing renders until the stored simulation (or the event's draw) is in,
+  // so the tab never flashes an empty default format first.
+  const [ready, setReady] = useState(false);
   useEffect(() => {
     loadEvents();
     loadLatestCombos();
     (async () => {
-      const populated = await loadLatest();
-      if (!populated) await loadEventAutofill();
+      try {
+        const populated = await loadLatest();
+        if (!populated) await loadEventAutofill();
+      } finally {
+        setReady(true);
+      }
     })();
   }, []);
   useEffect(() => {
@@ -11579,7 +11995,6 @@ function GroupsTab({ teams, teamLookup, players, refresh, groupVariant = null })
         groups: groupSlots.map((g) => g.map((v) => (v === "unknown" ? "unknown" : Number(v)))),
         group_format: groupFormat,
         combined_playoffs: combinedPlayoffs,
-        n_playoff_sims: Math.max(200, Math.min(20000, Number(playoffSims) || 2000)),
         playoff_stop_teams: groupFormat === "de8_top3" ? 1 : Number(playoffStopTeams) || 1,
       });
       if (start?.detail) {
@@ -11627,6 +12042,8 @@ function GroupsTab({ teams, teamLookup, players, refresh, groupVariant = null })
     setCombosUpdatedAt("");
     setCompletedResult(null);
     setTopMessage("");
+    // Start over from HLTV's current draw (live re-sync if it has TBD slots).
+    await loadEventAutofill();
   };
 
   const runCombinations = async () => {
@@ -11699,10 +12116,12 @@ function GroupsTab({ teams, teamLookup, players, refresh, groupVariant = null })
       setTopMessage(e?.message || "Failed to load combinations.");
     }
   };
+  // Only query rosters while the Top 5 tab is actually showing: the live-pool
+  // query costs ~0.5 s and 300 KB, which used to run on every Tournament open.
   useEffect(() => {
-    if (!combosReady) return;
+    if (!combosReady || groupsTab !== "top5" || groupsTopSubtab === "completed") return;
     queryCombos(0);
-  }, [combosReady, comboMode, comboSearch, sortKey]);
+  }, [combosReady, comboMode, comboSearch, sortKey, groupsTab, groupsTopSubtab]);
 
   const completedMatchCount = groupFormat === "de8" ? 10 : 5;
   const other = (pair, winner) => (pair.length === 2 ? pair.find((t) => String(t) !== String(winner)) : undefined);
@@ -11897,14 +12316,24 @@ function GroupsTab({ teams, teamLookup, players, refresh, groupVariant = null })
   // enumerated outcomes (probabilities sum to 1 per group). Available for both
   // GSL and 8-team formats regardless of the combined-playoff toggle.
   const groupQualifyOdds = useMemo(() => {
-    const outcomes = results?.outcomes;
-    if (!Array.isArray(outcomes) || outcomes.length === 0) return [];
     const byTeam = {};
     const ensure = (tid, g) => {
       const key = Number(tid);
       if (!byTeam[key]) byTeam[key] = { teamId: key, rate: 0, group: Number(g) || 0 };
       return byTeam[key];
     };
+    // Slim stored results carry the odds precomputed (the 80 MB outcomes list
+    // stays on the backend); every team in the draw gets a row, even at 0%.
+    const precomputed = results?.qualify_odds;
+    if (precomputed && typeof precomputed === "object") {
+      (results?.groups || []).forEach((ids, g) => (ids || []).forEach((tid) => ensure(tid, g)));
+      Object.entries(precomputed).forEach(([g, odds]) => {
+        Object.entries(odds || {}).forEach(([tid, p]) => (ensure(tid, g).rate += Number(p) || 0));
+      });
+      return Object.values(byTeam).sort((a, b) => a.group - b.group || b.rate - a.rate);
+    }
+    const outcomes = results?.outcomes;
+    if (!Array.isArray(outcomes) || outcomes.length === 0) return [];
     outcomes.forEach((o) => {
       const p = Number(o.probability) || 0;
       const g = Number(o.group) || 0;
@@ -11927,6 +12356,27 @@ function GroupsTab({ teams, teamLookup, players, refresh, groupVariant = null })
   }, [results]);
 
   const [breakdownPlayer, setBreakdownPlayer] = useState(null);
+  const [bakedInfo, setBakedInfo] = useState(null);
+  const playerNameById = useMemo(() => {
+    const m = {};
+    (players || []).forEach((p) => {
+      m[Number(p.player_id)] = p.name;
+    });
+    return m;
+  }, [players]);
+  // Strip order: title odds first (when there is a playoff), then the best
+  // group-place odds, so the favourites read top-down like the Playoff tab.
+  const valuationTeamOrder = useMemo(() => {
+    if (!results?.teams) return [];
+    const score = (tid) => {
+      const title = Number(results.playoff?.advance_rate?.[String(tid)] || 0);
+      const place = results.place_odds?.[String(tid)] || {};
+      const first = Number(place["1"] || 0);
+      const anyq = Object.values(place).reduce((acc, v) => acc + Number(v || 0), 0);
+      return title * 1000 + first * 10 + anyq;
+    };
+    return Object.keys(results.teams).sort((x, y) => score(y) - score(x));
+  }, [results]);
   const openGroupPlayer = (p) => {
     const comps = playerEvByPid[Number(p.player_id)] || {};
     setBreakdownPlayer({
@@ -11977,269 +12427,143 @@ function GroupsTab({ teams, teamLookup, players, refresh, groupVariant = null })
   return (
     <Section title="Double-Elimination Groups (BO3)">
       <div className="stack">
+        {!ready && <p className="muted">Loading group stage...</p>}
+        {ready && (
+        <>
+        {/* Same order as the Playoff tab: stage, player value, top 5 (with the
+            completed-groups picker as a Top 5 sub-tab). */}
         <div className="tab-bar small">
           <button className={groupsTab === "stage" ? "tab active" : "tab"} onClick={() => setGroupsTab("stage")}>
             Group Stage
           </button>
-          <button className={groupsTab === "top5" ? "tab active" : "tab"} onClick={() => setGroupsTab("top5")}>
-            Top 5 Teams
-          </button>
-          <button className={groupsTab === "completed" ? "tab active" : "tab"} onClick={() => setGroupsTab("completed")}>
-            Completed Groups
-          </button>
           <button className={groupsTab === "value" ? "tab active" : "tab"} onClick={() => setGroupsTab("value")}>
             Player Value
+          </button>
+          <button className={groupsTab === "top5" ? "tab active" : "tab"} onClick={() => setGroupsTab("top5")}>
+            Top 5 Teams
           </button>
         </div>
 
         {groupsTab === "stage" && (
           <>
-            <div className="actions" style={{ marginTop: 0 }}>
-              <button className="secondary" onClick={autofillFromHltv} disabled={busy || autofillBusy}>
-                {autofillBusy ? "Fetching event..." : "Autofill from HLTV event"}
-              </button>
-              {autofillMessage && <span className="muted">{autofillMessage}</span>}
-            </div>
+            {/* Display-only, like the Playoff tab: the draw comes from the HLTV
+                event page, loaded on open and re-synced automatically while any
+                slot is still undecided. */}
+            {autofillMessage && <p className="muted">{autofillMessage}</p>}
             {groupSlots.map((group, g) => {
-              const openingCount = seedsPerGroup / 2;
-              const openings = Array.from({ length: openingCount }, (_, i) => [i * 2, i * 2 + 1]);
-              const label = (idx) => {
-                const v = group[idx];
-                if (!v) return `Seed ${idx + 1}`;
-                return teamName(v);
-              };
-              const seedSelect = (idx) => (
-                <select
-                  value={group[idx]}
-                  onChange={(e) => setSlot(g * seedsPerGroup + idx, e.target.value)}
-                  disabled={busy}
-                >
-                  {teamOptions.map((option) => (
-                    <option key={option.value || "empty"} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-              );
               return (
-                <div className="card sub" key={`group-${g}`}>
-                  <h3>Group {g + 1}</h3>
-                  <p className="muted">
-                    {groupFormat === "de8"
-                      ? "Opening round pairings. Each winner advances in the upper bracket; each loser drops to the lower bracket."
-                      : "Opening round pairings. Winners meet in the winners' match; losers meet in the elimination match."}
-                  </p>
-                  <div className="bracket-setup">
-                    {openings.map(([a, b], mi) => (
-                      <div className="match-row" key={`g${g}-o${mi}`}>
-                        <span className="match-tag">Opening {mi + 1}</span>
-                        <div className="match-side">{seedSelect(a)}</div>
-                        <span className="vs">vs</span>
-                        <div className="match-side">{seedSelect(b)}</div>
-                      </div>
-                    ))}
+                <div className="card sub group-card" key={`group-${g}`}>
+                  <div className="group-card-head">
+                    <h3>Group {g + 1}</h3>
                   </div>
-                  <div className="bracket-depiction">
-                    <span className="bracket-title">Upper bracket</span>
-                    {groupFormat === "de8" ? (
-                      <>
-                        <div className="ub-flow">
-                          <div className="ub-col">
-                            <div className="ub-pair">
-                              <span>{label(0)}</span>
-                              <span>{label(1)}</span>
-                            </div>
-                            <div className="ub-pair">
-                              <span>{label(2)}</span>
-                              <span>{label(3)}</span>
-                            </div>
-                            <div className="ub-pair">
-                              <span>{label(4)}</span>
-                              <span>{label(5)}</span>
-                            </div>
-                            <div className="ub-pair">
-                              <span>{label(6)}</span>
-                              <span>{label(7)}</span>
-                            </div>
-                          </div>
-                          <div className="ub-arrow">→</div>
-                          <div className="ub-col">
-                            <div className="ub-node">Upper semi 1<small>Opening 1 W vs Opening 2 W</small></div>
-                            <div className="ub-node">Upper semi 2<small>Opening 3 W vs Opening 4 W</small></div>
-                          </div>
-                          <div className="ub-arrow">→</div>
-                          <div className="ub-col">
-                            <div className="ub-qual">Qualify (1st &amp; 2nd)<small>the two upper-semi winners</small></div>
-                          </div>
-                        </div>
-                        <p className="muted small">
-                          Opening losers drop to lower round 1. The two upper-semi losers then cross over —
-                          each faces the <em>other</em> semi's lower-round-1 winner — for the last two spots (3rd &amp; 4th).
-                        </p>
-                      </>
-                    ) : (
-                      <>
-                        <div className="ub-flow">
-                          <div className="ub-col">
-                            <div className="ub-pair">
-                              <span>{label(0)}</span>
-                              <span>{label(1)}</span>
-                            </div>
-                            <div className="ub-pair">
-                              <span>{label(2)}</span>
-                              <span>{label(3)}</span>
-                            </div>
-                          </div>
-                          <div className="ub-arrow">→</div>
-                          <div className="ub-col">
-                            <div className="ub-node">Winners' match<small>Opening 1 W vs Opening 2 W</small></div>
-                          </div>
-                          <div className="ub-arrow">→</div>
-                          <div className="ub-col">
-                            <div className="ub-qual">Qualify (1st)<small>winners'-match winner</small></div>
-                          </div>
-                        </div>
-                        <p className="muted small">
-                          Opening losers meet in the elimination match; its winner faces the winners'-match loser
-                          in the decider for 2nd place.
-                        </p>
-                      </>
-                    )}
-                  </div>
+                  <GroupBracketVisual
+                    format={groupFormat}
+                    slotIds={group}
+                    nameOf={(v) => (v ? teamName(v) : "")}
+                    hltvIdByTeamId={hltvIdByTeamId}
+                    combined={combinedPlayoffs}
+                    bo={groupBo}
+                  />
                 </div>
               );
             })}
-            <div className="actions">
-              <label className="checkbox-inline">
-                <input
-                  type="checkbox"
-                  checked={combinedPlayoffs}
-                  onChange={(e) => setCombinedPlayoffs(e.target.checked)}
-                  disabled={busy || !Number.isInteger(Math.log2(qualsPerGroup * groupCount))}
-                />
-                <span>Combined playoffs (qualifiers feed one single-elim bracket)</span>
-              </label>
-              <button className="primary" onClick={run} disabled={busy || !allSlotsFilled}>
-                {busy ? "Running..." : "Run Groups And Store Valuations"}
-              </button>
-              <button className="danger" onClick={resetStored} disabled={busy || !results}>
-                Reset Stored Valuations
-              </button>
-              {updatedAt && <p className="muted">Stored: {new Date(updatedAt).toLocaleString()}</p>}
-            </div>
-            {!Number.isInteger(Math.log2(qualsPerGroup * groupCount)) && (
-              <p className="muted">Combined playoffs need 1, 2, 4, 8, or 16 groups (a power-of-two bracket).</p>
+            {combinedDetected && !combinedSupported && (
+              <p className="warning-text" style={{ fontSize: 12, margin: 0 }}>
+                HLTV runs this as ONE fantasy game for the groups and the playoffs, but the simulator has no verified
+                playoff seeding for {combinedShape || "this shape"}. It has been flagged for development; valuations
+                here cover the group stage only.
+              </p>
             )}
-            {busy && runProgress.total > 0 && (
-              <>
-                <p className="muted">
-                  {runProgress.done <= groupCount
-                    ? `Enumerating groups: ${Math.min(runProgress.done, groupCount)} / ${groupCount}`
-                    : `Playoff simulations: ${(runProgress.done - groupCount).toLocaleString()} / ${(
-                        runProgress.total - groupCount
-                      ).toLocaleString()}`}
-                </p>
-                <div className="progress">
-                  <div
-                    className="progress-bar determinate"
-                    style={{ width: `${Math.min(100, (runProgress.done / runProgress.total) * 100)}%` }}
-                  />
-                </div>
-              </>
-            )}
-            {results?.playoff && qualificationOdds.length > 0 && (
-              <div className="card sub">
-                <h3>
-                  {Number(results.playoff.stop_teams || 1) > 1
-                    ? `Qualification Odds (top ${results.playoff.stop_teams})`
-                    : "Championship Odds"}
-                </h3>
-                <p className="muted">
-                  From {Number(results.playoff.n_sims || 0).toLocaleString()} playoff simulations on top of the exact
-                  group stage.
-                </p>
-                <table>
-                  <thead>
-                    <tr>
-                      <th>#</th>
-                      <th>Team</th>
-                      <th>{Number(results.playoff.stop_teams || 1) > 1 ? "Qualify %" : "Win %"}</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {qualificationOdds.slice(0, 16).map((row, idx) => (
-                      <tr key={row.teamId}>
-                        <td>{idx + 1}</td>
-                        <td>{teamName(row.teamId)}</td>
-                        <td>{(row.rate * 100).toFixed(1)}%</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+            <p className="muted" style={{ fontSize: 12 }}>
+              {results
+                ? `Valuations baked ${updatedAt ? new Date(updatedAt).toLocaleString() : ""}${
+                    bakedInfo?.trigger ? ` (${bakedInfo.trigger})` : ""
+                  } — exact group stage${results.combined_playoffs ? " + exact playoff" : ""}, refreshed after every import and nightly run.`
+                : "No valuations stored yet — they are baked automatically after import and after each nightly run, once HLTV has published the draw."}
+            </p>
+            {results && (
+              <div className="event-team-rows">
+                {valuationTeamOrder.map((tid) => {
+                  const data = results.teams[tid] || {};
+                  const info = (teams || []).find((t) => Number(t.team_id) === Number(tid));
+                  const groupIdx = (results.groups || []).findIndex((ids) => (ids || []).some((x) => Number(x) === Number(tid)));
+                  const place = results.place_odds?.[String(tid)] || {};
+                  const reach = results.playoff?.round_reach?.[String(tid)] || [];
+                  const labels = results.playoff?.round_labels || [];
+                  const title = Number(results.playoff?.advance_rate?.[String(tid)] || 0);
+                  const chips = [];
+                  const ordinal = { 1: "1st", 2: "2nd", 3: "3rd", 4: "4th" };
+                  ["1", "2", "3", "4"].forEach((rank) => {
+                    const p = Number(place[rank] || 0);
+                    if (p > 0.0005) chips.push([ordinal[Number(rank)], p]);
+                  });
+                  reach.forEach((p, r) => {
+                    if (Number(p) > 0.0005) chips.push([labels[r] || `R${r + 1}`, Number(p)]);
+                  });
+                  if (results.playoff) {
+                    chips.push([Number(results.playoff.stop_teams || 1) > 1 ? "Qualify" : "Title", title]);
+                  }
+                  const rows = Object.entries(data.players || {}).sort(
+                    (x, y) => Number(y[1].total_points ?? 0) - Number(x[1].total_points ?? 0)
+                  );
+                  return (
+                    <div className="event-team-row" key={tid}>
+                      <div className="event-team-head">
+                        <TeamLogo hltvTeamId={info?.hltv_team_id} name={teamName(tid)} size={42} />
+                        <div className="event-team-headtext">
+                          <span className="event-team-name">{teamName(tid)}</span>
+                          {groupIdx >= 0 && <span className="event-team-rank">Group {groupIdx + 1}</span>}
+                          <div className="event-team-reach">
+                            {chips.map(([label, p]) => (
+                              <div className="event-player-stat" key={label}>
+                                <div className="event-player-mini">{Math.round(p * 100)}%</div>
+                                <div className="event-player-stat-label">{label}</div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="event-team-players">
+                        {rows.map(([pid, comps]) => {
+                          const total = Number(comps.total_points ?? 0);
+                          const name = playerNameById[Number(pid)] || String(pid);
+                          return (
+                            <div
+                              className="event-player-card clickable"
+                              key={pid}
+                              onClick={() => openGroupPlayer({ player_id: Number(pid), name, team_id: Number(tid) })}
+                            >
+                              <PlayerPhoto playerId={Number(pid)} name={name} size={52} />
+                              <div className="event-player-name">{name}</div>
+                              {comps.role_id != null && (
+                                <div className="event-player-role">
+                                  <RoleBadge roleId={comps.role_id} size={16} />
+                                  <span>{ROLE_NAMES[comps.role_id] || `Role ${comps.role_id}`}</span>
+                                </div>
+                              )}
+                              <div className="event-player-rating">{total.toFixed(2)}</div>
+                              <div className="event-player-stats ev-mini">
+                                {[
+                                  ["Rating", comps.rating_points_total],
+                                  ["Win", comps.win_points_total],
+                                  ["Role", comps.role_points_total],
+                                  ["Boost", comps.booster_points_total],
+                                ].map(([label, value]) => (
+                                  <div className="event-player-stat" key={label}>
+                                    <div className="event-player-mini">{Number(value || 0).toFixed(1)}</div>
+                                    <div className="event-player-stat-label">{label}</div>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             )}
-            {results && groupQualifyOdds.length > 0 && (
-              <div className="card sub">
-                <h3>Group Qualification Odds</h3>
-                <p className="muted">
-                  Chance each team finishes in its group's qualifying {qualsPerGroup} spots, from the exact enumerated
-                  outcomes.
-                </p>
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Group</th>
-                      <th>Team</th>
-                      <th>Qualify %</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {groupQualifyOdds.map((row) => (
-                      <tr key={row.teamId}>
-                        <td>{row.group + 1}</td>
-                        <td>{teamName(row.teamId)}</td>
-                        <td>{(row.rate * 100).toFixed(1)}%</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-            {combinedPlayoffs && (
-              <>
-                <div className="grid two">
-                  <Input label="Playoff Simulations" value={playoffSims} onChange={setPlayoffSims} placeholder="2000" />
-                  <Select
-                    label="Bracket Ends At"
-                    value={playoffStopTeams}
-                    onChange={setPlayoffStopTeams}
-                    options={(() => {
-                      const bracket = groupCount * 2;
-                      const roundName = (teamsInRound) => {
-                        if (teamsInRound === 2) return "grand final";
-                        if (teamsInRound === 4) return "semi-finals";
-                        if (teamsInRound === 8) return "quarter-finals";
-                        return `round of ${teamsInRound}`;
-                      };
-                      const options = [{ value: "1", label: "Play out full bracket (champion)" }];
-                      for (let t = 2; t < bracket; t *= 2) {
-                        options.push({
-                          value: String(t),
-                          label: `Top ${t} qualify (last round: ${roundName(t * 2)})`,
-                        });
-                      }
-                      return options;
-                    })()}
-                  />
-                </div>
-                <p className="muted">
-                  Bracket seeding: group 1 winner vs group 2 runner-up (and vice versa), then onward in listed order.
-                  Player valuations add a Monte Carlo playoff run on top of the exact group stage; teams reaching the
-                  chosen end point qualify without playing further (and take no elimination penalty).
-                </p>
-              </>
-            )}
-            {runMessage && <p className="muted">{runMessage}</p>}
           </>
         )}
 
@@ -12252,6 +12576,19 @@ function GroupsTab({ teams, teamLookup, players, refresh, groupVariant = null })
             )}
             {results && (
               <>
+                <div className="tab-bar small">
+                  {groupsTopSubtabs.map((sub) => (
+                    <button
+                      key={sub.key}
+                      className={groupsTopSubtab === sub.key ? "tab active" : "tab"}
+                      onClick={() => setGroupsTopMode(sub.key)}
+                    >
+                      {sub.label}
+                    </button>
+                  ))}
+                </div>
+                {groupsTopSubtab !== "completed" && (
+                <>
                 <div className="actions">
                   {!liveMode && (
                     <button className="primary" onClick={runCombinations} disabled={busy}>
@@ -12276,31 +12613,14 @@ function GroupsTab({ teams, teamLookup, players, refresh, groupVariant = null })
                     </p>
                   )}
                 </div>
-                <div className="tab-bar small">
-                  <button className={comboMode === "average" ? "tab active" : "tab"} onClick={() => setComboMode("average")}>
-                    Average Player Value
-                  </button>
-                  <button
-                    className={comboMode === "single_outcome" ? "tab active" : "tab"}
-                    onClick={() => setComboMode("single_outcome")}
-                  >
-                    Best Single Outcome
-                  </button>
-                  <button
-                    className={comboMode === "most_outcomes" ? "tab active" : "tab"}
-                    onClick={() => setComboMode("most_outcomes")}
-                  >
-                    Most Likely Winner
-                  </button>
-                </div>
                 {results?.combined_playoffs && (
                   <p className="muted">
-                    Average EVs cover the whole event (exact groups + {Number(results?.playoff?.n_sims || 0).toLocaleString()}-sim
-                    playoff run). Ceiling and Completed Groups score the group stage only.
+                    Average EVs cover the whole event (exact groups + exact playoff enumeration). Ceiling and Completed
+                    Groups score the group stage only.
                   </p>
                 )}
                 <div className="grid two">
-                  <Input label="Search Combos" value={comboSearch} onChange={setComboSearch} placeholder="Player/team name or id" />
+                  <Input label="Search Combos" value={comboSearch} onChange={setComboSearch} placeholder="Player name" className="search-field" />
                   <div className="field">
                     <span>Filtered / Stored</span>
                     <div className="pill">{filteredCount.toLocaleString()}</div>
@@ -12371,24 +12691,21 @@ function GroupsTab({ teams, teamLookup, players, refresh, groupVariant = null })
                   </div>
                 )}
                 {topMessage && <p className="muted">{topMessage}</p>}
+                </>
+                )}
               </>
             )}
           </>
         )}
 
-        {groupsTab === "completed" && groupFormat === "de8_top3" && (
+        {groupsTab === "top5" && results && groupsTopSubtab === "completed" && groupFormat === "de8_top3" && (
           <p className="muted">
             Completed-bracket scoring for the top-3 double-elim variant isn't supported yet — use the Group
             Stage simulation.
           </p>
         )}
-        {groupsTab === "completed" && groupFormat !== "de8_top3" && (
+        {groupsTab === "top5" && results && groupsTopSubtab === "completed" && groupFormat !== "de8_top3" && (
           <>
-            {!results && (
-              <div className="card sub">
-                <p className="muted">Run the group stage first.</p>
-              </div>
-            )}
             {results &&
               activeCompletedDerived.map((group, g) => {
                 const pickRow = (matchIdx) => {
@@ -12510,6 +12827,8 @@ function GroupsTab({ teams, teamLookup, players, refresh, groupVariant = null })
             <p className="muted">Run the group stage first.</p>
           </div>
         )}
+        </>
+        )}
       </div>
       <GroupPlayerBreakdownModal
         player={breakdownPlayer}
@@ -12581,6 +12900,7 @@ function TournamentTab({ teams, teamLookup, players, sortTeams, applyFilters, on
   return (
     <div className="stack">
       {message && <p className="muted">{message}</p>}
+      {!kind && !message && <p className="muted">Loading tournament...</p>}
       {kind && !["swiss", "groups", "playoff", "bounty"].includes(kind) && (
         <p className="muted">
           Detected format: {kindInfo?.label || kind} — no simulator supports this format yet.
@@ -12594,6 +12914,11 @@ function TournamentTab({ teams, teamLookup, players, sortTeams, applyFilters, on
           players={players}
           refresh={refresh}
           groupVariant={kindInfo?.group_variant}
+          combinedDetected={typeof kindInfo?.combined_playoffs === "boolean" ? kindInfo.combined_playoffs : null}
+          combinedSupported={Boolean(kindInfo?.combined_supported)}
+          combinedShape={kindInfo?.combined_shape || ""}
+          playoffDetected={{ size: Number(kindInfo?.playoff_size || 0), byes: Number(kindInfo?.playoff_byes || 0) }}
+          groupBo={Number(kindInfo?.group_bo_rules?.default || 3)}
         />
       )}
       {kind === "playoff" && <PlayoffTab {...sharedProps} detectedBracketSize={kindInfo?.playoff_size} />}

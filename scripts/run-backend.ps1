@@ -4,14 +4,17 @@
 # Electron app just connects to it.
 #
 # Design notes, learned the hard way:
-# - Logs live under LOCALAPPDATA, NOT the repo: the repo is in OneDrive, whose
+# - Logs live under LOCALAPPDATA, NOT the repo: when the repo lived in OneDrive,
 #   sync locks wedged the old shared-file `*>>` redirect and froze the loop.
 # - The child python owns its log files via Start-Process redirects; this
 #   process never holds a log handle.
-# - Liveness = raw TCP connect to 127.0.0.1:8000 (Invoke-WebRequest can hang
-#   past its TimeoutSec and froze the old loop).
-# - HLTV scraping needs a HEADED Chrome (Cloudflare cookies), which only works
-#   in an interactive desktop session — hence logon-time, not a service.
+# - Liveness = memorized pid alive + raw TCP connect to the memorized port
+#   (Invoke-WebRequest can hang past its TimeoutSec and froze the old loop).
+# - The backend picks its own port: memorized one first, else the next free
+#   port, written to .runtime\backend-port.json (helpers in backend-port.ps1).
+#   Nothing here assumes 8000.
+# - HLTV scraping runs in HEADLESS Chrome (verified 2026-09-07 to pass
+#   Cloudflare), so no interactive desktop is required any more.
 
 $ErrorActionPreference = "Continue"
 
@@ -19,11 +22,18 @@ $ErrorActionPreference = "Continue"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $root = Split-Path -Parent $scriptDir
 Set-Location $root
+. (Join-Path $scriptDir "backend-port.ps1")
 
 # Single-instance guard via named mutex: two watchdogs fight over the backend.
 # First one in wins; the mutex dies with the process, so a crashed watchdog
-# never blocks a new one.
-$script:instanceMutex = New-Object System.Threading.Mutex($false, "HLTVFantasyBackendWatchdog")
+# never blocks a new one. "Global\" so the SYSTEM service (session 0) and a
+# logon-session launcher see the same mutex.
+$created = $false
+try {
+    $script:instanceMutex = New-Object System.Threading.Mutex($false, "Global\HLTVFantasyBackendWatchdog", [ref]$created)
+} catch {
+    $script:instanceMutex = New-Object System.Threading.Mutex($false, "HLTVFantasyBackendWatchdog", [ref]$created)
+}
 if (-not $script:instanceMutex.WaitOne(0)) {
     Write-Host "Another run-backend watchdog is already running; exiting."
     exit 0
@@ -32,10 +42,26 @@ if (-not $script:instanceMutex.WaitOne(0)) {
 $venvPy = Join-Path $root ".venv\Scripts\python.exe"
 if (-not (Test-Path $venvPy)) { $venvPy = "python" }
 
-# Headed browser so Cloudflare cookies persist in the Chrome profile.
-$env:HLTV_HEADLESS = "0"
+# Running as the SYSTEM service (scripts\install-service.ps1)? The interactive
+# user's Chrome profile is undecryptable for SYSTEM and LOCALAPPDATA points into
+# the system profile, so use service-owned locations under ProgramData instead.
+# The HLTV login reaches that profile via scripts\hltv-login-handoff.ps1.
+$isSystem = [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem
+$serviceRoot = Join-Path $env:ProgramData "HLTVFantasy"
+if ($isSystem) {
+    $env:HLTV_PROFILE_DIR = Join-Path $serviceRoot "chrome-profile"
+    New-Item -ItemType Directory -Force -Path $env:HLTV_PROFILE_DIR | Out-Null
+}
 
-$logDir = Join-Path $env:LOCALAPPDATA "HLTVFantasy\logs"
+# Headless Chrome: passes Cloudflare without a desktop session (see memory note
+# 2026-09-07). Set to "0" only if HLTV starts serving interactive challenges.
+$env:HLTV_HEADLESS = "1"
+
+if ($isSystem) {
+    $logDir = Join-Path $serviceRoot "logs"
+} else {
+    $logDir = Join-Path $env:LOCALAPPDATA "HLTVFantasy\logs"
+}
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $pointer = Join-Path $logDir "backend-latest.txt"
 # Keep only the newest 20 log files.
@@ -43,19 +69,11 @@ Get-ChildItem $logDir -Filter "backend-*.log*" -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending | Select-Object -Skip 20 |
     Remove-Item -Force -ErrorAction SilentlyContinue
 
-function Test-PortOpen {
-    try {
-        $c = New-Object System.Net.Sockets.TcpClient
-        $iar = $c.BeginConnect("127.0.0.1", 8000, $null, $null)
-        if ($iar.AsyncWaitHandle.WaitOne(1500)) { $c.EndConnect($iar); $c.Close(); return $true }
-        $c.Close()
-        return $false
-    } catch { return $false }
-}
-
 while ($true) {
-    if (Test-PortOpen) {
-        # Another instance owns port 8000; wait rather than crash-looping.
+    if (Test-BackendAlive) {
+        # The memorized backend is alive on its memorized port; wait rather
+        # than crash-looping. (A duplicate launch would exit by itself anyway:
+        # the backend probes /health before picking another port.)
         Start-Sleep -Seconds 15
         continue
     }

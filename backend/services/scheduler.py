@@ -183,6 +183,14 @@ class DataScheduler:
             tasks = self._enabled_tasks(cfg) or list(schedule_db.TASK_KEYS)
         elif task in schedule_db.TASK_KEYS:
             tasks = [task]
+        elif task == "hltv_session":
+            threading.Thread(
+                target=self._run_session_check_only, args=("manual",), name="scheduler-session-check", daemon=True
+            ).start()
+            return {"status": "started", "tasks": ["hltv_session"]}
+        elif task == "valuations":
+            threading.Thread(target=self._run_bake_only, args=("manual",), name="scheduler-bake", daemon=True).start()
+            return {"status": "started", "tasks": ["valuations"]}
         else:
             return {"status": "error", "detail": f"Unknown task '{task}'."}
         threading.Thread(
@@ -198,6 +206,70 @@ class DataScheduler:
         try:
             for task in tasks:
                 self._run_task(task, trigger, cfg)
+            # Bake the active event's valuations now that rankings, results and
+            # ratings are fresh, so the Tournament tab never computes on open.
+            self._bake_valuations(trigger)
+            # Every batch ends with a login-health check so a dying HLTV
+            # remember-me cookie is flagged weeks ahead in the run history.
+            self._check_hltv_session(trigger)
+        finally:
+            self._run_lock.release()
+            self._set_state(running=False, current_task=None, trigger=None, processed=0, total=0)
+
+    def _check_hltv_session(self, trigger: str) -> None:
+        """Is the scraper browser still signed in to HLTV, and for how long?
+        One page load, recorded as its own run row (status success / warning /
+        error) so the Scheduling tab shows it. See backend/services/hltv_session.py."""
+        from backend.services import hltv_session
+
+        run_id = schedule_db.start_run("hltv_session", trigger)
+        self._set_state(running=True, current_task="hltv_session", trigger=trigger, started_at=time.time(),
+                        processed=0, total=0, message="Checking HLTV login...")
+        try:
+            snap = hltv_session.check_session_health()
+            status = {"ok": "success", "warning": "warning"}.get(str(snap.get("level")), "error")
+            schedule_db.finish_run(run_id, status, str(snap.get("message") or ""))
+        except Exception as exc:  # noqa: BLE001 — never let the check break a batch
+            schedule_db.finish_run(run_id, "error", f"check failed: {exc}")
+            logger.exception("HLTV session check failed")
+
+    def _run_session_check_only(self, trigger: str) -> None:
+        if not self._run_lock.acquire(blocking=False):
+            return
+        try:
+            self._check_hltv_session(trigger)
+        finally:
+            self._run_lock.release()
+            self._set_state(running=False, current_task=None, trigger=None, processed=0, total=0)
+
+    def _bake_valuations(self, trigger: str) -> None:
+        """Run + store the groups valuation for the ACTIVE event (exact groups
+        and, when detected, the exact combined playoff). Recorded as its own
+        run row; a skip (not a groups event, draw not published) is a warning."""
+        from backend.data.event_db import get_active_event_id
+        from backend.routes import groups
+
+        run_id = schedule_db.start_run("valuations", trigger)
+        self._set_state(running=True, current_task="valuations", trigger=trigger, started_at=time.time(),
+                        processed=0, total=0, message="Baking event valuations...")
+        try:
+            active = get_active_event_id()
+            if not active:
+                schedule_db.finish_run(run_id, "warning", "no active event")
+                return
+            outcome = groups.bake_event_valuations(int(active), trigger=trigger)
+            status = {"ok": "success", "skipped": "warning"}.get(str(outcome.get("status")), "error")
+            schedule_db.finish_run(run_id, status, _short(outcome))
+            logger.info("Valuation bake (%s): %s", trigger, _short(outcome))
+        except Exception as exc:  # noqa: BLE001 — never let the bake break a batch
+            schedule_db.finish_run(run_id, "error", f"bake failed: {exc}")
+            logger.exception("Valuation bake failed")
+
+    def _run_bake_only(self, trigger: str) -> None:
+        if not self._run_lock.acquire(blocking=False):
+            return
+        try:
+            self._bake_valuations(trigger)
         finally:
             self._run_lock.release()
             self._set_state(running=False, current_task=None, trigger=None, processed=0, total=0)
@@ -241,6 +313,12 @@ class DataScheduler:
                     outcome = admin.run_trigger_backfill_blocking(int(fid), refresh_all=True)
                     notes.append(f"{fid}: {outcome}")
                 result["trigger_backfill"] = "; ".join(notes)
+                # Bake each new event's valuation straight away (stored per
+                # event), so it is ready the moment it is made active.
+                from backend.routes import groups
+
+                baked = [groups.bake_event_valuations(int(fid), trigger="import") for fid in sorted(result["imported"])]
+                result["valuations"] = "; ".join(f"{b.get('event_id')}: {b.get('status')} {b.get('reason') or b.get('seconds', '')}" for b in baked)
             else:
                 _prices, missing, _cov = admin._missing_trigger_players(None)
                 if missing:
@@ -299,11 +377,17 @@ class DataScheduler:
         hh, mm = (cfg.get("run_time") or "00:00").split(":")
         scheduled_today = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
         next_run = scheduled_today if now < scheduled_today else scheduled_today + timedelta(days=1)
+        from backend.services import dev_flags, hltv_session
+
         return {
             "config": cfg,
             "state": state,
             "next_run_at": next_run.timestamp(),
             "last_success_by_task": schedule_db.last_success_by_task(),
+            # Last persisted login-health snapshot (no page load here).
+            "hltv_session": hltv_session.load_snapshot(),
+            # Shapes/formats refused as unsupported and flagged for development.
+            "dev_flags": dev_flags.list_flags(),
         }
 
 

@@ -1,6 +1,8 @@
 import { contextBridge, ipcRenderer } from "electron";
 
-const API_BASE = "http://127.0.0.1:8000";
+// The main process resolved which port the backend actually bound (it picks a
+// free one and memorizes it in .runtime/backend-port.json); ask it once, sync.
+const API_BASE = ipcRenderer.sendSync("api-base") || "http://127.0.0.1:8000";
 const parseJsonSafe = async (res) => {
   const text = await res.text();
   if (!text) return {};
@@ -34,6 +36,7 @@ const requestJson = async (path, init = {}, timeoutMs = 30000) => {
 };
 
 contextBridge.exposeInMainWorld("api", {
+  baseUrl: API_BASE,
   get: (path, timeoutMs) => requestJson(path, {}, timeoutMs),
   post: (path, body, timeoutMs) =>
     requestJson(

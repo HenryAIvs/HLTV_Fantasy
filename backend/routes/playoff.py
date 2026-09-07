@@ -119,6 +119,8 @@ def _saved_combo_metric(team: dict, mode: str) -> float:
 
 
 def _filter_saved_combo_teams(teams: list[dict], include: set[int], exclude: set[int], search: str = "") -> list[dict]:
+    """Search matches PLAYER NAMES only — team/id filtering has its own
+    dedicated include/exclude controls."""
     q = str(search or "").strip().lower()
     filtered = []
     for team in teams or []:
@@ -128,23 +130,8 @@ def _filter_saved_combo_teams(teams: list[dict], include: set[int], exclude: set
             continue
         if exclude and pids.intersection(exclude):
             continue
-        if q:
-            if q not in str(team.get("cost", "")).lower() and q not in str(team.get("total_ev", "")).lower():
-                matched = False
-                for player in players:
-                    haystack = " ".join(
-                        [
-                            str(player.get("name") or ""),
-                            str(player.get("player_id") or ""),
-                            str(player.get("team_id") or ""),
-                            str(player.get("role_name") or ""),
-                        ]
-                    ).lower()
-                    if q in haystack:
-                        matched = True
-                        break
-                if not matched:
-                    continue
+        if q and not any(q in str(p.get("name") or "").lower() for p in players):
+            continue
         filtered.append(team)
     return filtered
 
@@ -367,6 +354,29 @@ def _clone_team_states(team_states: Dict[int, TeamState]) -> Dict[int, TeamState
     return cloned
 
 
+def cached_win_prob(prob_cache: Dict[tuple[int, int], float] | None, a_id: int, b_id: int) -> float:
+    """P(a beats b, Bo3) via the shared cache, always evaluated in a canonical
+    direction (lower team id first) and mirrored as 1 - p.
+
+    The win-probability model is not symmetric — p(a, b) and 1 - p(b, a) can
+    differ by a few percent — so caching whichever direction a caller asked
+    for first made results depend on evaluation order (the exact playoff
+    engine and the old seeding loop disagreed by up to 0.4 points per player
+    for that reason alone). One canonical direction makes every path agree.
+    """
+    if a_id == b_id:
+        return 0.5
+    key = (a_id, b_id)
+    if prob_cache is not None and key in prob_cache:
+        return prob_cache[key]
+    lo, hi = (a_id, b_id) if a_id < b_id else (b_id, a_id)
+    p_lo = calculate_win_probability(lo, hi, "bo3")
+    if prob_cache is not None:
+        prob_cache[(lo, hi)] = p_lo
+        prob_cache[(hi, lo)] = 1.0 - p_lo
+    return p_lo if a_id == lo else 1.0 - p_lo
+
+
 def _play_match_deterministic(
     team_states: Dict[int, TeamState],
     a_id: int,
@@ -381,14 +391,7 @@ def _play_match_deterministic(
     B = team_states[b_id]
     match_num_a = A.matches_played + 1
     match_num_b = B.matches_played + 1
-    key = (a_id, b_id)
-    if prob_cache is not None and key in prob_cache:
-        prob_a = prob_cache[key]
-    else:
-        prob_a = calculate_win_probability(a_id, b_id, "bo3")
-        if prob_cache is not None:
-            prob_cache[key] = prob_a
-            prob_cache[(b_id, a_id)] = 1.0 - prob_a
+    prob_a = cached_win_prob(prob_cache, a_id, b_id)
 
     if winner_id == a_id:
         winner, loser = A, B

@@ -7,7 +7,8 @@
       "Bash(python -m py_compile backend/routes/playoff.py)"
     ],
     "additionalDirectories": [
-      "c:\\Users\\goats\\.claude\\projects\\c--Users-goats-OneDrive-Desktop-Github-HLTV-Fantasy\\memory"
+      "C:\\Users\\goats\\.claude\\projects\\C--Github-HLTV-Fantasy\\memory",
+      "C:\\Users\\goats\\.claude\\projects\\c--Github-HLTV-Fantasy\\memory"
     ]
   }
 }

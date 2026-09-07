@@ -2192,6 +2192,52 @@ button:disabled {
   .ub-arrow { transform: rotate(90deg); align-self: center; }
 }
 
+/* Groups tab: one card per group — header with format pill, then the upper
+   and lower group brackets drawn with the Playoff tab's card + connector
+   system (.pb-bracket / .playoff-match-card). Display-only: the draw comes
+   from the HLTV event page. */
+.group-card { padding-top: 14px; }
+.group-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.group-card-head h3 { margin: 0; }
+.group-brackets { display: flex; flex-direction: column; gap: 14px; margin-top: 12px; }
+.group-bracket-title {
+  font-family: var(--display);
+  font-stretch: condensed;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #8fa3bf;
+  font-size: 12px;
+  margin: 0 0 6px;
+}
+.group-brackets .pb-bracket { padding: 14px 14px 10px; }
+.group-brackets .pb-round { flex: 1 0 190px; min-width: 190px; }
+.group-brackets .pb-round-title { font-size: 14px; }
+/* 1:1 rounds (lower round 2 / decider): the feeder card sits level with the
+   card it feeds, so drop the two-feeder vertical bar and keep the arms. */
+.pb-round.straight .pb-match-wrap::before { display: none; }
+/* Footer on deciding cards: where the winner / loser goes. */
+.playoff-match-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 5px 8px 6px;
+  border-top: 1px solid #232a34;
+  background: #10141a;
+  border-radius: 0 0 5px 5px;
+}
+.playoff-match-card:has(.playoff-match-foot) .playoff-match-teams { border-radius: 0; }
+.playoff-place {
+  font-family: var(--display);
+  font-stretch: condensed;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 11.5px;
+  line-height: 1.25;
+}
+.playoff-place.win { color: #79d69a; }
+.playoff-place.drop { color: #d9a27f; }
+.playoff-place.lose { color: #c97b7b; }
+
 /* HLTV-style per-team scoreboard in the stored-match modal */
 .modal.match-modal { max-width: 900px; }
 
@@ -2410,6 +2456,263 @@ button:disabled {
   pointer-events: none;
   font-variant-numeric: tabular-nums;
 }
+/* Top-teams filter panel: team cards with In/Out toggles, removable player
+   chips, and one aligned controls row */
+.filter-team-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.filter-team-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: #171c24;
+  border: 1px solid #2c3441;
+  padding: 8px 12px 8px 10px;
+}
+.filter-team-card.exc {
+  border-color: #b23b38;
+  opacity: 0.65;
+}
+.filter-team-name {
+  font-family: var(--display);
+  font-stretch: condensed;
+  text-transform: uppercase;
+  font-weight: 700;
+  font-size: 15px;
+  color: #e9edf3;
+  white-space: nowrap;
+}
+.filter-team-toggles {
+  display: flex;
+  gap: 6px;
+  margin-left: 4px;
+}
+.filter-toggle {
+  border: 1px solid #3a4452;
+  background: transparent;
+  color: #8fa3bf;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 4px 11px;
+  cursor: pointer;
+}
+.filter-toggle:hover {
+  color: #e9edf3;
+  border-color: #55627a;
+}
+.filter-toggle.out.on {
+  background: #e2504c;
+  border-color: #e2504c;
+  color: #0a0c10;
+}
+/* Included / Excluded player groups: accent-edged boxes with photo chips */
+.filter-group {
+  background: #171c24;
+  border: 1px solid #2c3441;
+  padding: 10px 14px 12px;
+}
+.filter-group.in { border-left: 3px solid #34d399; }
+.filter-group.out { border-left: 3px solid #e2504c; }
+.filter-group-title {
+  color: #8fa3bf;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 8px;
+}
+.filter-group .chips { margin-bottom: 0; }
+.filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #e9edf3;
+  padding: 4px 11px 4px 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.filter-chip.in {
+  background: rgba(52, 211, 153, 0.08);
+  border: 1px solid rgba(52, 211, 153, 0.45);
+}
+.filter-chip.out {
+  background: rgba(226, 80, 76, 0.08);
+  border: 1px solid rgba(226, 80, 76, 0.45);
+}
+.filter-chip .x { color: #8fa3bf; }
+.filter-chip:hover .x { color: #f2f5f9; }
+.filter-chip.in:hover { border-color: #34d399; }
+.filter-chip.out:hover { border-color: #e2504c; }
+.top5-controls-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.top5-controls-row .secondary,
+.top5-controls-row .primary {
+  margin-bottom: 2px;
+}
+.top5-controls-row .top5-search {
+  flex: 0 1 340px;
+  min-width: 240px;
+}
+/* Top-teams roster strips (bracket-stage layout for the ranked combos) */
+.combo-rank {
+  font-family: var(--display);
+  font-stretch: condensed;
+  font-weight: 700;
+  font-size: 34px;
+  color: #ff6b1a;
+  min-width: 52px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.combo-cost {
+  color: #8fa3bf;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.event-player-team {
+  font-size: 11px;
+  color: #8fa3bf;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.event-player-price.combo-price {
+  font-size: 13px;
+  margin-top: 2px;
+}
+.combo-outcomes { padding: 0 4px; }
+
+/* Top-teams ranking picker: segmented mode control + completed-bracket toggle */
+.top5-mode-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.seg {
+  display: inline-flex;
+  border: 1px solid #2c3441;
+  background: #12161d;
+}
+.seg-btn {
+  background: transparent;
+  border: none;
+  border-right: 1px solid #2c3441;
+  color: #8fa3bf;
+  font-family: var(--display);
+  font-stretch: condensed;
+  text-transform: uppercase;
+  font-weight: 700;
+  font-size: 13.5px;
+  letter-spacing: 0.05em;
+  padding: 9px 18px;
+  cursor: pointer;
+}
+.seg-btn:last-child { border-right: none; }
+.seg-btn:hover { color: #e9edf3; }
+.seg-btn.on {
+  background: #ff6b1a;
+  color: #0a0c10;
+}
+.seg-standalone {
+  margin-left: auto;
+  background: #12161d;
+  border: 1px solid #2c3441;
+  color: #8fa3bf;
+  font-family: var(--display);
+  font-stretch: condensed;
+  text-transform: uppercase;
+  font-weight: 700;
+  font-size: 13.5px;
+  letter-spacing: 0.05em;
+  padding: 9px 18px;
+  cursor: pointer;
+}
+.seg-standalone:hover { color: #e9edf3; }
+.seg-standalone.on {
+  background: #ff6b1a;
+  border-color: #ff6b1a;
+  color: #0a0c10;
+}
+
+/* App-wide cap for search inputs: no full-width bars */
+.field.search-field {
+  max-width: 340px;
+  width: 100%;
+}
+
+/* Autocomplete dropdown under a .suggest-field input */
+.suggest-field { position: relative; }
+.suggest-list {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 30;
+  margin-top: 4px;
+  background: #14181f;
+  border: 1px solid #3a4452;
+  display: flex;
+  flex-direction: column;
+  max-height: 264px;
+  overflow-y: auto;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.45);
+}
+.suggest-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-right: 8px;
+}
+.suggest-row:hover { background: #1d2431; }
+.suggest-item {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: none;
+  border: none;
+  color: #e9edf3;
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 13.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.suggest-row:hover .suggest-item { color: #ff8a47; }
+.suggest-action {
+  flex: none;
+  background: transparent;
+  border: 1px solid #3a4452;
+  color: #8fa3bf;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 3px 9px;
+  cursor: pointer;
+}
+.suggest-action.in:hover {
+  background: #34d399;
+  border-color: #34d399;
+  color: #0a0c10;
+}
+.suggest-action.out:hover {
+  background: #e2504c;
+  border-color: #e2504c;
+  color: #0a0c10;
+}
+
 /* Player value table: photo + name in one cell */
 .table-player-cell {
   display: flex;

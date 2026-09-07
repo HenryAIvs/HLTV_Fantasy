@@ -29,8 +29,8 @@ if (-not (Test-Path $venvPy)) {
     throw "venv Python not found at $venvPy (is Python installed and on PATH?)."
 }
 
-# HLTV scraping default: headed browser so Cloudflare cookies persist in the profile.
-$env:HLTV_HEADLESS = "0"
+# HLTV scraping default: headless Chrome (verified to pass Cloudflare; no desktop needed).
+$env:HLTV_HEADLESS = "1"
 
 Write-Host "Installing backend dependencies..."
 & $venvPy -m pip install --upgrade pip --quiet

@@ -1,4 +1,6 @@
 import json
+import logging
+import os
 import re
 import math
 import threading
@@ -19,7 +21,15 @@ from backend.data.event_db import (
 )
 from backend.data.player_db import add_or_update_player, get_player
 from backend.data.team_db import add_or_update_team, get_team_by_name
-from backend.services.hltv_browser import HLTVBrowserError, fetch_hltv_html, run_hltv_browser_session
+from backend.services.hltv_browser import (
+    HLTVBrowserError,
+    _kill_orphan_chrome,
+    close_hltv_browser,
+    fetch_hltv_html,
+    kill_own_uc_drivers,
+    run_hltv_browser_session,
+)
+from backend.services import hltv_session
 from backend.services.rating_picker import pick_match_rating
 from backend.swiss_stage.fantasy_scoring import (
     compute_rating_points,
@@ -1358,7 +1368,8 @@ def _ensure_app_login(driver) -> None:
     if _is_hltv_logged_in(driver):
         return
     raise RuntimeError(
-        "Not signed in to HLTV. Click Capture and sign in there (add any 5 players) — the session then persists for Fetch."
+        "Not signed in to HLTV. Run scripts\\hltv-login-handoff.ps1 from your desktop session "
+        "(it signs this browser in with your session cookies), or click Capture and sign in there."
     )
 
 
@@ -1533,6 +1544,135 @@ def hltv_login_session(payload: Dict[str, Any] | None = None):
     except HLTVBrowserError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"status": "ok", **(result or {})}
+
+
+# ---- HLTV session hand-off ---------------------------------------------------
+# The 24/7 backend runs as the SYSTEM service: no desktop, and its own Chrome
+# profile (SYSTEM cannot decrypt the interactive user's). HLTV's sign-in is
+# captcha-protected, so the login is established in the USER's session and the
+# session cookies are posted here (scripts\hltv-login-handoff.ps1). Verified:
+# `autologin` + `PHPSESSID` alone move the login between profiles, and the
+# autologin cookie lasts about a year.
+_HLTV_HANDOFF_COOKIE_ALLOWLIST = ("autologin", "PHPSESSID", "cf_clearance", "_cfuvid", "__cflb", "__cf_bm")
+_admin_logger = logging.getLogger(__name__)
+
+
+def _hltv_session_snapshot(driver) -> Dict[str, Any]:
+    # Login state + remember-me cookie expiry, graded ok/warning/error and
+    # persisted so the Scheduling tab can show it (backend/services/hltv_session.py).
+    snap = hltv_session.snapshot_from_driver(driver)
+    hltv_session.save_snapshot(snap)
+    return snap
+
+
+@router.get("/hltv-session-status")
+def hltv_session_status():
+    """Is the scraper's browser profile signed in to HLTV, and for how long?
+    Costs one page load; the result is also persisted for GET /schedule/status."""
+    try:
+        result = run_hltv_browser_session("https://www.hltv.org/", _hltv_session_snapshot, wait_text=None, timeout_ms=60000)
+    except HLTVBrowserError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"status": "ok", **(result or {})}
+
+
+@router.post("/hltv-session-cookies")
+def hltv_session_cookies(payload: Dict[str, Any]):
+    """Receive an HLTV login from an interactive session (cookie hand-off) and
+    add it to the scraper's browser profile. Requires an `autologin` cookie;
+    `PHPSESSID` and the Cloudflare cookies are optional extras."""
+    raw = (payload or {}).get("cookies")
+    if not isinstance(raw, list) or not raw:
+        raise HTTPException(status_code=400, detail="cookies must be a non-empty list")
+    cookies: List[Dict[str, Any]] = []
+    for item in raw:
+        item = item or {}
+        name = str(item.get("name") or "").strip()
+        value = str(item.get("value") or "")
+        if name not in _HLTV_HANDOFF_COOKIE_ALLOWLIST or not value:
+            continue
+        cookie: Dict[str, Any] = {
+            "name": name,
+            "value": value,
+            "domain": str(item.get("domain") or ".hltv.org"),
+            "path": str(item.get("path") or "/"),
+        }
+        try:
+            if item.get("expiry"):
+                cookie["expiry"] = int(item["expiry"])
+        except Exception:
+            pass
+        if item.get("secure"):
+            cookie["secure"] = True
+        if item.get("httpOnly"):
+            cookie["httpOnly"] = True
+        cookies.append(cookie)
+    names = sorted({c["name"] for c in cookies})
+    if "autologin" not in names:
+        raise HTTPException(status_code=400, detail="an 'autologin' cookie is required (PHPSESSID is optional)")
+
+    def apply(driver):
+        for cookie in cookies:
+            try:
+                driver.add_cookie(cookie)
+            except Exception as exc:
+                raise HLTVBrowserError(f"could not add cookie {cookie['name']}: {exc}") from exc
+        return _hltv_session_snapshot(driver)
+
+    try:
+        result = run_hltv_browser_session("https://www.hltv.org/", apply, wait_text=None, timeout_ms=60000) or {}
+    except HLTVBrowserError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if not result.get("logged_in"):
+        raise HTTPException(
+            status_code=409,
+            detail="Cookies were added but hltv.org still shows this browser signed out; sign in again in your session and retry.",
+        )
+    _admin_logger.info("HLTV session hand-off applied (%s); signed in as %s", ", ".join(names), result.get("username") or "?")
+    return {"status": "ok", "applied": names, **result}
+
+
+@router.get("/dev-flags")
+def get_dev_flags():
+    """Formats/shapes the app met but refuses to model yet (see services/dev_flags.py)."""
+    from backend.services import dev_flags
+
+    return {"flags": dev_flags.list_flags()}
+
+
+@router.delete("/dev-flags/{key:path}")
+def delete_dev_flag(key: str):
+    from backend.services import dev_flags
+
+    return {"status": "ok", "removed": dev_flags.clear_flag(key)}
+
+
+@router.post("/restart")
+def restart_backend():
+    """Exit the process shortly after responding; the watchdog relaunches it
+    with the current code. Exists because the backend may run as SYSTEM,
+    which an unelevated shell cannot kill (see scripts\\restart-backend.ps1)."""
+    _admin_logger.warning("Restart requested via API; exiting in 0.5s (the watchdog relaunches the backend)")
+
+    def _exit() -> None:
+        # A hard exit would orphan the shared Chrome and leave it holding the
+        # profile; close it first, then sweep anything still using the profile.
+        try:
+            close_hltv_browser()
+        except Exception:
+            pass
+        try:
+            kill_own_uc_drivers()
+        except Exception:
+            pass
+        try:
+            _kill_orphan_chrome()
+        except Exception:
+            pass
+        os._exit(0)
+
+    threading.Timer(0.5, _exit).start()
+    return {"status": "restarting", "pid": os.getpid()}
 
 
 TRIGGER_CAPTURE_DEBUG_PATH = _ROOT_DIR / "trigger_capture_debug.json"

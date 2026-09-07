@@ -1,6 +1,10 @@
 """Serve locally cached HLTV images (team logos, player photos) to the UI."""
 
-from fastapi import APIRouter, HTTPException
+import hashlib
+from email.utils import formatdate
+from pathlib import Path
+
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 
 from backend.services.image_cache import (
@@ -13,28 +17,39 @@ from backend.services.image_cache import (
 
 router = APIRouter()
 
-# no-cache (not no-store): the renderer may reuse images while revalidating,
-# so quality upgrades from a re-harvest show up on a plain reload instead of
-# being pinned for a day.
-_CACHE_HEADERS = {"Cache-Control": "no-cache"}
+# Images are stable, versioned by the UI (?v=N) and only change when the
+# harvester re-fetches a better copy. Cache them for an hour and hand out an
+# ETag so anything past that is a cheap 304 instead of a full re-download —
+# before this every page switch re-fetched 40-90 images (~1 MB) because the
+# old `no-cache` response carried no validator at all.
+_MAX_AGE_SECONDS = 3600
+
+
+def _image_response(kind: str, key: int, request: Request) -> Response:
+    path = image_path(kind, key)
+    if not path:
+        raise HTTPException(status_code=404, detail=f"No cached image for that {kind}")
+    stat = path.stat()
+    etag = f'W/"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+    headers = {
+        "Cache-Control": f"public, max-age={_MAX_AGE_SECONDS}",
+        "ETag": etag,
+        "Last-Modified": formatdate(stat.st_mtime, usegmt=True),
+    }
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
+    data = path.read_bytes()
+    return Response(content=data, media_type=sniff_content_type(data), headers=headers)
 
 
 @router.get("/team/{hltv_team_id}")
-def team_logo(hltv_team_id: int):
-    path = image_path("team", hltv_team_id)
-    if not path:
-        raise HTTPException(status_code=404, detail="No cached logo for that team")
-    data = path.read_bytes()
-    return Response(content=data, media_type=sniff_content_type(data), headers=_CACHE_HEADERS)
+def team_logo(hltv_team_id: int, request: Request):
+    return _image_response("team", hltv_team_id, request)
 
 
 @router.get("/player/{player_id}")
-def player_photo(player_id: int):
-    path = image_path("player", player_id)
-    if not path:
-        raise HTTPException(status_code=404, detail="No cached photo for that player")
-    data = path.read_bytes()
-    return Response(content=data, media_type=sniff_content_type(data), headers=_CACHE_HEADERS)
+def player_photo(player_id: int, request: Request):
+    return _image_response("player", player_id, request)
 
 
 @router.get("/status")
