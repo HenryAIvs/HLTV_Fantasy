@@ -203,8 +203,11 @@ def load_team_players(team_id: int) -> Dict[int, PlayerState]:
             roles_obj = _parse_json(d.get("roles_json"))
 
             role_id, major_pct, minor_pct = _compute_best_role_major_minor(roles_obj)
+            # 8 slots: a Swiss run is at most 5 matches, but one fantasy game
+            # spanning double-elim groups and the playoffs can reach 7 (each
+            # booster is used once per player, so later matches need their own).
             boosters_list, booster_ids, booster_edges = _compute_boosters_list(
-                boosters_obj, top_k=5, avg_rates=avg_rates
+                boosters_obj, top_k=8, avg_rates=avg_rates
             )
             booster_rates = _compute_booster_rates(boosters_obj)
 

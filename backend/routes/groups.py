@@ -197,6 +197,157 @@ def _normalize_groups_payload(payload: dict) -> dict:
     }
 
 
+# Match-slot labels per group format, in play order (the enumerators' keys).
+# (round key, short label, full name, bracket side, match slots folded into it).
+# A team plays at most one slot per round, so folding sums cleanly. The first
+# entry is the opening match every team plays.
+_GROUP_STAGE_ROUNDS: Dict[str, List[tuple]] = {
+    "gsl4": [
+        ("opening", "Opening", "Opening match", "upper", ["opening_1", "opening_2"]),
+        ("winners", "Winners'", "Winners' match", "upper", ["winners"]),
+        ("elimination", "Elimination", "Elimination match", "lower", ["elimination"]),
+        ("decider", "Decider", "Decider", "lower", ["decider"]),
+    ],
+    "de8": [
+        ("ub_r1", "UB R1", "Opening match", "upper", ["opening_1", "opening_2", "opening_3", "opening_4"]),
+        ("ub_sf", "UB SF", "Upper semi-final", "upper", ["upper_sf_1", "upper_sf_2"]),
+        ("lb_r1", "LB R1", "Lower round 1", "lower", ["lower_r1_1", "lower_r1_2"]),
+        ("lb_sf", "LB SF", "Lower semi-final", "lower", ["lower_sf_1", "lower_sf_2"]),
+    ],
+    "de8_top3": [
+        ("ub_r1", "UB R1", "Opening match", "upper", ["opening_1", "opening_2", "opening_3", "opening_4"]),
+        ("ub_sf", "UB SF", "Upper semi-final", "upper", ["upper_sf_1", "upper_sf_2"]),
+        ("ub_final", "UB Final", "Upper final", "upper", ["upper_final"]),
+        ("lb_r1", "LB R1", "Lower round 1", "lower", ["lower_r1_1", "lower_r1_2"]),
+        ("lb_sf", "LB SF", "Lower semi-final", "lower", ["lower_sf_1", "lower_sf_2"]),
+        ("lb_final", "LB Final", "Lower final", "lower", ["lower_final"]),
+    ],
+}
+_PLAYOFF_ROUND_FULL = {"QF": "Quarter-final", "SF": "Semi-final", "Final": "Final", "R16": "Round of 16", "R32": "Round of 32"}
+
+
+def _booster_meta(row: dict, p: Any) -> Optional[tuple]:
+    """(booster_id, name, trigger rate, slot, edge) for a scored match row, or
+    None when the slot has no booster. The slot is the team's match number, so
+    a group stage always maps to one slot; playoff rounds vary with the path."""
+    bid = row.get("booster_id")
+    if bid is None:
+        return None
+    slot = int(row.get("booster_slot") or row.get("match_number") or 0)
+    edges = getattr(p, "booster_edges", None) or []
+    edge = float(edges[slot - 1]) if 0 < slot <= len(edges) else 0.0
+    return (int(bid), str(row.get("booster_name") or f"Booster {bid}"), float(row.get("booster_trigger_rate") or 0.0), slot, edge)
+
+
+def _add_booster_weight(bucket: Dict[int, list], meta: Optional[tuple], w: float) -> None:
+    if meta is None or w <= 0.0:
+        return
+    bid = meta[0]
+    cell = bucket.get(bid)
+    if cell is None:
+        bucket[bid] = [w, meta[1], meta[2], meta[3], meta[4]]
+    else:
+        cell[0] += w
+
+
+def _booster_list(bucket: Dict[int, list]) -> List[Dict[str, Any]]:
+    """Boosters seen in a stage with their share of the times it is played."""
+    total = sum(v[0] for v in bucket.values())
+    if total <= 0.0:
+        return []
+    rows = [
+        {"booster_id": bid, "booster_name": v[1], "booster_rate": v[2], "slot": v[3], "edge": v[4], "share": v[0] / total}
+        for bid, v in bucket.items()
+    ]
+    rows.sort(key=lambda r: -r["share"])
+    return rows
+
+
+def _new_stage_acc() -> Dict[str, Any]:
+    return {
+        "reach": {}, "wins": {}, "players": {}, "penalty": {}, "padding": {}, "boost": {},
+        "elim": {}, "pad_prob": {}, "opp": {}, "opp_pts": {},
+    }
+
+
+def _accumulate_group_stage_stats(acc: Dict[str, Any], prob: float, states: Dict[int, TeamState], matches: List[dict]) -> None:
+    """Attribute one exact group outcome to match slots: which matches each
+    team played (and won) and against whom, each player's points per match
+    (and per opponent) from the scorer's per-match breakdown rows, the booster
+    each match used, where the team got knocked out (an ELIMINATION row follows
+    the match that ended its run) and the padding added straight to totals for
+    matches a quick qualifier skips."""
+    team_keys: Dict[int, List[str]] = {}
+    for m in matches:
+        for tid in m.get("teams") or []:
+            team_keys.setdefault(int(tid), []).append(str(m["key"]))
+        w = int(m.get("winner") or 0)
+        if w:
+            wins = acc["wins"].setdefault(w, {})
+            wins[str(m["key"])] = wins.get(str(m["key"]), 0.0) + prob
+    for tid, keys in team_keys.items():
+        reach = acc["reach"].setdefault(tid, {})
+        for k in keys:
+            reach[k] = reach.get(k, 0.0) + prob
+    for tid, ts in states.items():
+        tid = int(tid)
+        keys = team_keys.get(tid, [])
+        team_elim = acc["elim"].setdefault(tid, {})
+        team_opp = acc["opp"].setdefault(tid, {})
+        team_done = False  # elimination / opponent / padding odds are per team: take them from the first player
+        for pid, p in ts.players.items():
+            pid = int(pid)
+            per_key = acc["players"].setdefault(pid, {})
+            boost_keys = acc["boost"].setdefault(pid, {})
+            opp_pts = acc["opp_pts"].setdefault(pid, {})
+            seen = [0.0, 0.0, 0.0, 0.0]
+            penalty = 0.0
+            idx = 0
+            last_key: Optional[str] = None
+            for r in p.point_breakdown or []:
+                if r.get("match_type") == "ELIMINATION":
+                    pen = float(r.get("win_points") or 0.0)
+                    penalty += pen
+                    if not team_done and last_key is not None:
+                        cell = team_elim.setdefault(last_key, [0.0, 0.0])
+                        cell[0] += prob
+                        cell[1] += prob * pen
+                    continue
+                if idx >= len(keys):
+                    break
+                key = keys[idx]
+                idx += 1
+                last_key = key
+                comps = (float(r.get("rating_points") or 0), float(r.get("win_points") or 0),
+                         float(r.get("role_points") or 0), float(r.get("booster_points") or 0))
+                cell = per_key.setdefault(key, [0.0, 0.0, 0.0, 0.0, 0.0])
+                for i in range(4):
+                    cell[i] += prob * comps[i]
+                    seen[i] += comps[i]
+                cell[4] += prob * sum(comps)
+                _add_booster_weight(boost_keys.setdefault(key, {}), _booster_meta(r, p), prob)
+                opp = int(r.get("opponent_team_id") or 0)
+                op = opp_pts.setdefault(key, {})
+                op[opp] = op.get(opp, 0.0) + prob * sum(comps)
+                if not team_done:
+                    to = team_opp.setdefault(key, {}).setdefault(opp, [0.0, 0.0])
+                    to[0] += prob
+                    if r.get("did_win"):
+                        to[1] += prob
+            acc["penalty"][pid] = acc["penalty"].get(pid, 0.0) + prob * penalty
+            seen[1] += penalty
+            totals = (float(p.rating_points_total), float(p.win_points_total),
+                      float(p.role_points_total), float(p.booster_points_total))
+            pad_delta = [totals[i] - seen[i] for i in range(4)]
+            pad = acc["padding"].setdefault(pid, [0.0, 0.0, 0.0, 0.0])
+            for i in range(4):
+                pad[i] += prob * pad_delta[i]
+            if not team_done:
+                if any(abs(d) > 1e-9 for d in pad_delta):
+                    acc["pad_prob"][tid] = acc["pad_prob"].get(tid, 0.0) + prob
+                team_done = True
+
+
 def _enumerate_group_outcomes(
     team_ids: List[int],
     group_index: int,
@@ -204,6 +355,7 @@ def _enumerate_group_outcomes(
     team_rank_by_id: Dict[int, int],
     prob_cache: Dict,
     extra_rounds: int = 0,
+    stage_acc: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """All 32 exact outcomes of one GSL group, with per-player fantasy points.
 
@@ -282,6 +434,8 @@ def _enumerate_group_outcomes(
                                     "booster": float(p.booster_points_total),
                                 }
                                 player_breakdown[str(pid)] = [dict(rowb) for rowb in p.point_breakdown]
+                        if stage_acc is not None:
+                            _accumulate_group_stage_stats(stage_acc, float(prob), st5, [m1, m2, m3, m4, m5])
                         outcomes.append(
                             {
                                 "group": group_index,
@@ -304,6 +458,7 @@ def _enumerate_group8_outcomes(
     team_rank_by_id: Dict[int, int],
     prob_cache: Dict,
     extra_rounds: int = 0,
+    stage_acc: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """All 1024 exact outcomes of one 8-team double-elimination group (top 4
     qualify). Opening winners meet in the upper semis (winner qualifies); their
@@ -388,6 +543,8 @@ def _enumerate_group8_outcomes(
                                                         "role": float(p.role_points_total),
                                                         "booster": float(p.booster_points_total),
                                                     }
+                                            if stage_acc is not None:
+                                                _accumulate_group_stage_stats(stage_acc, float(prob), sj, [mo1, mo2, mo3, mo4, mu1, mu2, ml1, ml2, mls1, mls2])
                                             outcomes.append(
                                                 {
                                                     "group": group_index,
@@ -411,6 +568,7 @@ def _enumerate_group8_top3_outcomes(
     team_rank_by_id: Dict[int, int],
     prob_cache: Dict,
     extra_rounds: int = 0,
+    stage_acc: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """All 4096 exact outcomes of the Porto/Cologne 8-team double-elim group
     (top 3 qualify). Unlike the EWC variant the upper bracket plays its final:
@@ -529,6 +687,8 @@ def _enumerate_group8_top3_outcomes(
                                                                 "role": float(p.role_points_total),
                                                                 "booster": float(p.booster_points_total),
                                                             }
+                                                    if stage_acc is not None:
+                                                        _accumulate_group_stage_stats(stage_acc, float(prob), sk, [mo1, mo2, mo3, mo4, mu1, mu2, mf, ml1, ml2, mls1, mls2, mlf])
                                                     outcomes.append(
                                                         {
                                                             "group": group_index,
@@ -592,6 +752,17 @@ def reject_unsupported_combined_shape(group_format: str, group_count: int, event
     )
 
 
+# Group matches a qualifier has played by the time it enters the playoff, by
+# qualifier rank (the enumerators' `qualified` order). One fantasy game covers
+# groups and playoffs, so the playoff match numbers — and with them the booster
+# slots, each booster being usable once per player — continue from here.
+_GROUP_MATCHES_BY_RANK: Dict[str, List[int]] = {
+    "gsl4": [2, 3],           # winners' match winner; decider winner
+    "de8": [2, 2, 3, 3],      # upper-semi winners; lower-semi winners
+    "de8_top3": [3, 3, 4],    # upper-final winner; upper-final loser; lower-final winner
+}
+
+
 def _fresh_bracket_state(base_states: Dict[int, TeamState], tid: int, prior_matches: int) -> TeamState:
     """A team state as it stands when it plays its (prior_matches + 1)-th
     playoff match: zero points, and — alive in a single-elimination bracket —
@@ -613,6 +784,7 @@ def _exact_combined_playoffs(
     quals_per_group: int = 2,
     progress_callback=None,
     workers: int | None = None,
+    group_format: str = "de8_top3",
 ) -> Dict[str, Any]:
     """Exact expected playoff points for every player.
 
@@ -674,7 +846,13 @@ def _exact_combined_playoffs(
             prev = len(rounds[-1])
             rounds.append([(("win", r - 1, 2 * m), ("win", r - 1, 2 * m + 1)) for m in range(prev // 2)])
         entry_round = {}
-    roots = bracket_exact.build_tree(rounds, entry_round)
+    matches_by_rank = _GROUP_MATCHES_BY_RANK.get(group_format) or []
+    prior_matches = {
+        (g, rank): (matches_by_rank[rank] if rank < len(matches_by_rank) else 0)
+        for g in range(x)
+        for rank in range(quals_per_group)
+    }
+    roots = bracket_exact.build_tree(rounds, entry_round, prior_matches)
 
     # 3. Win-probability matrices between groups, from the shared cache
     #    (canonical direction, see playoff.cached_win_prob).
@@ -711,24 +889,71 @@ def _exact_combined_playoffs(
         out: Dict[int, tuple] = {}
         for ts in states.values():
             for pid, p in ts.players.items():
+                # 6th component: the elimination penalty inside the win total,
+                # so the per-round view can show it separately.
+                penalty = sum(
+                    float(r.get("win_points") or 0.0)
+                    for r in (p.point_breakdown or [])
+                    if r.get("match_type") == "ELIMINATION"
+                )
+                match_row = next((r for r in (p.point_breakdown or []) if r.get("match_type") != "ELIMINATION"), None)
                 out[int(pid)] = (
                     float(p.total_points), float(p.rating_points_total), float(p.win_points_total),
-                    float(p.role_points_total), float(p.booster_points_total),
+                    float(p.role_points_total), float(p.booster_points_total), penalty,
+                    _booster_meta(match_row, p) if match_row else None,
                 )
         return out
 
     accum: Dict[int, List[float]] = {}
+    stage_ev: Dict[int, Dict[int, List[float]]] = {}
+    stage_boost: Dict[int, Dict[int, Dict[int, list]]] = {}
+    player_penalty: Dict[int, float] = {}
+    round_wins: Dict[int, List[float]] = {}
+    round_elim: Dict[int, Dict[int, List[float]]] = {}  # team -> round -> [P(out here), expected penalty]
+    round_opp: Dict[int, Dict[int, Dict[int, List[float]]]] = {}  # team -> round -> opponent -> [P(play), P(play and win)]
+    round_opp_pts: Dict[int, Dict[int, Dict[int, float]]] = {}  # player -> round -> opponent -> expected match points
+    pid_team = {int(pid): tid for tid in all_team_ids for pid in base_states[tid].players}
     for key, w in weights.items():
+        a, b, winner, _na, _nb, rem = key
+        r = rounds_total - rem - 1
+        rw = round_wins.setdefault(winner, [0.0] * rounds_total)
+        rw[r] += w
+        loser = b if winner == a else a
+        for tid, opp in ((a, b), (b, a)):
+            oc = round_opp.setdefault(tid, {}).setdefault(r, {}).setdefault(opp, [0.0, 0.0])
+            oc[0] += w
+            if winner == tid:
+                oc[1] += w
+        elim_recorded = False
         for pid, comps in pairing_points(key).items():
             bucket = accum.setdefault(pid, [0.0, 0.0, 0.0, 0.0, 0.0])
             for i in range(5):
                 bucket[i] += w * comps[i]
+            penalty = comps[5]
+            opp = b if pid_team.get(pid) == a else a
+            op = round_opp_pts.setdefault(pid, {}).setdefault(r, {})
+            op[opp] = op.get(opp, 0.0) + w * (comps[0] - penalty)
+            if penalty and not elim_recorded and pid_team.get(pid) == loser:
+                ecell = round_elim.setdefault(loser, {}).setdefault(r, [0.0, 0.0])
+                ecell[0] += w
+                ecell[1] += w * penalty
+                elim_recorded = True
+            cell = stage_ev.setdefault(pid, {}).setdefault(r, [0.0, 0.0, 0.0, 0.0, 0.0])
+            cell[0] += w * comps[1]
+            cell[1] += w * (comps[2] - penalty)
+            cell[2] += w * comps[3]
+            cell[3] += w * comps[4]
+            cell[4] += w * (comps[0] - penalty)
+            player_penalty[pid] = player_penalty.get(pid, 0.0) + w * penalty
+            _add_booster_weight(stage_boost.setdefault(pid, {}).setdefault(r, {}), comps[6], w)
+    player_bye: Dict[int, float] = {}
     for tid, w in bye_weight.items():
         pad = _PLAYOFF_BYE_PADDING_POINTS * w
         for pid in base_states[tid].players:
             bucket = accum.setdefault(int(pid), [0.0, 0.0, 0.0, 0.0, 0.0])
             bucket[0] += pad
             bucket[2] += pad
+            player_bye[int(pid)] = player_bye.get(int(pid), 0.0) + pad
     if progress_callback:
         progress_callback(1, 1)
 
@@ -744,7 +969,7 @@ def _exact_combined_playoffs(
         r = rounds_total - rem - 1
         for tid in (a, b):
             row = round_reach.setdefault(tid, [0.0] * rounds_total)
-            row[r] += w * 0.5  # each pairing appears twice (winner a / winner b)
+            row[r] += w  # weights are P(match with that result); summing both winners gives P(match)
     if byes_to_semis:
         round_labels = ["QF", "SF", "Final"]
     else:
@@ -759,8 +984,37 @@ def _exact_combined_playoffs(
         "rounds": rounds_total,
         "round_labels": round_labels,
         "round_reach": {str(tid): row for tid, row in round_reach.items()},
+        "round_wins": {str(tid): row for tid, row in round_wins.items()},
         "stop_teams": stop_teams,
         "player_ev": player_ev,
+        # Per-round expected points by component (penalty excluded), the
+        # elimination penalty and the bye padding per player, for the modal.
+        "player_stage_ev": {
+            str(pid): {
+                str(r): {"rating": c[0], "win": c[1], "role": c[2], "booster": c[3], "total": c[4]}
+                for r, c in rounds_ev.items()
+            }
+            for pid, rounds_ev in stage_ev.items()
+        },
+        "player_penalty": {str(pid): v for pid, v in player_penalty.items()},
+        "player_bye": {str(pid): v for pid, v in player_bye.items()},
+        "round_elim": {
+            str(tid): {str(r): {"prob": c[0], "points": c[1]} for r, c in rounds.items()}
+            for tid, rounds in round_elim.items()
+        },
+        "bye_prob": {str(tid): float(w) for tid, w in bye_weight.items()},
+        "round_opp": {
+            str(tid): {str(r): {str(o): {"play": c[0], "win": c[1]} for o, c in opps.items()} for r, opps in rounds.items()}
+            for tid, rounds in round_opp.items()
+        },
+        "player_round_opp_pts": {
+            str(pid): {str(r): {str(o): v for o, v in opps.items()} for r, opps in rounds.items()}
+            for pid, rounds in round_opp_pts.items()
+        },
+        "player_stage_boost": {
+            str(pid): {str(r): _booster_list(bucket) for r, bucket in rounds.items()}
+            for pid, rounds in stage_boost.items()
+        },
         # P(team wins the last played round) — with stop_teams > 1 this is the
         # chance of qualifying onward rather than winning the whole bracket.
         "advance_rate": {str(tid): v for tid, v in sorted(advance.items(), key=lambda kv: -kv[1])},
@@ -768,18 +1022,22 @@ def _exact_combined_playoffs(
 
 
 
-def bake_event_valuations(event_id: int, trigger: str = "nightly") -> Dict[str, Any]:
+def bake_event_valuations(event_id: int, trigger: str = "import", only_if_missing: bool = False) -> Dict[str, Any]:
     """Run and store the groups valuation for one fantasy event off the request
-    path (nightly, and right after a new event is imported), so opening the
-    Tournament tab never computes anything. Uses the detected format, the
-    detected combined-playoff flag and the HLTV draw (re-fetched live once when
-    the stored draw still has TBD slots). Returns a short status dict; never
-    raises — the scheduler records the message."""
+    path — once, right after the event is imported — so opening the Tournament
+    tab never computes anything. Uses the detected format, the detected
+    combined-playoff flag and the HLTV draw (re-fetched live once when the
+    stored draw still has TBD slots). With only_if_missing the nightly run
+    only fills in an event that could not be baked at import (draw not
+    published yet); an existing valuation is never refreshed. Returns a short
+    status dict; never raises — the scheduler records the message."""
     from backend.data.event_db import get_event_detail, get_event_groups_autofill, get_event_tournament_kind, set_event_groups_autofill
     from backend.routes import events as events_routes
 
     started = time.time()
     event_id = int(event_id)
+    if only_if_missing and _GROUPS_STATE.load(key=event_id):
+        return {"status": "exists", "event_id": event_id, "reason": "already baked at import; not refreshed"}
     event = get_event_detail(event_id)
     if not event:
         return {"status": "skipped", "event_id": event_id, "reason": "event not found"}
@@ -841,6 +1099,181 @@ def bake_event_valuations(event_id: int, trigger: str = "nightly") -> Dict[str, 
     }
 
 
+def _assemble_stage_stats(
+    group_format: str,
+    acc: Dict[str, Any],
+    playoff: Optional[Dict[str, Any]],
+    teams_out: Dict[int, Dict[str, Any]],
+    team_rank_by_id: Optional[Dict[int, int]] = None,
+) -> Dict[str, Any]:
+    """Per-round view for the player breakdown modal, in the Playoff tab's
+    shape: for every round of the group (then of the playoff) each team's
+    chance of playing it, its opponents there (chance to meet, chance to beat),
+    the 'eliminated earlier' share (the -3-per-missed-round penalty, credited to
+    the rounds it misses) and the bye credit on the round a bye skips; each
+    player's expected points per round by component (net of those), per
+    opponent, and the booster the round uses. Group padding stays separate."""
+    rounds = _GROUP_STAGE_ROUNDS.get(group_format, [])
+    stages = [
+        {"key": rk, "label": lbl, "full": full, "phase": "group", "bracket": side, "opener": i == 0}
+        for i, (rk, lbl, full, side, _slots) in enumerate(rounds)
+    ]
+    po = playoff or {}
+    round_labels = po.get("round_labels") or []
+    po_keys = [f"po_{r}" for r in range(len(round_labels))]
+    for r, lbl in enumerate(round_labels):
+        stages.append({
+            "key": po_keys[r], "label": lbl, "full": _PLAYOFF_ROUND_FULL.get(lbl, lbl),
+            "phase": "playoff", "bracket": "playoff", "opener": False,
+        })
+    all_keys = [st["key"] for st in stages]
+    fold = {mk: rk for rk, _lbl, _full, _side, mks in rounds for mk in mks}
+    lower_order = [rk for rk, _lbl, _full, side, _slots in rounds if side == "lower"]
+
+    def missed_after(rk: str) -> List[str]:
+        """Rounds a team knocked out in `rk` never plays (the penalty is -3 each)."""
+        if rk in lower_order:
+            return lower_order[lower_order.index(rk) + 1:] + po_keys
+        if rk in po_keys:
+            return po_keys[po_keys.index(rk) + 1:]
+        return list(po_keys)
+
+    def folded(raw: Dict[str, float]) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for mk, v in raw.items():
+            rk = fold.get(mk, mk)
+            out[rk] = out.get(rk, 0.0) + float(v)
+        return out
+
+    ranks = team_rank_by_id or {}
+    teams: Dict[str, Dict[str, Any]] = {}
+    team_elim_before: Dict[int, Dict[str, List[float]]] = {}
+    for tid in teams_out:
+        tid_i = int(tid)
+        reach = folded(acc["reach"].get(tid_i) or {})
+        wins = folded(acc["wins"].get(tid_i) or {})
+        elim: Dict[str, List[float]] = {}
+        for mk, c in (acc["elim"].get(tid_i) or {}).items():
+            e = elim.setdefault(fold.get(mk, mk), [0.0, 0.0])
+            e[0] += c[0]
+            e[1] += c[1]
+        opps: Dict[str, Dict[int, List[float]]] = {}
+        for mk, per_opp in (acc["opp"].get(tid_i) or {}).items():
+            dest = opps.setdefault(fold.get(mk, mk), {})
+            for o, c in per_opp.items():
+                oc = dest.setdefault(int(o), [0.0, 0.0])
+                oc[0] += c[0]
+                oc[1] += c[1]
+        rr = (po.get("round_reach") or {}).get(str(tid)) or []
+        rw = (po.get("round_wins") or {}).get(str(tid)) or []
+        for r, p in enumerate(rr):
+            reach[po_keys[r]] = float(p)
+            wins[po_keys[r]] = float(rw[r]) if r < len(rw) else 0.0
+        for r, c in ((po.get("round_elim") or {}).get(str(tid)) or {}).items():
+            elim[po_keys[int(r)]] = [float(c["prob"]), float(c["points"])]
+        for r, per_opp in ((po.get("round_opp") or {}).get(str(tid)) or {}).items():
+            dest = opps.setdefault(po_keys[int(r)], {})
+            for o, c in per_opp.items():
+                dest[int(o)] = [float(c["play"]), float(c["win"])]
+        elim_before: Dict[str, List[float]] = {}
+        for k, (p_k, pts_k) in elim.items():
+            missed = missed_after(k)
+            if not missed:
+                continue
+            share = pts_k / len(missed)
+            for rk in missed:
+                e = elim_before.setdefault(rk, [0.0, 0.0])
+                e[0] += p_k
+                e[1] += share
+        team_elim_before[tid_i] = elim_before
+        bye_prob = float((po.get("bye_prob") or {}).get(str(tid)) or 0.0)
+        rounds_out: Dict[str, Dict[str, Any]] = {}
+        for rk in all_keys:
+            play = float(reach.get(rk, 0.0))
+            eb = elim_before.get(rk) or [0.0, 0.0]
+            rounds_out[rk] = {
+                "play": play,
+                "win": (wins.get(rk, 0.0) / play) if play > 0 else 0.0,
+                "opponents": {
+                    str(o): {"play": c[0], "win": (c[1] / c[0] if c[0] > 0 else 0.0)}
+                    for o, c in (opps.get(rk) or {}).items()
+                },
+                "elim_before": {"prob": eb[0], "points": eb[1]},
+                "bye": bye_prob if (po_keys and rk == po_keys[0]) else 0.0,
+            }
+        teams[str(tid)] = {
+            "rounds": rounds_out,
+            "rank": ranks.get(tid_i),
+            "padding_prob": float(acc["pad_prob"].get(tid_i) or 0.0),
+            "champion": float((po.get("advance_rate") or {}).get(str(tid)) or 0.0),
+        }
+
+    pid_team: Dict[int, int] = {}
+    for tid, t in teams_out.items():
+        for pid in (t.get("players") or {}):
+            pid_team[int(pid)] = int(tid)
+    players: Dict[str, Dict[str, Any]] = {}
+    keys = ("rating", "win", "role", "booster", "total")
+    for pid, per_key in acc["players"].items():
+        merged: Dict[str, List[float]] = {}
+        for mk, v in per_key.items():
+            cell = merged.setdefault(fold.get(mk, mk), [0.0, 0.0, 0.0, 0.0, 0.0])
+            for i in range(5):
+                cell[i] += v[i]
+        row: Dict[str, Any] = {"stages": {k: dict(zip(keys, v)) for k, v in merged.items()}}
+        boost_merged: Dict[str, Dict[int, list]] = {}
+        for mk, bucket in (acc["boost"].get(pid) or {}).items():
+            dest = boost_merged.setdefault(fold.get(mk, mk), {})
+            for bid, v in bucket.items():
+                cell = dest.get(bid)
+                if cell is None:
+                    dest[bid] = list(v)
+                else:
+                    cell[0] += v[0]
+        for rk, bucket in boost_merged.items():
+            if rk in row["stages"]:
+                row["stages"][rk]["boosters"] = _booster_list(bucket)
+        opp_merged: Dict[str, Dict[int, float]] = {}
+        for mk, per_opp in (acc["opp_pts"].get(pid) or {}).items():
+            dest = opp_merged.setdefault(fold.get(mk, mk), {})
+            for o, v in per_opp.items():
+                dest[int(o)] = dest.get(int(o), 0.0) + v
+        for rk, per_opp in opp_merged.items():
+            if rk in row["stages"]:
+                row["stages"][rk]["opponents"] = {str(o): v for o, v in per_opp.items()}
+        pad = acc["padding"].get(pid) or [0.0, 0.0, 0.0, 0.0]
+        row["padding"] = {"rating": pad[0], "win": pad[1], "role": pad[2], "booster": pad[3], "total": sum(pad)}
+        row["penalty"] = float(acc["penalty"].get(pid) or 0.0)
+        players[str(pid)] = row
+    for pid_s, per_round in (po.get("player_stage_ev") or {}).items():
+        row = players.setdefault(pid_s, {"stages": {}, "padding": {"rating": 0, "win": 0, "role": 0, "booster": 0, "total": 0}, "penalty": 0.0})
+        for r, cell in per_round.items():
+            rk = po_keys[int(r)]
+            row["stages"][rk] = dict(cell)
+            row["stages"][rk]["boosters"] = ((po.get("player_stage_boost") or {}).get(pid_s) or {}).get(str(r)) or []
+            row["stages"][rk]["opponents"] = ((po.get("player_round_opp_pts") or {}).get(pid_s) or {}).get(str(r)) or {}
+        row["playoff_penalty"] = float((po.get("player_penalty") or {}).get(pid_s) or 0.0)
+        row["playoff_bye"] = float((po.get("player_bye") or {}).get(pid_s) or 0.0)
+    # Net each round: the 'eliminated earlier' share and the bye credit sit in
+    # the win component (as in the Playoff tab), so the cards add up to the
+    # total once padding is added.
+    for pid_s, row in players.items():
+        tid_i = pid_team.get(int(pid_s))
+        if tid_i is None:
+            continue
+        eb_rounds = team_elim_before.get(tid_i) or {}
+        for rk, eb in eb_rounds.items():
+            cell = row["stages"].setdefault(rk, {"rating": 0.0, "win": 0.0, "role": 0.0, "booster": 0.0, "total": 0.0})
+            cell["win"] = float(cell.get("win") or 0.0) + eb[1]
+            cell["total"] = float(cell.get("total") or 0.0) + eb[1]
+        bye = float(row.get("playoff_bye") or 0.0)
+        if bye and po_keys:
+            cell = row["stages"].setdefault(po_keys[0], {"rating": 0.0, "win": 0.0, "role": 0.0, "booster": 0.0, "total": 0.0})
+            cell["win"] = float(cell.get("win") or 0.0) + bye
+            cell["total"] = float(cell.get("total") or 0.0) + bye
+    return {"stages": stages, "teams": teams, "players": players}
+
+
 def _compute_groups_result(payload: dict, progress_callback=None) -> dict:
     groups = payload["groups"]
     gf_raw = str(payload.get("group_format") or "").strip().lower()
@@ -857,6 +1290,7 @@ def _compute_groups_result(payload: dict, progress_callback=None) -> dict:
     prob_cache: Dict = {}
     outcomes: List[Dict[str, Any]] = []
     teams_out: Dict[int, Dict[str, Any]] = {}
+    stage_acc = _new_stage_acc()
     total_units = len(groups) + (1 if combined else 0)
     playoff_rounds = 0
     if combined:
@@ -867,7 +1301,8 @@ def _compute_groups_result(payload: dict, progress_callback=None) -> dict:
             playoff_rounds = max(1, int(math.log2(quals_per_group * len(groups))) - int(math.log2(stop_teams)))
     for g_idx, group in enumerate(groups):
         group_outcomes = enumerate_group(
-            group, g_idx, player_rows_by_id, team_rank_by_id, prob_cache, extra_rounds=playoff_rounds
+            group, g_idx, player_rows_by_id, team_rank_by_id, prob_cache, extra_rounds=playoff_rounds,
+            stage_acc=stage_acc,
         )
         outcomes.extend(group_outcomes)
         # Exact expected player totals for this group (its probabilities sum to 1).
@@ -915,6 +1350,7 @@ def _compute_groups_result(payload: dict, progress_callback=None) -> dict:
             prob_cache,
             stop_teams=int(payload.get("playoff_stop_teams") or 1),
             quals_per_group=quals_per_group,
+            group_format=group_format,
             progress_callback=(
                 (lambda done, total: progress_callback(len(groups) + (1 if done >= total else 0), total_units))
                 if progress_callback
@@ -963,6 +1399,7 @@ def _compute_groups_result(payload: dict, progress_callback=None) -> dict:
         "group_format": group_format,
         "quals_per_group": quals_per_group,
         "place_odds": place_odds,
+        "stage_stats": _assemble_stage_stats(group_format, stage_acc, playoff_summary, teams_out, team_rank_by_id),
         "combined_playoffs": combined,
         "playoff": playoff_summary,
         "method": "exact_enumeration_per_group" + ("_plus_exact_playoffs" if combined else ""),
@@ -1592,11 +2029,12 @@ def _slim_groups_results(results: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @router.get("/latest")
-def get_latest_groups(full: bool = False):
-    """Stored simulation for the active event. Slim by default (no outcomes
-    list; see _slim_groups_results) so the Groups tab opens instantly;
-    ?full=1 returns the raw stored blob."""
-    key = _state_key()
+def get_latest_groups(full: bool = False, event_id: Optional[int] = None):
+    """Stored simulation for the active event (or ?event_id= for another
+    event's stored run). Slim by default (no outcomes list; see
+    _slim_groups_results) so the Groups tab opens instantly; ?full=1 returns
+    the raw stored blob."""
+    key = int(event_id) if event_id else _state_key()
     latest = _GROUPS_STATE.load(key=key)
     if not latest:
         return {"exists": False, "event_id": key}
@@ -1607,6 +2045,15 @@ def get_latest_groups(full: bool = False):
         "results": latest["results"] if full else _slim_groups_results(latest["results"] or {}),
         "updated_at": latest["updated_at"],
     }
+
+
+@router.post("/bake")
+def bake_groups_event(event_id: Optional[int] = None):
+    """(Re)bake the stored valuation for one event — the active one by default —
+    synchronously, without changing which event is active. Same job the
+    scheduler runs at import; useful after a scoring change."""
+    key = int(event_id) if event_id else _state_key()
+    return bake_event_valuations(key, trigger="manual")
 
 
 @router.delete("/latest")

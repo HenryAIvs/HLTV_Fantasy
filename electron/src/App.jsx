@@ -1210,7 +1210,7 @@ function PointSourcesModal({ player, teamLookup, onClose }) {
   );
 }
 
-function GroupPlayerBreakdownModal({ player, teamLookup, onClose }) {
+function GroupPlayerBreakdownModal({ player, teamLookup, teams, onClose }) {
   if (!player) return null;
   const rating = Number(player.rating || 0);
   const win = Number(player.win || 0);
@@ -1219,9 +1219,219 @@ function GroupPlayerBreakdownModal({ player, teamLookup, onClose }) {
   const total = Number.isFinite(Number(player.total)) && Number(player.total) !== 0
     ? Number(player.total)
     : rating + win + role + booster;
+  const heroStats = [
+    ["Rating", rating],
+    ["Win", win],
+    ["Role", role],
+    ["Booster", booster],
+  ];
+  // Per-round view in the Playoff tab's card style: for every round of the
+  // group and of the playoff, the team's chance to play it, the opponents it
+  // can meet there (chance to meet, chance to beat, points when it happens),
+  // the bye / 'eliminated earlier' shares, and the booster the round uses.
+  // The opening match sits between the upper and lower bracket rows; the
+  // group padding gets a card of its own so the cards add up to the total.
+  const stageList = Array.isArray(player.stage_list) ? player.stage_list : [];
+  const stageEv = player.stage_ev || {};
+  const teamRounds = player.team_rounds || {};
+  const pct = (v) => `${Math.round(Number(v || 0) * 100)}%`;
+  const ordinal = (n) => {
+    const v = Number(n);
+    const suffix = v % 100 >= 11 && v % 100 <= 13 ? "th" : ["th", "st", "nd", "rd"][v % 10] || "th";
+    return `${v}${suffix}`;
+  };
+  const teamInfo = (tid) => (teams || []).find((t) => Number(t.team_id) === Number(tid));
+  const teamRank = (tid) => {
+    const info = teamInfo(tid);
+    const r = player.team_ranks?.[String(tid)] ?? info?.rank ?? info?.world_rank ?? info?.hltv_rank;
+    return r != null && Number(r) > 0 && Number(r) < 999 ? ` (#${r})` : "";
+  };
+  const matchCard = (s) => {
+    const cell = stageEv[s.key] || {};
+    const round = teamRounds[s.key] || {};
+    const play = Number(round.play || 0);
+    const bye = Number(round.bye || 0);
+    const elimProb = Number(round.elim_before?.prob || 0);
+    const elimPts = Number(round.elim_before?.points || 0);
+    const cellTotal = Number(cell.total || 0);
+    if (play < 0.0005 && bye < 0.0005 && elimProb < 0.0005 && Math.abs(cellTotal) < 0.005) return null;
+    const oppPts = cell.opponents || {};
+    const opponents = Object.entries(round.opponents || {})
+      .map(([tid, o]) => ({
+        team_id: Number(tid),
+        play: Number(o.play || 0),
+        win: Number(o.win || 0),
+        pts: Number(o.play || 0) > 0 ? Number(oppPts[tid] || 0) / Number(o.play || 0) : 0,
+      }))
+      .filter((o) => o.play > 0.0005)
+      .sort((a, b) => b.play - a.play);
+    // Long playoff lists (up to 15 possible opponents) keep the top 8 and
+    // fold the tail into one weighted row.
+    const shown = opponents.slice(0, 8);
+    const rest = opponents.slice(8);
+    const restPlay = rest.reduce((a, o) => a + o.play, 0);
+    const byePts = bye > 0.0005 ? Number(player.playoff_bye || 0) / bye : 0;
+    const elimEach = elimProb > 0.0005 ? elimPts / elimProb : 0;
+    const covered = play + bye + elimProb;
+    const elsewhere = s.phase === "group" && covered < 0.9995 ? 1 - covered : 0;
+    return {
+      key: s.key,
+      label: s.full || STAGE_FULL[s.label] || s.label,
+      chance: play > 0.0005 ? pct(Number(round.win || 0)) : bye > 0.0005 ? "Bye" : "—",
+      chanceLabel: play > 0.0005 ? "Match win" : null,
+      total: cellTotal,
+      minis: [
+        ["Rating", Number(cell.rating || 0)],
+        ["Win", Number(cell.win || 0)],
+        ["Role", Number(cell.role || 0)],
+        ["Boost", Number(cell.booster || 0)],
+      ],
+      boosters: Array.isArray(cell.boosters) ? cell.boosters : [],
+      rows: [
+        ...shown.map((o) => ({
+          key: `t${o.team_id}`,
+          team_id: o.team_id,
+          name: `${teamLookup[o.team_id] || o.team_id}${teamRank(o.team_id)}`,
+          play: o.play,
+          win: o.win,
+          pts: o.pts,
+        })),
+        ...(rest.length > 0
+          ? [{
+              key: "others",
+              muted: true,
+              name: `Others (${rest.length})`,
+              play: restPlay,
+              win: restPlay > 0 ? rest.reduce((a, o) => a + o.play * o.win, 0) / restPlay : 0,
+              pts: restPlay > 0 ? rest.reduce((a, o) => a + o.play * o.pts, 0) / restPlay : 0,
+            }]
+          : []),
+        ...(bye > 0.0005 ? [{ key: "bye", muted: true, name: "Bye", play: bye, pts: byePts }] : []),
+        ...(elimProb > 0.0005 ? [{ key: "elim", muted: true, name: "Out earlier", play: elimProb, pts: elimEach }] : []),
+        ...(elsewhere > 0.0005
+          ? [{ key: "else", muted: true, name: s.bracket === "lower" ? "Upper bracket" : "Lower bracket", play: elsewhere, pts: 0 }]
+          : []),
+      ],
+      totalPlay: covered + elsewhere,
+      totalWin: Number(round.win || 0),
+    };
+  };
+  const padding = player.padding || null;
+  const paddingProb = Number(player.padding_prob || 0);
+  const paddingCard =
+    padding && (Math.abs(Number(padding.total || 0)) > 0.005 || paddingProb > 0.0005)
+      ? {
+          key: "padding",
+          extra: true,
+          label: "Padding",
+          chance: pct(paddingProb),
+          chanceLabel: "Applies",
+          total: Number(padding.total || 0),
+          minis: [
+            ["Rating", Number(padding.rating || 0)],
+            ["Win", Number(padding.win || 0)],
+            ["Role", Number(padding.role || 0)],
+            ["Boost", Number(padding.booster || 0)],
+          ],
+          boosters: [],
+          rows: [
+            { key: "pad", muted: true, name: "Qualified early", play: paddingProb, pts: paddingProb > 0.0005 ? Number(padding.total || 0) / paddingProb : 0 },
+            ...(paddingProb < 0.9995 ? [{ key: "nopad", muted: true, name: "Plays all rounds", play: 1 - paddingProb, pts: 0 }] : []),
+          ],
+          totalPlay: 1,
+          totalWin: null,
+          note: "Credit for the group match a quick qualifier never plays: rating, +6 win and role, no booster.",
+        }
+      : null;
+  const sideOf = (s) => s.bracket || (s.phase === "playoff" ? "playoff" : "upper");
+  const groupStages = stageList.filter((s) => s.phase === "group");
+  const openerStage = groupStages.find((s) => s.opener) || groupStages[0] || null;
+  const opener = openerStage ? matchCard(openerStage) : null;
+  const upper = groupStages.filter((s) => s !== openerStage && sideOf(s) === "upper").map(matchCard).filter(Boolean);
+  const lower = groupStages.filter((s) => s !== openerStage && sideOf(s) === "lower").map(matchCard).filter(Boolean);
+  const playoff = stageList.filter((s) => s.phase === "playoff").map(matchCard).filter(Boolean);
+  // Padding sits between the upper semi-final and the upper final (the round
+  // it stands in for), so the grid reads: opener | UB SF / LB R1 | Padding /
+  // LB SF | UB Final / LB Final.
+  if (paddingCard && (upper.length > 0 || opener)) upper.splice(Math.min(1, upper.length), 0, paddingCard);
+  const groupCols = (opener ? 1 : 0) + Math.max(upper.length, lower.length);
+  const playoffCols = Math.max(groupCols, playoff.length, 1);
+  const hasStages = Boolean(opener) || upper.length > 0 || lower.length > 0 || playoff.length > 0;
+  const renderCard = (c) => (
+    <div className={`round-card${c.extra ? " extra" : ""}`} key={c.key}>
+      <div className="round-card-top">
+        <span className="round-card-name">{c.label}</span>
+        <span className="round-card-play">
+          <span className="round-card-chance">{c.chance}</span>
+          {c.chanceLabel && <span className="event-player-stat-label">{c.chanceLabel}</span>}
+        </span>
+      </div>
+      <div className="event-player-rating">{c.total.toFixed(2)}</div>
+      <div className="event-player-stats ev-mini">
+        {c.minis.map(([mlabel, value]) => (
+          <div className="event-player-stat" key={mlabel}>
+            <div className={`event-player-mini${value < -0.005 ? " neg" : ""}`}>{Number(value || 0).toFixed(1)}</div>
+            <div className="event-player-stat-label">{mlabel}</div>
+          </div>
+        ))}
+      </div>
+      {c.boosters.length > 0 && (
+        <div className="round-card-boosts">
+          {c.boosters.map((b) => (
+            <div className="round-card-boost" key={`${b.booster_id}-${b.slot}`}>
+              <BoosterBadge boosterId={b.booster_id} size={20} />
+              <span className="round-card-boost-name">
+                {b.booster_name || `Booster ${b.booster_id}`}
+                <span className="round-card-boost-slot">
+                  {ordinal(b.slot)} match{c.boosters.length > 1 ? ` · ${pct(b.share)} of the time` : ""}
+                </span>
+              </span>
+              <span className="round-card-boost-rate">{(Number(b.booster_rate || 0) * 100).toFixed(0)}%</span>
+              {Math.abs(Number(b.edge || 0)) > 0.0005 && (
+                <span className="round-card-boost-edge">
+                  {Number(b.edge) >= 0 ? "+" : ""}
+                  {(Number(b.edge) * 100).toFixed(0)}% vs avg
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {c.note && <div className="round-card-note">{c.note}</div>}
+      {c.rows.length > 0 && (
+        <div className="round-opps">
+          <div className="round-opp head">
+            <span className="round-opp-name">{c.extra ? "Outcome" : "Team"}</span>
+            <span className="round-opp-prob">{c.extra ? "Odds" : "Play"}</span>
+            <span className="round-opp-win">Win</span>
+            <span className="round-opp-pts">Pts</span>
+          </div>
+          {c.rows.map((r) => {
+            const info = r.team_id != null ? teamInfo(r.team_id) : null;
+            return (
+              <div className={`round-opp${r.muted ? " miss" : ""}`} key={r.key}>
+                {r.team_id != null && <TeamLogo hltvTeamId={info?.hltv_team_id} name={teamLookup[r.team_id]} size={16} />}
+                <span className="round-opp-name">{r.name}</span>
+                <span className="round-opp-prob">{pct(r.play)}</span>
+                <span className="round-opp-win">{r.win != null ? pct(r.win) : "—"}</span>
+                <span className="round-opp-pts">{r.pts >= 0 ? r.pts.toFixed(1) : r.pts.toFixed(1)}</span>
+              </div>
+            );
+          })}
+          <div className="round-opp total">
+            <span className="round-opp-name">Total</span>
+            <span className="round-opp-prob">{pct(c.totalPlay)}</span>
+            <span className="round-opp-win">{c.totalWin != null ? pct(c.totalWin) : "—"}</span>
+            <span className="round-opp-pts">{c.total.toFixed(1)}</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+  const gridStyle = (cols) => ({ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` });
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+      <div className="modal player-sources-modal" onClick={(e) => e.stopPropagation()}>
         <header className="modal-header">
           <h3>
             {player.name || `Player ${player.player_id}`}
@@ -1232,27 +1442,78 @@ function GroupPlayerBreakdownModal({ player, teamLookup, onClose }) {
           </button>
         </header>
         <div className="modal-body">
-          <p className="muted">
-            {player.note || "Expected points across every exact group outcome, weighted by its probability."}
-          </p>
-          <table>
-            <thead>
-              <tr>
-                <th>Source</th>
-                <th>{player.note ? "Points" : "Expected Points"}</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr><td>Rating</td><td>{rating.toFixed(2)}</td></tr>
-              <tr><td>Win</td><td>{win.toFixed(2)}</td></tr>
-              <tr><td>Role</td><td>{role.toFixed(2)}</td></tr>
-              <tr><td>Booster</td><td>{booster.toFixed(2)}</td></tr>
-              <tr>
-                <td><strong>Total</strong></td>
-                <td><strong>{total.toFixed(2)}</strong></td>
-              </tr>
-            </tbody>
-          </table>
+          <div className="breakdown-hero">
+            {player.role_id != null && (
+              <div className="breakdown-stat role">
+                <RoleBadge roleId={player.role_id} size={42} />
+                <div className="breakdown-stat-label">{ROLE_NAMES[player.role_id] || `Role ${player.role_id}`}</div>
+              </div>
+            )}
+            {heroStats.map(([label, value]) => (
+              <div className="breakdown-stat" key={label}>
+                <div className="breakdown-stat-value">{value.toFixed(2)}</div>
+                <div className="breakdown-stat-label">{label}</div>
+              </div>
+            ))}
+            <div className="breakdown-stat total">
+              <div className="breakdown-stat-value">{total.toFixed(2)}</div>
+              <div className="breakdown-stat-label">Total</div>
+            </div>
+          </div>
+          {player.note && <p className="muted">{player.note}</p>}
+          {!hasStages && !player.note && (
+            <p className="muted">
+              Expected points across every exact group outcome, weighted by its probability. Re-run the
+              valuation to see the per-round split.
+            </p>
+          )}
+          {(opener || upper.length > 0 || lower.length > 0) && (
+            <div className="stack round-row">
+              <h4>Group Stage</h4>
+              <div className="round-cards stage-grid bracket-grid" style={gridStyle(groupCols)}>
+                {opener && (
+                  <div className="bracket-cell opener" style={{ gridColumn: 1, gridRow: "1 / span 2" }}>
+                    {renderCard(opener)}
+                  </div>
+                )}
+                {upper.map((c, i) => (
+                  <div className="bracket-cell" style={{ gridColumn: i + (opener ? 2 : 1), gridRow: 1 }} key={`u-${c.key}`}>
+                    {renderCard(c)}
+                  </div>
+                ))}
+                {lower.map((c, i) => (
+                  <div className="bracket-cell" style={{ gridColumn: i + (opener ? 2 : 1), gridRow: 2 }} key={`l-${c.key}`}>
+                    {renderCard(c)}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {playoff.length > 0 && (
+            <div className="stack round-row">
+              <h4>Playoffs</h4>
+              <div className="round-cards stage-grid" style={gridStyle(playoffCols)}>{playoff.map(renderCard)}</div>
+            </div>
+          )}
+          {!hasStages && (
+            <table>
+              <thead>
+                <tr>
+                  <th>Source</th>
+                  <th>{player.note ? "Points" : "Expected Points"}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {heroStats.map(([label, value]) => (
+                  <tr key={label}><td>{label}</td><td>{value.toFixed(2)}</td></tr>
+                ))}
+                <tr>
+                  <td><strong>Total</strong></td>
+                  <td><strong>{total.toFixed(2)}</strong></td>
+                </tr>
+              </tbody>
+            </table>
+          )}
         </div>
       </div>
     </div>
@@ -11713,6 +11974,93 @@ function GroupBracketVisual({ format, slotIds, nameOf, hltvIdByTeamId, combined,
   );
 }
 
+// Playoff bracket skeleton for a combined event: the bracket's shape with
+// placeholder rows naming the group place that feeds each slot, in the same
+// card + connector system as the Playoff tab. Mirrors the simulator's
+// templates: the top-3 shape is the 6-team byes bracket; other shapes flatten
+// qualifiers seed-major and pair i vs N-1-i, with stopTeams ending early.
+function PlayoffSkeleton({ format, groupCount, qualsPerGroup, stopTeams = 1, bo = null }) {
+  const boDefault = Number(bo?.default || 3);
+  const boFinal = Number(bo?.grandFinal || boDefault);
+  const empty = {};
+  const ph = (text, key, muted = true) => (
+    <GroupTeamRow key={key} teamId={0} placeholder={text} muted={muted} hltvIdByTeamId={empty} />
+  );
+  const ordinal = (r) => ({ 1: "1st", 2: "2nd", 3: "3rd" }[r] || `${r}th`);
+  const seedLabel = (g, rank) => `Group ${g + 1} ${ordinal(rank + 1)}`;
+  let rounds;
+  if (format === "de8_top3") {
+    // Presented as HLTV lays it out: QF1's winner meets Group 2's winner,
+    // QF2's winner meets Group 1's winner, so the connectors read straight.
+    rounds = [
+      {
+        title: "Quarter-finals",
+        matches: [
+          { key: "qf1", title: "QF 1", meta: `BO${boDefault}`, rows: [ph(seedLabel(0, 1), "a", false), ph(seedLabel(1, 2), "b", false)] },
+          { key: "qf2", title: "QF 2", meta: `BO${boDefault}`, rows: [ph(seedLabel(1, 1), "a", false), ph(seedLabel(0, 2), "b", false)] },
+        ],
+      },
+      {
+        title: "Semi-finals",
+        straight: true,
+        matches: [
+          { key: "sf1", title: "SF 1", meta: `BO${boDefault}`, rows: [ph(`${seedLabel(1, 0)} (bye)`, "a", false), ph("Winner QF 1", "b")] },
+          { key: "sf2", title: "SF 2", meta: `BO${boDefault}`, rows: [ph(`${seedLabel(0, 0)} (bye)`, "a", false), ph("Winner QF 2", "b")] },
+        ],
+      },
+      {
+        title: "Grand final",
+        matches: [{ key: "f", title: "Final", meta: `BO${boFinal}`, rows: [ph("Winner SF 1", "a"), ph("Winner SF 2", "b")] }],
+      },
+    ];
+  } else {
+    const seeded = [];
+    for (let r = 0; r < qualsPerGroup; r += 1) for (let g = 0; g < groupCount; g += 1) seeded.push([g, r]);
+    const n = seeded.length;
+    const total = Math.max(1, Math.round(Math.log2(n)) - Math.round(Math.log2(Math.max(1, stopTeams))));
+    const titleFor = (teamsIn) => ({ 2: "Grand final", 4: "Semi-finals", 8: "Quarter-finals", 16: "Round of 16" }[teamsIn] || `Round of ${teamsIn}`);
+    const shortFor = (teamsIn) => ({ 2: "F", 4: "SF", 8: "QF", 16: "R16" }[teamsIn] || `R${teamsIn}`);
+    rounds = [];
+    for (let r = 0; r < total; r += 1) {
+      const teamsIn = n >> r;
+      const matches = n >> (r + 1);
+      const feeder = r > 0 ? shortFor(n >> (r - 1)) : "";
+      rounds.push({
+        title: titleFor(teamsIn),
+        matches: Array.from({ length: matches }, (_, m) => ({
+          key: `r${r}m${m}`,
+          title: teamsIn === 2 ? "Final" : `${shortFor(teamsIn)} ${m + 1}`,
+          meta: `BO${teamsIn === 2 ? boFinal : boDefault}`,
+          rows:
+            r === 0
+              ? [ph(seedLabel(...seeded[m]), "a", false), ph(seedLabel(...seeded[n - 1 - m]), "b", false)]
+              : [ph(`Winner ${feeder} ${2 * m + 1}`, "a"), ph(`Winner ${feeder} ${2 * m + 2}`, "b")],
+        })),
+      });
+    }
+  }
+  return (
+    <div className="group-brackets">
+      <div>
+        <div className="pb-bracket">
+          {rounds.map((round, r) => (
+            <div className={`pb-round${round.straight ? " straight" : ""}`} key={`${round.title}-${r}`}>
+              <div className="pb-round-title">{round.title}</div>
+              <div className="pb-matches">
+                {round.matches.map((m) => (
+                  <div className="pb-match-wrap" key={m.key}>
+                    <GroupMatchCard title={m.title} meta={m.meta} rows={m.rows} />
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function GroupsTab({
   teams,
   teamLookup,
@@ -11730,6 +12078,8 @@ function GroupsTab({
   combinedShape = "",
   // Best-of for group matches from the event's formats table (default Bo3).
   groupBo = 3,
+  // Playoff best-of rules { default, grandFinal } for the bracket skeleton.
+  playoffBo = null,
 }) {
   const [groupsTab, setGroupsTab] = useState("stage");
   const [events, setEvents] = useState([]);
@@ -12357,6 +12707,29 @@ function GroupsTab({
 
   const [breakdownPlayer, setBreakdownPlayer] = useState(null);
   const [bakedInfo, setBakedInfo] = useState(null);
+  // Collapsible group / playoff cards, remembered per browser so a long
+  // page can be skipped past on every visit. { "group-0": true, playoff: true }
+  const collapseStorageKey = "groups.collapsedCards";
+  const [collapsedCards, setCollapsedCards] = useState(() => {
+    try {
+      const raw = window.localStorage.getItem(collapseStorageKey);
+      const parsed = raw ? JSON.parse(raw) : null;
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  });
+  const toggleCard = (key) => {
+    setCollapsedCards((prev) => {
+      const next = { ...prev, [key]: !prev[key] };
+      try {
+        window.localStorage.setItem(collapseStorageKey, JSON.stringify(next));
+      } catch {
+        /* storage may be unavailable; the toggle still works for this session */
+      }
+      return next;
+    });
+  };
   const playerNameById = useMemo(() => {
     const m = {};
     (players || []).forEach((p) => {
@@ -12379,15 +12752,30 @@ function GroupsTab({
   }, [results]);
   const openGroupPlayer = (p) => {
     const comps = playerEvByPid[Number(p.player_id)] || {};
+    const stageStats = results?.stage_stats || null;
+    const stageRow = stageStats?.players?.[String(p.player_id)] || null;
+    const teamRow = stageStats?.teams?.[String(p.team_id)] || null;
     setBreakdownPlayer({
       player_id: p.player_id,
       name: p.name,
       team_id: p.team_id,
+      role_id: comps.role_id ?? p.role_id ?? null,
       rating: Number(comps.rating_points_total || 0),
       win: Number(comps.win_points_total || 0),
       role: Number(comps.role_points_total || 0),
       booster: Number(comps.booster_points_total || 0),
       total: Number(comps.total_points || 0),
+      stage_list: stageStats?.stages || [],
+      stage_ev: stageRow?.stages || {},
+      team_rounds: teamRow?.rounds || {},
+      team_ranks: Object.fromEntries(
+        Object.entries(stageStats?.teams || {}).map(([tid, t]) => [tid, t?.rank ?? null])
+      ),
+      padding_prob: Number(teamRow?.padding_prob || 0),
+      padding: stageRow?.padding || null,
+      penalty: Number(stageRow?.penalty || 0),
+      playoff_bye: Number(stageRow?.playoff_bye || 0),
+      playoff_penalty: Number(stageRow?.playoff_penalty || 0),
     });
   };
   const renderPlayerLinks = (list) =>
@@ -12451,22 +12839,59 @@ function GroupsTab({
                 slot is still undecided. */}
             {autofillMessage && <p className="muted">{autofillMessage}</p>}
             {groupSlots.map((group, g) => {
+              const key = `group-${g}`;
+              const isCollapsed = Boolean(collapsedCards[key]);
+              const summary = group
+                .map((v) => (v ? teamName(v) : "TBD"))
+                .join(" · ");
               return (
-                <div className="card sub group-card" key={`group-${g}`}>
-                  <div className="group-card-head">
+                <div className="card sub group-card" key={key}>
+                  <button type="button" className="group-card-head collapsible" onClick={() => toggleCard(key)}>
                     <h3>Group {g + 1}</h3>
-                  </div>
-                  <GroupBracketVisual
-                    format={groupFormat}
-                    slotIds={group}
-                    nameOf={(v) => (v ? teamName(v) : "")}
-                    hltvIdByTeamId={hltvIdByTeamId}
-                    combined={combinedPlayoffs}
-                    bo={groupBo}
-                  />
+                    {isCollapsed && <span className="group-card-summary">{summary}</span>}
+                    <span className="group-card-chevron" aria-hidden="true">
+                      {isCollapsed ? "▸" : "▾"}
+                    </span>
+                  </button>
+                  {!isCollapsed && (
+                    <GroupBracketVisual
+                      format={groupFormat}
+                      slotIds={group}
+                      nameOf={(v) => (v ? teamName(v) : "")}
+                      hltvIdByTeamId={hltvIdByTeamId}
+                      combined={combinedPlayoffs}
+                      bo={groupBo}
+                    />
+                  )}
                 </div>
               );
             })}
+            {combinedPlayoffs && combinedAllowed && (
+              <div className="card sub group-card">
+                <button type="button" className="group-card-head collapsible" onClick={() => toggleCard("playoff")}>
+                  <h3>Playoff bracket</h3>
+                  {collapsedCards.playoff && (
+                    <span className="group-card-summary">
+                      {groupFormat === "de8_top3"
+                        ? "6 teams · group winners bye to the semi-finals"
+                        : `${qualsPerGroup * groupCount} teams · single elimination`}
+                    </span>
+                  )}
+                  <span className="group-card-chevron" aria-hidden="true">
+                    {collapsedCards.playoff ? "▸" : "▾"}
+                  </span>
+                </button>
+                {!collapsedCards.playoff && (
+                  <PlayoffSkeleton
+                    format={groupFormat}
+                    groupCount={groupCount}
+                    qualsPerGroup={qualsPerGroup}
+                    stopTeams={groupFormat === "de8_top3" ? 1 : Number(playoffStopTeams) || 1}
+                    bo={playoffBo}
+                  />
+                )}
+              </div>
+            )}
             {combinedDetected && !combinedSupported && (
               <p className="warning-text" style={{ fontSize: 12, margin: 0 }}>
                 HLTV runs this as ONE fantasy game for the groups and the playoffs, but the simulator has no verified
@@ -12474,13 +12899,12 @@ function GroupsTab({
                 here cover the group stage only.
               </p>
             )}
-            <p className="muted" style={{ fontSize: 12 }}>
-              {results
-                ? `Valuations baked ${updatedAt ? new Date(updatedAt).toLocaleString() : ""}${
-                    bakedInfo?.trigger ? ` (${bakedInfo.trigger})` : ""
-                  } — exact group stage${results.combined_playoffs ? " + exact playoff" : ""}, refreshed after every import and nightly run.`
-                : "No valuations stored yet — they are baked automatically after import and after each nightly run, once HLTV has published the draw."}
-            </p>
+            {!results && (
+              <p className="muted" style={{ fontSize: 12 }}>
+                No valuations stored yet — they are baked when the event is imported, once HLTV has published the draw
+                (the nightly run retries until then).
+              </p>
+            )}
             {results && (
               <div className="event-team-rows">
                 {valuationTeamOrder.map((tid) => {
@@ -12833,6 +13257,7 @@ function GroupsTab({
       <GroupPlayerBreakdownModal
         player={breakdownPlayer}
         teamLookup={teamLookup}
+        teams={teams}
         onClose={() => setBreakdownPlayer(null)}
       />
     </Section>
@@ -12919,6 +13344,7 @@ function TournamentTab({ teams, teamLookup, players, sortTeams, applyFilters, on
           combinedShape={kindInfo?.combined_shape || ""}
           playoffDetected={{ size: Number(kindInfo?.playoff_size || 0), byes: Number(kindInfo?.playoff_byes || 0) }}
           groupBo={Number(kindInfo?.group_bo_rules?.default || 3)}
+          playoffBo={kindInfo?.playoff_bo_rules || null}
         />
       )}
       {kind === "playoff" && <PlayoffTab {...sharedProps} detectedBracketSize={kindInfo?.playoff_size} />}
@@ -13087,3 +13513,5 @@ export default function App() {
   );
 }
 
+// Named export so the modal can be rendered on its own (preview / visual checks).
+export { GroupPlayerBreakdownModal };

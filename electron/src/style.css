@@ -2199,6 +2199,30 @@ button:disabled {
 .group-card { padding-top: 14px; }
 .group-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .group-card-head h3 { margin: 0; }
+/* Collapsible card header: the whole header is the toggle. */
+.group-card-head.collapsible {
+  width: 100%;
+  padding: 0;
+  background: none;
+  border: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  flex-wrap: nowrap;
+  justify-content: flex-start;
+}
+.group-card-head.collapsible:hover h3 { color: #ff8a47; }
+.group-card-summary {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: #8fa3bf;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.group-card-chevron { margin-left: auto; color: #8fa3bf; font-size: 14px; flex: none; }
 .group-brackets { display: flex; flex-direction: column; gap: 14px; margin-top: 12px; }
 .group-bracket-title {
   font-family: var(--display);
@@ -3259,3 +3283,88 @@ button:disabled {
   font-stretch: normal;
   font-weight: 600;
 }
+
+
+/* Groups modal: equal-width stage cards so a trailing card never spans the row */
+.round-cards.stage-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+}
+
+/* Groups modal: upper / lower bracket rows and the booster line per stage */
+.round-row-title {
+  color: #8fa3bf;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  margin: 2px 0 -6px;
+}
+.round-row + .round-row { margin-top: 4px; }
+.round-card-boosts {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid #242b35;
+}
+.round-card-boosts .round-card-boost {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+.round-card-boost-slot {
+  display: block;
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  color: #8fa3bf;
+  margin-top: 1px;
+}
+.round-card-boost-share {
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: #8fa3bf;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.round-card-boost.none .round-card-boost-name {
+  color: #8fa3bf;
+  font-style: italic;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+/* Groups modal: padding / bye cards, the knocked-out strip and negative minis */
+.round-card.extra { border-top-color: #6d7d95; }
+.round-card.extra .event-player-rating { color: #c6d0dc; }
+.round-card-note {
+  width: 100%;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid #242b35;
+  color: #8fa3bf;
+  font-size: 12px;
+  line-height: 1.35;
+}
+.round-card-foot-value.neg,
+.event-player-mini.neg { color: #e0705a; }
+
+/* Groups modal bracket grid: the opening match spans both rows in column 1,
+   winners flow right along the top row, losers along the bottom row */
+.round-cards.stage-grid.bracket-grid { align-items: stretch; }
+.round-cards.stage-grid.bracket-grid .bracket-cell { display: flex; min-width: 0; }
+.round-cards.stage-grid.bracket-grid .bracket-cell .round-card { flex: 1; min-width: 0; }
+.round-cards.stage-grid.bracket-grid .bracket-cell.opener { align-items: center; }
+.round-cards.stage-grid.bracket-grid .bracket-cell.opener .round-card { flex: 1; }
+.round-cards.stage-grid .round-card { padding: 14px 16px; }
+.round-card .round-opps .round-opp-name { font-size: 13px; }
+
+/* Four-wide bracket cards: tighter opponent table so names keep their room */
+.round-cards.stage-grid .round-opp { gap: 6px; font-size: 12.5px; }
+.round-cards.stage-grid .round-opp-prob,
+.round-cards.stage-grid .round-opp-win { width: 38px; }
+.round-cards.stage-grid .round-opp-pts { width: 46px; font-size: 14px; }
+.round-cards.stage-grid .round-opp.head { font-size: 9px; }
+.round-cards.stage-grid .round-card-boost { font-size: 12px; gap: 7px; }

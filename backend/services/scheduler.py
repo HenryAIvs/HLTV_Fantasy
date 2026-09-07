@@ -206,9 +206,10 @@ class DataScheduler:
         try:
             for task in tasks:
                 self._run_task(task, trigger, cfg)
-            # Bake the active event's valuations now that rankings, results and
-            # ratings are fresh, so the Tournament tab never computes on open.
-            self._bake_valuations(trigger)
+            # Valuations are baked ONCE at import. The nightly pass only fills
+            # in an active event that could not be baked then (draw not yet
+            # published); it never refreshes an existing valuation.
+            self._bake_valuations(trigger, only_if_missing=True)
             # Every batch ends with a login-health check so a dying HLTV
             # remember-me cookie is flagged weeks ahead in the run history.
             self._check_hltv_session(trigger)
@@ -242,23 +243,28 @@ class DataScheduler:
             self._run_lock.release()
             self._set_state(running=False, current_task=None, trigger=None, processed=0, total=0)
 
-    def _bake_valuations(self, trigger: str) -> None:
+    def _bake_valuations(self, trigger: str, only_if_missing: bool = False) -> None:
         """Run + store the groups valuation for the ACTIVE event (exact groups
         and, when detected, the exact combined playoff). Recorded as its own
-        run row; a skip (not a groups event, draw not published) is a warning."""
+        run row; a skip (not a groups event, draw not published) is a warning.
+        With only_if_missing (the nightly pass) an already-baked event is left
+        alone and no run row is written."""
         from backend.data.event_db import get_active_event_id
         from backend.routes import groups
 
+        active = get_active_event_id()
+        if only_if_missing and active and groups._GROUPS_STATE.load(key=int(active)):
+            logger.debug("Valuations for event %s already baked; nightly pass leaves them alone", active)
+            return
         run_id = schedule_db.start_run("valuations", trigger)
         self._set_state(running=True, current_task="valuations", trigger=trigger, started_at=time.time(),
                         processed=0, total=0, message="Baking event valuations...")
         try:
-            active = get_active_event_id()
             if not active:
                 schedule_db.finish_run(run_id, "warning", "no active event")
                 return
-            outcome = groups.bake_event_valuations(int(active), trigger=trigger)
-            status = {"ok": "success", "skipped": "warning"}.get(str(outcome.get("status")), "error")
+            outcome = groups.bake_event_valuations(int(active), trigger=trigger, only_if_missing=only_if_missing)
+            status = {"ok": "success", "exists": "success", "skipped": "warning"}.get(str(outcome.get("status")), "error")
             schedule_db.finish_run(run_id, status, _short(outcome))
             logger.info("Valuation bake (%s): %s", trigger, _short(outcome))
         except Exception as exc:  # noqa: BLE001 — never let the bake break a batch
@@ -266,10 +272,11 @@ class DataScheduler:
             logger.exception("Valuation bake failed")
 
     def _run_bake_only(self, trigger: str) -> None:
+        # Manual run-now: always (re)bake the active event.
         if not self._run_lock.acquire(blocking=False):
             return
         try:
-            self._bake_valuations(trigger)
+            self._bake_valuations(trigger, only_if_missing=False)
         finally:
             self._run_lock.release()
             self._set_state(running=False, current_task=None, trigger=None, processed=0, total=0)
@@ -314,7 +321,8 @@ class DataScheduler:
                     notes.append(f"{fid}: {outcome}")
                 result["trigger_backfill"] = "; ".join(notes)
                 # Bake each new event's valuation straight away (stored per
-                # event), so it is ready the moment it is made active.
+                # event), so it is ready the moment it is made active. This is
+                # the one and only automatic bake; nothing refreshes it later.
                 from backend.routes import groups
 
                 baked = [groups.bake_event_valuations(int(fid), trigger="import") for fid in sorted(result["imported"])]

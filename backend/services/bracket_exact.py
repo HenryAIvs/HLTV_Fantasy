@@ -65,6 +65,9 @@ class Slot:
     group: int
     rank: int
     entry_round: int = 0  # round index this seed enters (byes enter later)
+    # Matches this seed already played in its group: playoff match numbers
+    # (booster slots) continue from there when groups + playoffs are one game.
+    prior_matches: int = 0
 
 
 @dataclass
@@ -74,17 +77,24 @@ class Match:
     round: int
 
 
-def build_tree(rounds: List[List[tuple]], entry_round: Dict[tuple, int]) -> List[Match]:
+def build_tree(
+    rounds: List[List[tuple]],
+    entry_round: Dict[tuple, int],
+    prior_matches: Optional[Dict[tuple, int]] = None,
+) -> List[Match]:
     """Template → match nodes. Feeders are ("seed", g, rank) or ("win", r, m).
+    prior_matches[(g, rank)] = group matches that seed has already played.
     Returns the root matches (the last round's matches)."""
     nodes: List[List[Match]] = []
+    prior = prior_matches or {}
     for r, matches in enumerate(rounds):
         row: List[Match] = []
         for fa, fb in matches:
             feeders = []
             for f in (fa, fb):
                 if f[0] == "seed":
-                    feeders.append(Slot(int(f[1]), int(f[2]), int(entry_round.get((f[1], f[2]), r))))
+                    key = (int(f[1]), int(f[2]))
+                    feeders.append(Slot(key[0], key[1], int(entry_round.get(key, r)), int(prior.get(key, 0))))
                 else:
                     feeders.append(nodes[f[1]][f[2]])
             row.append(Match(feeders[0], feeders[1], r))
@@ -221,8 +231,8 @@ def compute_pairing_weights(
         for (xi, yi), W in pair_w.items():
             x, y = left_slots[xi], right_slots[yi]
             pm = pwin(x.group, y.group)
-            num_x = r - x.entry_round + 1
-            num_y = r - y.entry_round + 1
+            num_x = x.prior_matches + r - x.entry_round + 1
+            num_y = y.prior_matches + r - y.entry_round + 1
             for i, j in np.argwhere(W > 0.0):
                 w = float(W[i, j])
                 a = specs[x.group].teams[i]
