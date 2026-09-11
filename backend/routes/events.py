@@ -4560,9 +4560,37 @@ def _detect_event_tournament_kind_cached(event: Dict[str, Any]) -> Dict[str, Any
     if cached and cached[0] == signature:
         return cached[1]
     detected = _detect_event_tournament_kind(event)
+    # Event start / end from the archived event page's date stamps, so bakes
+    # can tell whether the event has started (inputs are frozen from then on).
+    if "start_at" not in detected:
+        detected["start_at"], detected["end_at"] = _event_page_dates(event)
     with _KIND_CACHE_LOCK:
         _KIND_CACHE[event_id] = (signature, detected)
     return detected
+
+
+def _event_page_dates(event: Dict[str, Any]) -> tuple:
+    """(start, end) as epoch seconds from the archived HLTV event page: the
+    two `data-unix` stamps of its date cell (first / last day). (None, None)
+    when the page is not archived or carries no stamps."""
+    import re as _re
+
+    from backend.routes.groups import _find_event_snapshot_html
+
+    try:
+        html = _find_event_snapshot_html(event.get("hltv_event_id")) or ""
+    except Exception:  # noqa: BLE001
+        return None, None
+    if not html:
+        return None, None
+    cell = _re.search(r'class="eventdate"(.{0,600}?)</td>', html, flags=_re.S)
+    scope = cell.group(1) if cell else html[:200000]
+    stamps = [int(v) // 1000 for v in _re.findall(r'data-unix="(\d+)"', scope)[:2]]
+    if not stamps:
+        return None, None
+    start = stamps[0]
+    end = stamps[1] if len(stamps) > 1 else stamps[0]
+    return float(min(start, end)), float(max(start, end))
 
 
 def warm_kind_cache() -> None:

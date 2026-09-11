@@ -3,6 +3,11 @@ import math
 from collections import deque
 from typing import Any
 
+try:  # C-implemented Hungarian solver: ~50x faster than the flow below on 18x35
+    from scipy.optimize import linear_sum_assignment as _linear_sum_assignment
+except Exception:  # pragma: no cover - scipy is in requirements, but keep the pure-Python path
+    _linear_sum_assignment = None
+
 
 BOOSTER_POINT_VALUE = 5.0
 DEFAULT_EXPECTED_MAPS = 2.4
@@ -130,8 +135,16 @@ def _add_edge(graph: list[list[_Edge]], fr: int, to: int, cap: int, cost: float)
 
 
 def _max_weight_assignment(weights: list[list[float]]) -> list[tuple[int, int, float]]:
+    """Rows to distinct columns, maximum cardinality, maximum total weight.
+    Returns (row, col, weight) per assigned row."""
     if not weights or not weights[0]:
         return []
+    if _linear_sum_assignment is not None:
+        import numpy as np
+
+        w = np.asarray(weights, dtype=np.float64)
+        rows_idx, cols_idx = _linear_sum_assignment(w, maximize=True)
+        return [(int(r), int(c), float(w[r, c])) for r, c in zip(rows_idx, cols_idx)]
     rows = len(weights)
     cols = len(weights[0])
     source = 0

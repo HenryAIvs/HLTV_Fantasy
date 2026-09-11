@@ -19,6 +19,43 @@ h1, h2, h3, h4 {
 * { box-sizing: border-box; }
 body { margin: 0; }
 
+/* Scrollbars in the app palette (Chromium) */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: #0f1216; }
+::-webkit-scrollbar-thumb {
+  background: #2c3441;
+  border-radius: 6px;
+  border: 2px solid #0f1216;
+}
+::-webkit-scrollbar-thumb:hover { background: #3a4452; }
+::-webkit-scrollbar-corner { background: #0f1216; }
+
+/* In-app title strip: the drag region for the hidden native title bar; the
+   right-hand gap leaves room for the native window controls overlay. */
+.titlebar {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  padding: 0 150px 0 16px;
+  background: #0a0c10;
+  border-bottom: 1px solid #161b23;
+  -webkit-app-region: drag;
+  user-select: none;
+}
+.titlebar-brand {
+  font-family: var(--display);
+  font-stretch: condensed;
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #8fa3bf;
+}
+.titlebar-brand em { font-style: normal; color: #ff6b1a; }
+
 .layout {
   max-width: 1480px;
   margin: 0 auto;
@@ -3068,6 +3105,25 @@ button:disabled {
   gap: 10px;
   margin-top: 6px;
 }
+/* Team odds list under the team name: label left, value right, title in orange */
+.event-team-odds { display: flex; flex-direction: column; gap: 2px; margin-top: 7px; max-width: 150px; }
+.event-team-odd { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+.event-team-odd-label {
+  color: #8fa3bf;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
+.event-team-odd-value {
+  font-family: var(--display);
+  font-stretch: condensed;
+  font-weight: 700;
+  font-size: 14px;
+  color: #e9edf3;
+  font-variant-numeric: tabular-nums;
+}
+.event-team-odd.accent .event-team-odd-value { color: #ff6b1a; }
 /* Scoring-breakdown modal: broadcast-style summary strip + round cards */
 .modal.player-sources-modal {
   max-width: 1480px;
@@ -3076,16 +3132,71 @@ button:disabled {
 }
 .breakdown-hero {
   display: flex;
-  align-items: stretch;
+  align-items: center;
   justify-content: space-between;
-  gap: 18px;
+  gap: 28px;
   flex-wrap: wrap;
-  background: #171c24;
+  background: linear-gradient(90deg, #1b212b 0%, #171c24 40%);
   border: 1px solid #2c3441;
   border-left: 3px solid #ff6b1a;
-  padding: 18px 34px;
+  padding: 16px 30px 16px 22px;
   margin-bottom: 16px;
 }
+/* identity block: photo with the team logo pinned to its corner, then name / team / role */
+.breakdown-id { display: flex; align-items: center; gap: 18px; min-width: 0; flex: 0 1 auto; }
+.breakdown-id-photo { position: relative; flex: none; width: 68px; height: 68px; }
+.breakdown-id-photo .player-photo-img,
+.breakdown-id-photo .img-fallback.round {
+  width: 68px;
+  height: 68px;
+  border: 2px solid #2c3441;
+  background: #10151c;
+}
+.breakdown-id-logo {
+  position: absolute;
+  right: -8px;
+  bottom: -4px;
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: #1b212b;
+  border: 1px solid #2c3441;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
+}
+.breakdown-id-text { min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.breakdown-id-name {
+  font-family: var(--display);
+  font-stretch: condensed;
+  font-weight: 700;
+  font-size: 28px;
+  line-height: 1;
+  color: #e9edf3;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.breakdown-id-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #8fa3bf;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
+.breakdown-id-team { color: #c6d0dc; }
+.breakdown-id-sep { color: #4b5a70; }
+.breakdown-id-role { display: inline-flex; align-items: center; gap: 6px; }
+.breakdown-id-role .role-badge { margin: 0; }
+.breakdown-id-note { color: #ff8a47; letter-spacing: 0.06em; }
+/* stat cells share the remaining width evenly */
+.breakdown-stats { display: flex; align-items: flex-end; justify-content: space-evenly; gap: 18px; flex: 1 1 420px; min-width: 0; }
 .breakdown-stat {
   display: flex;
   flex-direction: column;
@@ -3368,3 +3479,220 @@ button:disabled {
 .round-cards.stage-grid .round-opp-pts { width: 46px; font-size: 14px; }
 .round-cards.stage-grid .round-opp.head { font-size: 9px; }
 .round-cards.stage-grid .round-card-boost { font-size: 12px; gap: 7px; }
+
+.ev-mini-caption {
+  color: #6d7d95;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-top: 2px;
+}
+
+/* Round card rows: role / booster info rows, the opponent table, the sums */
+/* Card sections: a small caps title with a rule under it, then the content */
+.round-section { width: 100%; display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.round-section-title {
+  font-family: var(--display);
+  font-stretch: condensed;
+  font-weight: 700;
+  font-size: 14px;
+  color: #e9edf3;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #242b35;
+}
+/* Total: the four components side by side, then Per match and Expected under them */
+.round-parts {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+  text-align: center;
+}
+.round-part { min-width: 0; line-height: 1.15; text-align: center; }
+.round-part-value {
+  font-family: var(--display);
+  font-stretch: condensed;
+  font-weight: 700;
+  font-size: 17px;
+  color: #c6d0dc;
+  font-variant-numeric: tabular-nums;
+}
+.round-part.total .round-part-value { color: #e9edf3; }
+.round-part-value.neg { color: #e0705a; }
+.round-part-value.accent { color: #ff6b1a; font-size: 21px; }
+/* Total × play chance (± credits) = expected, as one horizontal equation */
+.round-eq {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  margin-top: 2px;
+  padding-top: 8px;
+  border-top: 1px solid #242b35;
+}
+.round-eq .round-part-value { color: #e9edf3; }
+.round-eq .round-part-label { white-space: nowrap; }
+.round-eq-op {
+  color: #6d7d95;
+  font-size: 15px;
+  line-height: 1;
+  flex: none;
+  padding-bottom: 20px; /* sits level with the values, not the labels */
+}
+.round-part-label {
+  color: #8fa3bf;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-top: 2px;
+}
+.round-info-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 40px;
+  gap: 12px;
+  align-items: center;
+  min-width: 0;
+}
+.round-info-row + .round-info-row { margin-top: 1px; }
+.round-info-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  color: #e9edf3;
+  font-size: 12.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.round-info-main.muted { color: #8fa3bf; text-transform: none; letter-spacing: 0; font-style: italic; }
+.round-info-main .role-badge { margin: 0; flex: none; }
+.round-info-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1.25; }
+.round-info-name em {
+  display: block;
+  font-style: normal;
+  font-size: 10px;
+  color: #8fa3bf;
+  letter-spacing: 0.06em;
+  margin-top: 3px;
+}
+.round-info-detail {
+  color: #8fa3bf;
+  font-size: 11px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.round-info-value {
+  font-family: var(--display);
+  font-stretch: condensed;
+  font-weight: 700;
+  font-size: 17px;
+  color: #e9edf3;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.round-info-value.accent { color: #ff6b1a; font-size: 24px; }
+.round-table {
+  width: 100%;
+  display: grid;
+  /* number columns sized to their widest content across every row; one fixed gutter between them */
+  grid-template-columns: minmax(0, 1fr) repeat(4, auto);
+  column-gap: clamp(18px, 8%, 32px);
+  row-gap: 5px;
+}
+.round-trow {
+  display: grid;
+  grid-template-columns: subgrid;
+  grid-column: 1 / -1;
+  align-items: center;
+  font-size: 11.5px;
+  color: #c6d0dc;
+  font-variant-numeric: tabular-nums;
+}
+.round-trow.head {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0;
+  color: #8fa3bf;
+  white-space: nowrap;
+  align-items: end;
+}
+/* header text is centred on its column but does not size it (RATING is wider than any rating value) */
+.round-trow.head .round-tcell:not(.name) { width: 0; justify-self: center; display: flex; justify-content: center; }
+.round-trow.muted { color: #8fa3bf; }
+.round-tcell { text-align: center; min-width: 0; }
+.round-tcell.name { display: flex; align-items: center; gap: 6px; text-align: left; }
+.round-tcell-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.round-trow.avg {
+  margin-top: 2px;
+  padding-top: 7px;
+  border-top: 1px solid #242b35;
+  color: #e9edf3;
+  font-weight: 600;
+}
+.round-trow.avg .round-tcell.name {
+  color: #8fa3bf;
+  font-size: 10px;
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.round-tcell.neg { color: #e0705a; }
+.round-cell-dash { color: #4b5a70; }
+.round-card-note.top { margin-top: 8px; padding-top: 0; border-top: 0; }
+/* Vertical Total (padding card): big label / value rows spread to fill the card */
+.round-section.fill { flex: 1 1 auto; }
+.round-vparts {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-evenly;
+  gap: 8px;
+  padding: 8px 0 4px;
+}
+.round-vpart {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 14px;
+}
+.round-vpart-label {
+  color: #8fa3bf;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  white-space: nowrap;
+}
+.round-vpart-label i {
+  display: inline-block;
+  width: 20px;
+  font-style: normal;
+  font-size: 17px;
+  color: #6d7d95;
+  letter-spacing: 0;
+}
+.round-vpart-value {
+  font-family: var(--display);
+  font-stretch: condensed;
+  font-weight: 700;
+  font-size: 30px;
+  line-height: 1;
+  color: #c6d0dc;
+  font-variant-numeric: tabular-nums;
+}
+.round-vpart-value.neg { color: #e0705a; }
+.round-vpart.sum,
+.round-vpart.expected { border-top: 1px solid #242b35; padding-top: 12px; }
+.round-vpart.sum .round-vpart-label,
+.round-vpart.expected .round-vpart-label { color: #e9edf3; }
+.round-vpart.sum .round-vpart-value { color: #e9edf3; }
+.round-vpart-value.accent { color: #ff6b1a; font-size: 38px; }
+
+/* Groups Top 5 filters: chips above the list, mini toggles on each roster card */
+.filter-groups { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 14px; margin: 4px 0 10px; }
+.filter-clear { align-self: center; }
+.event-player-filters { display: flex; gap: 4px; margin-top: 6px; }
+.chip.mini { padding: 2px 8px; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; }
+.chip.mini.active.in { border-color: #3fbf7f; color: #3fbf7f; }
+.chip.mini.active.out { border-color: #e0705a; color: #e0705a; }

@@ -11,8 +11,39 @@ from backend.data.db import ROOT_DIR, connect as _connect
 PARAMS_PATH = str(ROOT_DIR / "winrate_params.json")
 
 
-@lru_cache(maxsize=2048)
+# Ranks pinned by a valuation running on a frozen input snapshot (an event
+# that has already started): consulted before the live teams table.
+_RANK_OVERRIDE: dict = {}
+
+
+class rank_overrides:
+    """Context manager: `with rank_overrides({team_id: hltv_rank}): ...` makes
+    the win model use those ranks instead of the teams table."""
+
+    def __init__(self, mapping: dict | None):
+        self.mapping = {int(k): int(v) for k, v in (mapping or {}).items() if v}
+
+    def __enter__(self):
+        self._saved = dict(_RANK_OVERRIDE)
+        _RANK_OVERRIDE.clear()
+        _RANK_OVERRIDE.update(self.mapping)
+        return self
+
+    def __exit__(self, *exc):
+        _RANK_OVERRIDE.clear()
+        _RANK_OVERRIDE.update(self._saved)
+        return False
+
+
 def _get_hltv_rank(team_id: int) -> int:
+    rank = _RANK_OVERRIDE.get(int(team_id))
+    if rank:
+        return max(1, int(rank))
+    return _get_hltv_rank_db(team_id)
+
+
+@lru_cache(maxsize=2048)
+def _get_hltv_rank_db(team_id: int) -> int:
     """
     Fetch hltv_rank for a given team_id from the teams table.
     If missing or invalid, fall back to a large rank (weaker team).

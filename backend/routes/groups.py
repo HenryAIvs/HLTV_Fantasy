@@ -11,6 +11,7 @@ import itertools
 import json
 import re
 import math
+import os
 import random
 import threading
 import time
@@ -22,6 +23,8 @@ from fastapi import APIRouter, HTTPException
 from backend.data.db import connect as _connect
 from backend.data.player_db import get_player
 from backend.data.singleton_state import SingletonState
+from backend.services import team_strength
+from backend.services import roster_kernels as rk
 from backend.routes.playoff import (
     _build_playoff_lookup_context,
     _clone_team_states,
@@ -40,6 +43,17 @@ from backend.services.swiss_booster_assignment import (
     parse_booster_rates,
 )
 from backend.services.team_optimizer import iter_valid_rosters, parse_optimizer_payload, serialize_roster
+from backend.services.roster_plan import (  # moved out of this module; shared with the playoff and swiss optimisers
+    _NUM_ROLES,
+    _ROLE_UNAVAILABLE,
+    _booster_bound_lagrangian,
+    _booster_slot_weights,
+    _exact_role_assignment,
+    _player_booster_sub,
+    _player_booster_ub,
+    _score_roster_exact,
+    optimize_group_boosters_for_roster,
+)
 from backend.swiss_stage.fantasy_scoring import compute_padding_components
 from backend.swiss_stage.swiss_models import TeamState
 from backend.swiss_stage.team_initialization import initialize_teams
@@ -100,7 +114,7 @@ GROUP_MATCH_LABELS = {
 
 
 def ensure_groups_schema() -> None:
-    for state in (_GROUPS_STATE, _GROUPS_BEST_STATE, _GROUPS_BEST_META):
+    for state in (_GROUPS_STATE, _GROUPS_BEST_STATE, _GROUPS_BEST_META, _INPUT_SNAPSHOT):
         state.ensure_table()
 
 
@@ -266,7 +280,7 @@ def _booster_list(bucket: Dict[int, list]) -> List[Dict[str, Any]]:
 def _new_stage_acc() -> Dict[str, Any]:
     return {
         "reach": {}, "wins": {}, "players": {}, "penalty": {}, "padding": {}, "boost": {},
-        "elim": {}, "pad_prob": {}, "opp": {}, "opp_pts": {},
+        "elim": {}, "pad_prob": {}, "opp": {}, "opp_pts": {}, "role": {},
     }
 
 
@@ -327,8 +341,14 @@ def _accumulate_group_stage_stats(acc: Dict[str, Any], prob: float, states: Dict
                 cell[4] += prob * sum(comps)
                 _add_booster_weight(boost_keys.setdefault(key, {}), _booster_meta(r, p), prob)
                 opp = int(r.get("opponent_team_id") or 0)
-                op = opp_pts.setdefault(key, {})
-                op[opp] = op.get(opp, 0.0) + prob * sum(comps)
+                oc = opp_pts.setdefault(key, {}).setdefault(opp, [0.0, 0.0, 0.0, 0.0])
+                for i in range(4):
+                    oc[i] += prob * comps[i]
+                if pid not in acc["role"]:
+                    acc["role"][pid] = (
+                        r.get("role_id"), float(r.get("role_major_pct") or 0.0),
+                        float(r.get("role_minor_pct") or 0.0), comps[2],
+                    )
                 if not team_done:
                     to = team_opp.setdefault(key, {}).setdefault(opp, [0.0, 0.0])
                     to[0] += prob
@@ -346,6 +366,30 @@ def _accumulate_group_stage_stats(acc: Dict[str, Any], prob: float, states: Dict
                 if any(abs(d) > 1e-9 for d in pad_delta):
                     acc["pad_prob"][tid] = acc["pad_prob"].get(tid, 0.0) + prob
                 team_done = True
+
+
+def _real_game_sums(states: Dict[int, TeamState], tid: int) -> Dict[str, List[float]]:
+    """Per player of `tid`: [rating, win, role, booster, games] summed over the
+    matches the team actually played in this outcome (its per-match breakdown
+    rows; eliminations and padding excluded). Feeds the playoff padding of a
+    team that skips a playoff round: a missed match is padded with the
+    player's average over the matches they did play."""
+    ts = states.get(int(tid))
+    out: Dict[str, List[float]] = {}
+    if not ts:
+        return out
+    for pid, p in ts.players.items():
+        sums = [0.0, 0.0, 0.0, 0.0, 0.0]
+        for r in p.point_breakdown or []:
+            if r.get("match_type") == "ELIMINATION":
+                continue
+            sums[0] += float(r.get("rating_points") or 0.0)
+            sums[1] += float(r.get("win_points") or 0.0)
+            sums[2] += float(r.get("role_points") or 0.0)
+            sums[3] += float(r.get("booster_points") or 0.0)
+            sums[4] += 1.0
+        out[str(pid)] = sums
+    return out
 
 
 def _enumerate_group_outcomes(
@@ -700,6 +744,10 @@ def _enumerate_group8_top3_outcomes(
                                                             "players": player_points,
                                                             "player_components": player_components,
                                                             "player_breakdown": {},
+                                                            # the winner skips the playoff quarter-final: its
+                                                            # players' sums over the group matches they played
+                                                            # feed that match's padding (see _exact_combined_playoffs)
+                                                            "first_games": _real_game_sums(sk, first),
                                                         }
                                                     )
     return outcomes
@@ -774,6 +822,37 @@ def _fresh_bracket_state(base_states: Dict[int, TeamState], tid: int, prior_matc
     return ts
 
 
+def _combined_bracket_template(x: int, quals_per_group: int, rounds_total: int, group_format: str) -> Dict[str, Any]:
+    """Bracket template shared by the exact valuation and the joint sampler:
+    rounds of (left, right) feeders — ("seed", group, rank) or ("win", round,
+    match) — the round each seed enters (byes enter later) and each seed's
+    group matches already played (its playoff matches continue the booster
+    slot numbering)."""
+    byes_to_semis = quals_per_group == 3
+    if byes_to_semis:
+        rounds = [
+            [(("seed", 0, 1), ("seed", 1, 2)), (("seed", 1, 1), ("seed", 0, 2))],  # QF1: A2 v B3, QF2: B2 v A3
+            [(("seed", 0, 0), ("win", 0, 1)), (("seed", 1, 0), ("win", 0, 0))],    # SF1: A1 v QF2 W, SF2: B1 v QF1 W
+            [(("win", 1, 0), ("win", 1, 1))],
+        ]
+        entry_round = {(0, 0): 1, (1, 0): 1}
+    else:
+        seeded = [(g, r) for r in range(quals_per_group) for g in range(x)]  # seed-major, like the old sim
+        n = len(seeded)
+        rounds = [[(("seed",) + seeded[i], ("seed",) + seeded[n - 1 - i]) for i in range(n // 2)]]
+        for r in range(1, rounds_total):
+            prev = len(rounds[-1])
+            rounds.append([(("win", r - 1, 2 * m), ("win", r - 1, 2 * m + 1)) for m in range(prev // 2)])
+        entry_round = {}
+    matches_by_rank = _GROUP_MATCHES_BY_RANK.get(group_format) or []
+    prior_matches = {
+        (g, rank): (matches_by_rank[rank] if rank < len(matches_by_rank) else 0)
+        for g in range(x)
+        for rank in range(quals_per_group)
+    }
+    return {"rounds": rounds, "entry_round": entry_round, "prior_matches": prior_matches, "byes_to_semis": byes_to_semis}
+
+
 def _exact_combined_playoffs(
     groups: List[List[int]],
     outcomes: List[Dict[str, Any]],
@@ -801,8 +880,9 @@ def _exact_combined_playoffs(
 
     Bracket shapes mirror the previous simulator exactly: quals_per_group == 3
     is the 6-team byes bracket (QF1 = A2 v B3, QF2 = B2 v A3, SF1 = A1 v QF2
-    winner, SF2 = B1 v QF1 winner, bye teams get 6 padding win points for the
-    quarter-final they skip); otherwise qualifiers are flattened seed-major
+    winner, SF2 = B1 v QF1 winner, bye teams get full padding for the
+    quarter-final they skip: +6 win plus their average rating and role over the
+    matches they actually play, no booster); otherwise qualifiers are flattened seed-major
     and paired i vs N-1-i, with stop_teams ending the bracket early (which
     splits it into independent sub-brackets).
     """
@@ -831,27 +911,8 @@ def _exact_combined_playoffs(
     specs = [bracket_exact.GroupSpec(groups[g], quals_per_group, tuple_probs[g]) for g in range(x)]
 
     # 2. Bracket template (feeders are ("seed", group, rank) or ("win", round, match)).
-    if byes_to_semis:
-        rounds = [
-            [(("seed", 0, 1), ("seed", 1, 2)), (("seed", 1, 1), ("seed", 0, 2))],  # QF1: A2 v B3, QF2: B2 v A3
-            [(("seed", 0, 0), ("win", 0, 1)), (("seed", 1, 0), ("win", 0, 0))],    # SF1: A1 v QF2 W, SF2: B1 v QF1 W
-            [(("win", 1, 0), ("win", 1, 1))],
-        ]
-        entry_round = {(0, 0): 1, (1, 0): 1}
-    else:
-        seeded = [(g, r) for r in range(quals_per_group) for g in range(x)]  # seed-major, like the old sim
-        n = len(seeded)
-        rounds = [[(("seed",) + seeded[i], ("seed",) + seeded[n - 1 - i]) for i in range(n // 2)]]
-        for r in range(1, rounds_total):
-            prev = len(rounds[-1])
-            rounds.append([(("win", r - 1, 2 * m), ("win", r - 1, 2 * m + 1)) for m in range(prev // 2)])
-        entry_round = {}
-    matches_by_rank = _GROUP_MATCHES_BY_RANK.get(group_format) or []
-    prior_matches = {
-        (g, rank): (matches_by_rank[rank] if rank < len(matches_by_rank) else 0)
-        for g in range(x)
-        for rank in range(quals_per_group)
-    }
+    template = _combined_bracket_template(x, quals_per_group, rounds_total, group_format)
+    rounds, entry_round, prior_matches = template["rounds"], template["entry_round"], template["prior_matches"]
     roots = bracket_exact.build_tree(rounds, entry_round, prior_matches)
 
     # 3. Win-probability matrices between groups, from the shared cache
@@ -911,13 +972,37 @@ def _exact_combined_playoffs(
     round_wins: Dict[int, List[float]] = {}
     round_elim: Dict[int, Dict[int, List[float]]] = {}  # team -> round -> [P(out here), expected penalty]
     round_opp: Dict[int, Dict[int, Dict[int, List[float]]]] = {}  # team -> round -> opponent -> [P(play), P(play and win)]
-    round_opp_pts: Dict[int, Dict[int, Dict[int, float]]] = {}  # player -> round -> opponent -> expected match points
+    round_opp_pts: Dict[int, Dict[int, Dict[int, List[float]]]] = {}  # player -> round -> opponent -> [rating, win, role, booster]
     pid_team = {int(pid): tid for tid in all_team_ids for pid in base_states[tid].players}
+    # Bye path (6-team bracket only): a team that skips the quarter-final plays
+    # the semi as its (prior0 + 1)th match and the final as its (prior0 + 2)th,
+    # numbers no quarter-final route reaches, so its pairings are identifiable.
+    bye_num: Dict[int, Dict[int, int]] = {}
+    group_of: Dict[int, int] = {}
+    if byes_to_semis:
+        for g in range(x):
+            for tid in groups[g]:
+                group_of[int(tid)] = g
+                bye_num[int(tid)] = {r: prior_matches[(g, 0)] + r for r in range(1, rounds_total)}
+    match_reach: Dict[int, Dict[int, float]] = {}  # team -> match number -> P(plays that match in the playoffs)
+    pairing_table: Dict[str, Dict[str, List[float]]] = {}  # "a,b,winner,num_a,num_b,rem" -> pid -> [total, rating, win, role]
+    bye_sf: Dict[int, List[float]] = {}  # team -> [P(lose the semi), P(win the semi)] on the bye path
+    bye_pts: Dict[int, Dict[int, List[List[float]]]] = {}  # team -> pid -> [[semi-loss path], [final path]] component sums
     for key, w in weights.items():
-        a, b, winner, _na, _nb, rem = key
+        a, b, winner, na, nb, rem = key
         r = rounds_total - rem - 1
         rw = round_wins.setdefault(winner, [0.0] * rounds_total)
         rw[r] += w
+        for tid, num in ((a, na), (b, nb)):
+            mr = match_reach.setdefault(tid, {})
+            mr[num] = mr.get(num, 0.0) + w
+        bye_sides = []
+        if byes_to_semis and r >= 1:
+            bye_sides = [tid for tid, num in ((a, na), (b, nb)) if bye_num.get(tid, {}).get(r) == num]
+            if r == 1:
+                for tid in bye_sides:
+                    cell = bye_sf.setdefault(tid, [0.0, 0.0])
+                    cell[1 if winner == tid else 0] += w
         loser = b if winner == a else a
         for tid, opp in ((a, b), (b, a)):
             oc = round_opp.setdefault(tid, {}).setdefault(r, {}).setdefault(opp, [0.0, 0.0])
@@ -925,14 +1010,29 @@ def _exact_combined_playoffs(
             if winner == tid:
                 oc[1] += w
         elim_recorded = False
-        for pid, comps in pairing_points(key).items():
+        pairing = pairing_points(key)
+        pairing_table[",".join(str(v) for v in key)] = {
+            str(pid): [float(c[0]), float(c[1]), float(c[2]), float(c[3])] for pid, c in pairing.items()  # total, rating, win, role
+        }
+        for pid, comps in pairing.items():
             bucket = accum.setdefault(pid, [0.0, 0.0, 0.0, 0.0, 0.0])
             for i in range(5):
                 bucket[i] += w * comps[i]
             penalty = comps[5]
+            if bye_sides and pid_team.get(pid) in bye_sides:
+                # a semi loss ends the run (4 matches played); a semi win or the final is the 5-match path
+                path = 1 if (r > 1 or winner == pid_team.get(pid)) else 0
+                dest = bye_pts.setdefault(pid_team[pid], {}).setdefault(pid, [[0.0] * 4, [0.0] * 4])[path]
+                dest[0] += w * comps[1]
+                dest[1] += w * (comps[2] - penalty)
+                dest[2] += w * comps[3]
+                dest[3] += w * comps[4]
             opp = b if pid_team.get(pid) == a else a
-            op = round_opp_pts.setdefault(pid, {}).setdefault(r, {})
-            op[opp] = op.get(opp, 0.0) + w * (comps[0] - penalty)
+            oc = round_opp_pts.setdefault(pid, {}).setdefault(r, {}).setdefault(opp, [0.0, 0.0, 0.0, 0.0])
+            oc[0] += w * comps[1]
+            oc[1] += w * (comps[2] - penalty)  # match win points only; the penalty is reported per round
+            oc[2] += w * comps[3]
+            oc[3] += w * comps[4]
             if penalty and not elim_recorded and pid_team.get(pid) == loser:
                 ecell = round_elim.setdefault(loser, {}).setdefault(r, [0.0, 0.0])
                 ecell[0] += w
@@ -946,14 +1046,48 @@ def _exact_combined_playoffs(
             cell[4] += w * (comps[0] - penalty)
             player_penalty[pid] = player_penalty.get(pid, 0.0) + w * penalty
             _add_booster_weight(stage_boost.setdefault(pid, {}).setdefault(r, {}), comps[6], w)
-    player_bye: Dict[int, float] = {}
-    for tid, w in bye_weight.items():
-        pad = _PLAYOFF_BYE_PADDING_POINTS * w
+    # Playoff padding for the quarter-final a bye skips: +6 win, and for rating
+    # and role the player's average over the matches actually played in the
+    # event (group matches + semi, + final when reached) — no booster, as with
+    # the group padding — i.e.
+    # E[(group sum + playoff sum) / matches played] along the bye path. The group
+    # sum is independent of the playoff path given the team took the bye, so the
+    # conditional group sums and the per-path playoff sums combine linearly.
+    group_sums: Dict[int, Dict[int, List[float]]] = {}
+    rank0_prob: Dict[int, float] = {}
+    if byes_to_semis:
+        for outcome in outcomes:
+            first = int(outcome["qualified"][0])
+            p_o = float(outcome["probability"])
+            rank0_prob[first] = rank0_prob.get(first, 0.0) + p_o
+            for pid_s, sums in (outcome.get("first_games") or {}).items():
+                cell = group_sums.setdefault(first, {}).setdefault(int(pid_s), [0.0] * 5)
+                for i in range(5):
+                    cell[i] += p_o * float(sums[i])
+    player_playoff_pad: Dict[int, List[float]] = {}
+    for tid, w_bye in bye_weight.items():
+        if w_bye <= 0.0:
+            continue
+        p1 = rank0_prob.get(tid, 0.0)
+        p_lose, p_win = bye_sf.get(tid, [0.0, 0.0])
         for pid in base_states[tid].players:
-            bucket = accum.setdefault(int(pid), [0.0, 0.0, 0.0, 0.0, 0.0])
-            bucket[0] += pad
-            bucket[2] += pad
-            player_bye[int(pid)] = player_bye.get(int(pid), 0.0) + pad
+            pid = int(pid)
+            gs = group_sums.get(tid, {}).get(pid) or [0.0] * 5
+            g_cond = [(gs[i] / p1) if p1 > 0 else 0.0 for i in range(5)]  # E[group sums, games | took the bye]
+            n_group = g_cond[4] if g_cond[4] > 0 else float(prior_matches.get((group_of.get(tid, 0), 0), 0))
+            nofinal, final = bye_pts.get(tid, {}).get(pid) or ([0.0] * 4, [0.0] * 4)
+            pad = [0.0, _PLAYOFF_BYE_PADDING_POINTS * w_bye, 0.0, 0.0]
+            for i in (0, 2):  # rating, role; booster is never padded
+                pad[i] = (
+                    g_cond[i] * (p_lose / (n_group + 1.0) + p_win / (n_group + 2.0))
+                    + nofinal[i] / (n_group + 1.0)
+                    + final[i] / (n_group + 2.0)
+                )
+            bucket = accum.setdefault(pid, [0.0, 0.0, 0.0, 0.0, 0.0])
+            bucket[0] += sum(pad)
+            for i in range(4):
+                bucket[i + 1] += pad[i]
+            player_playoff_pad[pid] = pad
     if progress_callback:
         progress_callback(1, 1)
 
@@ -985,10 +1119,18 @@ def _exact_combined_playoffs(
         "round_labels": round_labels,
         "round_reach": {str(tid): row for tid, row in round_reach.items()},
         "round_wins": {str(tid): row for tid, row in round_wins.items()},
+        # P(team plays its Nth match) in the playoffs, by match number (its
+        # group matches count first) — the booster slots of the roster solve.
+        "match_reach": {str(tid): {str(n): p for n, p in d.items()} for tid, d in match_reach.items()},
+        # For the joint outcome sampler (ceiling / most-likely-winner over the
+        # whole event): every reachable pairing's per-player points and the
+        # win-probability matrix between all teams.
+        "pairing_table": pairing_table,
+        "win_probs": {str(a): {str(b): match_prob(a, b) for b in all_team_ids if b != a} for a in all_team_ids},
         "stop_teams": stop_teams,
         "player_ev": player_ev,
         # Per-round expected points by component (penalty excluded), the
-        # elimination penalty and the bye padding per player, for the modal.
+        # elimination penalty and the playoff padding per player, for the modal.
         "player_stage_ev": {
             str(pid): {
                 str(r): {"rating": c[0], "win": c[1], "role": c[2], "booster": c[3], "total": c[4]}
@@ -997,7 +1139,10 @@ def _exact_combined_playoffs(
             for pid, rounds_ev in stage_ev.items()
         },
         "player_penalty": {str(pid): v for pid, v in player_penalty.items()},
-        "player_bye": {str(pid): v for pid, v in player_bye.items()},
+        "player_playoff_padding": {
+            str(pid): {"rating": v[0], "win": v[1], "role": v[2], "booster": v[3], "total": sum(v)}
+            for pid, v in player_playoff_pad.items()
+        },
         "round_elim": {
             str(tid): {str(r): {"prob": c[0], "points": c[1]} for r, c in rounds.items()}
             for tid, rounds in round_elim.items()
@@ -1008,7 +1153,13 @@ def _exact_combined_playoffs(
             for tid, rounds in round_opp.items()
         },
         "player_round_opp_pts": {
-            str(pid): {str(r): {str(o): v for o, v in opps.items()} for r, opps in rounds.items()}
+            str(pid): {
+                str(r): {
+                    str(o): {"rating": v[0], "win": v[1], "role": v[2], "booster": v[3], "total": sum(v)}
+                    for o, v in opps.items()
+                }
+                for r, opps in rounds.items()
+            }
             for pid, rounds in round_opp_pts.items()
         },
         "player_stage_boost": {
@@ -1022,7 +1173,102 @@ def _exact_combined_playoffs(
 
 
 
-def bake_event_valuations(event_id: int, trigger: str = "import", only_if_missing: bool = False) -> Dict[str, Any]:
+# Per-event snapshot of the valuation inputs (player rows, team ranks): taken
+# at every bake until the event starts, frozen from then on — see
+# `_event_inputs`. Keyed by fantasy event id.
+_INPUT_SNAPSHOT = SingletonState("event_input_snapshot_state", keyed=True)
+
+
+def event_start_at(event_id: int) -> Optional[float]:
+    """Epoch seconds the event starts (from its archived HLTV page), or None."""
+    from backend.data.event_db import get_event_detail
+    from backend.routes import events as events_routes
+
+    event = get_event_detail(int(event_id))
+    if not event:
+        return None
+    try:
+        detected = events_routes._detect_event_tournament_kind_cached(event)
+    except Exception:  # noqa: BLE001
+        return None
+    start = detected.get("start_at")
+    return float(start) if start else None
+
+
+def event_has_started(event_id: int) -> Optional[bool]:
+    """True/False from the event's start stamp; None when the start is unknown."""
+    start = event_start_at(event_id)
+    if start is None:
+        return None
+    return time.time() >= start
+
+
+def _take_input_snapshot(event_id: int, team_ids: List[int]) -> Dict[str, Any]:
+    """The valuation's inputs as of now: full player rows (rating, Top-X
+    ratings, roles, boosters) for every roster player of the teams, priced at
+    THIS event's fantasy prices (the players table's price column only holds
+    whichever event was imported last), and each team's HLTV rank."""
+    from backend.data.event_db import get_event_price
+
+    player_rows_by_id, team_rank_by_id = _build_playoff_lookup_context([int(t) for t in team_ids])
+    players: Dict[str, Dict[str, Any]] = {}
+    for pid, row in player_rows_by_id.items():
+        out = dict(row)
+        try:
+            price = get_event_price(int(pid), int(event_id))
+        except Exception:  # noqa: BLE001
+            price = None
+        if price is not None:
+            out["price"] = int(price)
+        players[str(pid)] = out
+    return {
+        "players": players,
+        "team_ranks": {str(tid): int(rank) for tid, rank in team_rank_by_id.items()},
+    }
+
+
+def _event_inputs(event_id: int, team_ids: List[int], refresh: bool = False) -> tuple:
+    """(snapshot, meta) for a bake. Before the event starts (or when the start
+    is unknown) a fresh snapshot is taken and stored; once it has started the
+    stored snapshot is reused unchanged — so re-bakes after a nightly rating
+    import cannot move a live event's values — unless `refresh` forces new
+    inputs. meta = {taken_at, frozen, started, start_at}."""
+    start = event_start_at(event_id)
+    started = bool(start) and time.time() >= float(start)
+    _INPUT_SNAPSHOT.ensure_table()  # idempotent; the table is new
+    existing = _INPUT_SNAPSHOT.load(key=int(event_id))
+    if existing and started and not refresh:
+        meta = dict((existing.get("payload") or {}))
+        meta.update({"frozen": True, "started": True, "start_at": start})
+        return existing["result"], meta
+    snapshot = _take_input_snapshot(event_id, team_ids)
+    meta = {"event_id": int(event_id), "taken_at": time.time(), "frozen": started, "started": started, "start_at": start}
+    _INPUT_SNAPSHOT.save(meta, snapshot, key=int(event_id))
+    return snapshot, meta
+
+
+def _lookup_context_from_snapshot(snapshot: Dict[str, Any], team_ids: List[int]) -> tuple:
+    """(player_rows_by_id, team_rank_by_id) in _build_playoff_lookup_context's
+    shape, from a stored snapshot (teams missing from it fall back to rank 100)."""
+    player_rows_by_id = {int(pid): dict(row) for pid, row in (snapshot.get("players") or {}).items()}
+    ranks = {int(t): int(r) for t, r in (snapshot.get("team_ranks") or {}).items()}
+    team_rank_by_id = {int(t): ranks.get(int(t), 100) for t in team_ids}
+    return player_rows_by_id, team_rank_by_id
+
+
+def _snapshot_player_row(results: dict, pid: int) -> Optional[dict]:
+    """The player row a stored run was valued with (its input snapshot), else
+    the live players table — so the live Top 5 prices, roles and boosters
+    match the stored expected points."""
+    row = ((results.get("input_snapshot") or {}).get("players") or {}).get(str(int(pid)))
+    if row:
+        return row
+    return get_player(int(pid))
+
+
+def bake_event_valuations(
+    event_id: int, trigger: str = "import", only_if_missing: bool = False, refresh_inputs: bool = False
+) -> Dict[str, Any]:
     """Run and store the groups valuation for one fantasy event off the request
     path — once, right after the event is imported — so opening the Tournament
     tab never computes anything. Uses the detected format, the detected
@@ -1083,11 +1329,20 @@ def bake_event_valuations(event_id: int, trigger: str = "import", only_if_missin
         return {"status": "skipped", "event_id": event_id, "reason": f"invalid shape: {exc.detail}"}
     payload["event_id"] = event_id
     payload["baked"] = {"trigger": trigger, "at": started}
+    all_team_ids = [t for g in groups_ids for t in g]
+    snapshot, inputs_meta = _event_inputs(event_id, all_team_ids, refresh=refresh_inputs)
+    payload["inputs"] = inputs_meta
     try:
-        result = _compute_groups_result(payload)
+        result = _compute_groups_result(payload, snapshot=snapshot)
+        model = _finalize_joint_precompute(result, event_id)
     except Exception as exc:  # noqa: BLE001
         return {"status": "error", "event_id": event_id, "reason": str(exc)[:300]}
     _GROUPS_STATE.save(payload, result, key=event_id)
+    if model is not None:
+        saved = _GROUPS_STATE.load(key=event_id)
+        if saved:
+            _JOINT_MODEL_CACHE.clear()
+            _JOINT_MODEL_CACHE[(event_id, saved["updated_at"])] = model
     playoff = result.get("playoff") or {}
     return {
         "status": "ok",
@@ -1095,6 +1350,7 @@ def bake_event_valuations(event_id: int, trigger: str = "import", only_if_missin
         "group_format": fmt,
         "combined_playoffs": combined,
         "pairings": playoff.get("pairings"),
+        "inputs": "frozen at event start" if inputs_meta.get("frozen") else "fresh (event not started)",
         "seconds": round(time.time() - started, 1),
     }
 
@@ -1110,9 +1366,10 @@ def _assemble_stage_stats(
     shape: for every round of the group (then of the playoff) each team's
     chance of playing it, its opponents there (chance to meet, chance to beat),
     the 'eliminated earlier' share (the -3-per-missed-round penalty, credited to
-    the rounds it misses) and the bye credit on the round a bye skips; each
-    player's expected points per round by component (net of those), per
-    opponent, and the booster the round uses. Group padding stays separate."""
+    the rounds it misses) and the chance a bye skips the first playoff round;
+    each player's expected points per round by component (net of the penalty),
+    per opponent, and the booster the round uses. The group padding and the
+    playoff padding (the round a bye skips) stay separate."""
     rounds = _GROUP_STAGE_ROUNDS.get(group_format, [])
     stages = [
         {"key": rk, "label": lbl, "full": full, "phase": "group", "bracket": side, "opener": i == 0}
@@ -1205,6 +1462,7 @@ def _assemble_stage_stats(
             "rounds": rounds_out,
             "rank": ranks.get(tid_i),
             "padding_prob": float(acc["pad_prob"].get(tid_i) or 0.0),
+            "playoff_padding_prob": bye_prob,
             "champion": float((po.get("advance_rate") or {}).get(str(tid)) or 0.0),
         }
 
@@ -1233,14 +1491,22 @@ def _assemble_stage_stats(
         for rk, bucket in boost_merged.items():
             if rk in row["stages"]:
                 row["stages"][rk]["boosters"] = _booster_list(bucket)
-        opp_merged: Dict[str, Dict[int, float]] = {}
+        opp_merged: Dict[str, Dict[int, List[float]]] = {}
         for mk, per_opp in (acc["opp_pts"].get(pid) or {}).items():
             dest = opp_merged.setdefault(fold.get(mk, mk), {})
             for o, v in per_opp.items():
-                dest[int(o)] = dest.get(int(o), 0.0) + v
+                cell = dest.setdefault(int(o), [0.0, 0.0, 0.0, 0.0])
+                for i in range(4):
+                    cell[i] += v[i]
         for rk, per_opp in opp_merged.items():
             if rk in row["stages"]:
-                row["stages"][rk]["opponents"] = {str(o): v for o, v in per_opp.items()}
+                row["stages"][rk]["opponents"] = {
+                    str(o): {"rating": v[0], "win": v[1], "role": v[2], "booster": v[3], "total": sum(v)}
+                    for o, v in per_opp.items()
+                }
+        role_info = acc["role"].get(pid)
+        if role_info:
+            row["role"] = {"role_id": role_info[0], "major": role_info[1], "minor": role_info[2], "points": role_info[3]}
         pad = acc["padding"].get(pid) or [0.0, 0.0, 0.0, 0.0]
         row["padding"] = {"rating": pad[0], "win": pad[1], "role": pad[2], "booster": pad[3], "total": sum(pad)}
         row["penalty"] = float(acc["penalty"].get(pid) or 0.0)
@@ -1253,10 +1519,13 @@ def _assemble_stage_stats(
             row["stages"][rk]["boosters"] = ((po.get("player_stage_boost") or {}).get(pid_s) or {}).get(str(r)) or []
             row["stages"][rk]["opponents"] = ((po.get("player_round_opp_pts") or {}).get(pid_s) or {}).get(str(r)) or {}
         row["playoff_penalty"] = float((po.get("player_penalty") or {}).get(pid_s) or 0.0)
-        row["playoff_bye"] = float((po.get("player_bye") or {}).get(pid_s) or 0.0)
-    # Net each round: the 'eliminated earlier' share and the bye credit sit in
-    # the win component (as in the Playoff tab), so the cards add up to the
-    # total once padding is added.
+        row["playoff_padding"] = dict(
+            (po.get("player_playoff_padding") or {}).get(pid_s)
+            or {"rating": 0.0, "win": 0.0, "role": 0.0, "booster": 0.0, "total": 0.0}
+        )
+    # Net each round: the 'eliminated earlier' share sits in the win component
+    # (as in the Playoff tab), so the cards add up to the total once the group
+    # and playoff paddings are added.
     for pid_s, row in players.items():
         tid_i = pid_team.get(int(pid_s))
         if tid_i is None:
@@ -1266,15 +1535,10 @@ def _assemble_stage_stats(
             cell = row["stages"].setdefault(rk, {"rating": 0.0, "win": 0.0, "role": 0.0, "booster": 0.0, "total": 0.0})
             cell["win"] = float(cell.get("win") or 0.0) + eb[1]
             cell["total"] = float(cell.get("total") or 0.0) + eb[1]
-        bye = float(row.get("playoff_bye") or 0.0)
-        if bye and po_keys:
-            cell = row["stages"].setdefault(po_keys[0], {"rating": 0.0, "win": 0.0, "role": 0.0, "booster": 0.0, "total": 0.0})
-            cell["win"] = float(cell.get("win") or 0.0) + bye
-            cell["total"] = float(cell.get("total") or 0.0) + bye
     return {"stages": stages, "teams": teams, "players": players}
 
 
-def _compute_groups_result(payload: dict, progress_callback=None) -> dict:
+def _compute_groups_result(payload: dict, progress_callback=None, snapshot: Optional[Dict[str, Any]] = None) -> dict:
     groups = payload["groups"]
     gf_raw = str(payload.get("group_format") or "").strip().lower()
     group_format = gf_raw if gf_raw in ("de8", "de8_top3") else "gsl4"
@@ -1286,7 +1550,32 @@ def _compute_groups_result(payload: dict, progress_callback=None) -> dict:
     }[group_format]
     combined = bool(payload.get("combined_playoffs"))
     all_team_ids = [tid for group in groups for tid in group]
-    player_rows_by_id, team_rank_by_id = _build_playoff_lookup_context(all_team_ids)
+    if snapshot:
+        player_rows_by_id, team_rank_by_id = _lookup_context_from_snapshot(snapshot, all_team_ids)
+    else:
+        player_rows_by_id, team_rank_by_id = _build_playoff_lookup_context(all_team_ids)
+    with team_strength.rank_overrides(team_rank_by_id if snapshot else None):
+        result = _compute_groups_result_inner(
+            payload, progress_callback, snapshot, groups, group_format, quals_per_group, enumerate_group,
+            combined, all_team_ids, player_rows_by_id, team_rank_by_id,
+        )
+    if snapshot:
+        # The rows this run was valued with travel with the results so the live
+        # Top 5 (prices, roles, boosters) matches the stored expected points.
+        meta = payload.get("inputs") or {}
+        result["input_snapshot"] = {
+            "taken_at": meta.get("taken_at"),
+            "frozen": bool(meta.get("frozen")),
+            "start_at": meta.get("start_at"),
+            "players": snapshot.get("players") or {},
+        }
+    return result
+
+
+def _compute_groups_result_inner(
+    payload, progress_callback, snapshot, groups, group_format, quals_per_group, enumerate_group,
+    combined, all_team_ids, player_rows_by_id, team_rank_by_id,
+) -> dict:
     prob_cache: Dict = {}
     outcomes: List[Dict[str, Any]] = []
     teams_out: Dict[int, Dict[str, Any]] = {}
@@ -1371,7 +1660,6 @@ def _compute_groups_result(payload: dict, progress_callback=None) -> dict:
                 comps["role_points_total"] += extra["role"]
                 comps["booster_points_total"] += extra["booster"]
                 comps["total_points_without_booster"] += extra["rating"] + extra["win"] + extra["role"]
-
     # Where each team finishes in its group: P(rank r) over the exact outcomes
     # (ranks are 1-based, only qualifying places are known by rank).
     place_odds: Dict[str, Dict[str, float]] = {}
@@ -1424,8 +1712,17 @@ def _run_groups_job(job_id: str, payload: dict) -> None:
         job["status"] = "running"
         job["updated_at"] = time.time()
     try:
-        result = _compute_groups_result(payload, progress_callback=_update)
-        _GROUPS_STATE.save(payload, result, key=int(payload.get("event_id") or _state_key()))
+        event_key = int(payload.get("event_id") or _state_key())
+        snapshot, inputs_meta = _event_inputs(event_key, [int(t) for g in payload["groups"] for t in g])
+        payload["inputs"] = inputs_meta
+        result = _compute_groups_result(payload, progress_callback=_update, snapshot=snapshot)
+        model = _finalize_joint_precompute(result, event_key)
+        _GROUPS_STATE.save(payload, result, key=event_key)
+        if model is not None:
+            saved = _GROUPS_STATE.load(key=event_key)
+            if saved:
+                _JOINT_MODEL_CACHE.clear()
+                _JOINT_MODEL_CACHE[(event_key, saved["updated_at"])] = model
         with GROUPS_JOBS_LOCK:
             job = GROUPS_JOBS.get(job_id)
             if not job:
@@ -1675,7 +1972,7 @@ def _parse_event_playoff_bracket(html: str) -> Dict[str, Any]:
     HLTV embeds it as a Bracket.SingleElimination named 'Single Elimination
     Bracket' (distinct from the single-slot '3rd Place Decider Match' bracket).
     The first round's type — Round8 / Round4 / Round2 — gives the field size
-    (16 / 8 / 4: RoundN has N matches), and each slot's team1/team2 lists the
+    (16 / 8: RoundN has N matches), and each slot's team1/team2 lists the
     seeded matchups in bracket order. Returns
     {bracket_size, seeds:[{id,name,ranking}|None,...]}, or bracket_size 0 with
     no seeds when the page has no such bracket (Swiss-only or not yet seeded).
@@ -1859,7 +2156,7 @@ def autofill_event_playoff(
         # seeded single-elim bracket (an import-time snapshot may predate the
         # draw); otherwise fall back to a live fetch of the canonical page.
         snap_html = _find_event_snapshot_html(hid)
-        if snap_html and int(_parse_event_playoff_bracket(snap_html).get("bracket_size") or 0) in (2, 4, 8, 16):
+        if snap_html and int(_parse_event_playoff_bracket(snap_html).get("bracket_size") or 0) in (8, 16):
             html = snap_html
         if html is None:
             if not url:
@@ -2016,6 +2313,9 @@ def _slim_groups_results(results: Dict[str, Any]) -> Dict[str, Any]:
     """
     results = results or {}
     slim = {k: v for k, v in results.items() if k != "outcomes"}
+    if isinstance(slim.get("playoff"), dict):
+        # the joint-outcome sampler's tables are query-time inputs, not tab data
+        slim["playoff"] = {k: v for k, v in slim["playoff"].items() if k not in ("pairing_table", "win_probs")}
     odds: Dict[str, Dict[str, float]] = {}
     for outcome in results.get("outcomes") or []:
         group = str(outcome.get("group", 0))
@@ -2048,12 +2348,14 @@ def get_latest_groups(full: bool = False, event_id: Optional[int] = None):
 
 
 @router.post("/bake")
-def bake_groups_event(event_id: Optional[int] = None):
+def bake_groups_event(event_id: Optional[int] = None, refresh_inputs: bool = False):
     """(Re)bake the stored valuation for one event — the active one by default —
     synchronously, without changing which event is active. Same job the
-    scheduler runs at import; useful after a scoring change."""
+    scheduler runs at import; useful after a scoring change. Once the event
+    has started its inputs (ratings, roles, boosters, ranks) stay frozen at
+    the pre-event snapshot; refresh_inputs=1 deliberately re-reads them."""
     key = int(event_id) if event_id else _state_key()
-    return bake_event_valuations(key, trigger="manual")
+    return bake_event_valuations(key, trigger="manual", refresh_inputs=bool(refresh_inputs))
 
 
 @router.delete("/latest")
@@ -2103,6 +2405,259 @@ def _group_outcome_probs_by_group(results: dict) -> Dict[int, List[float]]:
 # combinations (single group = 1024), else Monte-Carlo sample it.
 _MOST_OUTCOMES_EXACT_JOINT = 20000
 _MOST_OUTCOMES_SAMPLES = 4000
+# Combined events: joint outcomes (group results + playoff bracket) sampled for
+# the ceiling / most-likely modes — the joint space is ~33M for two 8-team
+# groups and a 6-team bracket, far too big to enumerate.
+_JOINT_SAMPLES = 100000
+_JOINT_MODEL_CACHE: Dict[Any, tuple] = {}  # (event, updated_at) -> model; ~64 MB each at 100k samples
+
+
+def _role_points_per_match(results: dict) -> Dict[int, float]:
+    """{pid: per-match points of the player's best role} from the stored stage stats."""
+    out: Dict[int, float] = {}
+    for pid_s, row in ((results.get("stage_stats") or {}).get("players") or {}).items():
+        pts = ((row or {}).get("role") or {}).get("points")
+        if pts is not None:
+            out[int(pid_s)] = float(pts)
+    return out
+
+
+def _event_outcome_model(results: dict, cache_key: Any = None) -> tuple:
+    """(vectors {0: {pid: np.ndarray}}, probs {0: np.ndarray}, group_of_player,
+    decomposition) — the outcome space the ceiling and most-likely-winner modes
+    score rosters over, always ONE outcome axis. A single group: its exact
+    outcomes. Otherwise _JOINT_SAMPLES sampled joint outcomes — a result for
+    every group match and, for combined events, every playoff match, scored
+    exactly like the valuation — each with probability 1/N. The vectors hold
+    each player's points with their OWN best role and boosters (the additive
+    search key); the decomposition {rw, mp, mr} holds per player the rating +
+    win points as scored, the matches played and the matches the role is
+    scored for, so a roster can be re-scored under its own plan. Average stays
+    exact. Stored runs without the decomposition inputs give decomposition
+    None (per-player scoring only)."""
+    import numpy as np
+
+    if cache_key is not None and cache_key in _JOINT_MODEL_CACHE:
+        return _JOINT_MODEL_CACHE[cache_key]
+    groups = results.get("groups") or []
+    if len(groups) == 1 and not ((results.get("playoff") or {}).get("pairing_table")):
+        raw = _group_player_outcome_vectors(results)
+        vectors = {0: {pid: np.asarray(v, dtype=np.float64) for pid, v in (raw.get(0) or {}).items()}}
+        probs = {0: np.asarray(_group_outcome_probs_by_group(results).get(0) or [], dtype=np.float64)}
+        decomp = _group_outcome_decomposition(results, 0)
+        model = (vectors, probs, {pid: 0 for pid in vectors[0]}, decomp)
+    else:
+        model = _sample_joint_outcomes(results, _JOINT_SAMPLES)
+    if cache_key is not None:
+        if len(_JOINT_MODEL_CACHE) >= 2:
+            _JOINT_MODEL_CACHE.pop(next(iter(_JOINT_MODEL_CACHE)))
+        _JOINT_MODEL_CACHE[cache_key] = model
+    return model
+
+
+def _group_outcome_decomposition(results: dict, group_index: int) -> Optional[Dict[str, Dict[int, Any]]]:
+    """{rw, mp, mr}: per player, over one group's stored outcomes in order —
+    rating + win as scored (paddings and penalties included), matches the team
+    played, matches the role is scored for (role points ÷ the best role's
+    per-match points, so padded matches count)."""
+    import numpy as np
+
+    outs = [o for o in (results.get("outcomes") or []) if int(o.get("group") or 0) == int(group_index)]
+    if not outs or not all(o.get("player_components") for o in outs):
+        return None
+    role_pm = _role_points_per_match(results)
+    pid_team: Dict[int, int] = {}
+    for tid, t in (results.get("teams") or {}).items():
+        for pid in (t.get("players") or {}):
+            pid_team[int(pid)] = int(tid)
+    pids = sorted({int(pid) for o in outs for pid in (o.get("players") or {})})
+    n = len(outs)
+    rw = {pid: np.zeros(n) for pid in pids}
+    mp = {pid: np.zeros(n, dtype=np.uint8) for pid in pids}
+    mr = {pid: np.zeros(n) for pid in pids}
+    for c, o in enumerate(outs):
+        played: Dict[int, int] = {}
+        for m in o.get("matches") or []:
+            for t in m.get("teams") or []:
+                played[int(t)] = played.get(int(t), 0) + 1
+        comps = o.get("player_components") or {}
+        for pid in pids:
+            cp = comps.get(str(pid)) or {}
+            rw[pid][c] = float(cp.get("rating") or 0.0) + float(cp.get("win") or 0.0)
+            mp[pid][c] = played.get(pid_team.get(pid, -1), 0)
+            pm = role_pm.get(pid, 0.0)
+            mr[pid][c] = (float(cp.get("role") or 0.0) / pm) if abs(pm) > 1e-9 else 0.0
+    return {"rw": rw, "mp": mp, "mr": mr}
+
+
+def _sample_joint_outcomes(results: dict, n: int, seed: int = 20240101) -> tuple:
+    """Sample n joint outcomes of a combined event and score every player in
+    each: the group result (its stored per-player totals, group padding and
+    penalties included), then the playoff bracket played match by match from
+    the qualifiers with the stored win probabilities, each pairing scored from
+    the stored table (booster slot numbering continues from the group matches,
+    elimination penalties included), and the playoff padding of a bye team's
+    players (+6 win plus their average rating and role over the matches played
+    in that outcome). Deterministic (fixed seed)."""
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    outcomes = results.get("outcomes") or []
+    groups = [[int(t) for t in g] for g in (results.get("groups") or [])]
+    x = len(groups)
+    po = results.get("playoff") or {}
+    fmt = str(results.get("group_format") or "gsl4")
+    quals = {"gsl4": 2, "de8": 4, "de8_top3": 3}.get(fmt, 2)
+    has_playoff = bool(po.get("pairing_table") and po.get("win_probs"))
+    if has_playoff:
+        rounds_total = int(po.get("rounds") or 1)
+        template = _combined_bracket_template(x, quals, rounds_total, fmt)
+        rounds, entry_round, prior_matches = template["rounds"], template["entry_round"], template["prior_matches"]
+        byes = bool(template["byes_to_semis"])
+    else:
+        rounds_total, rounds, entry_round, prior_matches, byes = 0, [], {}, {}, False
+    win_probs = {int(a): {int(b): float(p) for b, p in row.items()} for a, row in (po.get("win_probs") or {}).items()}
+    table = {
+        tuple(int(t) for t in k.split(",")): {int(pid): v for pid, v in row.items()}
+        for k, row in (po.get("pairing_table") or {}).items()
+    }
+    # the decomposition needs rating + win per pairing (4-value rows) and per-outcome components
+    decomposed = all(o.get("player_components") for o in outcomes) and (
+        not has_playoff or all(len(v) >= 4 for row in table.values() for v in row.values())
+    )
+    role_pm = _role_points_per_match(results)
+    pid_team: Dict[int, int] = {}
+    for tid, t in (results.get("teams") or {}).items():
+        for pid in (t.get("players") or {}):
+            pid_team[int(pid)] = int(tid)
+    by_group: Dict[int, List[dict]] = {}
+    for o in outcomes:
+        by_group.setdefault(int(o.get("group") or 0), []).append(o)
+    all_pids = sorted({int(pid) for o in outcomes for pid in (o.get("players") or {})})
+    vec = {pid: np.zeros(n, dtype=np.float64) for pid in all_pids}
+    rw = {pid: np.zeros(n, dtype=np.float64) for pid in all_pids} if decomposed else {}
+    mp = {pid: np.zeros(n, dtype=np.uint8) for pid in all_pids} if decomposed else {}
+    mr = {pid: np.zeros(n, dtype=np.float64) for pid in all_pids} if decomposed else {}
+    idx_by_group: Dict[int, Any] = {}
+    for g, olist in by_group.items():
+        p = np.asarray([float(o.get("probability") or 0.0) for o in olist], dtype=np.float64)
+        p = p / p.sum()
+        idx = rng.choice(len(olist), size=n, p=p)
+        idx_by_group[g] = idx
+        pids_g = sorted({int(pid) for o in olist for pid in (o.get("players") or {})})
+        mat = np.asarray(
+            [[float((o.get("players") or {}).get(str(pid)) or 0.0) for pid in pids_g] for o in olist],
+            dtype=np.float64,
+        )
+        picked = mat[idx]
+        for j, pid in enumerate(pids_g):
+            vec[pid] += picked[:, j]
+        if decomposed:
+            rw_mat = np.zeros((len(olist), len(pids_g)))
+            mp_mat = np.zeros((len(olist), len(pids_g)), dtype=np.uint8)
+            mr_mat = np.zeros((len(olist), len(pids_g)))
+            for c, o in enumerate(olist):
+                played: Dict[int, int] = {}
+                for m in o.get("matches") or []:
+                    for t in m.get("teams") or []:
+                        played[int(t)] = played.get(int(t), 0) + 1
+                comps = o.get("player_components") or {}
+                for j, pid in enumerate(pids_g):
+                    cp = comps.get(str(pid)) or {}
+                    rw_mat[c, j] = float(cp.get("rating") or 0.0) + float(cp.get("win") or 0.0)
+                    mp_mat[c, j] = played.get(pid_team.get(pid, -1), 0)
+                    pm = role_pm.get(pid, 0.0)
+                    mr_mat[c, j] = (float(cp.get("role") or 0.0) / pm) if abs(pm) > 1e-9 else 0.0
+            for j, pid in enumerate(pids_g):
+                rw[pid] += rw_mat[idx, j]
+                mp[pid] += mp_mat[idx, j]
+                mr[pid] += mr_mat[idx, j]
+    n_matches = sum(len(r) for r in rounds)
+    u = rng.random((n, max(n_matches, 1)))
+    missing = 0
+    # Python loop over samples: ~5 matches × 10 players each — fine for 20k.
+    for i in range(n):
+        seed_team: Dict[tuple, int] = {}
+        for g in range(x):
+            q = by_group[g][idx_by_group[g][i]].get("qualified") or []
+            for rank in range(quals):
+                if rank < len(q):
+                    seed_team[(g, rank)] = int(q[rank])
+        team_seed = {t: sd for sd, t in seed_team.items()}
+        winners: Dict[tuple, int] = {}
+        played: Dict[int, List[float]] = {}  # pid -> [rating, role, games] on the bye path (padding basis)
+        ui = 0
+        for r, matches in enumerate(rounds):
+            rem = rounds_total - r - 1
+            for m, (left, right) in enumerate(matches):
+                a = seed_team[(left[1], left[2])] if left[0] == "seed" else winners[(left[1], left[2])]
+                b = seed_team[(right[1], right[2])] if right[0] == "seed" else winners[(right[1], right[2])]
+                sa, sb = team_seed[a], team_seed[b]
+                na = prior_matches[sa] + r - entry_round.get(sa, 0) + 1
+                nb = prior_matches[sb] + r - entry_round.get(sb, 0) + 1
+                w = a if u[i, ui] < win_probs[a][b] else b
+                ui += 1
+                winners[(r, m)] = w
+                row = table.get((a, b, w, na, nb, rem))
+                if row is None:
+                    missing += 1
+                    continue
+                role_at = 3 if len(next(iter(row.values()))) >= 4 else 2
+                for pid, comps in row.items():
+                    vec[pid][i] += comps[0]
+                    if decomposed:
+                        rw[pid][i] += comps[1] + comps[2]
+                        mp[pid][i] += 1
+                        mr[pid][i] += 1.0
+                if byes:
+                    for t, sd in ((a, sa), (b, sb)):
+                        if entry_round.get(sd, 0) > 0:
+                            # only this team's players (the table row holds both sides)
+                            for pid in _team_pids_of(results, t):
+                                comps = row.get(pid)
+                                if comps is None:
+                                    continue
+                                acc = played.setdefault(pid, [0.0, 0.0, 0.0])
+                                acc[0] += comps[1]
+                                acc[1] += comps[role_at]
+                                acc[2] += 1.0
+        if byes:
+            for sd, t in seed_team.items():
+                if entry_round.get(sd, 0) <= 0:
+                    continue
+                fg = by_group[sd[0]][idx_by_group[sd[0]][i]].get("first_games") or {}
+                for pid_s, sums in fg.items():
+                    pid = int(pid_s)
+                    acc = played.get(pid) or [0.0, 0.0, 0.0]
+                    games = float(sums[4]) + acc[2]
+                    pad = _PLAYOFF_BYE_PADDING_POINTS
+                    rating_avg = (float(sums[0]) + acc[0]) / games if games > 0 else 0.0
+                    if games > 0:
+                        pad += rating_avg + (float(sums[2]) + acc[1]) / games
+                    if pid in vec:
+                        vec[pid][i] += pad
+                        if decomposed:
+                            rw[pid][i] += _PLAYOFF_BYE_PADDING_POINTS + rating_avg
+                            mr[pid][i] += 1.0
+    if missing:
+        import logging
+
+        logging.getLogger(__name__).warning("joint sampler: %d pairings missing from the stored table", missing)
+    decomp = {"rw": rw, "mp": mp, "mr": mr} if decomposed else None
+    return {0: vec}, {0: np.full(n, 1.0 / n, dtype=np.float64)}, {pid: 0 for pid in vec}, decomp
+
+
+_TEAM_PIDS_CACHE: Dict[int, Dict[int, List[int]]] = {}
+
+
+def _team_pids_of(results: dict, tid: int) -> List[int]:
+    key = id(results)
+    by_team = _TEAM_PIDS_CACHE.get(key)
+    if by_team is None:
+        by_team = {int(t): [int(pid) for pid in (row.get("players") or {})] for t, row in (results.get("teams") or {}).items()}
+        _TEAM_PIDS_CACHE.clear()
+        _TEAM_PIDS_CACHE[key] = by_team
+    return by_team.get(int(tid), [])
 # Only the strongest teams by average realistically ever win an outcome; compute
 # win probability for this many (the true winner is certainly among them).
 _WIN_PROB_CANDIDATES = 300
@@ -2123,6 +2678,43 @@ def _compute_group_win_probs(
     n_teams = len(team_pid_lists)
     win = [0.0] * n_teams
     if n_teams == 0 or not groups:
+        return win
+    if len(groups) == 1:
+        # One outcome axis (a single group, or the sampled joint outcomes of a
+        # combined event): vectorised — score every roster on every outcome,
+        # the best per outcome takes its probability (ties share it).
+        import numpy as np
+
+        g = groups[0]
+        gv = vectors[g]
+        probs = np.asarray(probs_by_group[g], dtype=np.float64)
+        n_out = len(probs)
+
+        def chunk_scores(start: int, stop: int) -> Any:
+            block = np.zeros((stop - start, n_out), dtype=np.float64)
+            for t in range(start, stop):
+                for pid in team_pid_lists[t]:
+                    v = gv.get(int(pid))
+                    if v is not None:
+                        block[t - start] += np.asarray(v, dtype=np.float64)
+            return block
+
+        # Three chunked passes (candidates × outcomes would be ~320 MB at once):
+        # the best score per outcome, how many rosters tie it, then each
+        # roster's share of the outcomes it tops.
+        step = 64  # 64 rosters × 100k outcomes × 8 B = 51 MB per chunk
+        best = np.full(n_out, -np.inf)
+        for start in range(0, n_teams, step):
+            best = np.maximum(best, chunk_scores(start, min(n_teams, start + step)).max(axis=0))
+        counts = np.zeros(n_out)
+        for start in range(0, n_teams, step):
+            counts += (chunk_scores(start, min(n_teams, start + step)) >= best - 1e-9).sum(axis=0)
+        share = probs / np.maximum(counts, 1)
+        for start in range(0, n_teams, step):
+            stop = min(n_teams, start + step)
+            ties = chunk_scores(start, stop) >= best - 1e-9
+            for t, v in enumerate((ties * share).sum(axis=1)):
+                win[start + t] = float(v)
         return win
 
     # Per team, the pids that fall in each group.
@@ -2199,7 +2791,7 @@ def _groups_players_info(results: dict, exclude: set) -> List[Dict[str, Any]]:
             pid = int(pid_raw)
             if pid in exclude:
                 continue
-            row = get_player(pid)
+            row = _snapshot_player_row(results, pid)
             if not row:
                 continue
             rating_ev = float(comps.get("rating_points_total") or 0.0)
@@ -2294,124 +2886,21 @@ def _group_team_reach_probs(results: dict) -> Dict[int, Dict[int, float]]:
     return reach
 
 
-def _player_booster_ub(team_id: int, reach_by_team: Dict[int, Dict[int, float]], rates: Dict[int, float]) -> float:
-    """Upper bound on a single player's booster EV: pair their most-reached
-    match slots with their highest trigger rates (a player can hold at most one
-    booster per match slot). Ignores that boosters are shared across the roster,
-    so summing this over 5 players over-counts — exactly what makes it a safe
-    admissible bound for pruning / ranking before the exact assignment."""
-    reach_probs = sorted((reach_by_team.get(int(team_id)) or {}).values(), reverse=True)
-    if not reach_probs:
-        return 0.0
-    triggers = sorted((rates or {}).values(), reverse=True)
-    ub = 0.0
-    for i, prob in enumerate(reach_probs):
-        trig = triggers[i] if i < len(triggers) else 0.0
-        ub += float(prob) * float(trig) * BOOSTER_POINT_VALUE
-    return ub
+def _team_match_reach_probs(results: dict) -> Dict[int, Dict[int, float]]:
+    """P(team plays its Nth match) over the whole event: the group matches from
+    the enumerated outcomes plus, for combined events, the playoff matches by
+    match number from the exact pairings (disjoint events, so they add). The
+    booster slots run through the playoffs, so the roster booster solve needs
+    the full run; stored results from before `playoff.match_reach` existed fall
+    back to the group matches only."""
+    reach = _group_team_reach_probs(results)
+    for tid_s, per_num in ((results.get("playoff") or {}).get("match_reach") or {}).items():
+        d = reach.setdefault(int(tid_s), {})
+        for num_s, p in per_num.items():
+            d[int(num_s)] = d.get(int(num_s), 0.0) + float(p)
+    return reach
 
 
-def optimize_group_boosters_for_roster(
-    players: List[Dict[str, Any]],
-    reach_by_team: Dict[int, Dict[int, float]],
-    rates_by_pid: Dict[int, Dict[int, float]],
-) -> Dict[str, Any]:
-    """Assign the 18 booster types across a roster's (player, match-slot) columns
-    to maximise total expected booster points (max-weight bipartite matching via
-    min-cost flow). Group matches are all scored as BO3 (matching the outcome
-    enumeration), so trigger rates need no BO1 adjustment.
-    """
-    columns: List[Dict[str, Any]] = []
-    for player in players:
-        pid = int(player["player_id"])
-        tid = int(player.get("team_id", 0))
-        for n, prob in sorted((reach_by_team.get(tid) or {}).items()):
-            if prob > 0:
-                columns.append(
-                    {
-                        "player_id": pid,
-                        "player_name": player.get("name", f"Player {pid}"),
-                        "match_number": int(n),
-                        "slot_probability": float(prob),
-                    }
-                )
-    if not columns:
-        return {"assignments": [], "total_expected_booster_points": 0.0}
-
-    weights: List[List[float]] = []
-    for booster_id in range(18):
-        row = []
-        for col in columns:
-            trig = float((rates_by_pid.get(col["player_id"]) or {}).get(booster_id, 0.0))
-            row.append(col["slot_probability"] * trig * BOOSTER_POINT_VALUE)
-        weights.append(row)
-
-    assignments: List[Dict[str, Any]] = []
-    total = 0.0
-    for booster_id, col_idx, ev in _max_weight_assignment(weights):
-        if ev <= 1e-9:
-            continue
-        col = columns[col_idx]
-        assignments.append(
-            {
-                "booster_id": int(booster_id),
-                "booster": BOOSTER_NAMES.get(int(booster_id), f"Booster {booster_id}"),
-                "player_id": int(col["player_id"]),
-                "player": col["player_name"],
-                "match_number": int(col["match_number"]),
-                "slot_probability": float(col["slot_probability"]),
-                "expected_points": float(ev),
-            }
-        )
-        total += float(ev)
-    return {"assignments": assignments, "total_expected_booster_points": total}
-
-
-_NUM_ROLES = 12
-_ROLE_UNAVAILABLE = -1e9  # weight for a role the player has no trigger data for
-
-
-def _exact_role_assignment(
-    players: List[Dict[str, Any]], role_scores_by_pid: Dict[int, Dict[int, float]]
-) -> tuple:
-    """Optimal clash-free role assignment: each player takes a DISTINCT role,
-    maximising total expected role points (max-weight matching via min-cost
-    flow). Per-role EV = the player's role_ev (which is best-role points, i.e.
-    best_per_match_score × padding-inclusive match count) scaled by that role's
-    per-match score relative to their best — role points scale linearly with the
-    per-match score over the same match count. Returns
-    (total_role_ev, {pid: role_index}, {pid: assigned_role_ev}).
-
-    This replaces the old 'everyone on their best role' sum (which ignored
-    clashes and overstated role); when two players share a best role the optimum
-    moves one to their next-best free role, reducing the total.
-    """
-    weights: List[List[float]] = []
-    for p in players:
-        pid = int(p["player_id"])
-        rs = role_scores_by_pid.get(pid) or {}
-        role_ev = float(p.get("role_ev") or 0.0)
-        best = max(rs.values()) if rs else 0.0
-        if abs(best) <= 1e-9:
-            # No usable role data — neutral everywhere so it never blocks others.
-            weights.append([0.0] * _NUM_ROLES)
-            continue
-        row = [_ROLE_UNAVAILABLE] * _NUM_ROLES
-        for r in range(_NUM_ROLES):
-            if r in rs:
-                row[r] = role_ev * (float(rs[r]) / best)
-        weights.append(row)
-
-    total = 0.0
-    role_of: Dict[int, int] = {}
-    role_ev_of: Dict[int, float] = {}
-    for row_idx, col_idx, w in _max_weight_assignment(weights):
-        pid = int(players[row_idx]["player_id"])
-        role_of[pid] = int(col_idx)
-        contrib = float(w) if w > _ROLE_UNAVAILABLE / 2 else 0.0
-        role_ev_of[pid] = contrib
-        total += contrib
-    return total, role_of, role_ev_of
 
 
 def _topk_rosters_bnb(
@@ -2423,12 +2912,15 @@ def _topk_rosters_bnb(
     include: set,
     true_score_fn=None,
     time_budget_seconds: float = 10.0,
+    bound_offset: float = 0.0,
+    role_scores_by_player: Optional[Dict[int, Dict[int, float]]] = None,
 ) -> tuple[List[Dict[str, Any]], bool]:
     """Top-k rosters by branch-and-bound without enumerating the full space.
 
     bound_scores must be an additive per-player upper bound on each player's
-    contribution; true_score_fn (if given) computes the roster's real score,
-    which must never exceed the additive bound (e.g. per-group ceiling).
+    contribution (plus bound_offset, a roster-wide constant such as the Σλ of
+    the Lagrangian booster bound); true_score_fn (if given) computes the
+    roster's real score, which must never exceed the additive bound.
 
     Returns (rosters, exact). With a near-binding budget the search can be
     slow, so it stops at time_budget_seconds and reports exact=False; results
@@ -2465,7 +2957,7 @@ def _topk_rosters_bnb(
         suffix_cheapest[i] = sums
 
     base_cost = sum(int(p.get("price") or 0) for p in forced)
-    base_score = sum(float(bound_scores.get(int(p["player_id"]), 0.0)) for p in forced)
+    base_score = float(bound_offset) + sum(float(bound_scores.get(int(p["player_id"]), 0.0)) for p in forced)
     base_counts: Dict[int, int] = {}
     for p in forced:
         tid = int(p.get("team_id") or 0)
@@ -2475,10 +2967,11 @@ def _topk_rosters_bnb(
     if base_cost > budget:
         return [], True
 
-    role_scores_by_player = {
-        int(p["player_id"]): extract_role_scores_for_player(get_player(int(p["player_id"])) or {})
-        for p in players_info
-    }
+    if role_scores_by_player is None:
+        role_scores_by_player = {
+            int(p["player_id"]): extract_role_scores_for_player(get_player(int(p["player_id"])) or {})
+            for p in players_info
+        }
     players_meta = {str(p["player_id"]): p for p in players_info}
 
     heap: List = []  # (true_score, tiebreak, chosen_players)
@@ -2537,25 +3030,40 @@ def _topk_rosters_bnb(
     out = []
     for true_score, _tie, roster in sorted(heap, key=lambda e: -e[0]):
         pids = [int(p["player_id"]) for p in roster]
-        assignment, _ = best_role_assignment_for_team(pids, role_scores_by_player)
-        roles = [str((assignment or {}).get(pid, "-")) for pid in pids]
-        total_ev = sum(float(p.get("total_ev") or 0.0) for p in roster)
+        # The search bound gives every player their BEST role; the roster's
+        # real role points come from the exact clash-free assignment (each
+        # role once, weighted by the team's expected match count), the same
+        # one the stored best-team run uses. Re-score each contender with it
+        # so the listed roles, per-player role EV and the roster EV agree.
+        _role_total, role_of, role_ev_of = _exact_role_assignment(roster, role_scores_by_player)
+        roles = [str(role_of.get(pid, "-")) for pid in pids]
+        bound_total = sum(float(p.get("total_ev") or 0.0) for p in roster)
         cost = sum(int(p.get("price") or 0) for p in roster)
-        serialized = serialize_roster(players_meta, pids, roles, total_ev, cost)
-        serialized["average_ev"] = float(total_ev)
-        serialized["mode_metric"] = float(true_score)
+        serialized = serialize_roster(players_meta, pids, roles, bound_total, cost)
+        adjusted_total = 0.0
         for player in serialized.get("players") or []:
+            pid = int(player["player_id"])
+            new_role_ev = role_ev_of.get(pid)
+            if new_role_ev is not None:
+                old_role_ev = float(player.get("role_ev") or 0.0)
+                player["role_ev"] = float(new_role_ev)
+                player["total_ev"] = float(player.get("total_ev") or 0.0) - old_role_ev + float(new_role_ev)
             player["mode_score"] = float(player.get("total_ev") or 0.0)
+            adjusted_total += float(player.get("total_ev") or 0.0)
+        serialized["total_ev"] = float(adjusted_total)
+        serialized["average_ev"] = float(adjusted_total)
+        serialized["mode_metric"] = float(true_score)
         out.append(serialized)
     return out, exact
 
 
-def _live_ceiling_scorer(results: dict, players_info: List[Dict[str, Any]]):
-    vectors = _group_player_outcome_vectors(results)
-    group_of_player: Dict[int, int] = {}
-    for g, by_pid in vectors.items():
-        for pid in by_pid:
-            group_of_player[pid] = g
+def _live_ceiling_scorer(model: tuple, players_info: List[Dict[str, Any]]):
+    """(per-player bound = their best outcome, roster ceiling function) over
+    the outcome model — per independent group the best outcome for the
+    roster's players there, summed."""
+    import numpy as np
+
+    vectors, _probs, group_of_player = model[0], model[1], model[2]
 
     def true_ceiling(roster: List[Dict[str, Any]]) -> float:
         by_group: Dict[int, List[int]] = {}
@@ -2566,16 +3074,9 @@ def _live_ceiling_scorer(results: dict, players_info: List[Dict[str, Any]]):
                 by_group.setdefault(g, []).append(pid)
         total = 0.0
         for g, pids in by_group.items():
-            group_vecs = vectors.get(g) or {}
-            n = len(next(iter(group_vecs.values()))) if group_vecs else 0
-            sums = [0.0] * n
-            for pid in pids:
-                vec = group_vecs.get(pid)
-                if not vec:
-                    continue
-                for i, v in enumerate(vec):
-                    sums[i] += v
-            total += max(sums) if sums else 0.0
+            vecs = [vectors[g][pid] for pid in pids if pid in vectors.get(g, {})]
+            if vecs:
+                total += float(np.sum(vecs, axis=0).max())
         return total
 
     bound_scores = {}
@@ -2583,8 +3084,273 @@ def _live_ceiling_scorer(results: dict, players_info: List[Dict[str, Any]]):
         pid = int(p["player_id"])
         g = group_of_player.get(pid)
         vec = (vectors.get(g) or {}).get(pid) if g is not None else None
-        bound_scores[pid] = max(vec) if vec else float(p.get("total_ev") or 0.0)
+        bound_scores[pid] = float(np.max(vec)) if vec is not None and len(vec) else float(p.get("total_ev") or 0.0)
     return bound_scores, true_ceiling
+
+
+def _dense_players(model: tuple, players_info: List[Dict[str, Any]]) -> tuple:
+    """(players, pids, prices, dense team indices, score matrix players × outcomes)
+    for the players present in a single-axis outcome model."""
+    import numpy as np
+
+    vectors, _probs, _group_of = model[0], model[1], model[2]
+    gv = vectors[0]
+    players = [p for p in players_info if int(p["player_id"]) in gv]
+    pids = [int(p["player_id"]) for p in players]
+    prices = np.asarray([int(p.get("price") or 0) for p in players], dtype=np.int64)
+    teams_raw = [int(p.get("team_id") or 0) for p in players]
+    tmap = {t: i for i, t in enumerate(sorted(set(teams_raw)))}
+    team_of = np.asarray([tmap[t] for t in teams_raw], dtype=np.int64)
+    M = np.stack([gv[pid] for pid in pids]) if pids else np.zeros((0, 0), dtype=np.float64)
+    return players, pids, prices, team_of, M
+
+
+def _dense_decomposition(model: tuple, pids: List[int]) -> Optional[tuple]:
+    """(RW, MP, MR) matrices players × outcomes for these pids, or None when
+    the model carries no decomposition."""
+    import numpy as np
+
+    decomp = model[3] if len(model) > 3 else None
+    if not decomp or not pids or any(pid not in decomp["rw"] for pid in pids):
+        return None
+    RW = np.stack([decomp["rw"][pid] for pid in pids])
+    MP = np.stack([decomp["mp"][pid] for pid in pids])
+    MR = np.stack([decomp["mr"][pid] for pid in pids])
+    return RW, MP, MR
+
+
+def _plan_scored_rosters(
+    keys: List[tuple], model: tuple, players_info: List[Dict[str, Any]], players_meta: Dict[str, Dict[str, Any]],
+    reach_by_team, rates_by_pid, role_scores_by_pid, progress_callback=None,
+) -> Optional[List[Dict[str, Any]]]:
+    """Serialised rosters for the candidate keys with ceiling / most-likely
+    metrics computed under each roster's own plan (exact roles + roster-wide
+    boosters) over the model's outcomes; None when the model has no
+    decomposition (callers then keep the per-player scoring)."""
+    from backend.services.roster_plan import plan_metrics
+
+    players, pids, _prices, _team_of, _M = _dense_players(model, players_info)
+    dec = _dense_decomposition(model, pids)
+    if dec is None or not keys:
+        return None
+    RW, MP, MR = dec
+    probs = model[1][0]
+    pid_idx = {pid: i for i, pid in enumerate(pids)}
+    keys = [k for k in keys if all(int(pid) in pid_idx for pid in k)]
+    metrics = plan_metrics(keys, players_meta, pid_idx, RW, MP, MR, probs, reach_by_team, rates_by_pid, role_scores_by_pid, progress_callback=progress_callback)
+    out = []
+    for key, m in zip(keys, metrics):
+        r = _score_roster_exact(list(key), players_meta, reach_by_team, rates_by_pid, role_scores_by_pid)
+        r["ceiling_points"] = float(m["ceiling"])
+        r["ceiling_probability"] = float(m["ceiling_p"])
+        r["outcome_win_probability"] = float(m["wins_prob"])
+        r["outcome_wins"] = float(m["wins_count"])
+        for player in r.get("players") or []:
+            pid = int(player.get("player_id") or 0)
+            player["ceiling_score"] = float(m["peak"].get(pid, 0.0))
+            player["mode_score"] = float(m["peak"].get(pid, 0.0))
+        out.append(r)
+    return out
+
+
+def _forced_mask(pids: List[int], options: Dict[str, Any]):
+    """Boolean mask of the included (forced) players, or None when an included
+    player is not in the pool (no legal roster then)."""
+    import numpy as np
+
+    idx = {pid: i for i, pid in enumerate(pids)}
+    forced = np.zeros(len(pids), dtype=np.bool_)
+    for pid in options.get("include") or ():
+        if int(pid) not in idx:
+            return None
+        forced[idx[int(pid)]] = True
+    return forced
+
+
+def _joint_winners(model: tuple, players_info: List[Dict[str, Any]], options: Dict[str, Any]) -> Dict[tuple, int]:
+    """Best legal roster in EVERY sampled outcome under the query's budget,
+    team cap and include / exclude (excluded players are already out of
+    players_info), tallied by roster — the compiled search does 100k outcomes
+    in ~0.2 s, so the most-likely-winner shares are exact within the sample
+    for any filter."""
+    players, pids, prices, team_of, M = _dense_players(model, players_info)
+    if len(pids) < 5:
+        return {}
+    forced = _forced_mask(pids, options)
+    if forced is None:
+        return {}
+    best = rk.best_rosters_batch(M, prices, team_of, int(options["budget"]), int(options["max_per_team"]), forced=forced)
+    wins: Dict[tuple, int] = {}
+    for row in best:
+        if row[0] < 0:
+            continue
+        key = tuple(sorted(int(pids[j]) for j in row))
+        wins[key] = wins.get(key, 0) + 1
+    return wins
+
+
+def _finalize_joint_precompute(result: dict, event_key: int) -> Optional[tuple]:
+    """After a combined valuation: sample the joint outcomes once (the caller
+    warms the query cache with the model) and run the compiled winner search
+    once so its kernels are compiled before the first query. No-op for
+    groups-only runs."""
+    po = result.get("playoff") or {}
+    if not (po.get("pairing_table") and po.get("win_probs")):
+        return None
+    model = _sample_joint_outcomes(result, _JOINT_SAMPLES)
+    players_info = _groups_players_info(result, set())
+    if len(players_info) >= 5:
+        _joint_winners(model, players_info, parse_optimizer_payload({}))
+    result.pop("joint_winners", None)
+    return model
+
+
+_PLAN_WINNER_CANDIDATES = 1200  # outcome-topping rosters re-scored under their plans for Most Likely Winner (~4 ms each at 100k outcomes)
+_CEILING_MAX_SAMPLES = 10000  # strongest sampled outcomes searched for the ceiling mode (~0.1 ms each, compiled)
+_CEILING_PER_SAMPLE = 25  # best rosters kept from each searched outcome
+
+
+def _rosters_by_outcome(
+    model: tuple,
+    players_info: List[Dict[str, Any]],
+    options: Dict[str, Any],
+    serialize,
+    k: int,
+    per_sample: int = _CEILING_PER_SAMPLE,
+    max_samples: int = _CEILING_MAX_SAMPLES,
+    time_budget_seconds: float = 6.0,
+) -> tuple:
+    """Strongest rosters of the strongest sampled joint outcomes (single-axis
+    models). Outcomes are visited by an upper bound (five best adjusted scores
+    s − λ·price plus λ·budget, minimised over a λ grid — valid for any λ ≥ 0,
+    and far tighter than the plain five-best sum when the best rosters spend
+    the whole budget); inside each the compiled search returns the exact top
+    rosters for that outcome (scores are additive there). Every roster found
+    gets its true ceiling (its best outcome over ALL samples). Returns
+    (rosters serialised by `serialize(pids)` sorted by ceiling, certified): the
+    top `certified` rosters are provably the best over the sample — no
+    unvisited outcome's bound reaches their ceilings."""
+    import heapq
+    import numpy as np
+
+    players, pids, prices_arr, team_of, M = _dense_players(model, players_info)
+    if len(pids) < 5:
+        return [], 0
+    forced = _forced_mask(pids, options)
+    if forced is None:
+        return [], 0
+    budget = int(options.get("budget") or 0)
+    cap = int(options.get("max_per_team") or 5)
+    prices = prices_arr.astype(np.float64)
+    sample_bound = np.partition(M, -5, axis=0)[-5:].sum(axis=0)
+    if budget > 0 and prices.max() > 0:
+        max_ratio = float(np.max(M.max(axis=1) / np.maximum(prices, 1.0)))
+        for lam in max_ratio * np.array([0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.55, 0.7, 0.85, 1.0]):
+            adj = M - lam * prices[:, None]
+            sample_bound = np.minimum(sample_bound, np.partition(adj, -5, axis=0)[-5:].sum(axis=0) + lam * budget)
+    order = np.argsort(-sample_bound)
+    # best score seen per roster over the visited outcomes: a lower bound on
+    # its ceiling that becomes exact at the outcome where it peaks (visited
+    # first, since outcomes are taken in bound order)
+    best_seen: Dict[tuple, float] = {}
+    rows_of: Dict[tuple, List[int]] = {}
+    kth = -1e300
+    next_bound = 0.0  # bound of the first outcome NOT visited (0 when all were)
+    deadline = time.monotonic() + max(1.0, float(time_budget_seconds))
+    for pos, i in enumerate(order[:max_samples]):
+        if pos % 128 == 0:
+            if len(best_seen) >= k:
+                kth = float(np.partition(np.fromiter(best_seen.values(), dtype=np.float64), -k)[-k])
+                if float(sample_bound[i]) <= kth + 1e-9:
+                    next_bound = float(sample_bound[i])
+                    break
+            if time.monotonic() > deadline:
+                next_bound = float(sample_bound[i])
+                break
+        for score_i, roster_idx in rk.top_rosters_one(M[:, i], prices_arr, team_of, budget, cap, per_sample, forced):
+            rows = [int(j) for j in roster_idx]
+            key = tuple(sorted(int(pids[j]) for j in rows))
+            if score_i > best_seen.get(key, -1e300):
+                best_seen[key] = float(score_i)
+                rows_of[key] = rows
+    else:
+        next_bound = float(sample_bound[order[max_samples]]) if max_samples < len(order) else 0.0
+    ranked_keys = sorted(best_seen, key=lambda kk: -best_seen[kk])[: max(k, 1)]
+    # exact ceilings for the page (max over ALL samples), then the final order
+    exact_ceiling = {key: float(M[rows_of[key]].sum(axis=0).max()) for key in ranked_keys}
+    ranked_keys.sort(key=lambda kk: -exact_ceiling[kk])
+    rosters = [serialize(list(key)) for key in ranked_keys]
+    certified = sum(1 for key in ranked_keys if exact_ceiling[key] >= next_bound - 1e-9)
+    return rosters, certified
+
+
+def _attach_ceiling_details(team: Dict[str, Any], model: tuple) -> None:
+    """ceiling_points, the probability of that outcome, and each player's score
+    in it (mode_score / ceiling_score), from the roster's best outcome per group."""
+    import numpy as np
+
+    vectors, probs, group_of_player = model[0], model[1], model[2]
+    pids = [int(p.get("player_id") or 0) for p in (team.get("players") or [])]
+    by_group: Dict[int, List[int]] = {}
+    for pid in pids:
+        g = group_of_player.get(pid)
+        if g is not None:
+            by_group.setdefault(g, []).append(pid)
+    total = 0.0
+    prob = 1.0
+    per_player: Dict[int, float] = {}
+    for g, gp in by_group.items():
+        vecs = [vectors[g][pid] for pid in gp if pid in vectors.get(g, {})]
+        if not vecs:
+            continue
+        sums = np.sum(vecs, axis=0)
+        idx = int(np.argmax(sums))
+        total += float(sums[idx])
+        prob *= float(probs[g][idx]) if g in probs and idx < len(probs[g]) else 1.0
+        for pid in gp:
+            v = vectors[g].get(pid)
+            if v is not None:
+                per_player[pid] = float(v[idx])
+    team["ceiling_points"] = float(total)
+    team["ceiling_probability"] = float(prob if by_group else 0.0)
+    for player in team.get("players") or []:
+        pid = int(player.get("player_id") or 0)
+        if pid in per_player:
+            player["ceiling_score"] = per_player[pid]
+            player["mode_score"] = per_player[pid]
+
+
+def _booster_prerequisites(
+    results: dict, players_info: List[Dict[str, Any]], options: Dict[str, Any], reach_by_team: Optional[Dict[int, Dict[int, float]]] = None
+) -> tuple:
+    """Whole-event match-reach odds per team, each player's parsed booster
+    trigger rates and role scores, and two per-player booster bounds set on
+    each player: `booster_ub`, the plain ceiling (safe for pool pruning), and
+    `booster_ub_tight`, the Lagrangian bound whose roster-wide constant is
+    returned as bound_offset (bound = Σ total_ev + Σ booster_ub_tight + offset).
+    Returns (reach_by_team, rates_by_pid, role_scores_by_pid, bound_offset)."""
+    if reach_by_team is None:
+        reach_by_team = _team_match_reach_probs(results)
+    rates_by_pid: Dict[int, Dict[int, float]] = {}
+    role_scores_by_pid: Dict[int, Dict[int, float]] = {}
+    for p in players_info:
+        pid = int(p["player_id"])
+        row = _snapshot_player_row(results, pid) or {}
+        rates_by_pid[pid] = parse_booster_rates(row.get("boosters_json"))
+        role_scores_by_pid[pid] = extract_role_scores_for_player(row)
+        p["booster_ub"] = _player_booster_ub(int(p.get("team_id", 0)), reach_by_team, rates_by_pid[pid])
+    # Reference rosters for the price tuning: the strongest by the plain bound.
+    loose = {int(p["player_id"]): float(p.get("total_ev") or 0.0) + float(p.get("booster_ub") or 0.0) for p in players_info}
+    refs, _exact = _topk_rosters_bnb(
+        players_info, loose, 20, options["budget"], options["max_per_team"], options["include"], None,
+        time_budget_seconds=2.0,
+    )
+    meta = {str(p["player_id"]): p for p in players_info}
+    ref_rosters = [[meta[str(p["player_id"])] for p in (r.get("players") or [])] for r in refs]
+    tight, bound_offset = _booster_bound_lagrangian(players_info, reach_by_team, rates_by_pid, ref_rosters)
+    for p in players_info:
+        p["booster_ub_tight"] = float(tight.get(int(p["player_id"]), p["booster_ub"]))
+    return reach_by_team, rates_by_pid, role_scores_by_pid, bound_offset
 
 
 def _run_groups_best_team_job(job_id: str, payload: dict) -> None:
@@ -2619,15 +3385,7 @@ def _run_groups_best_team_job(job_id: str, payload: dict) -> None:
         # the enumerated outcomes, each player's parsed trigger rates, and a
         # per-player booster upper bound (used for pruning + ranking before the
         # expensive exact assignment).
-        reach_by_team = _group_team_reach_probs(results)
-        rates_by_pid: Dict[int, Dict[int, float]] = {}
-        role_scores_by_pid: Dict[int, Dict[int, float]] = {}
-        for p in players_info:
-            pid = int(p["player_id"])
-            row = get_player(pid) or {}
-            rates_by_pid[pid] = parse_booster_rates(row.get("boosters_json"))
-            role_scores_by_pid[pid] = extract_role_scores_for_player(row)
-            p["booster_ub"] = _player_booster_ub(int(p.get("team_id", 0)), reach_by_team, rates_by_pid[pid])
+        reach_by_team, rates_by_pid, role_scores_by_pid, _bound_offset = _booster_prerequisites(results, players_info, options)
 
         # For large combined pools, prune players that can never be in an optimal
         # roster before the C(N,5) enumeration — keeps big events tractable while
@@ -2642,34 +3400,10 @@ def _run_groups_best_team_job(job_id: str, payload: dict) -> None:
                 if job2:
                     job2["pool_reduced_from"] = pool_reduced_from
                     job2["pool_reduced_to"] = pool_reduced_to
-        vectors = _group_player_outcome_vectors(results)
-        group_of_player: Dict[int, int] = {}
-        for g, by_pid in vectors.items():
-            for pid in by_pid:
-                group_of_player[pid] = g
+        # Outcome model for the ceiling / most-likely modes: exact group
+        # outcomes, or sampled joint outcomes (groups + playoffs) when combined.
+        model = _event_outcome_model(results, (state_key, latest["updated_at"]))
         players_meta = {str(p["player_id"]): p for p in players_info}
-
-        def _roster_ceiling(pids: List[int]) -> float:
-            # Groups are independent → best joint outcome is the best outcome
-            # per group summed.
-            ceiling = 0.0
-            by_group: Dict[int, List[int]] = {}
-            for pid in pids:
-                g = group_of_player.get(pid)
-                if g is not None:
-                    by_group.setdefault(g, []).append(pid)
-            for g, group_pids in by_group.items():
-                group_vecs = vectors.get(g) or {}
-                n = len(next(iter(group_vecs.values()))) if group_vecs else 0
-                totals = [0.0] * n
-                for pid in group_pids:
-                    vec = group_vecs.get(pid)
-                    if not vec:
-                        continue
-                    for i, v in enumerate(vec):
-                        totals[i] += v
-                ceiling += max(totals) if totals else 0.0
-            return ceiling
 
         # Phase 1: enumerate all valid rosters, ranking each by an admissible
         # upper bound (rating+win+role + the per-player booster ceiling). Keep
@@ -2683,14 +3417,14 @@ def _run_groups_best_team_job(job_id: str, payload: dict) -> None:
         ):
             pids = [int(p) for p in roster["pids"]]
             ub = float(roster["total_ev"]) + sum(
-                float(players_meta[str(pid)].get("booster_ub", 0.0)) for pid in pids
+                float(players_meta[str(pid)].get("booster_ub_tight", players_meta[str(pid)].get("booster_ub", 0.0)))
+                for pid in pids
             )
             payload_r = {
                 "pids": roster["pids"],
                 "roles": roster["roles"],
                 "cost": roster["cost"],
                 "total_ev": roster["total_ev"],
-                "ceiling": _roster_ceiling(pids),
             }
             counter += 1
             if len(heap) < exact_topk:
@@ -2703,32 +3437,17 @@ def _run_groups_best_team_job(job_id: str, payload: dict) -> None:
         valid_teams = []
         for _ub, _c, pr in sorted(heap, key=lambda x: -x[0]):
             pids = [int(p) for p in pr["pids"]]
-            roster_players = [players_meta[str(pid)] for pid in pids]
-            booster_result = optimize_group_boosters_for_roster(roster_players, reach_by_team, rates_by_pid)
-            role_total, role_of, role_ev_of = _exact_role_assignment(roster_players, role_scores_by_pid)
-            rating_win = sum(
-                float(players_meta[str(pid)].get("rating_ev", 0.0)) + float(players_meta[str(pid)].get("win_ev", 0.0))
-                for pid in pids
-            )
-            avg_ev = rating_win + role_total + float(booster_result["total_expected_booster_points"])
-            role_names = [str(role_of.get(pid, "-")) for pid in pids]
-            serialized = serialize_roster(
-                players_meta, pr["pids"], role_names, avg_ev, pr["cost"],
-                booster_assignments=booster_result["assignments"],
-            )
-            # Patch per-player role_ev to the exact-assigned role so the roster's
-            # player rows sum to the team's average_ev (no clash overcount).
-            for player in serialized.get("players") or []:
-                pid = int(player["player_id"])
-                new_role_ev = role_ev_of.get(pid)
-                if new_role_ev is not None:
-                    old_role_ev = float(player.get("role_ev") or 0.0)
-                    player["role_ev"] = float(new_role_ev)
-                    player["total_ev"] = float(player.get("total_ev") or 0.0) - old_role_ev + float(new_role_ev)
-                player["mode_score"] = float(player.get("total_ev") or 0.0)
-            serialized["average_ev"] = avg_ev
-            serialized["ceiling_points"] = float(pr["ceiling"])
+            serialized = _score_roster_exact(pids, players_meta, reach_by_team, rates_by_pid, role_scores_by_pid)
             valid_teams.append(serialized)
+        planned = _plan_scored_rosters(
+            [tuple(sorted(int(p["player_id"]) for p in t["players"])) for t in valid_teams],
+            model, players_info, players_meta, reach_by_team, rates_by_pid, role_scores_by_pid,
+        )
+        if planned is not None:
+            valid_teams = planned
+        else:
+            for serialized in valid_teams:
+                _attach_ceiling_details(serialized, model)
         valid_teams.sort(key=lambda team: float(team.get("average_ev") or 0.0), reverse=True)
 
         # Most-likely-winner: probability each roster is the single best pick
@@ -2736,11 +3455,10 @@ def _run_groups_best_team_job(job_id: str, payload: dict) -> None:
         # realistically win, so score just the top contenders (rest stay 0).
         for team in valid_teams:
             team["outcome_win_probability"] = 0.0
-        contenders = valid_teams[:_WIN_PROB_CANDIDATES]
+        contenders = [] if planned is not None else valid_teams[:_WIN_PROB_CANDIDATES]
         if contenders:
-            probs_by_group = _group_outcome_probs_by_group(results)
             contender_pids = [[int(p.get("player_id") or 0) for p in (t.get("players") or [])] for t in contenders]
-            win_probs = _compute_group_win_probs(contender_pids, vectors, group_of_player, probs_by_group)
+            win_probs = _compute_group_win_probs(contender_pids, model[0], model[2], model[1])
             for team, wp in zip(contenders, win_probs):
                 team["outcome_win_probability"] = float(wp)
 
@@ -2864,7 +3582,7 @@ def get_latest_groups_best_team():
     }
 
 
-def _live_groups_query(results: dict, body: dict, mode: str) -> Dict[str, Any]:
+def _live_groups_query(results: dict, body: dict, mode: str, cache_key: Any = None) -> Dict[str, Any]:
     options = parse_optimizer_payload(body)
     players_info = _groups_players_info(results, options["exclude"])
     if len(players_info) < 5:
@@ -2872,33 +3590,128 @@ def _live_groups_query(results: dict, body: dict, mode: str) -> Dict[str, Any]:
     page = int(body.get("page") or 0)
     page_size = int(body.get("page_size") or 200)
     k = min(LIVE_OPTIMIZER_MAX_K, max(210, (page + 1) * page_size + 10))
+    reach_by_team, rates_by_pid, role_scores_by_pid, bound_offset = _booster_prerequisites(results, players_info, options)
+    players_meta = {str(p["player_id"]): p for p in players_info}
+    # Admissible per-player bound for the average: rating+win+best role plus the
+    # Lagrangian booster bound (with bound_offset the roster-wide constant); the
+    # exact roster score never exceeds it.
+    bound_scores = {
+        int(p["player_id"]): float(p.get("total_ev") or 0.0) + float(p.get("booster_ub_tight") or 0.0)
+        for p in players_info
+    }
+
+    def exact_score(roster: List[Dict[str, Any]]) -> float:
+        # rating+win + exact clash-free roles + exact roster-wide boosters
+        booster = optimize_group_boosters_for_roster(roster, reach_by_team, rates_by_pid)["total_expected_booster_points"]
+        role_total, _role_of, _role_ev_of = _exact_role_assignment(roster, role_scores_by_pid)
+        rating_win = sum(float(p.get("rating_ev", 0.0)) + float(p.get("win_ev", 0.0)) for p in roster)
+        return rating_win + role_total + float(booster)
+
+    def rescore(cands: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [
+            _score_roster_exact(
+                [int(p["player_id"]) for p in (c.get("players") or [])],
+                players_meta, reach_by_team, rates_by_pid, role_scores_by_pid,
+            )
+            for c in cands
+        ]
+
+    exact_candidates = 0
+    certified_top = None  # how many of the top rosters are provably in order (ceiling mode)
     if mode == "single_outcome":
-        bound_scores, true_fn = _live_ceiling_scorer(results, players_info)
-        rosters, exact = _topk_rosters_bnb(
-            players_info, bound_scores, k, options["budget"], options["max_per_team"], options["include"], true_fn
-        )
-        for team in rosters:
-            team["ceiling_points"] = float(team.get("mode_metric") or 0.0)
+        model = _event_outcome_model(results, cache_key)
+        if len(model[0]) == 1:
+            # Sampled joint outcomes (or a single group): search the strongest
+            # outcomes one by one — a per-player "best sample" bound across 20k
+            # outcomes is far too loose for the plain branch-and-bound.
+            cand_keys, certified_top = _rosters_by_outcome(model, players_info, options, lambda pids: tuple(pids), k)
+            planned = _plan_scored_rosters(cand_keys, model, players_info, players_meta, reach_by_team, rates_by_pid, role_scores_by_pid)
+            if planned is not None:
+                # every candidate under its own plan: the ceiling is the best
+                # outcome with the plan's roles and boosters, not the players' own
+                planned.sort(key=lambda r: -float(r.get("ceiling_points") or 0.0))
+                rosters = planned
+                exact = True
+            else:
+                rosters = [_score_roster_exact(list(key), players_meta, reach_by_team, rates_by_pid, role_scores_by_pid) for key in cand_keys]
+                for team in rosters:
+                    _attach_ceiling_details(team, model)
+                exact = certified_top >= min(k, len(rosters))
+        else:
+            ceiling_bounds, true_fn = _live_ceiling_scorer(model, players_info)
+            rosters, exact = _topk_rosters_bnb(
+                players_info, ceiling_bounds, k, options["budget"], options["max_per_team"], options["include"], true_fn,
+                role_scores_by_player=role_scores_by_pid,
+            )
+            for team in rosters:
+                _attach_ceiling_details(team, model)
+        exact_candidates = len(rosters)
     elif mode == "most_outcomes":
-        # Rank the strongest-by-average teams by their probability of being the
-        # single best pick across the joint outcome space.
-        bound_scores = {int(p["player_id"]): float(p.get("total_ev") or 0.0) for p in players_info}
-        cand_k = max(k, _WIN_PROB_CANDIDATES)
-        rosters, exact = _topk_rosters_bnb(
-            players_info, bound_scores, cand_k, options["budget"], options["max_per_team"], options["include"], None
-        )
-        vectors = _group_player_outcome_vectors(results)
-        group_of_player = {pid: g for g, by_pid in vectors.items() for pid in by_pid}
-        probs_by_group = _group_outcome_probs_by_group(results)
-        team_pids = [[int(p.get("player_id") or 0) for p in (r.get("players") or [])] for r in rosters]
-        win_probs = _compute_group_win_probs(team_pids, vectors, group_of_player, probs_by_group)
-        for r, wp in zip(rosters, win_probs):
-            r["outcome_win_probability"] = float(wp)
+        model = _event_outcome_model(results, cache_key)
+        if len(model[0]) == 1:
+            # One outcome axis (sampled joint outcomes, or a single group): the
+            # compiled search finds the best legal roster in EVERY outcome under
+            # the query's own budget, team cap and include / exclude, so the win
+            # shares are exact within the sample and cover every roster.
+            wins = _joint_winners(model, players_info, options)
+            n_samples = float(len(model[1][0])) or 1.0
+            ranked_keys = [key_r for key_r, _w in sorted(wins.items(), key=lambda kv: -kv[1])]
+            # candidates: the rosters that top outcomes with their players' own
+            # best roles and boosters (the strongest 2,000), plus the strongest by
+            # plan average — then every candidate is re-scored under its plan
+            cand_keys = ranked_keys[:_PLAN_WINNER_CANDIDATES]
+            avg_cands, _ = _topk_rosters_bnb(
+                players_info, bound_scores, _WIN_PROB_CANDIDATES, options["budget"], options["max_per_team"], options["include"],
+                exact_score, bound_offset=bound_offset, role_scores_by_player=role_scores_by_pid,
+            )
+            have = set(cand_keys)
+            for c in avg_cands:
+                key_c = tuple(sorted(int(p["player_id"]) for p in c["players"]))
+                if key_c not in have:
+                    have.add(key_c)
+                    cand_keys.append(key_c)
+            planned = _plan_scored_rosters(cand_keys, model, players_info, players_meta, reach_by_team, rates_by_pid, role_scores_by_pid)
+            if planned is not None:
+                planned.sort(key=lambda r: (-float(r.get("outcome_win_probability") or 0.0), -float(r.get("average_ev") or 0.0)))
+                rosters = planned
+            else:
+                rosters = []
+                for key_r in ranked_keys:
+                    r = _score_roster_exact(list(key_r), players_meta, reach_by_team, rates_by_pid, role_scores_by_pid)
+                    r["outcome_win_probability"] = float(wins[key_r]) / n_samples
+                    rosters.append(r)
+            exact = True
+            exact_candidates = len(rosters)
+            certified_top = len(rosters)
+        else:
+            # Several independent exact groups: rank the strongest-by-bound
+            # teams by their chance of being the single best pick; their
+            # displayed average carries the exact booster + role solve.
+            cand_k = max(k, _WIN_PROB_CANDIDATES)
+            cands, exact = _topk_rosters_bnb(
+                players_info, bound_scores, cand_k, options["budget"], options["max_per_team"], options["include"],
+                exact_score, bound_offset=bound_offset,
+            )
+            rosters = rescore(cands)
+            exact_candidates = len(rosters)
+            team_pids = [[int(p.get("player_id") or 0) for p in (r.get("players") or [])] for r in rosters]
+            win_probs = _compute_group_win_probs(team_pids, model[0], model[2], model[1])
+            for r, wp in zip(rosters, win_probs):
+                r["outcome_win_probability"] = float(wp)
     else:
-        bound_scores = {int(p["player_id"]): float(p.get("total_ev") or 0.0) for p in players_info}
-        rosters, exact = _topk_rosters_bnb(
-            players_info, bound_scores, k, options["budget"], options["max_per_team"], options["include"], None
+        # Average: the search scores every roster it cannot prune with the
+        # exact role + booster assignments (the Lagrangian bound keeps that
+        # set small), so the top k is the true top k unless the time budget
+        # runs out (exact=False, best found so far).
+        cands, exact = _topk_rosters_bnb(
+            players_info, bound_scores, k, options["budget"], options["max_per_team"], options["include"],
+            exact_score, bound_offset=bound_offset,
         )
+        rosters = rescore(cands)
+        rosters.sort(key=lambda r: -float(r.get("average_ev") or 0.0))
+        exact_candidates = len(rosters)
+    if certified_top is None:
+        certified_top = len(rosters) if exact else 0
     search = str(body.get("search") or "")
     filtered = _filter_saved_combo_teams(rosters, set(), set(), search)
     sorted_teams = _sort_saved_combo_teams(filtered, mode, str(body.get("sort") or "ev_desc"))
@@ -2906,6 +3719,8 @@ def _live_groups_query(results: dict, body: dict, mode: str) -> Dict[str, Any]:
         "exists": True,
         "live": True,
         "exact": exact,
+        "exact_candidates": exact_candidates,
+        "certified_top": certified_top,
         "mode": mode,
         "total_teams": len(rosters),
         "filtered_count": len(sorted_teams),
@@ -2922,7 +3737,9 @@ def query_groups_best_team(payload: dict | None = None):
     mode = str(body.get("mode") or "average").strip().lower()
     if mode not in {"average", "single_outcome", "most_outcomes"}:
         mode = "average"
-    key = _state_key()
+    # body.event_id queries another event's stored run (tests / tools); the
+    # app itself always asks for the active event.
+    key = int(body.get("event_id") or 0) or _state_key()
     latest_sim = _GROUPS_STATE.load(key=key)
     if latest_sim and _is_live_pool(latest_sim["results"] or {}):
         # The live optimizer costs ~0.5 s per query; identical queries against
@@ -2932,7 +3749,7 @@ def query_groups_best_team(payload: dict | None = None):
             cached = _LIVE_QUERY_CACHE.get(cache_key)
         if cached is not None:
             return cached
-        result = _live_groups_query(latest_sim["results"] or {}, body, mode)
+        result = _live_groups_query(latest_sim["results"] or {}, body, mode, cache_key=(key, latest_sim["updated_at"]))
         result["updated_at"] = latest_sim["updated_at"]
         with _LIVE_QUERY_CACHE_LOCK:
             if len(_LIVE_QUERY_CACHE) >= 32:

@@ -185,6 +185,54 @@ function PlayerPhoto({ playerId, name, size = 26, className = "" }) {
   );
 }
 
+function BreakdownHero({ playerId, name, teamName, hltvTeamId, roleId, stats, total, note = null }) {
+  return (
+    <div className="breakdown-hero">
+      <div className="breakdown-id">
+        <div className="breakdown-id-photo">
+          <PlayerPhoto playerId={playerId} name={name} size={68} />
+          {teamName ? (
+            <span className="breakdown-id-logo">
+              <TeamLogo hltvTeamId={hltvTeamId} name={teamName} size={22} />
+            </span>
+          ) : null}
+        </div>
+        <div className="breakdown-id-text">
+          <div className="breakdown-id-name">{name}</div>
+          <div className="breakdown-id-meta">
+            {teamName ? <span className="breakdown-id-team">{teamName}</span> : null}
+            {teamName && roleId != null ? <span className="breakdown-id-sep">·</span> : null}
+            {roleId != null ? (
+              <span className="breakdown-id-role">
+                <RoleBadge roleId={roleId} size={18} />
+                {ROLE_NAMES[roleId] || `Role ${roleId}`}
+              </span>
+            ) : null}
+            {note ? (
+              <>
+                <span className="breakdown-id-sep">·</span>
+                <span className="breakdown-id-note">{note}</span>
+              </>
+            ) : null}
+          </div>
+        </div>
+      </div>
+      <div className="breakdown-stats">
+        {stats.map(([label, value]) => (
+          <div className="breakdown-stat" key={label}>
+            <div className="breakdown-stat-value">{Number(value || 0).toFixed(2)}</div>
+            <div className="breakdown-stat-label">{label}</div>
+          </div>
+        ))}
+        <div className="breakdown-stat total">
+          <div className="breakdown-stat-value">{Number(total || 0).toFixed(2)}</div>
+          <div className="breakdown-stat-label">Total</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const tabs = [
   { key: "view", label: "Database" },
   { key: "events", label: "Events" },
@@ -1212,29 +1260,78 @@ function PointSourcesModal({ player, teamLookup, onClose }) {
 
 function GroupPlayerBreakdownModal({ player, teamLookup, teams, onClose }) {
   if (!player) return null;
+  // Roster mode (opened from a Top 5 roster): the roster's assigned role and
+  // its booster plan replace the player's best role and own best boosters.
+  const roster = player.roster || null;
   const rating = Number(player.rating || 0);
   const win = Number(player.win || 0);
-  const role = Number(player.role || 0);
-  const booster = Number(player.booster || 0);
-  const total = Number.isFinite(Number(player.total)) && Number(player.total) !== 0
-    ? Number(player.total)
-    : rating + win + role + booster;
+  const role = roster ? Number(roster.role_ev || 0) : Number(player.role || 0);
+  const booster = roster ? Number(roster.booster_ev || 0) : Number(player.booster || 0);
+  const total = roster
+    ? rating + win + role + booster
+    : Number.isFinite(Number(player.total)) && Number(player.total) !== 0
+      ? Number(player.total)
+      : rating + win + role + booster;
   const heroStats = [
     ["Rating", rating],
     ["Win", win],
     ["Role", role],
     ["Booster", booster],
   ];
-  // Per-round view in the Playoff tab's card style: for every round of the
-  // group and of the playoff, the team's chance to play it, the opponents it
-  // can meet there (chance to meet, chance to beat, points when it happens),
-  // the bye / 'eliminated earlier' shares, and the booster the round uses.
-  // The opening match sits between the upper and lower bracket rows; the
-  // group padding gets a card of its own so the cards add up to the total.
+  // Per-round cards, read top to bottom: the role (trigger rates → points per
+  // match), the booster(s) for that match slot, the opponents the team can
+  // meet with their win chance and the rating / win points each brings, then
+  // the per-match sum of the four components, then that sum weighted by how
+  // often the round is actually played (plus any bye / out-earlier credit).
   const stageList = Array.isArray(player.stage_list) ? player.stage_list : [];
   const stageEv = player.stage_ev || {};
   const teamRounds = player.team_rounds || {};
+  const roleInfo = player.role_info || null;
+  // Role points scale linearly with the per-match score, so the assigned
+  // role's stage points are the best role's scaled by their ratio; each
+  // booster slot carries the roster's booster for that match number.
+  const bestPerMatch = roleInfo ? Number(roleInfo.points || 0) : 0;
+  const roleScale = roster && Math.abs(bestPerMatch) > 1e-9 ? Number(roster.per_match || 0) / bestPerMatch : 1;
+  const rosterBoosterBySlot = {};
+  (roster?.boosters || []).forEach((a) => {
+    const prob = Number(a.slot_probability || 0);
+    rosterBoosterBySlot[Number(a.match_number)] = {
+      booster_id: a.booster_id,
+      name: a.booster || `Booster ${a.booster_id}`,
+      rate: prob > 0 ? Number(a.expected_points || 0) / (prob * 5) : 0,
+    };
+  });
+  const rosterAdjust = (cell, play) => {
+    const list = Array.isArray(cell.boosters) ? cell.boosters : [];
+    const boosters = list.map((b) => {
+      const rb = rosterBoosterBySlot[Number(b.slot)];
+      return {
+        ...b,
+        booster_id: rb ? rb.booster_id : null,
+        booster_name: rb ? rb.name : "No booster left",
+        booster_rate: rb ? rb.rate : 0,
+      };
+    });
+    const boosterEv = play * boosters.reduce((a, b) => a + Number(b.share || 0) * 5 * Number(b.booster_rate || 0), 0);
+    const roleEv = Number(cell.role || 0) * roleScale;
+    return {
+      ...cell,
+      role: roleEv,
+      booster: boosterEv,
+      total: Number(cell.rating || 0) + Number(cell.win || 0) + roleEv + boosterEv,
+      boosters,
+    };
+  };
+  const padFor = (pad) =>
+    roster && pad
+      ? {
+          ...pad,
+          role: Number(pad.role || 0) * roleScale,
+          total: Number(pad.rating || 0) + Number(pad.win || 0) + Number(pad.role || 0) * roleScale + Number(pad.booster || 0),
+        }
+      : pad;
   const pct = (v) => `${Math.round(Number(v || 0) * 100)}%`;
+  const num = (v, d = 1) => Number(v || 0).toFixed(d);
   const ordinal = (n) => {
     const v = Number(n);
     const suffix = v % 100 >= 11 && v % 100 <= 13 ? "th" : ["th", "st", "nd", "rd"][v % 10] || "th";
@@ -1246,10 +1343,27 @@ function GroupPlayerBreakdownModal({ player, teamLookup, teams, onClose }) {
     const r = player.team_ranks?.[String(tid)] ?? info?.rank ?? info?.world_rank ?? info?.hltv_rank;
     return r != null && Number(r) > 0 && Number(r) < 999 ? ` (#${r})` : "";
   };
+  const roleRow = roster
+    ? {
+        role_id: roster.role_id,
+        name: ROLE_NAMES[roster.role_id] || (roster.role_id != null ? `Role ${roster.role_id}` : "No role"),
+        major: Number(roster.major || 0),
+        minor: Number(roster.minor || 0),
+        points: Number(roster.per_match || 0),
+      }
+    : roleInfo
+      ? {
+          role_id: roleInfo.role_id,
+          name: ROLE_NAMES[roleInfo.role_id] || (roleInfo.role_id != null ? `Role ${roleInfo.role_id}` : "No role"),
+          major: Number(roleInfo.major || 0),
+          minor: Number(roleInfo.minor || 0),
+          points: Number(roleInfo.points || 0),
+        }
+      : null;
   const matchCard = (s) => {
-    const cell = stageEv[s.key] || {};
     const round = teamRounds[s.key] || {};
     const play = Number(round.play || 0);
+    const cell = roster ? rosterAdjust(stageEv[s.key] || {}, play) : stageEv[s.key] || {};
     const bye = Number(round.bye || 0);
     const elimProb = Number(round.elim_before?.prob || 0);
     const elimPts = Number(round.elim_before?.points || 0);
@@ -1257,92 +1371,132 @@ function GroupPlayerBreakdownModal({ player, teamLookup, teams, onClose }) {
     if (play < 0.0005 && bye < 0.0005 && elimProb < 0.0005 && Math.abs(cellTotal) < 0.005) return null;
     const oppPts = cell.opponents || {};
     const opponents = Object.entries(round.opponents || {})
-      .map(([tid, o]) => ({
-        team_id: Number(tid),
-        play: Number(o.play || 0),
-        win: Number(o.win || 0),
-        pts: Number(o.play || 0) > 0 ? Number(oppPts[tid] || 0) / Number(o.play || 0) : 0,
-      }))
+      .map(([tid, o]) => {
+        const p = Number(o.play || 0);
+        const c = oppPts[tid] || {};
+        const per = (v) => (p > 0 ? Number(v || 0) / p : 0);
+        return {
+          team_id: Number(tid),
+          play: p,
+          win: Number(o.win || 0),
+          rating: per(c.rating),
+          winPts: per(c.win),
+          total: per(c.total),
+        };
+      })
       .filter((o) => o.play > 0.0005)
       .sort((a, b) => b.play - a.play);
-    // Long playoff lists (up to 15 possible opponents) keep the top 8 and
-    // fold the tail into one weighted row.
     const shown = opponents.slice(0, 8);
     const rest = opponents.slice(8);
     const restPlay = rest.reduce((a, o) => a + o.play, 0);
-    const byePts = bye > 0.0005 ? Number(player.playoff_bye || 0) / bye : 0;
-    const elimEach = elimProb > 0.0005 ? elimPts / elimProb : 0;
+    const wavg = (list, key) => (restPlay > 0 ? list.reduce((a, o) => a + o.play * o[key], 0) / restPlay : 0);
+    const oppPlay = opponents.reduce((a, o) => a + o.play, 0);
+    const oppAvg = (key) => (oppPlay > 0 ? opponents.reduce((a, o) => a + o.play * o[key], 0) / oppPlay : 0);
+    const avgRow = oppPlay > 0.0005 ? { play: oppPlay, win: oppAvg("win"), winPts: oppAvg("winPts"), rating: oppAvg("rating") } : null;
     const covered = play + bye + elimProb;
     const elsewhere = s.phase === "group" && covered < 0.9995 ? 1 - covered : 0;
+    const perMatch = {
+      rating: play > 0.0005 ? Number(cell.rating || 0) / play : 0,
+      win: play > 0.0005 ? (Number(cell.win || 0) - elimPts) / play : 0,
+      role: play > 0.0005 ? Number(cell.role || 0) / play : 0,
+      booster: play > 0.0005 ? Number(cell.booster || 0) / play : 0,
+    };
+    const perMatchTotal = perMatch.rating + perMatch.win + perMatch.role + perMatch.booster;
+    const boosters = Array.isArray(cell.boosters) ? cell.boosters : [];
+    const steps = [
+      { op: "", label: "Total", value: num(perMatchTotal) },
+      { op: "×", label: "Play chance", value: pct(play) },
+      ...(Math.abs(elimPts) > 0.005 ? [{ op: "−", label: "Out early", value: num(Math.abs(elimPts)) }] : []),
+    ];
     return {
       key: s.key,
       label: s.full || STAGE_FULL[s.label] || s.label,
       chance: play > 0.0005 ? pct(Number(round.win || 0)) : bye > 0.0005 ? "Bye" : "—",
       chanceLabel: play > 0.0005 ? "Match win" : null,
-      total: cellTotal,
-      minis: [
-        ["Rating", Number(cell.rating || 0)],
-        ["Win", Number(cell.win || 0)],
-        ["Role", Number(cell.role || 0)],
-        ["Boost", Number(cell.booster || 0)],
-      ],
-      boosters: Array.isArray(cell.boosters) ? cell.boosters : [],
+      roleRow,
+      boosterRows: boosters.map((b) => ({
+        key: `${b.booster_id}-${b.slot}`,
+        booster_id: b.booster_id,
+        name: b.booster_name || `Booster ${b.booster_id}`,
+        slot: b.slot,
+        share: boosters.length > 1 ? Number(b.share || 0) : null,
+        rate: Number(b.booster_rate || 0),
+        points: 5 * Number(b.booster_rate || 0),
+      })),
+      noBooster: boosters.length === 0 && play > 0.0005,
+      tableHead: "Team",
       rows: [
         ...shown.map((o) => ({
           key: `t${o.team_id}`,
           team_id: o.team_id,
-          name: `${teamLookup[o.team_id] || o.team_id}${teamRank(o.team_id)}`,
+          name: String(teamLookup[o.team_id] || o.team_id),
           play: o.play,
           win: o.win,
-          pts: o.pts,
+          winPts: o.winPts,
+          rating: o.rating,
+          total: o.total,
         })),
         ...(rest.length > 0
-          ? [{
-              key: "others",
-              muted: true,
-              name: `Others (${rest.length})`,
-              play: restPlay,
-              win: restPlay > 0 ? rest.reduce((a, o) => a + o.play * o.win, 0) / restPlay : 0,
-              pts: restPlay > 0 ? rest.reduce((a, o) => a + o.play * o.pts, 0) / restPlay : 0,
-            }]
+          ? [{ key: "others", muted: true, name: `Others (${rest.length})`, play: restPlay, win: wavg(rest, "win"), winPts: wavg(rest, "winPts"), rating: wavg(rest, "rating"), total: wavg(rest, "total") }]
           : []),
-        ...(bye > 0.0005 ? [{ key: "bye", muted: true, name: "Bye", play: bye, pts: byePts }] : []),
-        ...(elimProb > 0.0005 ? [{ key: "elim", muted: true, name: "Out earlier", play: elimProb, pts: elimEach }] : []),
+        ...(elimProb > 0.0005 ? [{ key: "elim", muted: true, name: "Out earlier", play: elimProb, winPts: elimPts / elimProb, total: elimPts / elimProb }] : []),
         ...(elsewhere > 0.0005
-          ? [{ key: "else", muted: true, name: s.bracket === "lower" ? "Upper bracket" : "Lower bracket", play: elsewhere, pts: 0 }]
+          ? [{ key: "else", muted: true, name: s.bracket === "lower" ? "Upper bracket" : "Lower bracket", play: elsewhere, total: 0 }]
           : []),
       ],
-      totalPlay: covered + elsewhere,
-      totalWin: Number(round.win || 0),
+      avgRow,
+      ledger: {
+        parts: [
+          ["Rating", perMatch.rating],
+          ["Win", perMatch.win],
+          ["Role", perMatch.role],
+          ["Booster", perMatch.booster],
+        ],
+        sum: perMatchTotal,
+        steps,
+      },
+      total: cellTotal,
     };
   };
-  const padding = player.padding || null;
-  const paddingProb = Number(player.padding_prob || 0);
-  const paddingCard =
-    padding && (Math.abs(Number(padding.total || 0)) > 0.005 || paddingProb > 0.0005)
-      ? {
-          key: "padding",
-          extra: true,
-          label: "Padding",
-          chance: pct(paddingProb),
-          chanceLabel: "Applies",
-          total: Number(padding.total || 0),
-          minis: [
-            ["Rating", Number(padding.rating || 0)],
-            ["Win", Number(padding.win || 0)],
-            ["Role", Number(padding.role || 0)],
-            ["Boost", Number(padding.booster || 0)],
-          ],
-          boosters: [],
-          rows: [
-            { key: "pad", muted: true, name: "Qualified early", play: paddingProb, pts: paddingProb > 0.0005 ? Number(padding.total || 0) / paddingProb : 0 },
-            ...(paddingProb < 0.9995 ? [{ key: "nopad", muted: true, name: "Plays all rounds", play: 1 - paddingProb, pts: 0 }] : []),
-          ],
-          totalPlay: 1,
-          totalWin: null,
-          note: "Credit for the group match a quick qualifier never plays: rating, +6 win and role, no booster.",
-        }
-      : null;
+  // Padding cards (group: the match a quick qualifier skips; playoff: the
+  // quarter-final a bye skips): a flat credit, so the card is the points list
+  // and the multiplication, laid out vertically in large type to fill its cell.
+  const padCard = (key, label, pad, prob) => {
+    if (!pad || !(Math.abs(Number(pad.total || 0)) > 0.005 || prob > 0.0005)) return null;
+    const per = (v) => (prob > 0.0005 ? Number(v || 0) / prob : 0);
+    const perMatch = { rating: per(pad.rating), win: per(pad.win), role: per(pad.role), booster: per(pad.booster) };
+    const perMatchTotal = perMatch.rating + perMatch.win + perMatch.role + perMatch.booster;
+    return {
+      key,
+      extra: true,
+      label,
+      chance: null,
+      chanceLabel: null,
+      vertical: true,
+      roleRow: null,
+      boosterRows: [],
+      noBooster: false,
+      note: null,
+      rows: [],
+      avgRow: null,
+      ledger: {
+        parts: [
+          ["Rating", perMatch.rating],
+          ["Win", perMatch.win],
+          ["Role", perMatch.role],
+          ["Booster", perMatch.booster],
+        ],
+        sum: perMatchTotal,
+        steps: [
+          { op: "", label: "Total", value: num(perMatchTotal) },
+          { op: "×", label: "Applies", value: pct(prob) },
+        ],
+      },
+      total: Number(pad.total || 0),
+    };
+  };
+  const paddingCard = padCard("padding", "Padding", padFor(player.padding || null), Number(player.padding_prob || 0));
+  const playoffPadCard = padCard("po_padding", "Padding", padFor(player.playoff_padding || null), Number(player.playoff_pad_prob || 0));
   const sideOf = (s) => s.bracket || (s.phase === "playoff" ? "playoff" : "upper");
   const groupStages = stageList.filter((s) => s.phase === "group");
   const openerStage = groupStages.find((s) => s.opener) || groupStages[0] || null;
@@ -1350,82 +1504,162 @@ function GroupPlayerBreakdownModal({ player, teamLookup, teams, onClose }) {
   const upper = groupStages.filter((s) => s !== openerStage && sideOf(s) === "upper").map(matchCard).filter(Boolean);
   const lower = groupStages.filter((s) => s !== openerStage && sideOf(s) === "lower").map(matchCard).filter(Boolean);
   const playoff = stageList.filter((s) => s.phase === "playoff").map(matchCard).filter(Boolean);
-  // Padding sits between the upper semi-final and the upper final (the round
-  // it stands in for), so the grid reads: opener | UB SF / LB R1 | Padding /
-  // LB SF | UB Final / LB Final.
   if (paddingCard && (upper.length > 0 || opener)) upper.splice(Math.min(1, upper.length), 0, paddingCard);
+  if (playoffPadCard && playoff.length > 0) playoff.splice(Math.min(1, playoff.length), 0, playoffPadCard);
   const groupCols = (opener ? 1 : 0) + Math.max(upper.length, lower.length);
-  const playoffCols = Math.max(groupCols, playoff.length, 1);
+  const playoffCols = Math.max(1, playoff.length);
   const hasStages = Boolean(opener) || upper.length > 0 || lower.length > 0 || playoff.length > 0;
+  const dash = <span className="round-cell-dash">—</span>;
   const renderCard = (c) => (
     <div className={`round-card${c.extra ? " extra" : ""}`} key={c.key}>
       <div className="round-card-top">
         <span className="round-card-name">{c.label}</span>
-        <span className="round-card-play">
-          <span className="round-card-chance">{c.chance}</span>
-          {c.chanceLabel && <span className="event-player-stat-label">{c.chanceLabel}</span>}
-        </span>
+        {c.chance && (
+          <span className="round-card-play">
+            <span className="round-card-chance">{c.chance}</span>
+            {c.chanceLabel && <span className="event-player-stat-label">{c.chanceLabel}</span>}
+          </span>
+        )}
       </div>
-      <div className="event-player-rating">{c.total.toFixed(2)}</div>
-      <div className="event-player-stats ev-mini">
-        {c.minis.map(([mlabel, value]) => (
-          <div className="event-player-stat" key={mlabel}>
-            <div className={`event-player-mini${value < -0.005 ? " neg" : ""}`}>{Number(value || 0).toFixed(1)}</div>
-            <div className="event-player-stat-label">{mlabel}</div>
+      {c.note && <div className="round-card-note top">{c.note}</div>}
+      {c.roleRow && (
+        <div className="round-section">
+          <div className="round-section-title">Role</div>
+          <div className="round-info-row">
+            <span className="round-info-main">
+              {c.roleRow.role_id != null && <RoleBadge roleId={c.roleRow.role_id} size={20} />}
+              <span className="round-info-name">
+                {c.roleRow.name}
+                <em>
+                  {pct(c.roleRow.major)} major · {pct(c.roleRow.minor)} minor
+                </em>
+              </span>
+            </span>
+            <span className="round-info-value">{num(c.roleRow.points)}</span>
           </div>
-        ))}
-      </div>
-      {c.boosters.length > 0 && (
-        <div className="round-card-boosts">
-          {c.boosters.map((b) => (
-            <div className="round-card-boost" key={`${b.booster_id}-${b.slot}`}>
-              <BoosterBadge boosterId={b.booster_id} size={20} />
-              <span className="round-card-boost-name">
-                {b.booster_name || `Booster ${b.booster_id}`}
-                <span className="round-card-boost-slot">
-                  {ordinal(b.slot)} match{c.boosters.length > 1 ? ` · ${pct(b.share)} of the time` : ""}
+        </div>
+      )}
+      {(c.boosterRows.length > 0 || c.noBooster) && (
+        <div className="round-section">
+          <div className="round-section-title">Booster</div>
+          {c.boosterRows.map((b) => (
+            <div className="round-info-row" key={b.key}>
+              <span className="round-info-main">
+                {b.booster_id != null && <BoosterBadge boosterId={b.booster_id} size={20} />}
+                <span className="round-info-name">
+                  {b.name}
+                  <em>
+                    {ordinal(b.slot)} match · {pct(b.rate)} trigger{b.share != null ? ` · ${pct(b.share)} of the time` : ""}
+                  </em>
                 </span>
               </span>
-              <span className="round-card-boost-rate">{(Number(b.booster_rate || 0) * 100).toFixed(0)}%</span>
-              {Math.abs(Number(b.edge || 0)) > 0.0005 && (
-                <span className="round-card-boost-edge">
-                  {Number(b.edge) >= 0 ? "+" : ""}
-                  {(Number(b.edge) * 100).toFixed(0)}% vs avg
-                </span>
-              )}
+              <span className="round-info-value">{num(b.points)}</span>
             </div>
           ))}
+          {c.noBooster && (
+            <div className="round-info-row">
+              <span className="round-info-main muted">None left for this match</span>
+              <span className="round-info-value">0.0</span>
+            </div>
+          )}
         </div>
       )}
-      {c.note && <div className="round-card-note">{c.note}</div>}
       {c.rows.length > 0 && (
-        <div className="round-opps">
-          <div className="round-opp head">
-            <span className="round-opp-name">{c.extra ? "Outcome" : "Team"}</span>
-            <span className="round-opp-prob">{c.extra ? "Odds" : "Play"}</span>
-            <span className="round-opp-win">Win</span>
-            <span className="round-opp-pts">Pts</span>
-          </div>
-          {c.rows.map((r) => {
-            const info = r.team_id != null ? teamInfo(r.team_id) : null;
-            return (
-              <div className={`round-opp${r.muted ? " miss" : ""}`} key={r.key}>
-                {r.team_id != null && <TeamLogo hltvTeamId={info?.hltv_team_id} name={teamLookup[r.team_id]} size={16} />}
-                <span className="round-opp-name">{r.name}</span>
-                <span className="round-opp-prob">{pct(r.play)}</span>
-                <span className="round-opp-win">{r.win != null ? pct(r.win) : "—"}</span>
-                <span className="round-opp-pts">{r.pts >= 0 ? r.pts.toFixed(1) : r.pts.toFixed(1)}</span>
+        <div className="round-section">
+          <div className="round-section-title">Win and Rating</div>
+            <div className="round-table">
+            <div className="round-trow head">
+              <span className="round-tcell name">{c.tableHead}</span>
+              <span className="round-tcell">{c.extra ? "Odds" : "Play"}</span>
+              <span className="round-tcell">Win%</span>
+              <span className="round-tcell">Win</span>
+              <span className="round-tcell">Rating</span>
+            </div>
+            {c.rows.map((r) => {
+              const info = r.team_id != null ? teamInfo(r.team_id) : null;
+              return (
+                <div className={`round-trow${r.muted ? " muted" : ""}`} key={r.key}>
+                  <span className="round-tcell name">
+                    {r.team_id != null && <TeamLogo hltvTeamId={info?.hltv_team_id} name={teamLookup[r.team_id]} size={14} />}
+                    <span className="round-tcell-text">{r.name}</span>
+                  </span>
+                  <span className="round-tcell">{pct(r.play)}</span>
+                  <span className="round-tcell">{r.win != null ? pct(r.win) : dash}</span>
+                  <span className={`round-tcell${Number(r.winPts) < -0.005 ? " neg" : ""}`}>{r.winPts != null ? num(r.winPts) : dash}</span>
+                  <span className="round-tcell">{r.rating != null ? num(r.rating) : dash}</span>
+                </div>
+              );
+            })}
+            {c.avgRow && (
+              <div className="round-trow avg">
+                <span className="round-tcell name">
+                  <span className="round-tcell-text">Average</span>
+                </span>
+                <span className="round-tcell">{pct(c.avgRow.play)}</span>
+                <span className="round-tcell">{c.avgRow.win != null ? pct(c.avgRow.win) : dash}</span>
+                <span className={`round-tcell${Number(c.avgRow.winPts) < -0.005 ? " neg" : ""}`}>{num(c.avgRow.winPts)}</span>
+                <span className="round-tcell">{num(c.avgRow.rating)}</span>
               </div>
-            );
-          })}
-          <div className="round-opp total">
-            <span className="round-opp-name">Total</span>
-            <span className="round-opp-prob">{pct(c.totalPlay)}</span>
-            <span className="round-opp-win">{c.totalWin != null ? pct(c.totalWin) : "—"}</span>
-            <span className="round-opp-pts">{c.total.toFixed(1)}</span>
+            )}
           </div>
         </div>
       )}
+      <div className={`round-section${c.vertical ? " fill" : ""}`}>
+        <div className="round-section-title">Total</div>
+        {c.vertical ? (
+          <div className="round-vparts">
+            {c.ledger.parts.map(([label, v]) => (
+              <div className="round-vpart" key={label}>
+                <span className="round-vpart-label">{label}</span>
+                <span className={`round-vpart-value${Number(v) < -0.005 ? " neg" : ""}`}>{num(v)}</span>
+              </div>
+            ))}
+            {c.ledger.steps.map((st, i) => (
+              <div className={`round-vpart${i === 0 ? " sum" : ""}`} key={st.label}>
+                <span className="round-vpart-label">
+                  {st.op && <i>{st.op}</i>}
+                  {st.label}
+                </span>
+                <span className="round-vpart-value">{st.value}</span>
+              </div>
+            ))}
+            <div className="round-vpart expected">
+              <span className="round-vpart-label">
+                <i>=</i>
+                Expected
+              </span>
+              <span className="round-vpart-value accent">{num(c.total, 2)}</span>
+            </div>
+          </div>
+        ) : (
+          <>
+            <div className="round-parts">
+              {[["Total", c.ledger.sum], ...c.ledger.parts].map(([label, v], i) => (
+                <div className={`round-part${i === 0 ? " total" : ""}`} key={label}>
+                  <div className={`round-part-value${Number(v) < -0.005 ? " neg" : ""}`}>{num(v)}</div>
+                  <div className="round-part-label">{label}</div>
+                </div>
+              ))}
+            </div>
+            <div className="round-eq">
+              {c.ledger.steps.map((st) => (
+                <React.Fragment key={st.label}>
+                  {st.op && <span className="round-eq-op">{st.op}</span>}
+                  <div className="round-part">
+                    <div className="round-part-value">{st.value}</div>
+                    <div className="round-part-label">{st.label}</div>
+                  </div>
+                </React.Fragment>
+              ))}
+              <span className="round-eq-op">=</span>
+              <div className="round-part">
+                <div className="round-part-value accent">{num(c.total, 2)}</div>
+                <div className="round-part-label">Expected</div>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
     </div>
   );
   const gridStyle = (cols) => ({ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` });
@@ -1433,33 +1667,26 @@ function GroupPlayerBreakdownModal({ player, teamLookup, teams, onClose }) {
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal player-sources-modal" onClick={(e) => e.stopPropagation()}>
         <header className="modal-header">
-          <h3>
-            {player.name || `Player ${player.player_id}`}
-            {player.team_id ? ` (${teamLookup[player.team_id] || player.team_id})` : ""} Point Sources
-          </h3>
+          <h3>Point Sources</h3>
           <button className="close" onClick={onClose}>
             &times;
           </button>
         </header>
         <div className="modal-body">
-          <div className="breakdown-hero">
-            {player.role_id != null && (
-              <div className="breakdown-stat role">
-                <RoleBadge roleId={player.role_id} size={42} />
-                <div className="breakdown-stat-label">{ROLE_NAMES[player.role_id] || `Role ${player.role_id}`}</div>
-              </div>
-            )}
-            {heroStats.map(([label, value]) => (
-              <div className="breakdown-stat" key={label}>
-                <div className="breakdown-stat-value">{value.toFixed(2)}</div>
-                <div className="breakdown-stat-label">{label}</div>
-              </div>
-            ))}
-            <div className="breakdown-stat total">
-              <div className="breakdown-stat-value">{total.toFixed(2)}</div>
-              <div className="breakdown-stat-label">Total</div>
-            </div>
-          </div>
+          <BreakdownHero
+            playerId={player.player_id}
+            name={player.name || `Player ${player.player_id}`}
+            teamName={player.team_id ? teamLookup[player.team_id] || String(player.team_id) : null}
+            hltvTeamId={player.team_id ? teamInfo(player.team_id)?.hltv_team_id : null}
+            roleId={roster ? roster.role_id : player.role_id}
+            note={
+              roster
+                ? `in this roster · best role ${ROLE_NAMES[player.role_id] || (player.role_id != null ? `Role ${player.role_id}` : "—")}`
+                : null
+            }
+            stats={heroStats}
+            total={total}
+          />
           {player.note && <p className="muted">{player.note}</p>}
           {!hasStages && !player.note && (
             <p className="muted">
@@ -3684,10 +3911,10 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   const [latestPayload, setLatestPayload] = useState(null);
   const [updatedAt, setUpdatedAt] = useState("");
   const [slots, setSlots] = useState(Array(8).fill(""));
-  const [bracketSize, setBracketSize] = useState(8); // 8 = exact, 16 = Monte-Carlo
+  const [bracketSize, setBracketSize] = useState(8); // every size up to 16 is enumerated exactly
   // null = stored-sim hydration pending, 0 = no stored sim, else its size.
   const [storedSize, setStoredSize] = useState(null);
-  const [mcSims, setMcSims] = useState(5000); // Monte-Carlo samples for large (16-team) fields
+  const [mcSims, setMcSims] = useState(5000); // Monte-Carlo samples, only used for fields beyond 16 teams
   // Self-loading bracket: once the stored-sim hydration has resolved, seed
   // the page from the event automatically whenever the stored sim doesn't
   // match the detected format (or there is none).
@@ -3696,7 +3923,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     if (isBounty || autoSeededRef.current) return;
     if (storedSize === null) return; // hydration still pending
     const size = Number(detectedBracketSize);
-    if (![2, 4, 6, 8, 16].includes(size)) return;
+    if (![6, 8, 16].includes(size)) return;
     if (storedSize === size) return; // stored sim already fits this format
     autoSeededRef.current = true;
     autofillPlayoffFromEvent();
@@ -3704,7 +3931,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   }, [storedSize, detectedBracketSize]);
 
   // Fill the seed slots + bracket size straight from the linked HLTV event's
-  // single-elimination playoff bracket (16/8/4), in bracket order.
+  // single-elimination playoff bracket (16/8), in bracket order.
   const autofillPlayoffFromEvent = async () => {
     setPlayoffAutofillBusy(true);
     setPlayoffAutofillMessage("");
@@ -3721,7 +3948,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       const ids = (data.team_ids || []).map((x) => String(x || ""));
       const names = data.team_names || [];
       const size = Number(data.bracket_size || ids.length);
-      if (![2, 4, 6, 8, 16].includes(size)) {
+      if (![6, 8, 16].includes(size)) {
         setPlayoffAutofillMessage(`Unsupported bracket size (${size}).`);
         return;
       }
@@ -3958,7 +4185,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     return <TeamLogo hltvTeamId={hltvIdByTeamId[id]} name={teamLookup[id]} size={24} />;
   };
   // Bracket geometry helpers shared by the seeding view and the completed-bracket
-  // picker so both work for any power-of-two field (8 exact, 16 Monte-Carlo).
+  // picker so both work for any power-of-two field (exact up to 16 teams).
   const bracketTotalRounds = (n) => (n >= 2 ? Math.round(Math.log2(n)) : 0);
   const roundTitleForTeams = (teamsInRound) =>
     ({ 2: "Grand final", 4: "Semi-finals", 8: "Quarter-finals", 16: "Round of 16", 32: "Round of 32" }[teamsInRound] ||
@@ -4573,7 +4800,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     setLatestPayload(payload);
     setSlots((payload.team_slots || []).map((x) => String(x)));
     const loadedSize = (payload.team_slots || []).length;
-    setBracketSize([2, 4, 6, 8, 16].includes(loadedSize) ? loadedSize : 8);
+    setBracketSize([6, 8, 16].includes(loadedSize) ? loadedSize : 8);
     setStoredSize(loadedSize);
     setMcSims(Number(payload.mc_sims) || 5000);
     setHasThirdPlaceDecider(Boolean(payload.has_third_place_decider));
@@ -5240,8 +5467,9 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
               <>
                 {combosApproximate && (
                   <p className="muted">
-                    16-team field: too large to score every roster exactly, so the strongest {sharedComboCount.toLocaleString()} candidate
-                    teams are ranked. Average value is exact; ceiling and most-likely-winner are near-exact among these candidates.
+                    Large field: every outcome is enumerated exactly, and Most Likely Winner counts the true best roster of each
+                    one. Average Value lists the strongest {sharedComboCount.toLocaleString()} rosters exactly; Best Single Outcome is
+                    exact for its top roster and ranked among those candidates below it.
                   </p>
                 )}
                 {busy && (
@@ -5757,7 +5985,9 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                   </div>
                   <div className="event-team-players">
                     {team.players.map((p) => {
-                      const roleId = roleIdFromName(p.role_name);
+                      const roleNum = Number(p.role_name);
+                      const roleId =
+                        p.role_name != null && p.role_name !== "" && Number.isFinite(roleNum) ? roleNum : roleIdFromName(p.role_name);
                       return (
                         <div
                           className="event-player-card clickable"
@@ -5997,41 +6227,30 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
         <div className="modal-backdrop" onClick={() => setCompletedPlayerBreakdown(null)}>
           <div className="modal player-sources-modal" onClick={(e) => e.stopPropagation()}>
             <header className="modal-header">
-              <h3>{completedPlayerBreakdown.name || `Player ${completedPlayerBreakdown.player_id}`} Point Sources</h3>
+              <h3>Point Sources</h3>
               <button className="close" onClick={() => setCompletedPlayerBreakdown(null)}>
                 &times;
               </button>
             </header>
             <div className="modal-body">
-              <div className="breakdown-hero">
-                {completedPlayerBreakdown.role_id != null && (
-                  <div className="breakdown-stat role">
-                    <RoleBadge roleId={completedPlayerBreakdown.role_id} size={42} />
-                    <div className="breakdown-stat-label">
-                      {ROLE_NAMES[completedPlayerBreakdown.role_id] || `Role ${completedPlayerBreakdown.role_id}`}
-                    </div>
-                  </div>
-                )}
-                {[
-                  ["Rating", "rating"],
-                  ["Win", "win"],
-                  ["Role", "role"],
-                  ["Booster", "booster"],
-                ].map(([label, key]) => (
-                  <div className="breakdown-stat" key={key}>
-                    <div className="breakdown-stat-value">
-                      {completedBreakdownValue(completedPlayerBreakdown, key).toFixed(2)}
-                    </div>
-                    <div className="breakdown-stat-label">{label}</div>
-                  </div>
-                ))}
-                <div className="breakdown-stat total">
-                  <div className="breakdown-stat-value">
-                    {completedBreakdownValue(completedPlayerBreakdown, "total").toFixed(2)}
-                  </div>
-                  <div className="breakdown-stat-label">Total</div>
-                </div>
-              </div>
+              <BreakdownHero
+                playerId={completedPlayerBreakdown.player_id}
+                name={completedPlayerBreakdown.name || `Player ${completedPlayerBreakdown.player_id}`}
+                teamName={
+                  completedPlayerBreakdown.team_id
+                    ? teamLookup[completedPlayerBreakdown.team_id] || String(completedPlayerBreakdown.team_id)
+                    : null
+                }
+                hltvTeamId={hltvIdByTeamId[Number(completedPlayerBreakdown.team_id)]}
+                roleId={completedPlayerBreakdown.role_id}
+                stats={[
+                  ["Rating", completedBreakdownValue(completedPlayerBreakdown, "rating")],
+                  ["Win", completedBreakdownValue(completedPlayerBreakdown, "win")],
+                  ["Role", completedBreakdownValue(completedPlayerBreakdown, "role")],
+                  ["Booster", completedBreakdownValue(completedPlayerBreakdown, "booster")],
+                ]}
+                total={completedBreakdownValue(completedPlayerBreakdown, "total")}
+              />
               {completedPlayerBreakdown.stage_ev &&
                 Array.isArray(completedPlayerBreakdown.stage_list) &&
                 completedPlayerBreakdown.stage_list.length > 0 && (
@@ -12136,6 +12355,32 @@ function GroupsTab({
     return m;
   }, [teams]);
   const [comboSearch, setComboSearch] = useState("");
+  // Include / exclude filters for the Top 5 (player ids); sent with every query.
+  const [includeSet, setIncludeSet] = useState(new Set());
+  const [excludeSet, setExcludeSet] = useState(new Set());
+  const toggleFilter = (pid, kind) => {
+    const id = Number(pid);
+    const flip = (setter, on) =>
+      setter((prev) => {
+        const next = new Set(prev);
+        if (on) next.add(id);
+        else next.delete(id);
+        return next;
+      });
+    if (kind === "include") {
+      const on = !includeSet.has(id);
+      flip(setIncludeSet, on);
+      if (on) flip(setExcludeSet, false);
+    } else {
+      const on = !excludeSet.has(id);
+      flip(setExcludeSet, on);
+      if (on) flip(setIncludeSet, false);
+    }
+  };
+  const clearFilters = () => {
+    setIncludeSet(new Set());
+    setExcludeSet(new Set());
+  };
   const [sortKey, setSortKey] = useState("ev_desc");
   const [topTeams, setTopTeams] = useState(null);
   const [allTeams, setAllTeams] = useState(null);
@@ -12448,7 +12693,15 @@ function GroupsTab({
     try {
       const data = await api.post(
         "/groups/best-team/query",
-        { mode: comboMode, search: comboSearch, sort: sortKey, page: nextPage, page_size: 200 },
+        {
+          mode: comboMode,
+          search: comboSearch,
+          sort: sortKey,
+          page: nextPage,
+          page_size: 200,
+          include_player_ids: Array.from(includeSet),
+          exclude_player_ids: Array.from(excludeSet),
+        },
         120000
       );
       if (seq !== querySeqRef.current) return;
@@ -12458,7 +12711,7 @@ function GroupsTab({
       setPage(Number(data.page || nextPage || 0));
       setTopMessage(
         data.exact === false
-          ? "Search hit its time budget — showing the best rosters found so far (near-optimal, not proven optimal)."
+          ? "Ranking not proven exact for this page (time budget or contender limit) — showing the best rosters found, scored exactly."
           : ""
       );
     } catch (e) {
@@ -12471,7 +12724,7 @@ function GroupsTab({
   useEffect(() => {
     if (!combosReady || groupsTab !== "top5" || groupsTopSubtab === "completed") return;
     queryCombos(0);
-  }, [combosReady, comboMode, comboSearch, sortKey, groupsTab, groupsTopSubtab]);
+  }, [combosReady, comboMode, comboSearch, sortKey, groupsTab, groupsTopSubtab, includeSet, excludeSet]);
 
   const completedMatchCount = groupFormat === "de8" ? 10 : 5;
   const other = (pair, winner) => (pair.length === 2 ? pair.find((t) => String(t) !== String(winner)) : undefined);
@@ -12750,7 +13003,22 @@ function GroupsTab({
     };
     return Object.keys(results.teams).sort((x, y) => score(y) - score(x));
   }, [results]);
-  const openGroupPlayer = (p) => {
+  // Roster mode: the stored valuation only carries the best role's trigger
+  // rates, so the roster's assigned role gets its own from the player row.
+  const withRosterRole = (ctx, pid) => {
+    const prow = (players || []).find((x) => Number(x.player_id) === Number(pid));
+    let rolesObj = {};
+    try {
+      rolesObj = prow?.roles_json ? JSON.parse(prow.roles_json) : {};
+    } catch {
+      rolesObj = {};
+    }
+    const rr = rolesObj[String(ctx.role_id)] || {};
+    const major = Number(rr.major || 0);
+    const minor = Number(rr.minor || 0);
+    return { ...ctx, major, minor, per_match: 5 * major + 2 * minor - 2 * (1 - major - minor) };
+  };
+  const openGroupPlayer = (p, rosterCtx = null) => {
     const comps = playerEvByPid[Number(p.player_id)] || {};
     const stageStats = results?.stage_stats || null;
     const stageRow = stageStats?.players?.[String(p.player_id)] || null;
@@ -12772,10 +13040,13 @@ function GroupsTab({
         Object.entries(stageStats?.teams || {}).map(([tid, t]) => [tid, t?.rank ?? null])
       ),
       padding_prob: Number(teamRow?.padding_prob || 0),
+      role_info: stageRow?.role || null,
       padding: stageRow?.padding || null,
       penalty: Number(stageRow?.penalty || 0),
-      playoff_bye: Number(stageRow?.playoff_bye || 0),
+      playoff_padding: stageRow?.playoff_padding || null,
+      playoff_pad_prob: Number(teamRow?.playoff_padding_prob || 0),
       playoff_penalty: Number(stageRow?.playoff_penalty || 0),
+      roster: rosterCtx ? withRosterRole(rosterCtx, p.player_id) : null,
     });
   };
   const renderPlayerLinks = (list) =>
@@ -12915,17 +13186,17 @@ function GroupsTab({
                   const reach = results.playoff?.round_reach?.[String(tid)] || [];
                   const labels = results.playoff?.round_labels || [];
                   const title = Number(results.playoff?.advance_rate?.[String(tid)] || 0);
-                  const chips = [];
-                  const ordinal = { 1: "1st", 2: "2nd", 3: "3rd", 4: "4th" };
-                  ["1", "2", "3", "4"].forEach((rank) => {
-                    const p = Number(place[rank] || 0);
-                    if (p > 0.0005) chips.push([ordinal[Number(rank)], p]);
-                  });
-                  reach.forEach((p, r) => {
-                    if (Number(p) > 0.0005) chips.push([labels[r] || `R${r + 1}`, Number(p)]);
-                  });
+                  // The odds that matter for a team: making the playoffs (any
+                  // qualifying place), winning the group (the bye to the semis in
+                  // the top-3 format), reaching the final, and the title.
+                  const qualify = Object.values(place).reduce((acc, v) => acc + Number(v || 0), 0);
+                  const first = Number(place["1"] || 0);
+                  const finalReach = reach.length > 0 ? Number(reach[reach.length - 1] || 0) : null;
+                  const earlyStop = Number(results.playoff?.stop_teams || 1) > 1;
+                  const odds = [[results.playoff ? "Playoffs" : "Qualify", qualify, false], ["Win group", first, false]];
                   if (results.playoff) {
-                    chips.push([Number(results.playoff.stop_teams || 1) > 1 ? "Qualify" : "Title", title]);
+                    if (finalReach != null && !earlyStop) odds.push([labels[labels.length - 1] || "Final", finalReach, false]);
+                    odds.push([earlyStop ? "Qualify" : "Title", title, true]);
                   }
                   const rows = Object.entries(data.players || {}).sort(
                     (x, y) => Number(y[1].total_points ?? 0) - Number(x[1].total_points ?? 0)
@@ -12937,11 +13208,11 @@ function GroupsTab({
                         <div className="event-team-headtext">
                           <span className="event-team-name">{teamName(tid)}</span>
                           {groupIdx >= 0 && <span className="event-team-rank">Group {groupIdx + 1}</span>}
-                          <div className="event-team-reach">
-                            {chips.map(([label, p]) => (
-                              <div className="event-player-stat" key={label}>
-                                <div className="event-player-mini">{Math.round(p * 100)}%</div>
-                                <div className="event-player-stat-label">{label}</div>
+                          <div className="event-team-odds">
+                            {odds.map(([label, p, accent]) => (
+                              <div className={`event-team-odd${accent ? " accent" : ""}`} key={label}>
+                                <span className="event-team-odd-label">{label}</span>
+                                <span className="event-team-odd-value">{Math.round(p * 100)}%</span>
                               </div>
                             ))}
                           </div>
@@ -13021,12 +13292,6 @@ function GroupsTab({
                         : "Run Combinations"}
                     </button>
                   )}
-                  {liveMode && (
-                    <p className="muted">
-                      Large event: rosters are optimized live per query (top 2,000 under current constraints) — no
-                      precompute needed.
-                    </p>
-                  )}
                   {!liveMode && combosUpdatedAt && (
                     <p className="muted">Combinations stored: {new Date(combosUpdatedAt).toLocaleString()}</p>
                   )}
@@ -13037,19 +13302,42 @@ function GroupsTab({
                     </p>
                   )}
                 </div>
-                {results?.combined_playoffs && (
-                  <p className="muted">
-                    Average EVs cover the whole event (exact groups + exact playoff enumeration). Ceiling and Completed
-                    Groups score the group stage only.
-                  </p>
-                )}
                 <div className="grid two">
                   <Input label="Search Combos" value={comboSearch} onChange={setComboSearch} placeholder="Player name" className="search-field" />
-                  <div className="field">
-                    <span>Filtered / Stored</span>
-                    <div className="pill">{filteredCount.toLocaleString()}</div>
-                  </div>
                 </div>
+                {(includeSet.size > 0 || excludeSet.size > 0) && (
+                  <div className="filter-groups">
+                    {includeSet.size > 0 && (
+                      <div className="filter-group in">
+                        <div className="filter-group-title">Included Players</div>
+                        <div className="chips">
+                          {Array.from(includeSet).map((pid) => (
+                            <button key={`inc-${pid}`} className="filter-chip in" title="Remove filter" onClick={() => toggleFilter(pid, "include")}>
+                              <PlayerPhoto playerId={pid} name={playerNameById[pid]} size={20} />
+                              {playerNameById[pid] || `Player ${pid}`} <span className="x">&times;</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {excludeSet.size > 0 && (
+                      <div className="filter-group out">
+                        <div className="filter-group-title">Excluded Players</div>
+                        <div className="chips">
+                          {Array.from(excludeSet).map((pid) => (
+                            <button key={`exc-${pid}`} className="filter-chip out" title="Remove filter" onClick={() => toggleFilter(pid, "exclude")}>
+                              <PlayerPhoto playerId={pid} name={playerNameById[pid]} size={20} />
+                              {playerNameById[pid] || `Player ${pid}`} <span className="x">&times;</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    <button type="button" className="chip filter-clear" onClick={clearFilters}>
+                      Clear filters
+                    </button>
+                  </div>
+                )}
                 {topTeams && topTeams.length > 0 && (
                   <div className="card sub">
                     <h3>Top Teams</h3>
@@ -13071,12 +13359,7 @@ function GroupsTab({
                                 <div className="combo-rank">#{idx + 1}</div>
                                 <div className="event-team-headtext">
                                   <span className="event-team-name">{metricLabel(team)}</span>
-                                  <span className="combo-cost">
-                                    Cost ${Number(team.cost || 0).toLocaleString()}
-                                    {comboMode !== "single_outcome" && Number(team?.booster_ev) > 0
-                                      ? ` · incl. booster ${Number(team.booster_ev).toFixed(1)}`
-                                      : ""}
-                                  </span>
+                                  <span className="combo-cost">Cost ${Number(team.cost || 0).toLocaleString()}</span>
                                 </div>
                               </div>
                               <div className="event-team-players">
@@ -13088,12 +13371,26 @@ function GroupsTab({
                                       : roleIdFromName(p.role_name);
                                   const assigned = boostByPid[Number(p.player_id)];
                                   const boost = assigned != null ? assigned : Number(p.booster_ev || 0);
-                                  const score = Number(p.mode_score ?? p.total_ev ?? 0) + (assigned || 0);
+                                  // serialised rosters already fold the assigned booster into total_ev
+                                  const score =
+                                    Number(p.mode_score ?? p.total_ev ?? 0) +
+                                    (assigned != null && !(Number(p.booster_ev) > 0) ? assigned : 0);
+                                  const rosterCtx =
+                                    (team.booster_assignments || []).length > 0
+                                      ? {
+                                          role_id: roleId,
+                                          role_ev: Number(p.role_ev || 0),
+                                          booster_ev: boost,
+                                          boosters: (team.booster_assignments || []).filter(
+                                            (a) => Number(a.player_id) === Number(p.player_id)
+                                          ),
+                                        }
+                                      : null;
                                   return (
                                     <div
                                       className="event-player-card clickable"
                                       key={p.player_id}
-                                      onClick={() => openGroupPlayer(p)}
+                                      onClick={() => openGroupPlayer(p, rosterCtx)}
                                     >
                                       <PlayerPhoto playerId={Number(p.player_id)} name={p.name} size={52} />
                                       <div className="event-player-name">{p.name}</div>
@@ -13118,6 +13415,28 @@ function GroupsTab({
                                       </div>
                                       <div className="event-player-price combo-price">
                                         ${Math.round(Number(p.price || 0) / 1000)}k
+                                      </div>
+                                      <div className="event-player-filters">
+                                        <button
+                                          type="button"
+                                          className={`chip mini${includeSet.has(Number(p.player_id)) ? " active in" : ""}`}
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            toggleFilter(p.player_id, "include");
+                                          }}
+                                        >
+                                          {includeSet.has(Number(p.player_id)) ? "Included" : "Include"}
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className={`chip mini${excludeSet.has(Number(p.player_id)) ? " active out" : ""}`}
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            toggleFilter(p.player_id, "exclude");
+                                          }}
+                                        >
+                                          {excludeSet.has(Number(p.player_id)) ? "Excluded" : "Exclude"}
+                                        </button>
                                       </div>
                                     </div>
                                   );
@@ -13563,17 +13882,25 @@ export default function App() {
   };
 
   return (
-    <div className="layout">
-      <nav className="tab-bar">
-        {tabs.map((t) => (
-          <TabButton key={t.key} active={t.key === active} onClick={() => setActive(t.key)}>
-            {t.label}
-          </TabButton>
-        ))}
-      </nav>
+    <>
+      {/* Drag region standing in for the hidden native title bar (see main.js). */}
+      <div className="titlebar">
+        <span className="titlebar-brand">
+          CS Fantasy <em>Toolkit</em>
+        </span>
+      </div>
+      <div className="layout">
+        <nav className="tab-bar">
+          {tabs.map((t) => (
+            <TabButton key={t.key} active={t.key === active} onClick={() => setActive(t.key)}>
+              {t.label}
+            </TabButton>
+          ))}
+        </nav>
 
-      <main className="content">{contentMap[active]}</main>
-    </div>
+        <main className="content">{contentMap[active]}</main>
+      </div>
+    </>
   );
 }
 

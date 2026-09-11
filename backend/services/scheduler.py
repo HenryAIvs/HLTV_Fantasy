@@ -253,9 +253,17 @@ class DataScheduler:
         from backend.routes import groups
 
         active = get_active_event_id()
+        refresh_inputs = False
         if only_if_missing and active and groups._GROUPS_STATE.load(key=int(active)):
-            logger.debug("Valuations for event %s already baked; nightly pass leaves them alone", active)
-            return
+            # Already baked. Until the event starts, tonight's rating / ranking
+            # imports should flow into it (fresh inputs, re-bake); from the
+            # start on — or when the start is unknown — it is left alone.
+            if groups.event_has_started(int(active)) is False:
+                only_if_missing = False
+                refresh_inputs = True
+            else:
+                logger.debug("Valuations for event %s already baked and the event has started; left alone", active)
+                return
         run_id = schedule_db.start_run("valuations", trigger)
         self._set_state(running=True, current_task="valuations", trigger=trigger, started_at=time.time(),
                         processed=0, total=0, message="Baking event valuations...")
@@ -263,7 +271,9 @@ class DataScheduler:
             if not active:
                 schedule_db.finish_run(run_id, "warning", "no active event")
                 return
-            outcome = groups.bake_event_valuations(int(active), trigger=trigger, only_if_missing=only_if_missing)
+            outcome = groups.bake_event_valuations(
+                int(active), trigger=trigger, only_if_missing=only_if_missing, refresh_inputs=refresh_inputs
+            )
             status = {"ok": "success", "exists": "success", "skipped": "warning"}.get(str(outcome.get("status")), "error")
             schedule_db.finish_run(run_id, status, _short(outcome))
             logger.info("Valuation bake (%s): %s", trigger, _short(outcome))

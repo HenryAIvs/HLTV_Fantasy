@@ -127,6 +127,14 @@ const createWindow = () => {
     height: 1000,
     minWidth: 1280,
     minHeight: 980,
+    // Window chrome in the app's palette: the native title bar is hidden and
+    // replaced by the renderer's .titlebar strip (the drag region), with the
+    // native minimise / maximise / close controls drawn dark by the overlay.
+    // The menu bar stays out of sight (Alt reveals it; its shortcuts still work).
+    backgroundColor: "#0a0c10",
+    titleBarStyle: "hidden",
+    titleBarOverlay: { color: "#0a0c10", symbolColor: "#c6d0dc", height: 36 },
+    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
     },

@@ -349,6 +349,10 @@ def parse_swiss_bo_rules(format_text: str) -> Optional[Dict[str, int]]:
 _GROUP_MAIN_RE = re.compile(r"^(?:Double elimination|GSL) Bo(\d)$")
 _GROUP_SUB_RES = {
     "upperRound1": re.compile(r"^- Upper bracket quarter-finals Bo(\d)$"),
+    # Double-elimination brackets played as the whole event (closed qualifiers,
+    # e.g. PGL Masters Bucharest 2026 Europe Closed Qualifier) end in a longer
+    # grand final.
+    "grandFinal": re.compile(r"^- Grand final Bo(\d)$"),
 }
 _ANY_BO_RE = re.compile(r"\bBo\d\b")
 

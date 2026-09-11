@@ -16,6 +16,8 @@ from backend.services.team_optimizer import (
     serialize_roster,
 )
 from backend.services.swiss_booster_assignment import optimize_swiss_boosters_for_roster
+from backend.services.role_assignment import extract_role_scores_for_player
+from backend.services.roster_plan import _exact_role_assignment
 from backend.swiss_stage.fantasy_montecarlo import simulate_swiss_fantasy
 from backend.data.team_db import get_all_teams
 
@@ -296,6 +298,12 @@ def _compute_best_teams_from_results(results: dict, payload: dict, progress_call
 
     cache_id = uuid.uuid4().hex
     players_meta = {str(p["player_id"]): p for p in players_info_sorted}
+    # Roles in a roster must not clash: each roster gets the exact assignment
+    # (each player a distinct role, total role points maximised), not everyone
+    # on their own best role.
+    role_scores_by_pid = {
+        int(p["player_id"]): extract_role_scores_for_player(get_player(int(p["player_id"])) or {}) for p in players_info_sorted
+    }
     conn = _connect()
     top_entries = []
     total_valid = 0
@@ -320,8 +328,10 @@ def _compute_best_teams_from_results(results: dict, payload: dict, progress_call
                 expected_maps=expected_maps,
             )
             booster_assignments = booster_result.get("assignments", [])
-            total_ev = float(roster["total_ev"]) + float(booster_result.get("total_expected_booster_points", 0.0))
-            role_names = roster["roles"]
+            role_total, role_of, _role_ev_of = _exact_role_assignment(roster["players"], role_scores_by_pid)
+            rating_win = sum(float(p.get("total_ev") or 0.0) - float(p.get("role_ev") or 0.0) for p in roster["players"])
+            total_ev = rating_win + float(role_total) + float(booster_result.get("total_expected_booster_points", 0.0))
+            role_names = [str(role_of.get(int(pid), "-")) for pid in combo_ids]
             conn.execute(
                 """
                 INSERT INTO best_team_combos (
