@@ -106,6 +106,20 @@ non-empty `message` shows as a notice bar above the tabs. The app probes
 same probe drives the "Can't reach the server" screen during an outage.
 Delete the file to go back to the defaults.
 
+## Which event the public app shows
+
+Public users pick any imported event from the Event dropdown on the
+Tournament page (or View on the Events tab); the choice is remembered per
+install and defaults to the server's current event. Stored runs (groups,
+playoff, Swiss) are keyed by fantasy event, and every read endpoint takes
+`?event_id=` to serve another event's run. Runs started from the operator app
+always target the active event.
+
+Valuations are frozen once an event starts: the nightly bake refreshes a
+groups event only until its first match, and playoff runs only change when
+you press Run Combinations. Playoff Top 5 queries are cached and warmed at
+startup and after each run.
+
 ## What the public app needs published
 
 The scheduler bakes the active event's valuations nightly; the Top 5 queries

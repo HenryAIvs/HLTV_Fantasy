@@ -16,20 +16,33 @@ SIM_JOBS_LOCK = threading.Lock()
 
 
 _SIM_STATE = SingletonState(
-    "swiss_simulation_state", result_column="results_json", result_key="results", iso_timestamps=True
+    "swiss_simulation_state", result_column="results_json", result_key="results", iso_timestamps=True, keyed=True
 )
+
+
+def _event_key(event_id=None) -> int:
+    """Stored swiss runs are keyed by fantasy event (the active one unless a
+    read asks for ?event_id=)."""
+    from backend.data.event_db import get_active_event_id
+
+    try:
+        if event_id:
+            return int(event_id)
+    except (TypeError, ValueError):
+        pass
+    return int(get_active_event_id() or 1)
 
 
 def ensure_simulation_schema() -> None:
     _SIM_STATE.ensure_table()
 
 
-def save_latest_simulation(payload: dict, results: dict) -> None:
-    _SIM_STATE.save(payload, results)
+def save_latest_simulation(payload: dict, results: dict, event_id=None) -> None:
+    _SIM_STATE.save(payload, results, key=_event_key(event_id))
 
 
-def load_latest_simulation() -> dict | None:
-    return _SIM_STATE.load()
+def load_latest_simulation(event_id=None) -> dict | None:
+    return _SIM_STATE.load(key=_event_key(event_id))
 
 
 def _normalize_sim_payload(payload: dict) -> dict:
@@ -171,8 +184,8 @@ def get_simulation_job(job_id: str):
 
 
 @router.get("/latest")
-def get_latest_simulation():
-    row = load_latest_simulation()
+def get_latest_simulation(event_id: int | None = None):
+    row = load_latest_simulation(event_id)
     if not row:
         return {"exists": False}
     return {
@@ -187,7 +200,7 @@ def get_latest_simulation():
 def reset_latest_simulation():
     conn = _connect()
     try:
-        conn.execute("DELETE FROM swiss_simulation_state WHERE singleton_id = 1")
+        conn.execute("DELETE FROM swiss_simulation_state WHERE singleton_id = ?", (_event_key(None),))
         conn.commit()
     finally:
         conn.close()

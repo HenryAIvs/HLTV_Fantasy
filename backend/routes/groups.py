@@ -82,10 +82,17 @@ _GROUPS_BEST_STATE = SingletonState("groups_best_team_state", keyed=True)
 _GROUPS_BEST_META = SingletonState("groups_best_team_meta", keyed=True)
 
 
-def _state_key() -> int:
-    """Row key for the stored groups state: the active fantasy event id."""
+def _state_key(event_id: Optional[int] = None) -> int:
+    """Row key for the stored groups state: the requested fantasy event, else
+    the active one (reads pass ?event_id= so the public app can view any
+    imported event; runs always target the active event)."""
     from backend.data.event_db import get_active_event_id
 
+    try:
+        if event_id:
+            return int(event_id)
+    except (TypeError, ValueError):
+        pass
     return int(get_active_event_id() or 1)
 
 
@@ -3640,8 +3647,8 @@ def get_groups_best_team_job(job_id: str):
 
 
 @router.get("/best-team/latest")
-def get_latest_groups_best_team():
-    key = _state_key()
+def get_latest_groups_best_team(event_id: Optional[int] = None):
+    key = _state_key(event_id)
     latest_sim = _GROUPS_STATE.load(key=key)
     if latest_sim and _is_live_pool(latest_sim["results"] or {}):
         return {"exists": True, "live": True, "updated_at": latest_sim["updated_at"]}
@@ -3880,8 +3887,10 @@ def _seed_live_queries(key: int, latest_sim: Optional[dict] = None) -> Dict[str,
 
 
 @router.post("/best-team/query")
-def query_groups_best_team(payload: dict | None = None):
-    body = payload or {}
+def query_groups_best_team(payload: dict | None = None, event_id: Optional[int] = None):
+    body = dict(payload or {})
+    if event_id:
+        body["event_id"] = int(event_id)
     mode = str(body.get("mode") or "average").strip().lower()
     if mode not in {"average", "single_outcome", "most_outcomes"}:
         mode = "average"
@@ -3938,9 +3947,9 @@ def _find_completed_group_outcomes(results: dict, picks_by_group: List[List[int]
 
 
 @router.post("/best-team/completed-query")
-def query_groups_best_team_completed(payload: dict | None = None):
+def query_groups_best_team_completed(payload: dict | None = None, event_id: Optional[int] = None):
     body = payload or {}
-    key = _state_key()
+    key = _state_key(event_id or body.get("event_id"))
     latest = _GROUPS_STATE.load(key=key)
     if not latest:
         raise HTTPException(status_code=404, detail="No stored group stage found.")

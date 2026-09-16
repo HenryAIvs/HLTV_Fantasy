@@ -38,18 +38,18 @@ PLAYOFF_COMPLETED_BRACKET_JOBS_LOCK = threading.Lock()
 # a `variant` field ("main"/"bounty") in payloads or query params.
 _STATE_SETS = {
     "main": {
-        "playoff": SingletonState("playoff_simulation_state", result_column="results_json", result_key="results"),
-        "completed": SingletonState("playoff_completed_bracket_state"),
-        "best": SingletonState("playoff_best_team_state"),
+        "playoff": SingletonState("playoff_simulation_state", result_column="results_json", result_key="results", keyed=True),
+        "completed": SingletonState("playoff_completed_bracket_state", keyed=True),
+        "best": SingletonState("playoff_best_team_state", keyed=True),
         # Small summary saved alongside the combos blob so metadata endpoints
         # never have to materialize the (multi-hundred-MB) result_json.
-        "meta": SingletonState("playoff_best_team_meta"),
+        "meta": SingletonState("playoff_best_team_meta", keyed=True),
     },
     "bounty": {
-        "playoff": SingletonState("bounty_playoff_simulation_state", result_column="results_json", result_key="results"),
-        "completed": SingletonState("bounty_completed_bracket_state"),
-        "best": SingletonState("bounty_best_team_state"),
-        "meta": SingletonState("bounty_best_team_meta"),
+        "playoff": SingletonState("bounty_playoff_simulation_state", result_column="results_json", result_key="results", keyed=True),
+        "completed": SingletonState("bounty_completed_bracket_state", keyed=True),
+        "best": SingletonState("bounty_best_team_state", keyed=True),
+        "meta": SingletonState("bounty_best_team_meta", keyed=True),
     },
 }
 
@@ -62,26 +62,52 @@ def _states(variant) -> dict:
     return _STATE_SETS[_variant(variant)]
 
 
+def _event_key(event_id=None) -> int:
+    """Row key for stored playoff state: the requested fantasy event, else the
+    active one. Runs started from the operator app always target the active
+    event; read endpoints accept ?event_id= so the public app can show any
+    imported event's stored run."""
+    from backend.data.event_db import get_active_event_id
+
+    try:
+        if event_id:
+            return int(event_id)
+    except (TypeError, ValueError):
+        pass
+    return int(get_active_event_id() or 1)
+
+
 def ensure_playoff_schema() -> None:
     for states in _STATE_SETS.values():
         for state in states.values():
             state.ensure_table()
+    # These tables were single-row until 2026-09-16; the row they held was the
+    # active event's run, so it becomes that event's row (once).
+    try:
+        from backend.data.event_db import get_active_event_id
+
+        active = get_active_event_id()
+        if active:
+            for state in _STATE_SETS["main"].values():
+                state.migrate_legacy_row(int(active))
+    except Exception:  # noqa: BLE001 - never block startup on the migration
+        pass
 
 
-def save_latest_playoff(payload: dict, results: dict, variant: str = "main") -> None:
-    _states(variant)["playoff"].save(payload, results)
+def save_latest_playoff(payload: dict, results: dict, variant: str = "main", event_id=None) -> None:
+    _states(variant)["playoff"].save(payload, results, key=_event_key(event_id))
 
 
-def load_latest_playoff(variant: str = "main") -> dict | None:
-    return _states(variant)["playoff"].load()
+def load_latest_playoff(variant: str = "main", event_id=None) -> dict | None:
+    return _states(variant)["playoff"].load(key=_event_key(event_id))
 
 
-def save_latest_completed_bracket(payload: dict, result: dict, variant: str = "main") -> None:
-    _states(variant)["completed"].save(payload, result)
+def save_latest_completed_bracket(payload: dict, result: dict, variant: str = "main", event_id=None) -> None:
+    _states(variant)["completed"].save(payload, result, key=_event_key(event_id))
 
 
-def load_latest_completed_bracket(variant: str = "main") -> dict | None:
-    return _states(variant)["completed"].load()
+def load_latest_completed_bracket(variant: str = "main", event_id=None) -> dict | None:
+    return _states(variant)["completed"].load(key=_event_key(event_id))
 
 
 def _best_team_meta_summary(result: dict) -> dict:
@@ -98,13 +124,54 @@ def _best_team_meta_summary(result: dict) -> dict:
     }
 
 
-def save_latest_playoff_best_team(payload: dict, result: dict, variant: str = "main") -> None:
-    _states(variant)["best"].save(payload, result)
-    _states(variant)["meta"].save(payload, _best_team_meta_summary(result))
+def save_latest_playoff_best_team(payload: dict, result: dict, variant: str = "main", event_id=None) -> None:
+    key = _event_key(event_id)
+    _states(variant)["best"].save(payload, result, key=key)
+    _states(variant)["meta"].save(payload, _best_team_meta_summary(result), key=key)
+    _query_cache_clear()
+    # Warm the default Top 5 queries off the request path (the combos blob
+    # parse plus the first sort is the slow part; the public app opens on it).
+    threading.Thread(target=seed_playoff_queries, args=(variant, key), name="playoff-top5-warmup", daemon=True).start()
 
 
-def load_latest_playoff_best_team(variant: str = "main") -> dict | None:
-    return _states(variant)["best"].load()
+def load_latest_playoff_best_team(variant: str = "main", event_id=None) -> dict | None:
+    return _states(variant)["best"].load(key=_event_key(event_id))
+
+
+# Saved-combos query responses memoized per (variant, event, stored-run stamp,
+# body). Responses are small (10 + one page of rosters); the work they save is
+# the blob parse and the full sort of every stored roster.
+_QUERY_CACHE: dict = {}
+_QUERY_CACHE_LOCK = threading.Lock()
+_QUERY_CACHE_MAX = 256
+
+
+def _query_cache_clear() -> None:
+    with _QUERY_CACHE_LOCK:
+        _QUERY_CACHE.clear()
+
+
+def _query_cache_key(variant: str, key: int, updated_at, body: dict) -> tuple:
+    return (_variant(variant), int(key), str(updated_at), json.dumps(body, sort_keys=True, default=str))
+
+
+def seed_playoff_queries(variant: str = "main", event_id=None) -> dict:
+    """Run the three default Top 5 queries for an event's stored combos so the
+    first public request answers from cache. Returns seconds per mode."""
+    import time as _time
+
+    timings = {}
+    key = _event_key(event_id)
+    for mode in ("average", "single_outcome", "most_outcomes"):
+        t0 = _time.time()
+        try:
+            query_latest_best_team_playoff({"mode": mode, "variant": _variant(variant), "page": 0}, event_id=key)
+            timings[mode] = round(_time.time() - t0, 2)
+        except HTTPException:
+            timings[mode] = "none"
+        except Exception as exc:  # noqa: BLE001
+            timings[mode] = f"error: {exc}"
+    return timings
 
 
 def _saved_combo_metric(team: dict, mode: str) -> float:
@@ -2927,7 +2994,7 @@ def _run_playoff_best_team_job(job_id: str, payload: dict | None = None) -> None
 
     try:
         body = payload or {}
-        latest = load_latest_playoff(body.get("variant"))
+        latest = load_latest_playoff(body.get("variant"), body.get("event_id"))
         if not latest:
             raise HTTPException(status_code=404, detail="No stored playoff simulation found. Run Playoff Bracket first.")
 
@@ -3055,7 +3122,7 @@ def _stored_outcome_detail(latest: dict, idx: int) -> dict:
 
 
 @router.post("/outcome-player-detail")
-def outcome_player_detail(payload: dict | None = None):
+def outcome_player_detail(payload: dict | None = None, event_id: int | None = None):
     """A player's points match by match in one stored outcome (the roster's
     best bracket), under the roster's plan when role_id / booster_assignments
     are given: the assigned role's per-match points replace the player's own
@@ -3063,8 +3130,10 @@ def outcome_player_detail(payload: dict | None = None):
     from backend.services.role_assignment import extract_role_scores_for_player
     from backend.services.swiss_booster_assignment import parse_booster_rates
 
-    body = payload or {}
-    latest = load_latest_playoff(body.get("variant"))
+    body = dict(payload or {})
+    if event_id:
+        body["event_id"] = int(event_id)
+    latest = load_latest_playoff(body.get("variant"), body.get("event_id"))
     if not latest:
         raise HTTPException(status_code=404, detail="No stored playoff simulation found. Run Playoff Bracket first.")
     pid = int(body.get("player_id") or 0)
@@ -3125,7 +3194,7 @@ def outcome_player_detail(payload: dict | None = None):
 
 
 @router.post("/winning-player-detail")
-def winning_player_detail(payload: dict | None = None):
+def winning_player_detail(payload: dict | None = None, event_id: int | None = None):
     """A player's expected points per stage over a set of stored outcomes (the
     brackets a roster wins), weighted by outcome probability, under the
     roster's plan when role_id / booster_assignments are given. Returned in the
@@ -3134,8 +3203,10 @@ def winning_player_detail(payload: dict | None = None):
     from backend.services.role_assignment import extract_role_scores_for_player
     from backend.services.swiss_booster_assignment import parse_booster_rates
 
-    body = payload or {}
-    latest = load_latest_playoff(body.get("variant"))
+    body = dict(payload or {})
+    if event_id:
+        body["event_id"] = int(event_id)
+    latest = load_latest_playoff(body.get("variant"), body.get("event_id"))
     if not latest:
         raise HTTPException(status_code=404, detail="No stored playoff simulation found. Run Playoff Bracket first.")
     results = latest.get("results") or {}
@@ -3383,7 +3454,7 @@ def winning_player_detail(payload: dict | None = None):
 @router.post("/best-team/from-latest")
 def best_team_playoff_from_latest(payload: dict | None = None):
     body = payload or {}
-    latest = load_latest_playoff(body.get("variant"))
+    latest = load_latest_playoff(body.get("variant"), body.get("event_id"))
     if not latest:
         raise HTTPException(status_code=404, detail="No stored playoff simulation found. Run Playoff Bracket first.")
     options = parse_optimizer_payload(body)
@@ -3568,7 +3639,7 @@ def _outcome_matches_completed_bracket(outcome: Dict, picks: Dict[str, object]) 
 
 
 def _selected_completed_outcome_from_latest(payload: dict | None = None) -> tuple[dict, dict]:
-    latest = load_latest_playoff((payload or {}).get("variant"))
+    latest = load_latest_playoff((payload or {}).get("variant"), (payload or {}).get("event_id"))
     if not latest:
         raise HTTPException(status_code=404, detail="No stored playoff simulation found. Run Playoff Bracket first.")
     body = payload or {}
@@ -3795,7 +3866,7 @@ def best_team_for_completed_bracket_from_latest(payload: dict | None = None):
 @router.post("/best-team/bracket-from-latest/start")
 def start_completed_bracket_from_latest(payload: dict | None = None):
     body = payload or {}
-    latest = load_latest_playoff(body.get("variant"))
+    latest = load_latest_playoff(body.get("variant"), body.get("event_id"))
     if not latest:
         raise HTTPException(status_code=404, detail="No stored playoff simulation found. Run Playoff Bracket first.")
 
@@ -3844,8 +3915,8 @@ def get_completed_bracket_job(job_id: str):
 
 
 @router.get("/best-team/bracket-from-latest/latest")
-def get_latest_completed_bracket(variant: str = "main"):
-    latest = load_latest_completed_bracket(variant)
+def get_latest_completed_bracket(variant: str = "main", event_id: int | None = None):
+    latest = load_latest_completed_bracket(variant, event_id)
     if not latest:
         return {"exists": False}
     # Rows saved before all_teams was dropped carry every roster; serializing
@@ -3863,7 +3934,7 @@ def get_latest_completed_bracket(variant: str = "main"):
 @router.post("/best-team/from-latest/start")
 def start_best_team_playoff_from_latest(payload: dict | None = None):
     body = payload or {}
-    latest = load_latest_playoff(body.get("variant"))
+    latest = load_latest_playoff(body.get("variant"), body.get("event_id"))
     if not latest:
         raise HTTPException(status_code=404, detail="No stored playoff simulation found. Run Playoff Bracket first.")
 
@@ -3912,9 +3983,10 @@ def get_best_team_playoff_job(job_id: str):
 
 
 @router.get("/best-team/from-latest/latest")
-def get_latest_best_team_playoff_from_latest(variant: str = "main"):
+def get_latest_best_team_playoff_from_latest(variant: str = "main", event_id: int | None = None):
     states = _states(variant)
-    meta = states["meta"].load()
+    key = _event_key(event_id)
+    meta = states["meta"].load(key=key)
     if meta:
         summary = meta["result"] or {}
         return {
@@ -3937,7 +4009,7 @@ def get_latest_best_team_playoff_from_latest(variant: str = "main"):
     conn = _connect()
     try:
         row = conn.execute(
-            f"SELECT payload_json, updated_at FROM {best_table} WHERE singleton_id = 1"
+            f"SELECT payload_json, updated_at FROM {best_table} WHERE singleton_id = ?", (key,)
         ).fetchone()
         if not row:
             return {"exists": False}
@@ -3958,8 +4030,9 @@ def get_latest_best_team_playoff_from_latest(variant: str = "main"):
                        json_array_length(result_json, '$.all_teams') AS total_teams,
                        json_extract(result_json, '$.processed_combinations') AS processed_combinations,
                        json_extract(result_json, '$.total_combinations') AS total_combinations
-                FROM {best_table} WHERE singleton_id = 1
-                """
+                FROM {best_table} WHERE singleton_id = ?
+                """,
+                (key,),
             ).fetchone()
             if extracted:
                 summary = {key: extracted[key] for key in summary}
@@ -3967,7 +4040,7 @@ def get_latest_best_team_playoff_from_latest(variant: str = "main"):
             pass  # blob too large to summarize here; exists/payload still useful
     finally:
         conn.close()
-    states["meta"].save(payload, summary)
+    states["meta"].save(payload, summary, key=key)
     return {
         "exists": True,
         "payload": payload,
@@ -3981,11 +4054,28 @@ def get_latest_best_team_playoff_from_latest(variant: str = "main"):
 
 
 @router.post("/best-team/from-latest/query")
-def query_latest_best_team_playoff(payload: dict | None = None):
-    body = payload or {}
-    latest = load_latest_playoff_best_team(body.get("variant"))
+def query_latest_best_team_playoff(payload: dict | None = None, event_id: int | None = None):
+    body = dict(payload or {})
+    if event_id:
+        body["event_id"] = int(event_id)
+    key = _event_key(body.get("event_id"))
+    latest = load_latest_playoff_best_team(body.get("variant"), key)
     if not latest:
         raise HTTPException(status_code=404, detail="No stored team combinations found. Run Combinations first.")
+    cache_key = _query_cache_key(body.get("variant"), key, latest["updated_at"], body)
+    with _QUERY_CACHE_LOCK:
+        cached = _QUERY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    response = _query_saved_combos(body, latest)
+    with _QUERY_CACHE_LOCK:
+        if len(_QUERY_CACHE) >= _QUERY_CACHE_MAX:
+            _QUERY_CACHE.pop(next(iter(_QUERY_CACHE)))
+        _QUERY_CACHE[cache_key] = response
+    return response
+
+
+def _query_saved_combos(body: dict, latest: dict) -> dict:
     options = parse_optimizer_payload(body)
     mode = str(body.get("mode") or "average").strip().lower()
     if mode not in {"average", "single_outcome", "most_outcomes"}:
@@ -4017,9 +4107,11 @@ def query_latest_best_team_playoff(payload: dict | None = None):
 
 
 @router.post("/best-team/from-latest/completed-query")
-def query_latest_best_team_for_completed_bracket(payload: dict | None = None):
-    body = payload or {}
-    latest_combos = load_latest_playoff_best_team(body.get("variant"))
+def query_latest_best_team_for_completed_bracket(payload: dict | None = None, event_id: int | None = None):
+    body = dict(payload or {})
+    if event_id:
+        body["event_id"] = int(event_id)
+    latest_combos = load_latest_playoff_best_team(body.get("variant"), body.get("event_id"))
     if not latest_combos:
         raise HTTPException(status_code=404, detail="No stored team combinations found. Run Combinations first.")
     latest_playoff, selected = _selected_completed_outcome_from_latest(body)
@@ -4122,8 +4214,8 @@ def query_latest_best_team_for_completed_bracket(payload: dict | None = None):
 
 
 @router.get("/latest")
-def get_latest_playoff(variant: str = "main"):
-    latest = load_latest_playoff(variant)
+def get_latest_playoff(variant: str = "main", event_id: int | None = None):
+    latest = load_latest_playoff(variant, event_id)
     if not latest:
         return {"exists": False}
     results = latest["results"] or {}
@@ -4141,10 +4233,11 @@ def get_latest_playoff(variant: str = "main"):
 @router.delete("/latest")
 def reset_latest_playoff(variant: str = "main"):
     states = _states(variant)
+    key = _event_key(None)
     conn = _connect()
     try:
         for state in states.values():
-            conn.execute(f"DELETE FROM {state.table} WHERE singleton_id = 1")
+            conn.execute(f"DELETE FROM {state.table} WHERE singleton_id = ?", (key,))
         conn.commit()
     finally:
         conn.close()

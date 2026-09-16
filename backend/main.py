@@ -80,6 +80,10 @@ async def _lifespan(app: FastAPI):
     def _warm() -> None:
         events.warm_kind_cache()  # ~1 s; needed by the first Tournament open
         groups.warm_caches()  # ~10 s: outcome sample + the three default Top 5 queries
+        try:
+            playoff.seed_playoff_queries()  # parse the combos blob + cache the default queries
+        except Exception:  # noqa: BLE001
+            pass
 
     threading.Thread(target=_warm, name="cache-warmup", daemon=True).start()
     yield

@@ -114,6 +114,27 @@ class SingletonState:
         finally:
             conn.close()
 
+    def migrate_legacy_row(self, to_key: int) -> bool:
+        """Re-key the single-row era row (key 1) as `to_key` when no row for
+        that key exists yet: when a table becomes keyed, the run it holds
+        keeps showing for the event it belonged to (the active one)."""
+        if not self.keyed or int(to_key) == 1:
+            return False
+        conn = connect()
+        try:
+            has_legacy = conn.execute(f"SELECT 1 FROM {self.table} WHERE singleton_id = 1").fetchone()
+            has_target = conn.execute(
+                f"SELECT 1 FROM {self.table} WHERE singleton_id = ?", (int(to_key),)
+            ).fetchone()
+            if not has_legacy or has_target:
+                return False
+            conn.execute(f"UPDATE {self.table} SET singleton_id = ? WHERE singleton_id = 1", (int(to_key),))
+            conn.commit()
+        finally:
+            conn.close()
+        self.invalidate()
+        return True
+
     # ---- persistence ---------------------------------------------------------
     def save(self, payload: dict, result: dict, key: Optional[int] = None) -> None:
         k = self._key(key)

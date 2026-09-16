@@ -393,7 +393,33 @@ const requestJson = async (path, init = {}, timeoutMs = 60000) => {
   return data;
 };
 
-const api = window.api || {
+// Public build: the event the user is viewing (null = follow the server's
+// active event). Tournament-data requests carry it as ?event_id= so the
+// backend serves that event's stored runs (see _event_key in the routers).
+let VIEW_EVENT_ID = (() => {
+  try {
+    const v = Number(localStorage.getItem("cs.viewEventId"));
+    return Number.isFinite(v) && v > 0 ? v : null;
+  } catch {
+    return null;
+  }
+})();
+const rememberViewEvent = (id) => {
+  VIEW_EVENT_ID = id || null;
+  try {
+    if (id) localStorage.setItem("cs.viewEventId", String(id));
+    else localStorage.removeItem("cs.viewEventId");
+  } catch {
+    /* per-viewer convenience only */
+  }
+};
+const EVENT_SCOPED_PATH = /^\/(playoff|groups|simulate|best-team)(\/|$)/;
+const withViewEvent = (path) => {
+  if (!PUBLIC_BUILD || !VIEW_EVENT_ID || !EVENT_SCOPED_PATH.test(path)) return path;
+  return `${path}${path.includes("?") ? "&" : "?"}event_id=${VIEW_EVENT_ID}`;
+};
+
+const rawApi = window.api || {
   get: (path, timeoutMs) => requestJson(path, {}, timeoutMs),
   post: (path, body) =>
     requestJson(path, {
@@ -411,6 +437,12 @@ const api = window.api || {
     }
     return { status: "ok" };
   },
+};
+const api = {
+  ...rawApi,
+  get: (path, timeoutMs) => rawApi.get(withViewEvent(path), timeoutMs),
+  post: (path, body, timeoutMs) => rawApi.post(withViewEvent(path), body, timeoutMs),
+  delete: (path) => rawApi.delete(withViewEvent(path)),
 };
 
 const TOP_RATING_TIERS = [5, 10, 20, 30, 50];
@@ -7574,7 +7606,7 @@ function DevLabTab({ players }) {
   );
 }
 
-function EventsTab({ refreshData, notify, players, teams = [], onOpenPlayer, onOpenTeam }) {
+function EventsTab({ refreshData, notify, players, teams = [], onOpenPlayer, onOpenTeam, viewEventId = null, onViewEvent = null }) {
   const [events, setEvents] = useState([]);
   const [activeEventId, setActiveEventId] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -7613,16 +7645,18 @@ function EventsTab({ refreshData, notify, players, teams = [], onOpenPlayer, onO
     loadEvents();
   }, []);
 
-  // Teams & Prices below the table always shows the ACTIVE event.
+  // Teams & Prices below the table shows the ACTIVE event (operator) or the
+  // event the user is viewing (public build).
+  const shownEventId = PUBLIC_BUILD ? viewEventId ?? activeEventId : activeEventId;
   const [activeEventDetail, setActiveEventDetail] = useState(null);
   useEffect(() => {
-    if (!activeEventId) {
+    if (!shownEventId) {
       setActiveEventDetail(null);
       return undefined;
     }
     let cancelled = false;
     api
-      .get(`/events/${activeEventId}`)
+      .get(`/events/${shownEventId}`)
       .then((d) => {
         if (!cancelled && d && !d.detail) setActiveEventDetail(d);
       })
@@ -7630,7 +7664,7 @@ function EventsTab({ refreshData, notify, players, teams = [], onOpenPlayer, onO
     return () => {
       cancelled = true;
     };
-  }, [activeEventId]);
+  }, [shownEventId]);
 
   // Active event rosters: teams in HLTV-rank order (best first, unranked
   // last), players by price, each joined with their overall rating.
@@ -7710,7 +7744,19 @@ function EventsTab({ refreshData, notify, players, teams = [], onOpenPlayer, onO
                       <td>{ev.team_count ?? 0}</td>
                       <td>
                         {PUBLIC_BUILD ? (
-                          activeEventId === ev.event_id ? <span className="event-active-badge">Active</span> : <span className="muted">-</span>
+                          <div className="event-status-cell">
+                            {activeEventId === ev.event_id && <span className="event-active-badge">Current</span>}
+                            {shownEventId === ev.event_id ? (
+                              <span className="event-viewing-badge">Viewing</span>
+                            ) : (
+                              <button
+                                className="secondary"
+                                onClick={() => onViewEvent && onViewEvent(ev.event_id === activeEventId ? null : ev.event_id)}
+                              >
+                                View
+                              </button>
+                            )}
+                          </div>
                         ) : (
                           <div className="actions" style={{ marginTop: 0 }}>
                             <button
@@ -14545,19 +14591,24 @@ function BountyTab(props) {
   );
 }
 
-function TournamentTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpenPlayer, refresh, notify }) {
+function TournamentTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpenPlayer, refresh, notify, eventId = null, onSelectEvent = null }) {
   // One adaptive page: the active fantasy event's kind (per-stage, e.g. a
   // "Cologne Groups" event shows only the group stage) picks which tournament
   // UI renders. Auto-detected on the backend; a manual override is stored on
   // the event for the rare ambiguous case (and to reach Bounty mode).
   const [kindInfo, setKindInfo] = useState(null);
   const [message, setMessage] = useState("");
+  // Imported events + the server's current one, for the public event picker.
+  const [eventList, setEventList] = useState([]);
+  const [serverActive, setServerActive] = useState(null);
 
   const loadKind = async () => {
     setMessage("");
     try {
       const evs = await api.get("/events/");
-      const active = evs?.active_event_id ?? null;
+      setEventList(evs?.events || []);
+      setServerActive(evs?.active_event_id ?? null);
+      const active = eventId ?? evs?.active_event_id ?? null;
       if (active == null) {
         setKindInfo(null);
         setMessage("No active fantasy event. Set one active in the Events tab.");
@@ -14586,8 +14637,29 @@ function TournamentTab({ teams, teamLookup, players, sortTeams, applyFilters, on
 
   const kind = kindInfo?.kind || null;
   const sharedProps = { teams, teamLookup, players, sortTeams, applyFilters, onOpenPlayer };
+  const viewedId = eventId ?? serverActive;
   return (
     <div className="stack">
+      {PUBLIC_BUILD && eventList.length > 1 && (
+        <div className="event-picker">
+          <span className="event-picker-label">Event</span>
+          <select
+            id="tournament-event-picker"
+            value={viewedId ?? ""}
+            onChange={(e) => {
+              const id = Number(e.target.value);
+              if (onSelectEvent) onSelectEvent(id === serverActive ? null : id);
+            }}
+          >
+            {eventList.map((ev) => (
+              <option key={ev.event_id} value={ev.event_id}>
+                {ev.name || `Event ${ev.event_id}`}
+                {ev.event_id === serverActive ? " (current)" : ""}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
       {message && <p className="muted">{message}</p>}
       {!kind && !message && <p className="muted">Loading tournament...</p>}
       {kind && !["swiss", "groups", "playoff", "bounty", "double_elim"].includes(kind) && (
@@ -14634,6 +14706,12 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const server = useServerStatus();
+  // Public build: which event the user is looking at (null = the server's).
+  const [viewEventId, setViewEventIdState] = useState(VIEW_EVENT_ID);
+  const selectViewEvent = (id) => {
+    rememberViewEvent(id);
+    setViewEventIdState(id || null);
+  };
   // When the server comes back after an outage the tabs' first loads have
   // already failed; fetch again as soon as the gate lifts.
   const serverWasOk = useRef(server.status === "ok");
@@ -14762,11 +14840,14 @@ export default function App() {
         teams={teams}
         onOpenPlayer={handleOpenPlayerFromAnywhere}
         onOpenTeam={handleOpenTeamFromAnywhere}
+        viewEventId={viewEventId}
+        onViewEvent={selectViewEvent}
       />
     ),
     devlab: <DevLabTab players={players} />,
     tournament: (
       <TournamentTab
+        key={`tournament-${viewEventId || "current"}`}
         teams={teams}
         teamLookup={teamLookup}
         players={players}
@@ -14775,6 +14856,8 @@ export default function App() {
         onOpenPlayer={handleOpenPlayerFromAnywhere}
         refresh={load}
         notify={notify}
+        eventId={viewEventId}
+        onSelectEvent={selectViewEvent}
       />
     ),
     scheduling: <SchedulingTab notify={notify} players={players} refresh={load} mapStats={mapStatsJob} teams={teams} />,
