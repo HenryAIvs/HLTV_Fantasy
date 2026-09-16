@@ -17,6 +17,7 @@ from backend.data.player_db import ensure_schema, ensure_topx_windows_schema
 from backend.data.team_db import ensure_team_schema
 from backend.data.schedule_db import ensure_schedule_schema
 from backend.services.scheduler import scheduler
+from backend.services.public_access import PublicAccessMiddleware, admin_token
 
 SCHEMA_INITIALIZERS = (
     ensure_schema,
@@ -77,8 +78,8 @@ async def _lifespan(app: FastAPI):
     import threading
 
     def _warm() -> None:
-        groups.warm_caches()
-        events.warm_kind_cache()
+        events.warm_kind_cache()  # ~1 s; needed by the first Tournament open
+        groups.warm_caches()  # ~10 s: outcome sample + the three default Top 5 queries
 
     threading.Thread(target=_warm, name="cache-warmup", daemon=True).start()
     yield
@@ -88,6 +89,12 @@ async def _lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     configure_logging()
     app = FastAPI(title="CS Fantasy API", version="0.1.0", lifespan=_lifespan)
+    # Public callers (the distributed app, anything through the tunnel) only
+    # reach the read-only surface; the operator's own machine and holders of
+    # the admin token get everything. Added before CORS so refusals still
+    # carry the CORS headers.
+    app.add_middleware(PublicAccessMiddleware)
+    admin_token()  # make sure .runtime/admin-token.txt exists for the operator
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -96,6 +103,24 @@ def create_app() -> FastAPI:
     )
     for router, prefix, tag in ROUTERS:
         app.include_router(router, prefix=prefix, tags=[tag])
+
+    @app.get("/public/config")
+    def public_config() -> dict:
+        """What the distributed app needs to know about this server."""
+        from backend.data.event_db import get_active_event_id
+
+        try:
+            active = get_active_event_id()
+        except Exception:
+            active = None
+        return {
+            "app": APP_ID,
+            "name": "CS Fantasy Toolkit",
+            "api_version": "0.1.0",
+            "min_client_version": "0.1.0",
+            "active_event_id": active,
+            "message": "",
+        }
 
     @app.get("/health")
     def health() -> dict:

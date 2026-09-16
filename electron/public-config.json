@@ -1,0 +1,5 @@
+{
+  "apiBase": "http://127.0.0.1:8000",
+  "configUrl": "https://henryaivs.github.io/HLTV_Fantasy/api.json",
+  "siteUrl": "https://henryaivs.github.io/HLTV_Fantasy/"
+}

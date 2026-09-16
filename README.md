@@ -57,7 +57,7 @@ backend/
   swiss_stage/      Swiss-bracket Monte Carlo simulation
 electron/
   main.js           Electron entry; spawns the backend
-  preload.js        Exposes a small fetch wrapper as window.api
+  preload.cjs       Exposes a small fetch wrapper as window.api
   src/App.jsx       React UI
 scripts/migrations/ One-off historical schema migrations (already applied)
 ```

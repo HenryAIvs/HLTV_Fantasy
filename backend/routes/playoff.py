@@ -18,7 +18,7 @@ from backend.data.player_db import get_player
 from backend.data.singleton_state import SingletonState
 from backend.data.team_db import get_team_by_id
 from backend.services.team_optimizer import iter_valid_rosters, optimize_rosters, parse_optimizer_payload, serialize_roster
-from backend.swiss_stage.fantasy_scoring import compute_elimination_penalty_components
+from backend.swiss_stage.fantasy_scoring import compute_elimination_penalty_components, compute_role_points
 from backend.swiss_stage.team_initialization import initialize_teams
 from backend.swiss_stage.swiss_models import TeamState, PlayerState
 from backend.services.match_engine import simulate_match_outcome, apply_fantasy_points_for_team, calculate_win_probability, BOOSTER_NAMES
@@ -219,6 +219,19 @@ def _booster_slots_for(ps: PlayerState | None) -> list[dict]:
             }
         )
     return slots
+
+
+def _role_info_for(ps: PlayerState | None) -> dict | None:
+    """The player's best role as the modal shows it: id, trigger rates and
+    points per match."""
+    if ps is None:
+        return None
+    return {
+        "role_id": ps.role_id,
+        "major": float(ps.major_pct or 0.0),
+        "minor": float(ps.minor_pct or 0.0),
+        "points": float(compute_role_points(ps)),
+    }
 
 
 def _build_playoff_lookup_context(team_slots: List[int]) -> tuple[Dict[int, dict], Dict[int, int]]:
@@ -672,6 +685,7 @@ def _exact_weighted_player_totals(
                 "total_points_without_booster": (sums["rating"] + sums["win"] + sums["role"]) / denom,
                 "role_id": ps.role_id if ps else None,
                 "booster_slots": _booster_slots_for(ps),
+                "role_info": _role_info_for(ps),
             }
         results[tid] = {
             "team_id": tid,
@@ -806,6 +820,7 @@ def _exact_bracket6_player_totals(
                 "total_points_without_booster": (sums["rating"] + sums["win"] + sums["role"]) / denom,
                 "role_id": ps.role_id if ps else None,
                 "booster_slots": _booster_slots_for(ps),
+                "role_info": _role_info_for(ps),
             }
         results[tid] = {"team_id": tid, "wins": 0, "losses": 0, "players": players_out}
 
@@ -1032,6 +1047,7 @@ def _monte_carlo_parallel(
                 "total_points_without_booster": (sums["rating"] + sums["win"] + sums["role"]) / denom,
                 "role_id": ps.role_id if ps else None,
                 "booster_slots": _booster_slots_for(ps),
+                "role_info": _role_info_for(ps),
             }
         results[tid] = {"team_id": tid, "wins": 0, "losses": 0, "players": players_out}
 
@@ -1116,6 +1132,7 @@ def _monte_carlo_bracket_totals(
                 "total_points_without_booster": (sums["rating"] + sums["win"] + sums["role"]) / denom,
                 "role_id": ps.role_id if ps else None,
                 "booster_slots": _booster_slots_for(ps),
+                "role_info": _role_info_for(ps),
             }
         results[tid] = {"team_id": tid, "wins": 0, "losses": 0, "players": players_out}
 
@@ -1176,6 +1193,7 @@ def _exact_bracket_n_player_totals(
     n_players = len(pids)
     totals = np.zeros((n_players, n_out), dtype=np.float32)
     rw_mat = np.zeros((n_players, n_out), dtype=np.float32)  # rating + win (penalties included) per outcome
+    rt_mat = np.zeros((n_players, n_out), dtype=np.float32)  # rating alone per outcome
     mp_mat = np.zeros((n_players, n_out), dtype=np.uint8)  # matches played per outcome
     comps_ev = np.zeros((n_players, 5), dtype=np.float64)  # Σ prob × [total, rating, win, role, booster]
     probs = np.zeros(n_out, dtype=np.float64)
@@ -1225,6 +1243,7 @@ def _exact_bracket_n_player_totals(
         probs[idx] = prob
         totals[:, idx] = run[0]
         rw_mat[:, idx] = np.asarray(run[1], dtype=np.float64) + np.asarray(run[2], dtype=np.float64)
+        rt_mat[:, idx] = np.asarray(run[1], dtype=np.float64)
         mp_mat[:, idx] = run_mp
         for c in range(5):
             comps_ev[:, c] += prob * np.asarray(run[c], dtype=np.float64)
@@ -1285,6 +1304,7 @@ def _exact_bracket_n_player_totals(
                 "total_points_without_booster": float(e[1] + e[2] + e[3]),
                 "role_id": ps.role_id if ps else None,
                 "booster_slots": _booster_slots_for(ps),
+                "role_info": _role_info_for(ps),
             }
         results[tid] = {"team_id": tid, "wins": 0, "losses": 0, "players": players_out}
     outcomes = [{"probability": float(probs[i]), "code": int(i)} for i in range(n_out)]
@@ -1297,6 +1317,7 @@ def _exact_bracket_n_player_totals(
             "f32_b64": base64.b64encode(totals.tobytes()).decode("ascii"),
             "rw_b64": base64.b64encode(rw_mat.tobytes()).decode("ascii"),
             "mp_b64": base64.b64encode(mp_mat.tobytes()).decode("ascii"),
+            "rt_b64": base64.b64encode(rt_mat.tobytes()).decode("ascii"),
         },
         "bracket_template": template,
     }
@@ -1414,14 +1435,20 @@ def _outcome_matrix(results: Dict) -> tuple:
         n = int(om.get("n") or len(outcomes))
         M = np.frombuffer(base64.b64decode(om["f32_b64"]), dtype=np.float32).reshape(len(pids), n).astype(np.float64)
         probs = np.asarray([float(o.get("probability") or 0.0) for o in outcomes], dtype=np.float64)
-        RW = MP = MR = None
+        RW = MP = MR = RT = None
         if om.get("rw_b64") and om.get("mp_b64"):
+            if om.get("rt_b64"):
+                RT = np.frombuffer(base64.b64decode(om["rt_b64"]), dtype=np.float32).reshape(len(pids), n).astype(np.float64)
             RW = np.frombuffer(base64.b64decode(om["rw_b64"]), dtype=np.float32).reshape(len(pids), n).astype(np.float64)
             MP = np.frombuffer(base64.b64decode(om["mp_b64"]), dtype=np.uint8).reshape(len(pids), n).copy()
-            MR = MP.astype(np.float64)
-        return pids, M, probs, RW, MP, MR
+            if om.get("mr_b64"):
+                # role matches differ from matches played when a champion is padded
+                MR = np.frombuffer(base64.b64decode(om["mr_b64"]), dtype=np.uint8).reshape(len(pids), n).astype(np.float64)
+            else:
+                MR = MP.astype(np.float64)
+        return pids, M, probs, RW, MP, MR, RT
     if not outcomes:
-        return [], None, None, None, None, None
+        return [], None, None, None, None, None, None
     pid_set = sorted({int(pid) for o in outcomes for pid in (o.get("players") or {})})
     idx = {pid: i for i, pid in enumerate(pid_set)}
     n = len(outcomes)
@@ -1429,6 +1456,7 @@ def _outcome_matrix(results: Dict) -> tuple:
     probs = np.zeros(n, dtype=np.float64)
     has_components = all(o.get("player_components") for o in outcomes)
     RW = np.zeros((len(pid_set), n), dtype=np.float64) if has_components else None
+    RT = np.zeros((len(pid_set), n), dtype=np.float64) if has_components else None
     MP = np.zeros((len(pid_set), n), dtype=np.uint8) if has_components else None
     pid_team = {}
     for tid, tdata in (results.get("teams") or {}).items():
@@ -1441,6 +1469,7 @@ def _outcome_matrix(results: Dict) -> tuple:
         if has_components:
             for pid, comp in (o.get("player_components") or {}).items():
                 RW[idx[int(pid)], c] = float(comp.get("rating") or 0.0) + float(comp.get("win") or 0.0)
+                RT[idx[int(pid)], c] = float(comp.get("rating") or 0.0)
             played: Dict[int, int] = {}
             for matches in (o.get("bracket") or {}).values():
                 for m in matches or []:
@@ -1449,7 +1478,7 @@ def _outcome_matrix(results: Dict) -> tuple:
             for pid in pid_set:
                 MP[idx[pid], c] = played.get(pid_team.get(pid, -1), 0)
     MR = MP.astype(np.float64) if has_components else None
-    return pid_set, M, probs, RW, MP, MR
+    return pid_set, M, probs, RW, MP, MR, RT
 
 
 def _bracket_player_totals(
@@ -1495,6 +1524,617 @@ def _bracket_player_totals(
         progress_callback=progress_callback,
     )
     return results, best, count, outcomes, None
+
+
+def _bracket_kind(value) -> str:
+    """'double' for a whole-event double-elimination bracket, else 'single'."""
+    return "double" if str(value or "").strip().lower() in ("double", "double_elim", "de8", "de8_full") else "single"
+
+
+def _normalize_playoff_payload(payload: dict) -> dict:
+    slots: List[int] = payload.get("team_slots") or []
+    if len(slots) not in _ALLOWED_BRACKET_SIZES:
+        raise HTTPException(status_code=400, detail="team_slots must contain 6, 8, or 16 team IDs")
+    bracket_kind = _bracket_kind(payload.get("bracket_kind"))
+    if bracket_kind == "double" and len(slots) != 8:
+        raise HTTPException(status_code=400, detail="The double-elimination bracket needs exactly 8 teams")
+    has_third_place_decider = bool(payload.get("has_third_place_decider", False))
+    if len(slots) == 6 or bracket_kind == "double":
+        has_third_place_decider = False  # the byes bracket and double elimination have no decider
+    normalized = {
+        "team_slots": [int(x) for x in slots],
+        "has_third_place_decider": has_third_place_decider,
+        "bracket_kind": bracket_kind,
+    }
+    mc_sims = _clamp_mc_sims(payload.get("mc_sims"))
+    if mc_sims:
+        normalized["mc_sims"] = mc_sims
+    if _variant(payload.get("variant")) == "bounty":
+        qf_pairs_raw = payload.get("qf_pairs") or []
+        qf_pairs = [[int(a), int(b)] for a, b in qf_pairs_raw] if len(qf_pairs_raw) == 4 else []
+        used = [tid for pair in qf_pairs for tid in pair]
+        if sorted(used) != sorted(normalized["team_slots"]):
+            raise HTTPException(status_code=400, detail="qf_pairs must pair all 8 teams exactly once (finish the draft first)")
+        normalized["variant"] = "bounty"
+        normalized["qf_pairs"] = qf_pairs
+        normalized["sf_picks"] = dict(payload.get("sf_picks") or {})
+        normalized["has_third_place_decider"] = False
+        normalized["bracket_kind"] = "single"
+    return normalized
+
+
+def _bounty_sf_pairs_resolver(team_slots: List[int], sf_picks: dict):
+    """SF pairings for a set of QF winners in the Bounty re-draft format.
+
+    `sf_picks` maps a scenario key (the 4 surviving team ids, sorted ascending,
+    joined with '-') to explicit SF pairs [[a, b], [c, d]]. Scenarios without a
+    stored pick fall back to the default: the highest-seeded bottom-half
+    survivor drafts the weakest (lowest-seeded) top-half survivor.
+    """
+    seed_index = {int(tid): idx for idx, tid in enumerate(team_slots)}
+
+    def resolve(qf_winners: List[int]):
+        winners = [int(t) for t in qf_winners]
+        key = "-".join(str(t) for t in sorted(winners))
+        picked = sf_picks.get(key)
+        if picked and len(picked) == 2:
+            pairs = [[int(a), int(b)] for a, b in picked]
+            if sorted(t for pair in pairs for t in pair) == sorted(winners):
+                return [(pairs[0][0], pairs[0][1]), (pairs[1][0], pairs[1][1])]
+        surv = sorted(winners, key=lambda t: seed_index.get(t, 99))
+        return [(surv[2], surv[1]), (surv[3], surv[0])]
+
+    return resolve
+
+
+# --- 8-team double elimination played as the whole event (StarLadder StarSeries) ---
+#
+# (match key, stage, feeder A, feeder B) in play order; feeders are ("seed",
+# slot index), ("win", match key) or ("lose", match key). Lower semis are
+# crossed (each upper-semi loser meets the OTHER side's lower-round-1 winner)
+# and the consolidation final is the upper-final loser v the lower-final
+# winner — HLTV's DoubleElimination8 routing, verified by the autofill parser.
+_DOUBLE8_MATCHES: List[tuple] = [
+    ("ub_r1_1", "ub_r1", ("seed", 0), ("seed", 1)),
+    ("ub_r1_2", "ub_r1", ("seed", 2), ("seed", 3)),
+    ("ub_r1_3", "ub_r1", ("seed", 4), ("seed", 5)),
+    ("ub_r1_4", "ub_r1", ("seed", 6), ("seed", 7)),
+    ("ub_sf_1", "ub_sf", ("win", "ub_r1_1"), ("win", "ub_r1_2")),
+    ("ub_sf_2", "ub_sf", ("win", "ub_r1_3"), ("win", "ub_r1_4")),
+    ("lb_r1_1", "lb_r1", ("lose", "ub_r1_1"), ("lose", "ub_r1_2")),
+    ("lb_r1_2", "lb_r1", ("lose", "ub_r1_3"), ("lose", "ub_r1_4")),
+    ("lb_sf_1", "lb_sf", ("lose", "ub_sf_2"), ("win", "lb_r1_1")),
+    ("lb_sf_2", "lb_sf", ("lose", "ub_sf_1"), ("win", "lb_r1_2")),
+    ("ub_final", "ub_final", ("win", "ub_sf_1"), ("win", "ub_sf_2")),
+    ("lb_final", "lb_final", ("win", "lb_sf_1"), ("win", "lb_sf_2")),
+    ("cons_final", "cons_final", ("lose", "ub_final"), ("win", "lb_final")),
+    ("grand_final", "grand_final", ("win", "ub_final"), ("win", "cons_final")),
+]
+# Stages in schedule order, including the two rounds a team can sit out.
+_DOUBLE8_STAGES = ["ub_r1", "ub_sf", "lb_r1", "bye_r3", "lb_sf", "ub_final", "lb_final", "bye_r5", "cons_final", "grand_final"]
+# The event is scored as six rounds: 1 upper round 1 · 2 upper semis + lower
+# round 1 · 3 lower semis · 4 upper final + lower final · 5 consolidation
+# final · 6 grand final. A team knocked out in round r is charged -3 for each
+# of the 6 - r rounds it misses (lower-bracket losses only; upper-bracket
+# losers drop down). Upper-semi winners sit out round 3 and are padded with
+# the per-match average of their first two games; the upper-final winner sits
+# out round 5 and is padded with the average of its three real games. Pads
+# carry rating, win and role, no booster.
+_DOUBLE8_ROUNDS_TOTAL = 6
+_DOUBLE8_REM = {"ub_r1": 0, "ub_sf": 0, "ub_final": 0, "lb_r1": 4, "lb_sf": 3, "lb_final": 2, "cons_final": 1, "grand_final": 0}
+_DOUBLE8_PAD_AFTER = {"ub_sf": ("bye_r3", 2), "ub_final": ("bye_r5", 3)}  # stage -> (pad stage, real games averaged)
+# Lower-bracket rounds a team knocked out at a stage then misses (-3 each; the
+# stage stats credit them there, as the group stats do, instead of on the loss)
+_DOUBLE8_MISSED_AFTER = {
+    "lb_r1": ["lb_sf", "lb_final", "cons_final", "grand_final"],
+    "lb_sf": ["lb_final", "cons_final", "grand_final"],
+    "lb_final": ["cons_final", "grand_final"],
+    "cons_final": ["grand_final"],
+}
+# How the Point Sources modal lays the stages out: two bracket sections
+# (rounds 1-3, rounds 4-6) with upper and lower rows; the byes are pad cards.
+_DOUBLE8_LAYOUT = [
+    {"key": "ub_r1", "full": "Upper round 1", "section": "r13", "section_title": "Rounds 1 – 3", "bracket": "upper", "opener": True},
+    {"key": "ub_sf", "full": "Upper semi-final", "section": "r13", "section_title": "Rounds 1 – 3", "bracket": "upper"},
+    {"key": "bye_r3", "full": "Round 3 bye", "section": "r13", "section_title": "Rounds 1 – 3", "bracket": "upper", "pad": True},
+    {"key": "lb_r1", "full": "Lower round 1", "section": "r13", "section_title": "Rounds 1 – 3", "bracket": "lower"},
+    {"key": "lb_sf", "full": "Lower semi-final", "section": "r13", "section_title": "Rounds 1 – 3", "bracket": "lower"},
+    {"key": "ub_final", "full": "Upper final", "section": "r46", "section_title": "Rounds 4 – 6", "bracket": "upper"},
+    {"key": "bye_r5", "full": "Round 5 bye", "section": "r46", "section_title": "Rounds 4 – 6", "bracket": "upper", "pad": True},
+    {"key": "grand_final", "full": "Grand final", "section": "r46", "section_title": "Rounds 4 – 6", "bracket": "upper"},
+    {"key": "lb_final", "full": "Lower final", "section": "r46", "section_title": "Rounds 4 – 6", "bracket": "lower"},
+    {"key": "cons_final", "full": "Consolidation final", "section": "r46", "section_title": "Rounds 4 – 6", "bracket": "lower"},
+]
+_DOUBLE8_PADDING_RULE = (
+    "Six scheduled rounds: upper-semi winners sit out round 3 and are padded with the per-match average of their "
+    "first two games; the upper-final winner sits out round 5 and is padded with the average of its three real games "
+    "(rating, win, role, no booster). A team knocked out in round r is charged -3 for each of the 6 - r rounds it misses."
+)
+
+
+def _double8_feed(feeder, team_slots: List[int], winners: Dict[str, int], losers: Dict[str, int]) -> int:
+    kind, ref = feeder[0], feeder[1]
+    if kind == "seed":
+        return int(team_slots[int(ref)])
+    return int((winners if kind == "win" else losers)[str(ref)])
+
+
+def _double8_template(team_slots: List[int]) -> Dict:
+    return {
+        "kind": "double",
+        "team_slots": [int(t) for t in team_slots],
+        "matches": [[k, s, list(fa), list(fb)] for k, s, fa, fb in _DOUBLE8_MATCHES],
+        "stages": list(_DOUBLE8_STAGES),
+        "third_place": False,
+        "rounds": 0,
+    }
+
+
+def _decode_double8_code(code: int, template: Dict, prob_cache: Dict | None = None) -> Dict[str, List[dict]]:
+    """The bracket dict (stage -> matches with winner / loser / p_win_a / teams)
+    for one outcome code of the double-elimination enumeration (one bit per
+    match in play order, 0 = the first-listed team wins)."""
+    team_slots = [int(t) for t in template.get("team_slots") or []]
+    matches = template.get("matches") or [[k, s, list(fa), list(fb)] for k, s, fa, fb in _DOUBLE8_MATCHES]
+    prob_cache = prob_cache if prob_cache is not None else {}
+    n_matches = len(matches)
+    winners: Dict[str, int] = {}
+    losers: Dict[str, int] = {}
+    out: Dict[str, List[dict]] = {}
+    for m, (key, stage, fa, fb) in enumerate(matches):
+        a = _double8_feed(fa, team_slots, winners, losers)
+        b = _double8_feed(fb, team_slots, winners, losers)
+        bit = (int(code) >> (n_matches - 1 - m)) & 1
+        w, l = (b, a) if bit else (a, b)
+        winners[key] = w
+        losers[key] = l
+        out.setdefault(stage, []).append({"key": key, "winner": w, "loser": l, "p_win_a": cached_win_prob(prob_cache, a, b), "teams": [a, b]})
+    return out
+
+
+def _double8_match_winners_to_code(team_slots: List[int], match_winners: List[int]) -> int:
+    """Outcome code of a fully picked bracket (raises HTTPException on a pick
+    that is not in its match)."""
+    winners: Dict[str, int] = {}
+    losers: Dict[str, int] = {}
+    code = 0
+    for m, (key, _stage, fa, fb) in enumerate(_DOUBLE8_MATCHES):
+        a = _double8_feed(fa, team_slots, winners, losers)
+        b = _double8_feed(fb, team_slots, winners, losers)
+        picked = int(match_winners[m])
+        if picked not in (a, b):
+            raise HTTPException(status_code=400, detail=f"{key}: winner {picked} is not in match ({a} vs {b}).")
+        winners[key] = picked
+        losers[key] = a if picked == b else b
+        code = (code << 1) | (1 if picked == b else 0)
+    return code
+
+
+def _exact_double8_player_totals(
+    team_slots: List[int],
+    vrs_ranks: Dict[int, int],
+    progress_callback=None,
+) -> tuple[Dict[int, Dict], Dict, int, List[Dict], Dict]:
+    """Exact enumeration of the whole 8-team double-elimination bracket: 14
+    matches, 16,384 outcomes. Every distinct pairing (teams, winner, each
+    side's match number, rounds the loser misses) is scored once with the
+    deterministic scorer and memoised; the walk adds and subtracts those rows.
+    The two round pads (_DOUBLE8_PAD_AFTER) are applied on the path as soon
+    as the match that earns them is won, from the winner's real games so far.
+    Outputs the compact per-outcome matrices (totals, rating+win, matches
+    played, matches the role scores for) for the roster optimiser and the
+    stage stats (team reach per stage, per-player expected points per stage
+    with opponent rows; the pads sit on their own bye stages)."""
+    import numpy as np
+
+    n = len(team_slots)
+    if n != 8:
+        raise ValueError(f"the double-elimination bracket needs 8 teams, got {n}")
+    team_slots = [int(t) for t in team_slots]
+    base_states = initialize_teams(team_slots, vrs_ranks)
+    player_rows_by_id, team_rank_by_id = _build_playoff_lookup_context(team_slots)
+    prob_cache: Dict[tuple[int, int], float] = {}
+    pids: List[int] = []
+    pid_index: Dict[int, int] = {}
+    team_pids: Dict[int, List[int]] = {}
+    team_of_pid: Dict[int, int] = {}
+    for tid in team_slots:
+        team_pids[tid] = []
+        for pid in base_states[tid].players:
+            pid_index[int(pid)] = len(pids)
+            pids.append(int(pid))
+            team_pids[tid].append(int(pid))
+            team_of_pid[int(pid)] = tid
+    n_players = len(pids)
+    team_arr = np.asarray([team_of_pid[pid] for pid in pids], dtype=np.int64)
+    team_idx = {tid: np.asarray([pid_index[p] for p in team_pids[tid]], dtype=np.int64) for tid in team_slots}
+    n_matches = len(_DOUBLE8_MATCHES)
+    n_out = 2 ** n_matches
+    totals = np.zeros((n_players, n_out), dtype=np.float32)
+    rw_mat = np.zeros((n_players, n_out), dtype=np.float32)
+    rt_mat = np.zeros((n_players, n_out), dtype=np.float32)  # rating alone (pads included)
+    mp_mat = np.zeros((n_players, n_out), dtype=np.uint8)
+    mr_mat = np.zeros((n_players, n_out), dtype=np.uint8)
+    comps_ev = np.zeros((n_players, 5), dtype=np.float64)  # Σ prob × [total, rating, win, role, booster]
+    probs = np.zeros(n_out, dtype=np.float64)
+    run = np.zeros((5, n_players), dtype=np.float64)  # real match rows along the path: total, rating, win, role, booster
+    run_mp = np.zeros(n_players, dtype=np.int64)
+    padv = np.zeros((3, n_players), dtype=np.float64)  # round pads along the path: rating, win, role
+    pad_cnt = np.zeros(n_players, dtype=np.int64)
+    memo: Dict[tuple, tuple] = {}
+    pair_acc: Dict[tuple, float] = {}  # (stage, a, b, winner, num_a, num_b) -> probability mass
+    pad_stages = sorted({st for st, _g in _DOUBLE8_PAD_AFTER.values()})
+    pad_acc = {st: np.zeros((3, n_players), dtype=np.float64) for st in pad_stages}  # Σ prob × pad
+    pad_reach = {st: {tid: 0.0 for tid in team_slots} for st in pad_stages}
+    champion_acc: Dict[int, float] = {tid: 0.0 for tid in team_slots}
+    played: Dict[int, int] = {tid: 0 for tid in team_slots}
+    winners: Dict[str, int] = {}
+    losers: Dict[str, int] = {}
+
+    def pairing(a: int, b: int, winner: int, num_a: int, num_b: int, rem: int) -> tuple:
+        key = (a, b, winner, num_a, num_b, rem)
+        hit = memo.get(key)
+        if hit is not None:
+            return hit
+        states = {
+            a: _fresh_bracket_state(base_states, a, num_a - 1),
+            b: _fresh_bracket_state(base_states, b, num_b - 1),
+        }
+        _w, _l, p_a, _branch = _play_match_deterministic(
+            states, a, b, winner, remaining_rounds_after=rem, prob_cache=prob_cache,
+            player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id,
+        )
+        idx: List[int] = []
+        comps: List[List[float]] = []
+        meta: List[dict] = []
+        for ts in states.values():
+            for pid, p in ts.players.items():
+                idx.append(pid_index[int(pid)])
+                comps.append([
+                    float(p.total_points), float(p.rating_points_total), float(p.win_points_total),
+                    float(p.role_points_total), float(p.booster_points_total),
+                ])
+                row = next((r for r in p.point_breakdown if r.get("match_number") is not None), {})
+                meta.append({
+                    "booster_id": row.get("booster_id"),
+                    "booster_name": row.get("booster_name"),
+                    "booster_rate": float(row.get("booster_trigger_rate") or 0.0),
+                    "opponent_rank": row.get("opponent_rank"),
+                })
+        memo[key] = (np.asarray(idx, dtype=np.int64), np.asarray(comps, dtype=np.float64).T, float(p_a), meta)
+        return memo[key]
+
+    leaf_count = [0]
+
+    def leaf(prob: float) -> None:
+        idx = leaf_count[0]
+        leaf_count[0] += 1
+        probs[idx] = prob
+        tot = run[0] + padv[0] + padv[1] + padv[2]
+        totals[:, idx] = tot
+        rw_mat[:, idx] = run[1] + run[2] + padv[0] + padv[1]
+        rt_mat[:, idx] = run[1] + padv[0]
+        mp_mat[:, idx] = run_mp
+        mr_mat[:, idx] = run_mp + pad_cnt
+        comps_ev[:, 0] += prob * tot
+        comps_ev[:, 1] += prob * (run[1] + padv[0])
+        comps_ev[:, 2] += prob * (run[2] + padv[1])
+        comps_ev[:, 3] += prob * (run[3] + padv[2])
+        comps_ev[:, 4] += prob * run[4]
+        champion_acc[winners["grand_final"]] += prob
+        if progress_callback and idx % 1024 == 0:
+            progress_callback(idx, n_out)
+
+    def play(m: int, prob: float) -> None:
+        if m == n_matches:
+            leaf(prob)
+            return
+        key, stage, fa, fb = _DOUBLE8_MATCHES[m]
+        a = _double8_feed(fa, team_slots, winners, losers)
+        b = _double8_feed(fb, team_slots, winners, losers)
+        num_a = played[a] + 1
+        num_b = played[b] + 1
+        rem = _DOUBLE8_REM[stage]
+        pad_spec = _DOUBLE8_PAD_AFTER.get(stage)
+        for w in (a, b):
+            idx, comps, p_a, _meta = pairing(a, b, w, num_a, num_b, rem)
+            p_node = prob * (p_a if w == a else 1.0 - p_a)
+            run[:, idx] += comps
+            run_mp[idx] += 1
+            winners[key] = w
+            losers[key] = b if w == a else a
+            played[a] += 1
+            played[b] += 1
+            pk = (stage, a, b, w, num_a, num_b)
+            pair_acc[pk] = pair_acc.get(pk, 0.0) + p_node
+            pad = None
+            if pad_spec:
+                pst, games = pad_spec
+                widx = team_idx[w]
+                pad = run[1:4, widx] / float(games)  # average rating / win / role of the real games so far
+                padv[:, widx] += pad
+                pad_cnt[widx] += 1
+                pad_acc[pst][:, widx] += p_node * pad
+                pad_reach[pst][w] += p_node
+            play(m + 1, p_node)
+            if pad is not None:
+                padv[:, widx] -= pad
+                pad_cnt[widx] -= 1
+            played[a] -= 1
+            played[b] -= 1
+            run[:, idx] -= comps
+            run_mp[idx] -= 1
+
+    if progress_callback:
+        progress_callback(0, n_out)
+    play(0, 1.0)
+    assert leaf_count[0] == n_out, (leaf_count[0], n_out)
+
+    results: Dict[int, Dict] = {}
+    for tid in team_slots:
+        players_out: Dict[int, Dict[str, float]] = {}
+        for pid in team_pids[tid]:
+            e = comps_ev[pid_index[pid]]
+            ps = base_states[tid].players.get(pid)
+            players_out[pid] = {
+                "total_points": float(e[0]),
+                "rating_points_total": float(e[1]),
+                "win_points_total": float(e[2]),
+                "role_points_total": float(e[3]),
+                "booster_points_total": float(e[4]),
+                "total_points_without_booster": float(e[1] + e[2] + e[3]),
+                "role_id": ps.role_id if ps else None,
+                "booster_slots": _booster_slots_for(ps),
+                "role_info": _role_info_for(ps),
+            }
+        results[tid] = {"team_id": tid, "wins": 0, "losses": 0, "players": players_out}
+    outcomes = [{"probability": float(probs[i]), "code": int(i)} for i in range(n_out)]
+    template = _double8_template(team_slots)
+    best_bracket = _decode_double8_code(int(np.argmax(probs)), template, prob_cache)
+
+    # ---- stage stats in the Point Sources modal's contract: per team the
+    # rounds it can play (reach, win chance, opponents, elimination credit,
+    # byes); per player the points per stage with the boosters seen and the
+    # per-opponent sums. Knock-out penalties come off the losing match and are
+    # credited to the lower-bracket rounds the team then misses (-3 each).
+    total_p = float(probs.sum()) or 1.0
+    reach = {tid: {st: 0.0 for st in _DOUBLE8_STAGES} for tid in team_slots}
+    win_mass = {tid: {st: 0.0 for st in _DOUBLE8_STAGES} for tid in team_slots}
+    team_opps: Dict[int, Dict[str, Dict[int, List[float]]]] = {tid: {} for tid in team_slots}
+    elim_before: Dict[int, Dict[str, List[float]]] = {tid: {} for tid in team_slots}
+    cells: Dict[str, Dict[str, Dict[str, float]]] = {
+        str(pid): {st: {"rating": 0.0, "win": 0.0, "role": 0.0, "booster": 0.0, "total": 0.0} for st in _DOUBLE8_STAGES}
+        for pid in pids
+    }
+    opp_pts: Dict[str, Dict[str, Dict[int, List[float]]]] = {}
+    boost_mass: Dict[tuple, Dict[tuple, float]] = {}  # (pid, stage) -> {(booster_id, name, rate, slot): prob}
+    for (stage, a, b, w, num_a, num_b), mass in pair_acc.items():
+        rem = _DOUBLE8_REM[stage]
+        reach[a][stage] += mass
+        reach[b][stage] += mass
+        win_mass[w][stage] += mass
+        for tid, opp in ((a, b), (b, a)):
+            oc = team_opps[tid].setdefault(stage, {}).setdefault(opp, [0.0, 0.0])
+            oc[0] += mass
+            if tid == w:
+                oc[1] += mass
+        idx, comps, _p_a, meta = memo[(a, b, w, num_a, num_b, rem)]
+        for r in range(len(idx)):
+            j = int(idx[r])
+            pid_str = str(pids[j])
+            tid = int(team_arr[j])
+            opp = b if tid == a else a
+            rating, role, booster = float(comps[1, r]), float(comps[3, r]), float(comps[4, r])
+            # the match's own win points: the knock-out penalty is credited to the missed rounds below
+            win = float(comps[2, r]) + (3.0 * rem if (tid != w and rem > 0) else 0.0)
+            cell = cells[pid_str][stage]
+            cell["rating"] += mass * rating
+            cell["win"] += mass * win
+            cell["role"] += mass * role
+            cell["booster"] += mass * booster
+            cell["total"] += mass * (rating + win + role + booster)
+            oc = opp_pts.setdefault(pid_str, {}).setdefault(stage, {}).setdefault(opp, [0.0, 0.0, 0.0, 0.0])
+            oc[0] += mass * rating
+            oc[1] += mass * win
+            oc[2] += mass * role
+            oc[3] += mass * booster
+            bm = boost_mass.setdefault((pid_str, stage), {})
+            slot = num_a if tid == a else num_b
+            bkey = (meta[r].get("booster_id"), meta[r].get("booster_name"), float(meta[r].get("booster_rate") or 0.0), int(slot))
+            bm[bkey] = bm.get(bkey, 0.0) + mass
+        if rem > 0:
+            loser = b if w == a else a
+            for later in _DOUBLE8_MISSED_AFTER.get(stage, []):
+                e = elim_before[loser].setdefault(later, [0.0, 0.0])
+                e[0] += mass
+                e[1] += -3.0 * mass
+                for pid in team_pids[loser]:
+                    c = cells[str(pid)][later]
+                    c["win"] -= 3.0 * mass
+                    c["total"] -= 3.0 * mass
+    for pst in pad_stages:
+        for tid in team_slots:
+            reach[tid][pst] = pad_reach[pst][tid]
+        for j, pid in enumerate(pids):
+            pr, pw, po = float(pad_acc[pst][0, j]), float(pad_acc[pst][1, j]), float(pad_acc[pst][2, j])
+            if pr or pw or po:
+                cell = cells[str(pid)][pst]
+                cell["rating"] += pr
+                cell["win"] += pw
+                cell["role"] += po
+                cell["total"] += pr + pw + po
+    players_stats: Dict[str, Dict[str, Any]] = {}
+    for pid in pids:
+        pid_str = str(pid)
+        tid = team_of_pid[pid]
+        stages_out: Dict[str, Dict[str, Any]] = {}
+        for st in _DOUBLE8_STAGES:
+            cell = cells[pid_str][st]
+            entry: Dict[str, Any] = {k: v / total_p for k, v in cell.items()}
+            bm = boost_mass.get((pid_str, st)) or {}
+            bt = sum(bm.values())
+            entry["boosters"] = (
+                sorted(
+                    [
+                        {"booster_id": bid, "booster_name": name, "booster_rate": rate, "slot": slot, "share": m / bt}
+                        for (bid, name, rate, slot), m in bm.items()
+                        if bid is not None
+                    ],
+                    key=lambda x: -x["share"],
+                )
+                if bt > 0
+                else []
+            )
+            entry["opponents"] = {
+                str(o): {"rating": v[0] / total_p, "win": v[1] / total_p, "role": v[2] / total_p, "booster": v[3] / total_p, "total": sum(v) / total_p}
+                for o, v in ((opp_pts.get(pid_str) or {}).get(st) or {}).items()
+            }
+            stages_out[st] = entry
+        players_stats[pid_str] = {"stages": stages_out, "role": _role_info_for(base_states[tid].players.get(pid))}
+    teams_stats: Dict[str, Dict[str, Any]] = {}
+    for tid in team_slots:
+        rounds: Dict[str, Dict[str, Any]] = {}
+        for st in _DOUBLE8_STAGES:
+            is_pad = st in pad_stages
+            eb = elim_before[tid].get(st) or [0.0, 0.0]
+            rounds[st] = {
+                "play": 0.0 if is_pad else reach[tid][st] / total_p,
+                "win": (win_mass[tid][st] / reach[tid][st]) if (reach[tid][st] > 0 and not is_pad) else 0.0,
+                "opponents": {
+                    str(o): {"play": c[0] / total_p, "win": (c[1] / c[0]) if c[0] > 0 else 0.0}
+                    for o, c in (team_opps[tid].get(st) or {}).items()
+                },
+                "elim_before": {"prob": eb[0] / total_p, "points": eb[1] / total_p},
+                "bye": (reach[tid][st] / total_p) if is_pad else 0.0,
+            }
+        teams_stats[str(tid)] = {
+            "reach": {st: reach[tid][st] / total_p for st in _DOUBLE8_STAGES},
+            "champion": champion_acc[tid] / total_p,
+            "rounds": rounds,
+            "rank": team_rank_by_id.get(tid),
+            "padding_prob": 0.0,
+            "playoff_padding_prob": 0.0,
+        }
+    stage_stats = {
+        "stages": list(_DOUBLE8_STAGES),
+        "layout": [dict(x) for x in _DOUBLE8_LAYOUT],
+        "teams": teams_stats,
+        "players": players_stats,
+    }
+    extra = {
+        "outcome_matrix": {
+            "pids": pids,
+            "n": int(n_out),
+            "f32_b64": base64.b64encode(totals.tobytes()).decode("ascii"),
+            "rw_b64": base64.b64encode(rw_mat.tobytes()).decode("ascii"),
+            "mp_b64": base64.b64encode(mp_mat.tobytes()).decode("ascii"),
+            "mr_b64": base64.b64encode(mr_mat.tobytes()).decode("ascii"),
+            "rt_b64": base64.b64encode(rt_mat.tobytes()).decode("ascii"),
+        },
+        "bracket_template": template,
+        "stage_stats": stage_stats,
+        "padding_rule": _DOUBLE8_PADDING_RULE,
+    }
+    if progress_callback:
+        progress_callback(n_out, n_out)
+    return results, best_bracket, n_out, outcomes, extra
+
+
+def _double8_pad_team(ts: TeamState, games: int, stage_key: str) -> None:
+    """Pad every player of a team sitting out a round with the per-match
+    average of its real games so far (breakdown rows carrying a match
+    number): rating, win and role, no booster."""
+    label = {"bye_r3": "round 3", "bye_r5": "round 5"}.get(stage_key, stage_key)
+    for p in ts.players.values():
+        real = [r for r in p.point_breakdown if r.get("match_number") is not None]
+        n = float(max(1, int(games)))
+        pr = sum(float(r.get("rating_points") or 0.0) for r in real) / n
+        pw = sum(float(r.get("win_points") or 0.0) for r in real) / n
+        po = sum(float(r.get("role_points") or 0.0) for r in real) / n
+        p.rating_points_total += pr
+        p.win_points_total += pw
+        p.role_points_total += po
+        p.total_points += pr + pw + po
+        p.point_breakdown.append(
+            {
+                "match_number": None,
+                "match_type": "PADDING",
+                "opponent_team_id": None,
+                "opponent_rank": None,
+                "did_win": None,
+                "win_probability": 0.0,
+                "rating_used": None,
+                "rating_points": float(pr),
+                "win_points": float(pw),
+                "role_id": p.role_id,
+                "role_major_pct": float(p.major_pct),
+                "role_minor_pct": float(p.minor_pct),
+                "role_points": float(po),
+                "booster_slot": None,
+                "booster_id": None,
+                "booster_name": None,
+                "booster_trigger_rate": 0.0,
+                "booster_points": 0.0,
+                "total_points": float(pr + pw + po),
+                "note": f"Padding for {label} (sat out): per-match average of the {len(real)} played",
+            }
+        )
+
+
+def _deterministic_double8_outcome(team_slots: List[int], vrs_ranks: Dict[int, int], match_winners: List[int]) -> Dict:
+    """Play the double-elimination bracket implied by the user's 14 picks (play
+    order) with real team states and return one outcome dict in the stored
+    shape (probability, bracket, players, player_components, player_breakdown),
+    the round pads and knock-out penalties included as breakdown rows."""
+    team_slots = [int(t) for t in team_slots]
+    if len(match_winners) != len(_DOUBLE8_MATCHES):
+        raise HTTPException(status_code=400, detail=f"Completed bracket needs winners for all {len(_DOUBLE8_MATCHES)} matches; got {len(match_winners)}.")
+    code = _double8_match_winners_to_code(team_slots, match_winners)
+    states = initialize_teams(team_slots, vrs_ranks)
+    player_rows_by_id, team_rank_by_id = _build_playoff_lookup_context(team_slots)
+    prob_cache: Dict[tuple[int, int], float] = {}
+    winners: Dict[str, int] = {}
+    losers: Dict[str, int] = {}
+    bracket: Dict[str, List[dict]] = {}
+    path_prob = 1.0
+    for m, (key, stage, fa, fb) in enumerate(_DOUBLE8_MATCHES):
+        a = _double8_feed(fa, team_slots, winners, losers)
+        b = _double8_feed(fb, team_slots, winners, losers)
+        picked = int(match_winners[m])
+        w, l, p_win_a, branch_p = _play_match_deterministic(
+            states, a, b, picked, remaining_rounds_after=_DOUBLE8_REM[stage], prob_cache=prob_cache,
+            player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id,
+        )
+        path_prob *= branch_p
+        winners[key] = w
+        losers[key] = l
+        bracket.setdefault(stage, []).append({"key": key, "winner": w, "loser": l, "p_win_a": p_win_a, "teams": [a, b]})
+        pad_spec = _DOUBLE8_PAD_AFTER.get(stage)
+        if pad_spec:
+            _double8_pad_team(states[w], pad_spec[1], pad_spec[0])
+    player_points: Dict[str, float] = {}
+    player_components: Dict[str, Dict[str, float]] = {}
+    player_breakdown: Dict[str, List[dict]] = {}
+    for ts in states.values():
+        for pid, p in ts.players.items():
+            player_points[str(pid)] = float(p.total_points)
+            player_components[str(pid)] = {
+                "total": float(p.total_points),
+                "total_without_booster": float(p.rating_points_total + p.win_points_total + p.role_points_total),
+                "rating": float(p.rating_points_total),
+                "win": float(p.win_points_total),
+                "role": float(p.role_points_total),
+                "booster": float(p.booster_points_total),
+            }
+            player_breakdown[str(pid)] = [dict(row) for row in p.point_breakdown]
+    return {
+        "probability": float(path_prob),
+        "code": int(code),
+        "bracket": bracket,
+        "players": player_points,
+        "player_components": player_components,
+        "player_breakdown": player_breakdown,
+    }
 
 
 _STAGE_MAIN_ORDER = ["round_of_32", "round_of_16", "quarters", "semis", "final"]
@@ -1736,6 +2376,23 @@ def _compute_playoff_result(payload: dict, progress_callback=None) -> dict:
     # vrs_ranks not relevant here (use default 999)
     vrs_ranks = {tid: 999 for tid in slots}
 
+    if _bracket_kind(payload.get("bracket_kind")) == "double":
+        exact_players, best_bracket, outcomes_count, outcomes, extra = _exact_double8_player_totals(
+            slots, vrs_ranks, progress_callback=progress_callback
+        )
+        stage_stats = extra.pop("stage_stats")
+        return {
+            "bracket": best_bracket,
+            "teams": exact_players,
+            "method": "exact_enumeration",
+            "outcomes_count": outcomes_count,
+            "outcomes": outcomes,
+            "has_third_place_decider": False,
+            "bracket_kind": "double",
+            **extra,
+            "stage_stats": stage_stats,
+        }
+
     quarters_override = None
     sf_pairs_resolver = None
     if _variant(payload.get("variant")) == "bounty":
@@ -1849,7 +2506,9 @@ def _run_playoff_job(job_id: str, payload: dict) -> None:
 def start_playoff(payload: dict):
     normalized = _normalize_playoff_payload(payload)
     n_slots = len(normalized.get("team_slots") or [])
-    if 2 ** max(0, n_slots - 1) <= _BRACKET_EXACT_OUTCOME_LIMIT:
+    if normalized.get("bracket_kind") == "double":
+        total_outcomes = 2 ** len(_DOUBLE8_MATCHES)
+    elif 2 ** max(0, n_slots - 1) <= _BRACKET_EXACT_OUTCOME_LIMIT:
         total_outcomes = (2 ** max(0, n_slots - 1)) * (2 if normalized.get("has_third_place_decider") else 1)
     else:
         # Monte-Carlo sample count for large fields (user-configurable).
@@ -2030,13 +2689,13 @@ def _optimize_playoff_teams_by_outcomes(
 
     from backend.routes.groups import LIVE_OPTIMIZER_MAX_K, _booster_prerequisites, _topk_rosters_bnb
     from backend.services import roster_kernels as rk
-    from backend.services.roster_plan import match_reach_from_played, plan_for_roster, plan_outcome_scores
+    from backend.services.roster_plan import match_reach_from_played, plan_for_roster, plan_metrics
     from backend.services.role_assignment import best_role_assignment_for_team, extract_role_scores_for_player
 
     include = {int(x) for x in (include or set())}
     if len(players_info) < 5:
         return {"error": "Not enough players after exclusions"}
-    pids_all, M_all, probs, RW_all, MP_all, MR_all = _outcome_matrix(results)
+    pids_all, M_all, probs, RW_all, MP_all, MR_all, RT_all = _outcome_matrix(results)
     if M_all is None or M_all.shape[1] == 0:
         if mode == "average":
             return _optimize_playoff_teams(players_info, include, budget, max_per_team, progress_callback=progress_callback)
@@ -2058,6 +2717,7 @@ def _optimize_playoff_teams_by_outcomes(
     RW = np.ascontiguousarray(RW_all[sel]) if plans_on else None
     MP = np.ascontiguousarray(MP_all[sel]) if plans_on else None
     MR = np.ascontiguousarray(MR_all[sel]) if plans_on else None
+    RT = np.ascontiguousarray(RT_all[sel]) if (plans_on and RT_all is not None) else None
     prices = np.asarray([int(p.get("price") or 0) for p in players], dtype=np.int64)
     teams_raw = [int(p.get("team_id") or 0) for p in players]
     tmap = {t: i for i, t in enumerate(sorted(set(teams_raw)))}
@@ -2116,53 +2776,64 @@ def _optimize_playoff_teams_by_outcomes(
         return {"error": "No valid roster under these constraints"}
 
     # ---- score every candidate in every outcome (under its plan when available)
-    best_val = np.full(N, -np.inf)
-    best_key = [-1] * N
     avg = np.empty(C)
     ceil = np.empty(C)
     ceil_p = np.empty(C)
     argmax = np.empty(C, dtype=np.int64)
     plans: list = [None] * C
     scores_at_peak: list = [None] * C
-    for i, key in enumerate(keys):
-        rows = [pid_idx[pid] for pid in key]
-        if plans_on:
-            roster_players = [players_meta[str(pid)] for pid in key]
-            plan = plan_for_roster(roster_players, reach_by_team, rates_by_pid, role_scores)
-            plans[i] = plan
-            S = plan_outcome_scores(plan, list(key), rows, RW, MP, MR)
-        else:
-            S = M[rows].sum(axis=0)
-        avg[i] = float(S @ probs)
-        o = int(np.argmax(S))
-        argmax[i] = o
-        mx = float(S[o])
-        ceil[i] = mx
-        ceil_p[i] = float(probs[S >= mx - 1e-9].sum())
-        better = S > best_val + 1e-9
-        if better.any():
-            best_val[better] = S[better]
-            for c in np.nonzero(better)[0]:
-                best_key[c] = i
-        if plans_on:
-            plan_ = plans[i]
-            per = {}
-            for pid, j in zip(key, rows):
-                b = plan_["slot_rates"].get(int(pid)) or {}
-                boost = sum(BOOSTER_POINT_VALUE * float(b.get(k, 0.0)) for k in range(1, int(MP[j, o]) + 1))
-                per[int(pid)] = float(RW[j, o]) + float(plan_["role_pm"].get(int(pid), 0.0)) * float(MR[j, o]) + boost
-            scores_at_peak[i] = per
-        else:
-            scores_at_peak[i] = {int(pid): float(M[j, o]) for pid, j in zip(key, rows)}
-        if progress_callback and (i + 1) % 256 == 0:
-            progress_callback(i + 1, C)
+    parts_at_peak: list = [None] * C
+    parts_at_win: list = [None] * C
     wins_prob = np.zeros(C)
     wins_count = np.zeros(C)
-    for c in range(N):
-        i = best_key[c]
-        if i >= 0:
-            wins_prob[i] += probs[c]
-            wins_count[i] += 1
+    wins_idx: list = [[] for _ in range(C)]
+    if plans_on:
+        # every candidate under its plan in every outcome: the fused compiled
+        # kernel shared with the groups tab
+        metrics = plan_metrics(
+            keys, players_meta, pid_idx, RW, MP, MR, probs, reach_by_team, rates_by_pid, role_scores,
+            progress_callback=progress_callback, RT=RT,
+        )
+        for i, m in enumerate(metrics):
+            plans[i] = m["plan"]
+            avg[i] = float(m["avg"])
+            ceil[i] = float(m["ceiling"])
+            ceil_p[i] = float(m["ceiling_p"])
+            argmax[i] = int(m["argmax"])
+            scores_at_peak[i] = m["peak"]
+            parts_at_peak[i] = m.get("peak_parts")
+            parts_at_win[i] = m.get("win_parts")
+            wins_prob[i] = float(m["wins_prob"])
+            wins_count[i] = float(m["wins_count"])
+            wins_idx[i] = list(m.get("wins_idx") or [])
+    else:
+        best_val = np.full(N, -np.inf)
+        best_key = [-1] * N
+        for i, key in enumerate(keys):
+            rows = [pid_idx[pid] for pid in key]
+            S = M[rows].sum(axis=0)
+            avg[i] = float(S @ probs)
+            o = int(np.argmax(S))
+            argmax[i] = o
+            mx = float(S[o])
+            ceil[i] = mx
+            ceil_p[i] = float(probs[S >= mx - 1e-9].sum())
+            better = S > best_val + 1e-9
+            if better.any():
+                best_val[better] = S[better]
+                for c in np.nonzero(better)[0]:
+                    best_key[c] = i
+            scores_at_peak[i] = {int(pid): float(M[j, o]) for pid, j in zip(key, rows)}
+            if progress_callback and (i + 1) % 256 == 0:
+                progress_callback(i + 1, C)
+        for c in range(N):
+            i = best_key[c]
+            if i >= 0:
+                wins_prob[i] += probs[c]
+                wins_count[i] += 1
+                wins_idx[i].append(int(c))
+        for i in range(C):
+            wins_idx[i].sort(key=lambda c: -float(probs[c]))
 
     # ---- serialise
     teams_out: list = []
@@ -2191,12 +2862,20 @@ def _optimize_playoff_teams_by_outcomes(
             pid = int(player.get("player_id") or 0)
             cs = float(peak.get(pid, 0.0))
             player["ceiling_score"] = cs
+            player["ceiling_parts"] = (parts_at_peak[i] or {}).get(pid)
+            wp = (parts_at_win[i] or {}).get(pid)
+            if wp:
+                player["win_parts"] = wp
+                player["win_score"] = float(wp.get("total") or 0.0)
             player["mode_score"] = cs if mode == "single_outcome" else float(player.get("total_ev") or 0.0)
+        serialized["ceiling_outcome_index"] = int(argmax[i])
+        serialized["win_conditional_ev"] = float(sum(float(v.get("total") or 0.0) for v in (parts_at_win[i] or {}).values()))
         serialized["average_ev"] = float(avg[i])
         serialized["total_ev"] = float(avg[i])
         serialized["ceiling_points"] = float(ceil[i])
         serialized["ceiling_probability"] = float(ceil_p[i])
         serialized["outcome_wins"] = float(wins_count[i])
+        serialized["winning_outcome_indexes"] = wins_idx[i]
         serialized["outcome_win_probability"] = float(wins_prob[i])
         serialized["mode"] = mode
         teams_out.append(serialized)
@@ -2337,6 +3016,368 @@ def best_team_playoff(payload: dict):
     if extra:
         fresh.update(extra)
     return _optimize_playoff_teams_by_outcomes(players_info, fresh, include, budget, max_per_team, mode)
+
+
+def _stored_outcome_detail(latest: dict, idx: int) -> dict:
+    """One stored outcome as a full dict (bracket + per-player breakdown):
+    the stored record when it carries a breakdown, else the code replayed
+    deterministically (double elimination or knock-out)."""
+    results = latest.get("results") or {}
+    lp = latest.get("payload") or {}
+    team_slots = [int(x) for x in (lp.get("team_slots") or [])]
+    outcomes = results.get("outcomes") or []
+    if idx < 0 or idx >= len(outcomes):
+        raise HTTPException(status_code=400, detail="Outcome index out of range for the stored run.")
+    stored = outcomes[idx]
+    if stored.get("player_breakdown"):
+        return stored
+    vrs = {tid: 999 for tid in team_slots}
+    code = int(stored.get("code") if stored.get("code") is not None else idx)
+    if _bracket_kind(lp.get("bracket_kind")) == "double":
+        template = results.get("bracket_template") or _double8_template(team_slots)
+        br = _decode_double8_code(code, template)
+        flat = [next(m["winner"] for m in br[stage] if m["key"] == key) for key, stage, _fa, _fb in _DOUBLE8_MATCHES]
+        return _deterministic_double8_outcome(team_slots, vrs, flat)
+    template = results.get("bracket_template") or {
+        "team_slots": team_slots,
+        "third_place": bool(lp.get("has_third_place_decider")),
+        "rounds": int(round(math.log2(max(len(team_slots), 2)))),
+    }
+    br = _decode_bracket_code(code, template)
+    round_winners: List[List[int]] = []
+    alive = list(team_slots)
+    while len(alive) > 1:
+        ms = br.get(_round_name_for(len(alive))) or []
+        round_winners.append([int(m["winner"]) for m in ms])
+        alive = [int(m["winner"]) for m in ms]
+    third = int(((br.get("third_place") or [{}])[0]).get("winner") or 0)
+    return _deterministic_completed_outcome(team_slots, vrs, round_winners, bool(template.get("third_place")), third)
+
+
+@router.post("/outcome-player-detail")
+def outcome_player_detail(payload: dict | None = None):
+    """A player's points match by match in one stored outcome (the roster's
+    best bracket), under the roster's plan when role_id / booster_assignments
+    are given: the assigned role's per-match points replace the player's own
+    (pads included), and each match slot pays the roster's booster for it."""
+    from backend.services.role_assignment import extract_role_scores_for_player
+    from backend.services.swiss_booster_assignment import parse_booster_rates
+
+    body = payload or {}
+    latest = load_latest_playoff(body.get("variant"))
+    if not latest:
+        raise HTTPException(status_code=404, detail="No stored playoff simulation found. Run Playoff Bracket first.")
+    pid = int(body.get("player_id") or 0)
+    if body.get("outcome_index") is None:
+        raise HTTPException(status_code=400, detail="outcome_index is required")
+    idx = int(body.get("outcome_index"))
+    outcome = _stored_outcome_detail(latest, idx)
+    rows = [dict(r) for r in ((outcome.get("player_breakdown") or {}).get(str(pid)) or [])]
+    if not rows:
+        raise HTTPException(status_code=404, detail="That player has no rows in this bracket.")
+    prow = get_player(pid) or {}
+    role_id = body.get("role_id")
+    role_pm = None
+    major = minor = None
+    if role_id is not None and str(role_id).strip() != "":
+        role_id = int(role_id)
+        scores = extract_role_scores_for_player(prow)
+        role_pm = float(scores.get(role_id, 0.0))
+        try:
+            roles_obj = json.loads(prow.get("roles_json") or "{}")
+            rr = roles_obj.get(str(role_id)) or {}
+            major, minor = float(rr.get("major") or 0.0), float(rr.get("minor") or 0.0)
+        except Exception:
+            major = minor = None
+    assignments = [a for a in (body.get("booster_assignments") or []) if int(a.get("player_id") or 0) == pid]
+    rates = parse_booster_rates(prow.get("boosters_json")) if assignments else {}
+    by_slot = {int(a.get("match_number") or 0): int(a.get("booster_id")) for a in assignments if a.get("booster_id") is not None}
+    for r in rows:
+        real = r.get("match_number") is not None
+        if role_pm is not None and (real or str(r.get("match_type") or "").upper() == "PADDING"):
+            r["role_points"] = float(role_pm)
+            r["role_id"] = role_id
+            if major is not None:
+                r["role_major_pct"] = major
+                r["role_minor_pct"] = minor
+        if assignments and real:
+            bid = by_slot.get(int(r["match_number"]))
+            if bid is None:
+                r.update({"booster_id": None, "booster_name": "No booster left", "booster_trigger_rate": 0.0, "booster_points": 0.0})
+            else:
+                rate = float(rates.get(bid, 0.0))
+                r.update({"booster_id": bid, "booster_name": BOOSTER_NAMES.get(bid, f"Booster {bid}"), "booster_trigger_rate": rate, "booster_points": BOOSTER_POINT_VALUE * rate})
+        r["total_points"] = float(r.get("rating_points") or 0.0) + float(r.get("win_points") or 0.0) + float(r.get("role_points") or 0.0) + float(r.get("booster_points") or 0.0)
+    comps = {
+        "rating": sum(float(r.get("rating_points") or 0.0) for r in rows),
+        "win": sum(float(r.get("win_points") or 0.0) for r in rows),
+        "role": sum(float(r.get("role_points") or 0.0) for r in rows),
+        "booster": sum(float(r.get("booster_points") or 0.0) for r in rows),
+    }
+    comps["total"] = comps["rating"] + comps["win"] + comps["role"] + comps["booster"]
+    return {
+        "outcome_index": idx,
+        "probability": float(outcome.get("probability") or 0.0),
+        "bracket": outcome.get("bracket") or {},
+        "rows": rows,
+        "components": comps,
+    }
+
+
+@router.post("/winning-player-detail")
+def winning_player_detail(payload: dict | None = None):
+    """A player's expected points per stage over a set of stored outcomes (the
+    brackets a roster wins), weighted by outcome probability, under the
+    roster's plan when role_id / booster_assignments are given. Returned in the
+    Point Sources modal's contract (stage cells with boosters and opponents,
+    team rounds with play / win / elimination credit / byes, DE layout)."""
+    from backend.services.role_assignment import extract_role_scores_for_player
+    from backend.services.swiss_booster_assignment import parse_booster_rates
+
+    body = payload or {}
+    latest = load_latest_playoff(body.get("variant"))
+    if not latest:
+        raise HTTPException(status_code=404, detail="No stored playoff simulation found. Run Playoff Bracket first.")
+    results = latest.get("results") or {}
+    lp = latest.get("payload") or {}
+    team_slots = [int(x) for x in (lp.get("team_slots") or [])]
+    pid = int(body.get("player_id") or 0)
+    idxs = [int(x) for x in (body.get("outcome_indexes") or [])]
+    outcomes = results.get("outcomes") or []
+    idxs = [i for i in idxs if 0 <= i < len(outcomes)]
+    if not idxs:
+        raise HTTPException(status_code=400, detail="outcome_indexes is required")
+    tid = None
+    for t, tdata in (results.get("teams") or {}).items():
+        if str(pid) in {str(k) for k in (tdata.get("players") or {})}:
+            tid = int(t)
+            break
+    if tid is None or tid not in team_slots:
+        raise HTTPException(status_code=404, detail="That player is not in the stored bracket.")
+    double = _bracket_kind(lp.get("bracket_kind")) == "double"
+    template = results.get("bracket_template") or (
+        _double8_template(team_slots)
+        if double
+        else {"team_slots": team_slots, "third_place": bool(lp.get("has_third_place_decider")), "rounds": int(round(math.log2(max(len(team_slots), 2))))}
+    )
+    base_states = initialize_teams(team_slots, {t: 999 for t in team_slots})
+    player_rows_by_id, team_rank_by_id = _build_playoff_lookup_context(team_slots)
+    prob_cache: Dict[tuple[int, int], float] = {}
+    memo: Dict[tuple, dict] = {}
+
+    def pairing(a: int, b: int, w: int, na: int, nb: int, rem: int) -> dict:
+        key = (a, b, w, na, nb, rem)
+        hit = memo.get(key)
+        if hit is not None:
+            return hit
+        states = {a: _fresh_bracket_state(base_states, a, na - 1), b: _fresh_bracket_state(base_states, b, nb - 1)}
+        _play_match_deterministic(
+            states, a, b, w, remaining_rounds_after=rem, prob_cache=prob_cache,
+            player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id,
+        )
+        rows: Dict[int, dict] = {}
+        for ts in states.values():
+            for p_id, p in ts.players.items():
+                real = next((r for r in p.point_breakdown if r.get("match_number") is not None), {})
+                rows[int(p_id)] = {
+                    "rating": float(real.get("rating_points") or 0.0),
+                    "win": float(real.get("win_points") or 0.0),
+                    "role": float(real.get("role_points") or 0.0),
+                    "booster": float(real.get("booster_points") or 0.0),
+                    "booster_id": real.get("booster_id"),
+                    "booster_name": real.get("booster_name"),
+                    "booster_rate": float(real.get("booster_trigger_rate") or 0.0),
+                    "opponent_rank": real.get("opponent_rank"),
+                }
+        memo[key] = rows
+        return rows
+
+    # plan adjustments
+    prow = get_player(pid) or {}
+    role_pm = None
+    role_id = body.get("role_id")
+    if role_id is not None and str(role_id).strip() != "":
+        role_id = int(role_id)
+        role_pm = float(extract_role_scores_for_player(prow).get(role_id, 0.0))
+    assignments = [a for a in (body.get("booster_assignments") or []) if int(a.get("player_id") or 0) == pid]
+    rates = parse_booster_rates(prow.get("boosters_json")) if assignments else {}
+    by_slot = {int(a.get("match_number") or 0): int(a.get("booster_id")) for a in assignments if a.get("booster_id") is not None}
+
+    def adjust(row: dict, slot: int, is_pad: bool) -> dict:
+        r = dict(row)
+        if role_pm is not None:
+            r["role"] = float(role_pm)
+        if assignments and not is_pad:
+            bid = by_slot.get(int(slot))
+            if bid is None:
+                r.update({"booster": 0.0, "booster_id": None, "booster_name": "No booster left", "booster_rate": 0.0})
+            else:
+                rate = float(rates.get(bid, 0.0))
+                r.update({"booster": BOOSTER_POINT_VALUE * rate, "booster_id": bid, "booster_name": BOOSTER_NAMES.get(bid, f"Booster {bid}"), "booster_rate": rate})
+        if is_pad:
+            r.update({"booster": 0.0, "booster_id": None, "booster_name": None, "booster_rate": 0.0})
+        return r
+
+    if double:
+        stages = list(_DOUBLE8_STAGES)
+        pad_stages = {v[0] for v in _DOUBLE8_PAD_AFTER.values()}
+        missed_after = _DOUBLE8_MISSED_AFTER
+    else:
+        n = len(team_slots)
+        names: List[str] = []
+        k = n
+        while k > 1:
+            names.append(_round_name_for(k))
+            k //= 2
+        stages = names + (["third_place"] if template.get("third_place") else [])
+        pad_stages = set()
+        missed_after = {st: [x for x in names[names.index(st) + 1 :]] for st in names}
+
+    cells = {st: {"rating": 0.0, "win": 0.0, "role": 0.0, "booster": 0.0, "total": 0.0} for st in stages}
+    play = {st: 0.0 for st in stages}
+    wins = {st: 0.0 for st in stages}
+    bye = {st: 0.0 for st in stages}
+    elim = {st: [0.0, 0.0] for st in stages}
+    opp_round: Dict[str, Dict[int, List[float]]] = {st: {} for st in stages}
+    opp_pts: Dict[str, Dict[int, List[float]]] = {st: {} for st in stages}
+    boost: Dict[str, Dict[tuple, float]] = {st: {} for st in stages}
+    ranks: Dict[int, Any] = {}
+    mass = 0.0
+
+    def add_match(stage: str, row: dict, opp: int, won: bool, weight: float) -> None:
+        c = cells[stage]
+        c["rating"] += weight * row["rating"]
+        c["win"] += weight * row["win"]
+        c["role"] += weight * row["role"]
+        c["booster"] += weight * row["booster"]
+        c["total"] += weight * (row["rating"] + row["win"] + row["role"] + row["booster"])
+        play[stage] += weight
+        if won:
+            wins[stage] += weight
+        oc = opp_round[stage].setdefault(opp, [0.0, 0.0])
+        oc[0] += weight
+        if won:
+            oc[1] += weight
+        op = opp_pts[stage].setdefault(opp, [0.0, 0.0, 0.0, 0.0])
+        op[0] += weight * row["rating"]
+        op[1] += weight * row["win"]
+        op[2] += weight * row["role"]
+        op[3] += weight * row["booster"]
+        if row.get("booster_id") is not None:
+            bk = (row["booster_id"], row.get("booster_name"), float(row.get("booster_rate") or 0.0), int(row.get("slot") or 0))
+            boost[stage][bk] = boost[stage].get(bk, 0.0) + weight
+        if row.get("opponent_rank") is not None:
+            ranks[opp] = row.get("opponent_rank")
+
+    def add_pad(stage: str, pad: dict, weight: float) -> None:
+        c = cells[stage]
+        c["rating"] += weight * pad["rating"]
+        c["win"] += weight * pad["win"]
+        c["role"] += weight * pad["role"]
+        c["total"] += weight * (pad["rating"] + pad["win"] + pad["role"])
+        bye[stage] += weight
+
+    def add_penalty(stage: str, rem: int, weight: float) -> None:
+        for later in missed_after.get(stage, [])[: max(0, rem)]:
+            cells[later]["win"] -= 3.0 * weight
+            cells[later]["total"] -= 3.0 * weight
+            elim[later][0] += weight
+            elim[later][1] += -3.0 * weight
+
+    for idx in idxs:
+        stored = outcomes[idx]
+        p_c = float(stored.get("probability") or 0.0)
+        if p_c <= 0:
+            continue
+        mass += p_c
+        code = int(stored.get("code") if stored.get("code") is not None else idx)
+        played = {t: 0 for t in team_slots}
+        real_rows: List[dict] = []
+        if double:
+            br = _decode_double8_code(code, template)
+            for key, stage, _fa, _fb in _DOUBLE8_MATCHES:
+                m = next(x for x in br[stage] if x["key"] == key)
+                a, b = int(m["teams"][0]), int(m["teams"][1])
+                w = int(m["winner"])
+                na, nb = played[a] + 1, played[b] + 1
+                played[a] += 1
+                played[b] += 1
+                rem = _DOUBLE8_REM[stage]
+                if tid in (a, b):
+                    slot = na if tid == a else nb
+                    row = adjust(pairing(a, b, w, na, nb, rem)[pid], slot, False)
+                    row["slot"] = slot
+                    real_rows.append(row)
+                    add_match(stage, row, b if tid == a else a, w == tid, p_c)
+                    if w != tid and rem > 0:
+                        add_penalty(stage, rem, p_c)
+                pad_spec = _DOUBLE8_PAD_AFTER.get(stage)
+                if pad_spec and w == tid:
+                    games = float(pad_spec[1])
+                    pad = {
+                        "rating": sum(r["rating"] for r in real_rows) / games,
+                        "win": sum(r["win"] for r in real_rows) / games,
+                        "role": (float(role_pm) if role_pm is not None else sum(r["role"] for r in real_rows) / games),
+                    }
+                    add_pad(pad_spec[0], pad, p_c)
+        else:
+            br = _decode_bracket_code(code, template)
+            rounds_total = int(template.get("rounds") or len([s for s in stages if s != "third_place"]))
+            for r_i, stage in enumerate(stages):
+                for m in br.get(stage) or []:
+                    a, b = int(m["teams"][0]), int(m["teams"][1])
+                    w = int(m["winner"])
+                    na, nb = played[a] + 1, played[b] + 1
+                    played[a] += 1
+                    played[b] += 1
+                    rem = 0 if stage == "third_place" else max(0, rounds_total - r_i - 1)
+                    if tid in (a, b):
+                        slot = na if tid == a else nb
+                        row = adjust(pairing(a, b, w, na, nb, rem)[pid], slot, False)
+                        row["slot"] = slot
+                        add_match(stage, row, b if tid == a else a, w == tid, p_c)
+                        if w != tid and rem > 0:
+                            add_penalty(stage, rem, p_c)
+
+    if mass <= 0:
+        raise HTTPException(status_code=400, detail="The given outcomes carry no probability.")
+    stage_ev: Dict[str, Dict[str, Any]] = {}
+    team_rounds: Dict[str, Dict[str, Any]] = {}
+    for st in stages:
+        entry: Dict[str, Any] = {k: v / mass for k, v in cells[st].items()}
+        bt = sum(boost[st].values())
+        entry["boosters"] = (
+            sorted(
+                [{"booster_id": bid, "booster_name": name, "booster_rate": rate, "slot": slot, "share": m / bt} for (bid, name, rate, slot), m in boost[st].items()],
+                key=lambda x: -x["share"],
+            )
+            if bt > 0
+            else []
+        )
+        entry["opponents"] = {
+            str(o): {"rating": v[0] / mass, "win": v[1] / mass, "role": v[2] / mass, "booster": v[3] / mass, "total": sum(v) / mass}
+            for o, v in opp_pts[st].items()
+        }
+        stage_ev[st] = entry
+        team_rounds[st] = {
+            "play": play[st] / mass,
+            "win": (wins[st] / play[st]) if play[st] > 0 else 0.0,
+            "opponents": {str(o): {"play": c[0] / mass, "win": (c[1] / c[0]) if c[0] > 0 else 0.0} for o, c in opp_round[st].items()},
+            "elim_before": {"prob": elim[st][0] / mass, "points": elim[st][1] / mass},
+            "bye": bye[st] / mass,
+        }
+    comps = {k: sum(stage_ev[st][k] for st in stages) for k in ("rating", "win", "role", "booster", "total")}
+    return {
+        "n_outcomes": len(idxs),
+        "mass": mass,
+        "stages": stages,
+        "layout": [dict(x) for x in _DOUBLE8_LAYOUT] if double else None,
+        "stage_ev": stage_ev,
+        "team_rounds": team_rounds,
+        "team_ranks": {str(t): r for t, r in ranks.items()},
+        "components": comps,
+        "team_id": tid,
+    }
 
 
 @router.post("/best-team/from-latest")
@@ -2552,9 +3593,12 @@ def _selected_completed_outcome_from_latest(payload: dict | None = None) -> tupl
     team_slots = [int(x) for x in (latest_payload.get("team_slots") or [])]
     if not team_slots:
         raise HTTPException(status_code=400, detail="Stored playoff run is missing its team slots.")
+    vrs_ranks = {tid: 999 for tid in team_slots}
+    if _bracket_kind(latest_payload.get("bracket_kind")) == "double":
+        picks = [int(x) for x in (body.get("match_winners") or [])]
+        return latest, _deterministic_double8_outcome(team_slots, vrs_ranks, picks)
     has_third_place = bool(latest_payload.get("has_third_place_decider", False))
     round_winners, third_place_winner = _completed_bracket_round_winners(body, team_slots)
-    vrs_ranks = {tid: 999 for tid in team_slots}
     outcome = _deterministic_completed_outcome(
         team_slots, vrs_ranks, round_winners, has_third_place, third_place_winner
     )

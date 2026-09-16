@@ -144,21 +144,46 @@ class DataScheduler:
         except Exception:
             logger.exception("SetThreadExecutionState failed")
 
+    # A catch-up run this close before the next slot also counts for that slot,
+    # so a machine that comes back late in the afternoon does not run twice.
+    _CATCH_UP_COVERS_NEXT = timedelta(hours=6)
+
+    def _due_slot(self, cfg: Dict[str, Any], now: datetime) -> datetime:
+        """The most recent daily slot that has passed: today's, or yesterday's
+        while today's is still ahead."""
+        hh, mm = (cfg.get("run_time") or "00:00").split(":")
+        today_slot = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+        return today_slot if now >= today_slot else today_slot - timedelta(days=1)
+
+    def _pending_slot(self, cfg: Dict[str, Any], now: datetime) -> Optional[datetime]:
+        """The slot the batch still owes, or None. A slot is covered once a
+        scheduled or catch-up run started at or after it (survives restarts
+        via the DB), or when a catch-up ran within a few hours before it."""
+        due = self._due_slot(cfg, now)
+        last = schedule_db.last_scheduled_run_ts()
+        if last >= due.timestamp():
+            return None
+        if last > 0 and due.timestamp() - last < self._CATCH_UP_COVERS_NEXT.total_seconds():
+            return None
+        return due
+
     def _maybe_run_scheduled(self) -> None:
         cfg = schedule_db.get_schedule_config()
         if not cfg.get("enabled"):
             return
         now = datetime.now()
-        hh, mm = (cfg.get("run_time") or "00:00").split(":")
-        scheduled = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
-        if now < scheduled:
-            return
-        # Already fired since today's slot? (survives restarts via the DB.)
-        if schedule_db.last_scheduled_run_ts() >= scheduled.timestamp():
+        due = self._pending_slot(cfg, now)
+        if due is None:
             return
         if self._run_lock.locked():
             return  # a manual run is in progress; retry next tick
-        self._run_batch(self._enabled_tasks(cfg), trigger="scheduled", cfg=cfg)
+        # Fired at the slot itself: a normal scheduled run. Anything later is a
+        # catch-up: the machine or the backend was down at the slot, so the
+        # batch runs now instead of skipping the day.
+        trigger = "scheduled" if now - due < timedelta(minutes=5) else "catch-up"
+        if trigger == "catch-up":
+            logger.info("Catching up the %s batch missed at %s", cfg.get("run_time"), due.strftime("%Y-%m-%d %H:%M"))
+        self._run_batch(self._enabled_tasks(cfg), trigger=trigger, cfg=cfg)
 
     # ---- running -------------------------------------------------------------
     @staticmethod
@@ -395,12 +420,17 @@ class DataScheduler:
         hh, mm = (cfg.get("run_time") or "00:00").split(":")
         scheduled_today = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
         next_run = scheduled_today if now < scheduled_today else scheduled_today + timedelta(days=1)
+        pending = self._pending_slot(cfg, now) if cfg.get("enabled") else None
+        if pending is not None:
+            next_run = now  # the missed slot is caught up on the next tick
         from backend.services import dev_flags, hltv_session
 
         return {
             "config": cfg,
             "state": state,
             "next_run_at": next_run.timestamp(),
+            "catch_up_pending": pending is not None,
+            "missed_slot_at": pending.timestamp() if pending is not None else None,
             "last_success_by_task": schedule_db.last_success_by_task(),
             # Last persisted login-health snapshot (no page load here).
             "hltv_session": hltv_session.load_snapshot(),

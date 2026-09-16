@@ -196,7 +196,7 @@ def last_scheduled_run_ts() -> float:
     conn = _connect()
     try:
         row = conn.execute(
-            "SELECT MAX(started_at) AS ts FROM schedule_runs WHERE trigger = 'scheduled'"
+            "SELECT MAX(started_at) AS ts FROM schedule_runs WHERE trigger IN ('scheduled', 'catch-up')"
         ).fetchone()
     finally:
         conn.close()

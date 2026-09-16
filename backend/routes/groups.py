@@ -92,16 +92,28 @@ def _state_key() -> int:
 # Live best-team queries memoized per (event, stored-run stamp, body).
 _LIVE_QUERY_CACHE: Dict[tuple, dict] = {}
 _LIVE_QUERY_CACHE_LOCK = threading.Lock()
+_LIVE_COMPUTE_LOCK = threading.Lock()  # one live query computes at a time (the kernels already use every core)
+_LIVE_QUERY_MODES = ("average", "single_outcome", "most_outcomes")
 
 
 def warm_caches() -> None:
-    """Parse the active event's stored groups run into the state cache at
-    startup (in a background thread) so the first Tournament open after a
-    restart does not pay the ~1 s blob parse itself."""
+    """At startup (in a background thread): parse the active event's stored
+    groups run into the state cache (~1 s blob parse) and run its three default
+    Top 5 queries — the outcome sample, the compiled searches and the plan
+    scoring — so the first Tournament open after a restart is served from the
+    cache."""
     try:
-        _GROUPS_STATE.load(key=_state_key())
+        key = _state_key()
+        latest = _GROUPS_STATE.load(key=key)
     except Exception:
-        pass
+        return
+    import logging
+
+    try:
+        timings = _seed_live_queries(key, latest)
+        logging.getLogger(__name__).info("Top 5 warm-up for event %s: %s", key, timings)
+    except Exception:
+        logging.getLogger(__name__).warning("Top 5 warm-up failed", exc_info=True)
 
 GROUP_MATCH_KEYS = ["opening_1", "opening_2", "winners", "elimination", "decider"]
 GROUP_MATCH_LABELS = {
@@ -1338,15 +1350,17 @@ def bake_event_valuations(
     except Exception as exc:  # noqa: BLE001
         return {"status": "error", "event_id": event_id, "reason": str(exc)[:300]}
     _GROUPS_STATE.save(payload, result, key=event_id)
-    if model is not None:
-        saved = _GROUPS_STATE.load(key=event_id)
-        if saved:
-            _JOINT_MODEL_CACHE.clear()
-            _JOINT_MODEL_CACHE[(event_id, saved["updated_at"])] = model
+    saved = _GROUPS_STATE.load(key=event_id)
+    if model is not None and saved:
+        _JOINT_MODEL_CACHE.clear()
+        _JOINT_MODEL_CACHE[(event_id, saved["updated_at"])] = model
+    # the app's first Top 5 open comes from the cache: seed the default queries now
+    top5_warm = _seed_live_queries(event_id, saved) if saved else {}
     playoff = result.get("playoff") or {}
     return {
         "status": "ok",
         "event_id": event_id,
+        "top5_warm_seconds": top5_warm,
         "group_format": fmt,
         "combined_playoffs": combined,
         "pairings": playoff.get("pairings"),
@@ -1718,11 +1732,13 @@ def _run_groups_job(job_id: str, payload: dict) -> None:
         result = _compute_groups_result(payload, progress_callback=_update, snapshot=snapshot)
         model = _finalize_joint_precompute(result, event_key)
         _GROUPS_STATE.save(payload, result, key=event_key)
-        if model is not None:
-            saved = _GROUPS_STATE.load(key=event_key)
-            if saved:
-                _JOINT_MODEL_CACHE.clear()
-                _JOINT_MODEL_CACHE[(event_key, saved["updated_at"])] = model
+        saved = _GROUPS_STATE.load(key=event_key)
+        if model is not None and saved:
+            _JOINT_MODEL_CACHE.clear()
+            _JOINT_MODEL_CACHE[(event_key, saved["updated_at"])] = model
+        if saved:
+            # seed the default Top 5 queries off the job's critical path
+            threading.Thread(target=_seed_live_queries, args=(event_key, saved), name="top5-warmup", daemon=True).start()
         with GROUPS_JOBS_LOCK:
             job = GROUPS_JOBS.get(job_id)
             if not job:
@@ -2127,6 +2143,26 @@ def _parse_bracket6_from_structure(html: str):
     return None
 
 
+def _parse_event_double8_bracket(html: str) -> Optional[Dict[str, Any]]:
+    """Seeds of a whole-event 8-team double-elimination bracket (StarLadder
+    StarSeries), in upper-round-1 slot order, from the typed bracket JSON —
+    None when the page has no such bracket. Raises HTTPException when the
+    page routes its matches differently from the simulator."""
+    from backend.services.event_format import parse_bracket_stages
+
+    try:
+        brackets = parse_bracket_stages(html or "")
+    except Exception:
+        return None
+    for b in brackets:
+        if b.get("bracket") != "double_elim" or int(b.get("size") or 0) != 8 or str(b.get("variant") or "") != "de8_full":
+            continue
+        if b.get("routing_error"):
+            raise HTTPException(status_code=422, detail=f"Double-elimination bracket routing not supported: {b['routing_error']}")
+        return {"seeds": list(b.get("seeds") or []), "grand_final_bo": int(b.get("grand_final_bo") or 3)}
+    return None
+
+
 def autofill_event_playoff(
     hltv_event_url: str = "",
     hltv_event_id=None,
@@ -2158,6 +2194,12 @@ def autofill_event_playoff(
         snap_html = _find_event_snapshot_html(hid)
         if snap_html and int(_parse_event_playoff_bracket(snap_html).get("bracket_size") or 0) in (8, 16):
             html = snap_html
+        elif snap_html:
+            try:
+                if _parse_event_double8_bracket(snap_html):
+                    html = snap_html
+            except HTTPException:
+                html = snap_html  # the routing error is reported below
         if html is None:
             if not url:
                 raise HTTPException(status_code=400, detail="No HLTV event link found. Import the event first or pass hltv_event_id.")
@@ -2165,6 +2207,28 @@ def autofill_event_playoff(
                 html = fetch_hltv_html(url, wait_text=None, timeout_ms=45000)
             except HLTVBrowserError as exc:
                 raise HTTPException(status_code=502, detail=f"Failed to fetch HLTV event page: {exc}") from exc
+
+    # Whole-event double elimination (StarLadder StarSeries): 8 seeds in
+    # upper-round-1 slot order, played by the playoff simulator's DE bracket.
+    double8 = _parse_event_double8_bracket(html)
+    if double8 is not None:
+        all_teams = get_all_teams()
+        by_hltv_id: Dict[int, int] = {}
+        by_name: Dict[str, int] = {}
+        for t in all_teams:
+            tid = int(t.get("team_id") or 0)
+            hltv = t.get("hltv_team_id")
+            if hltv:
+                by_hltv_id[int(hltv)] = tid
+            by_name.setdefault(_normalize_team_name(str(t.get("name") or "")), tid)
+        seeds = (list(double8["seeds"]) + [None] * 8)[:8]
+        return {
+            "bracket_size": 8,
+            "bracket_kind": "double",
+            "grand_final_bo": int(double8.get("grand_final_bo") or 3),
+            "team_ids": [_resolve_playoff_seed_team_id(s, by_hltv_id, by_name) for s in seeds],
+            "team_names": [(s["name"] if s else "TBD") for s in seeds],
+        }
 
     # Byes bracket (Porto/Cologne playoffs): resolved from the structured JSON
     # into the 6-slot convention [bye1, qf1a, qf1b, qf2a, qf2b, bye2].
@@ -2473,6 +2537,7 @@ def _group_outcome_decomposition(results: dict, group_index: int) -> Optional[Di
     pids = sorted({int(pid) for o in outs for pid in (o.get("players") or {})})
     n = len(outs)
     rw = {pid: np.zeros(n) for pid in pids}
+    rt = {pid: np.zeros(n) for pid in pids}
     mp = {pid: np.zeros(n, dtype=np.uint8) for pid in pids}
     mr = {pid: np.zeros(n) for pid in pids}
     for c, o in enumerate(outs):
@@ -2484,10 +2549,11 @@ def _group_outcome_decomposition(results: dict, group_index: int) -> Optional[Di
         for pid in pids:
             cp = comps.get(str(pid)) or {}
             rw[pid][c] = float(cp.get("rating") or 0.0) + float(cp.get("win") or 0.0)
+            rt[pid][c] = float(cp.get("rating") or 0.0)
             mp[pid][c] = played.get(pid_team.get(pid, -1), 0)
             pm = role_pm.get(pid, 0.0)
             mr[pid][c] = (float(cp.get("role") or 0.0) / pm) if abs(pm) > 1e-9 else 0.0
-    return {"rw": rw, "mp": mp, "mr": mr}
+    return {"rw": rw, "rt": rt, "mp": mp, "mr": mr}
 
 
 def _sample_joint_outcomes(results: dict, n: int, seed: int = 20240101) -> tuple:
@@ -2536,6 +2602,7 @@ def _sample_joint_outcomes(results: dict, n: int, seed: int = 20240101) -> tuple
     all_pids = sorted({int(pid) for o in outcomes for pid in (o.get("players") or {})})
     vec = {pid: np.zeros(n, dtype=np.float64) for pid in all_pids}
     rw = {pid: np.zeros(n, dtype=np.float64) for pid in all_pids} if decomposed else {}
+    rt = {pid: np.zeros(n, dtype=np.float64) for pid in all_pids} if decomposed else {}
     mp = {pid: np.zeros(n, dtype=np.uint8) for pid in all_pids} if decomposed else {}
     mr = {pid: np.zeros(n, dtype=np.float64) for pid in all_pids} if decomposed else {}
     idx_by_group: Dict[int, Any] = {}
@@ -2554,6 +2621,7 @@ def _sample_joint_outcomes(results: dict, n: int, seed: int = 20240101) -> tuple
             vec[pid] += picked[:, j]
         if decomposed:
             rw_mat = np.zeros((len(olist), len(pids_g)))
+            rt_mat = np.zeros((len(olist), len(pids_g)))
             mp_mat = np.zeros((len(olist), len(pids_g)), dtype=np.uint8)
             mr_mat = np.zeros((len(olist), len(pids_g)))
             for c, o in enumerate(olist):
@@ -2565,11 +2633,13 @@ def _sample_joint_outcomes(results: dict, n: int, seed: int = 20240101) -> tuple
                 for j, pid in enumerate(pids_g):
                     cp = comps.get(str(pid)) or {}
                     rw_mat[c, j] = float(cp.get("rating") or 0.0) + float(cp.get("win") or 0.0)
+                    rt_mat[c, j] = float(cp.get("rating") or 0.0)
                     mp_mat[c, j] = played.get(pid_team.get(pid, -1), 0)
                     pm = role_pm.get(pid, 0.0)
                     mr_mat[c, j] = (float(cp.get("role") or 0.0) / pm) if abs(pm) > 1e-9 else 0.0
             for j, pid in enumerate(pids_g):
                 rw[pid] += rw_mat[idx, j]
+                rt[pid] += rt_mat[idx, j]
                 mp[pid] += mp_mat[idx, j]
                 mr[pid] += mr_mat[idx, j]
     n_matches = sum(len(r) for r in rounds)
@@ -2607,6 +2677,7 @@ def _sample_joint_outcomes(results: dict, n: int, seed: int = 20240101) -> tuple
                     vec[pid][i] += comps[0]
                     if decomposed:
                         rw[pid][i] += comps[1] + comps[2]
+                        rt[pid][i] += comps[1]
                         mp[pid][i] += 1
                         mr[pid][i] += 1.0
                 if byes:
@@ -2638,12 +2709,13 @@ def _sample_joint_outcomes(results: dict, n: int, seed: int = 20240101) -> tuple
                         vec[pid][i] += pad
                         if decomposed:
                             rw[pid][i] += _PLAYOFF_BYE_PADDING_POINTS + rating_avg
+                            rt[pid][i] += rating_avg
                             mr[pid][i] += 1.0
     if missing:
         import logging
 
         logging.getLogger(__name__).warning("joint sampler: %d pairings missing from the stored table", missing)
-    decomp = {"rw": rw, "mp": mp, "mr": mr} if decomposed else None
+    decomp = {"rw": rw, "rt": rt, "mp": mp, "mr": mr} if decomposed else None
     return {0: vec}, {0: np.full(n, 1.0 / n, dtype=np.float64)}, {pid: 0 for pid in vec}, decomp
 
 
@@ -3116,7 +3188,9 @@ def _dense_decomposition(model: tuple, pids: List[int]) -> Optional[tuple]:
     RW = np.stack([decomp["rw"][pid] for pid in pids])
     MP = np.stack([decomp["mp"][pid] for pid in pids])
     MR = np.stack([decomp["mr"][pid] for pid in pids])
-    return RW, MP, MR
+    rt = decomp.get("rt") or {}
+    RT = np.stack([rt[pid] for pid in pids]) if all(pid in rt for pid in pids) else None
+    return RW, MP, MR, RT
 
 
 def _plan_scored_rosters(
@@ -3133,11 +3207,14 @@ def _plan_scored_rosters(
     dec = _dense_decomposition(model, pids)
     if dec is None or not keys:
         return None
-    RW, MP, MR = dec
+    RW, MP, MR, RT = dec
     probs = model[1][0]
     pid_idx = {pid: i for i, pid in enumerate(pids)}
     keys = [k for k in keys if all(int(pid) in pid_idx for pid in k)]
-    metrics = plan_metrics(keys, players_meta, pid_idx, RW, MP, MR, probs, reach_by_team, rates_by_pid, role_scores_by_pid, progress_callback=progress_callback)
+    metrics = plan_metrics(
+        keys, players_meta, pid_idx, RW, MP, MR, probs, reach_by_team, rates_by_pid, role_scores_by_pid,
+        progress_callback=progress_callback, RT=RT,
+    )
     out = []
     for key, m in zip(keys, metrics):
         r = _score_roster_exact(list(key), players_meta, reach_by_team, rates_by_pid, role_scores_by_pid)
@@ -3149,6 +3226,13 @@ def _plan_scored_rosters(
             pid = int(player.get("player_id") or 0)
             player["ceiling_score"] = float(m["peak"].get(pid, 0.0))
             player["mode_score"] = float(m["peak"].get(pid, 0.0))
+            player["ceiling_parts"] = (m.get("peak_parts") or {}).get(pid)
+            wp = (m.get("win_parts") or {}).get(pid)
+            if wp:
+                player["win_parts"] = wp
+                player["win_score"] = float(wp.get("total") or 0.0)
+        r["ceiling_outcome_index"] = int(m["argmax"])
+        r["win_conditional_ev"] = float(sum(float(v.get("total") or 0.0) for v in (m.get("win_parts") or {}).values()))
         out.append(r)
     return out
 
@@ -3218,19 +3302,17 @@ def _rosters_by_outcome(
     k: int,
     per_sample: int = _CEILING_PER_SAMPLE,
     max_samples: int = _CEILING_MAX_SAMPLES,
-    time_budget_seconds: float = 6.0,
 ) -> tuple:
     """Strongest rosters of the strongest sampled joint outcomes (single-axis
-    models). Outcomes are visited by an upper bound (five best adjusted scores
+    models). Outcomes are ranked by an upper bound (five best adjusted scores
     s − λ·price plus λ·budget, minimised over a λ grid — valid for any λ ≥ 0,
     and far tighter than the plain five-best sum when the best rosters spend
-    the whole budget); inside each the compiled search returns the exact top
-    rosters for that outcome (scores are additive there). Every roster found
-    gets its true ceiling (its best outcome over ALL samples). Returns
+    the whole budget); the compiled batch search then returns the exact top
+    rosters of the strongest `max_samples` outcomes, in parallel. Every roster
+    found gets its true ceiling (its best outcome over ALL samples). Returns
     (rosters serialised by `serialize(pids)` sorted by ceiling, certified): the
     top `certified` rosters are provably the best over the sample — no
     unvisited outcome's bound reaches their ceilings."""
-    import heapq
     import numpy as np
 
     players, pids, prices_arr, team_of, M = _dense_players(model, players_info)
@@ -3242,45 +3324,41 @@ def _rosters_by_outcome(
     budget = int(options.get("budget") or 0)
     cap = int(options.get("max_per_team") or 5)
     prices = prices_arr.astype(np.float64)
-    sample_bound = np.partition(M, -5, axis=0)[-5:].sum(axis=0)
+    lams = [0.0]
     if budget > 0 and prices.max() > 0:
         max_ratio = float(np.max(M.max(axis=1) / np.maximum(prices, 1.0)))
-        for lam in max_ratio * np.array([0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.55, 0.7, 0.85, 1.0]):
-            adj = M - lam * prices[:, None]
-            sample_bound = np.minimum(sample_bound, np.partition(adj, -5, axis=0)[-5:].sum(axis=0) + lam * budget)
-    order = np.argsort(-sample_bound)
+        lams += [max_ratio * f for f in (0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.55, 0.7, 0.85, 1.0)]
+    sample_bound = rk.lagrangian_bound_cols(M, prices, lams, float(budget))
+    order = np.argsort(-sample_bound, kind="stable")
+    visited = order[: max(1, min(int(max_samples), len(order)))]
+    sc, ro, found = rk.top_rosters_batch(
+        np.ascontiguousarray(M[:, visited]), prices_arr, team_of, budget, cap, max(1, int(per_sample)), forced
+    )
+    mask = np.arange(sc.shape[1])[None, :] < found[:, None]
+    if not mask.any():
+        return [], 0
+    rows = np.sort(ro[mask], axis=1)
+    scores = sc[mask]
+    n_players = len(pids)
+    keys = rows[:, 0].astype(np.int64)
+    for d in range(1, 5):
+        keys = keys * n_players + rows[:, d]
+    uniq, first, inv = np.unique(keys, return_index=True, return_inverse=True)
     # best score seen per roster over the visited outcomes: a lower bound on
-    # its ceiling that becomes exact at the outcome where it peaks (visited
-    # first, since outcomes are taken in bound order)
-    best_seen: Dict[tuple, float] = {}
-    rows_of: Dict[tuple, List[int]] = {}
-    kth = -1e300
-    next_bound = 0.0  # bound of the first outcome NOT visited (0 when all were)
-    deadline = time.monotonic() + max(1.0, float(time_budget_seconds))
-    for pos, i in enumerate(order[:max_samples]):
-        if pos % 128 == 0:
-            if len(best_seen) >= k:
-                kth = float(np.partition(np.fromiter(best_seen.values(), dtype=np.float64), -k)[-k])
-                if float(sample_bound[i]) <= kth + 1e-9:
-                    next_bound = float(sample_bound[i])
-                    break
-            if time.monotonic() > deadline:
-                next_bound = float(sample_bound[i])
-                break
-        for score_i, roster_idx in rk.top_rosters_one(M[:, i], prices_arr, team_of, budget, cap, per_sample, forced):
-            rows = [int(j) for j in roster_idx]
-            key = tuple(sorted(int(pids[j]) for j in rows))
-            if score_i > best_seen.get(key, -1e300):
-                best_seen[key] = float(score_i)
-                rows_of[key] = rows
-    else:
-        next_bound = float(sample_bound[order[max_samples]]) if max_samples < len(order) else 0.0
-    ranked_keys = sorted(best_seen, key=lambda kk: -best_seen[kk])[: max(k, 1)]
-    # exact ceilings for the page (max over ALL samples), then the final order
-    exact_ceiling = {key: float(M[rows_of[key]].sum(axis=0).max()) for key in ranked_keys}
-    ranked_keys.sort(key=lambda kk: -exact_ceiling[kk])
-    rosters = [serialize(list(key)) for key in ranked_keys]
-    certified = sum(1 for key in ranked_keys if exact_ceiling[key] >= next_bound - 1e-9)
+    # its ceiling that is exact at the outcome where it peaks (visited, since
+    # the visited outcomes are the strongest by bound)
+    best_seen = np.full(len(uniq), -np.inf)
+    np.maximum.at(best_seen, np.asarray(inv).reshape(-1), scores)
+    top = np.argsort(-best_seen, kind="stable")[: max(k, 1)]
+    top_rows = rows[first[top]]
+    # exact ceilings (max over ALL samples), then the final order
+    exact_ceiling = np.empty(len(top))
+    for st in range(0, len(top), 16):
+        exact_ceiling[st:st + 16] = M[top_rows[st:st + 16]].sum(axis=1).max(axis=1)
+    final = np.argsort(-exact_ceiling, kind="stable")
+    next_bound = float(sample_bound[order[len(visited)]]) if len(visited) < len(order) else 0.0
+    rosters = [serialize(sorted(int(pids[j]) for j in top_rows[i])) for i in final]
+    certified = int(np.sum(exact_ceiling[final] >= next_bound - 1e-9))
     return rosters, certified
 
 
@@ -3731,6 +3809,76 @@ def _live_groups_query(results: dict, body: dict, mode: str, cache_key: Any = No
     }
 
 
+def _live_query_cache_key(key: int, updated_at: Any, mode: str, body: dict) -> tuple:
+    """Cache key of a live Top 5 query: the stored run, the mode and the
+    normalised filters (so the warm-up's default queries hit for the app's
+    first open whatever order or defaults the request body carries)."""
+    options = parse_optimizer_payload(body)
+    return (
+        int(key),
+        updated_at,
+        str(mode),
+        str(body.get("search") or ""),
+        str(body.get("sort") or "ev_desc"),
+        int(body.get("page") or 0),
+        int(body.get("page_size") or 200),
+        int(options["budget"]),
+        int(options["max_per_team"]),
+        tuple(sorted(int(x) for x in options["include"])),
+        tuple(sorted(int(x) for x in options["exclude"])),
+    )
+
+
+def _cached_live_query(key: int, latest_sim: dict, mode: str, body: dict) -> Dict[str, Any]:
+    """The live Top 5 query for a stored run, from the query cache when the
+    same query (mode + filters) was already answered for that run. Queries
+    compute one at a time: the compiled kernels use every core, and a query
+    that arrives while the warm-up computes the same one waits for its result
+    instead of duplicating it."""
+    cache_key = _live_query_cache_key(key, latest_sim["updated_at"], mode, body)
+    with _LIVE_QUERY_CACHE_LOCK:
+        cached = _LIVE_QUERY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    with _LIVE_COMPUTE_LOCK:
+        with _LIVE_QUERY_CACHE_LOCK:
+            cached = _LIVE_QUERY_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        result = _live_groups_query(latest_sim["results"] or {}, body, mode, cache_key=(key, latest_sim["updated_at"]))
+        result["updated_at"] = latest_sim["updated_at"]
+        with _LIVE_QUERY_CACHE_LOCK:
+            if len(_LIVE_QUERY_CACHE) >= 32:
+                _LIVE_QUERY_CACHE.pop(next(iter(_LIVE_QUERY_CACHE)))
+            _LIVE_QUERY_CACHE[cache_key] = result
+    return result
+
+
+def _seed_live_queries(key: int, latest_sim: Optional[dict] = None) -> Dict[str, float]:
+    """Answer the three default Top 5 queries of a stored run (no filters,
+    first page — what the app asks for when the tab opens) so they come from
+    the cache. Runs after every bake and at startup; returns the seconds each
+    mode took."""
+    latest_sim = latest_sim or _GROUPS_STATE.load(key=key)
+    if not latest_sim or not _is_live_pool(latest_sim.get("results") or {}):
+        return {}
+    timings: Dict[str, float] = {}
+    for mode in _LIVE_QUERY_MODES:
+        body = {
+            "mode": mode, "search": "", "sort": "ev_desc", "page": 0, "page_size": 200,
+            "include_player_ids": [], "exclude_player_ids": [],
+        }
+        t0 = time.monotonic()
+        try:
+            _cached_live_query(int(key), latest_sim, mode, body)
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).warning("Top 5 warm-up failed for %s/%s", key, mode, exc_info=True)
+        timings[mode] = round(time.monotonic() - t0, 2)
+    return timings
+
+
 @router.post("/best-team/query")
 def query_groups_best_team(payload: dict | None = None):
     body = payload or {}
@@ -3742,20 +3890,7 @@ def query_groups_best_team(payload: dict | None = None):
     key = int(body.get("event_id") or 0) or _state_key()
     latest_sim = _GROUPS_STATE.load(key=key)
     if latest_sim and _is_live_pool(latest_sim["results"] or {}):
-        # The live optimizer costs ~0.5 s per query; identical queries against
-        # the same stored run (tab re-opens, paging back) come from a small cache.
-        cache_key = (key, latest_sim["updated_at"], mode, json.dumps(body, sort_keys=True, default=str))
-        with _LIVE_QUERY_CACHE_LOCK:
-            cached = _LIVE_QUERY_CACHE.get(cache_key)
-        if cached is not None:
-            return cached
-        result = _live_groups_query(latest_sim["results"] or {}, body, mode, cache_key=(key, latest_sim["updated_at"]))
-        result["updated_at"] = latest_sim["updated_at"]
-        with _LIVE_QUERY_CACHE_LOCK:
-            if len(_LIVE_QUERY_CACHE) >= 32:
-                _LIVE_QUERY_CACHE.pop(next(iter(_LIVE_QUERY_CACHE)))
-            _LIVE_QUERY_CACHE[cache_key] = result
-        return result
+        return _cached_live_query(key, latest_sim, mode, body)
     latest = _GROUPS_BEST_STATE.load(key=key)
     if not latest:
         raise HTTPException(status_code=404, detail="No stored combinations found. Run Combinations first.")

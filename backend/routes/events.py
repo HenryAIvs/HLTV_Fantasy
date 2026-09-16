@@ -4299,13 +4299,26 @@ def _detect_event_tournament_kind(event: Dict[str, Any]) -> Dict[str, Any]:
         if "_qual" in str(b.get("variant") or "") and advance.get("count"):
             label += f", top {advance['count']} qualify"
         label += ")"
+        full8 = str(b.get("variant") or "") == "de8_full" and int(b["size"] or 0) == 8
+        if full8:
+            gf_bo = int(b.get("grand_final_bo") or 0)
+            group_rules = structure.get("group_bo_rules") or {}
+            gf_bo = gf_bo or int(group_rules.get("grandFinal") or 0)
+            if group_rules.get("default"):
+                label += f" — Bo{group_rules['default']}"
+                if gf_bo and gf_bo != group_rules["default"]:
+                    label += f", grand final Bo{gf_bo}"
         candidates.append(
             {
                 "kind": "double_elim",
                 "label": label,
                 "group_format": None,
                 "group_variant": b.get("variant"),
-                "playoff_size": 0,
+                # the whole-event 8-team bracket is played by the playoff simulator
+                "playoff_size": int(b["size"] or 0) if full8 else 0,
+                "bracket_kind": "double" if full8 else None,
+                "grand_final_bo": (int(b.get("grand_final_bo") or 0) or None) if full8 else None,
+                "routing_error": b.get("routing_error") if full8 else None,
                 "roster": roster,
                 "size": int(b["size"] or len(roster)),
             }
@@ -4426,6 +4439,9 @@ def _detect_event_tournament_kind(event: Dict[str, Any]) -> Dict[str, Any]:
         "group_variant": (chosen or {}).get("group_variant"),
         "playoff_size": playoff_size,
         "playoff_byes": playoff_byes,
+        "bracket_kind": (chosen or {}).get("bracket_kind") or "single",
+        "grand_final_bo": (chosen or {}).get("grand_final_bo"),
+        "routing_error": (chosen or {}).get("routing_error"),
         "combined_playoffs": combined,
         "combined_supported": combined_supported,
         "combined_shape": combined_shape,
@@ -4621,6 +4637,7 @@ def get_event_kind(event_id: int):
             "groups": "Group Stage",
             "playoff": "Playoff",
             "bounty": "Bounty Draft",
+            "double_elim": "Double-Elimination Bracket",
         }.get(override, override)
     else:
         label = detected["label"]
@@ -4634,6 +4651,9 @@ def get_event_kind(event_id: int):
         "group_variant": detected.get("group_variant"),
         "playoff_size": detected["playoff_size"],
         "playoff_byes": detected.get("playoff_byes", 0),
+        "bracket_kind": detected.get("bracket_kind") or "single",
+        "grand_final_bo": detected.get("grand_final_bo"),
+        "routing_error": detected.get("routing_error"),
         "combined_playoffs": detected.get("combined_playoffs", False),
         "combined_supported": detected.get("combined_supported", False),
         "combined_shape": detected.get("combined_shape", ""),
@@ -4657,8 +4677,8 @@ def set_event_kind(event_id: int, payload: Dict[str, Any] | None = None):
     kind = (payload or {}).get("kind")
     if isinstance(kind, str) and kind.strip().lower() in ("", "auto"):
         kind = None
-    if kind is not None and str(kind).strip().lower() not in ("swiss", "groups", "playoff", "bounty"):
-        raise HTTPException(status_code=400, detail="kind must be swiss, groups, playoff, bounty, or auto")
+    if kind is not None and str(kind).strip().lower() not in ("swiss", "groups", "playoff", "bounty", "double_elim"):
+        raise HTTPException(status_code=400, detail="kind must be swiss, groups, playoff, bounty, double_elim, or auto")
     set_event_tournament_kind(int(event_id), kind)
     return get_event_kind(int(event_id))
 

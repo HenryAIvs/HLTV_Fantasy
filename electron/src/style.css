@@ -57,7 +57,7 @@ body { margin: 0; }
 .titlebar-brand em { font-style: normal; color: #ff6b1a; }
 
 .layout {
-  max-width: 1480px;
+  max-width: 2400px;
   margin: 0 auto;
   padding: 18px 28px 40px;
 }
@@ -2653,6 +2653,12 @@ button:disabled {
   margin-top: 2px;
 }
 .combo-outcomes { padding: 0 4px; }
+/* Most Likely Winner: per-team finishing pattern over the roster's winning brackets */
+.pattern-table { width: auto; border-collapse: collapse; font-size: 13px; margin: 2px 0 6px; }
+.pattern-table th, .pattern-table td { padding: 3px 12px 3px 0; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.pattern-table th { color: #8fa3bf; font-weight: 600; font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; }
+.pattern-table th:first-child, .pattern-table td:first-child { text-align: left; padding-right: 18px; }
+.pattern-team { display: inline-flex; align-items: center; gap: 6px; }
 
 /* Top-teams ranking picker: segmented mode control + completed-bracket toggle */
 .top5-mode-row {
@@ -3007,11 +3013,23 @@ button:disabled {
   gap: 4px;
   background: #171c24;
   border: 1px solid #2c3441;
-  padding: 12px 14px;
+  padding: 12px 20px;
   flex: 1 1 0;
-  min-width: 130px;
+  min-width: 205px;
+  max-width: 340px;
   clip-path: polygon(8px 0, 100% 0, 100% 100%, 0 100%, 0 8px);
 }
+/* the four component tiles never reach the card edge: they share the width evenly and their labels stay compact */
+.event-player-card .event-player-stats.ev-mini {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(40px, 1fr));
+  gap: 0;
+  width: 100%;
+  max-width: 250px;
+  justify-items: center;
+}
+.event-player-card .event-player-stats.ev-mini .event-player-stat { min-width: 0; }
+.event-player-card .event-player-stats.ev-mini .event-player-stat-label { font-size: 9.5px; letter-spacing: 0.05em; }
 .event-player-name {
   font-weight: 600;
   font-size: 14.5px;
@@ -3105,6 +3123,41 @@ button:disabled {
   gap: 10px;
   margin-top: 6px;
 }
+/* Double-elimination odds: a wider team column holding an aligned grid —
+   round headers across, upper and lower rows, final and title spanning both */
+.event-team-row.double-head { grid-template-columns: 460px 1fr; }
+.reach-grid {
+  display: grid;
+  grid-template-columns: auto repeat(5, 44px) 52px 44px;
+  column-gap: 6px;
+  row-gap: 3px;
+  align-items: center;
+  justify-items: center;
+  margin-top: 8px;
+}
+.reach-h {
+  color: #8fa3bf;
+  font-size: 9.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.reach-h.side { justify-self: start; padding-right: 4px; }
+.reach-v {
+  font-family: var(--display);
+  font-stretch: condensed;
+  font-size: 15px;
+  font-weight: 700;
+  color: #c6d0dc;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.reach-v.bye { color: #ff8a47; }
+.reach-v.final { font-size: 17px; border-left: 1px solid #2c3441; padding-left: 8px; justify-self: stretch; }
+.reach-v.title { border-left: 0; padding-left: 0; }
 /* Team odds list under the team name: label left, value right, title in orange */
 .event-team-odds { display: flex; flex-direction: column; gap: 2px; margin-top: 7px; max-width: 150px; }
 .event-team-odd { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
@@ -3126,8 +3179,8 @@ button:disabled {
 .event-team-odd.accent .event-team-odd-value { color: #ff6b1a; }
 /* Scoring-breakdown modal: broadcast-style summary strip + round cards */
 .modal.player-sources-modal {
-  max-width: 1480px;
-  width: 94%;
+  max-width: 2300px;
+  width: 96%;
   padding: 20px 26px;
 }
 .breakdown-hero {
@@ -3469,7 +3522,14 @@ button:disabled {
 .round-cards.stage-grid.bracket-grid .bracket-cell .round-card { flex: 1; min-width: 0; }
 .round-cards.stage-grid.bracket-grid .bracket-cell.opener { align-items: center; }
 .round-cards.stage-grid.bracket-grid .bracket-cell.opener .round-card { flex: 1; }
-.round-cards.stage-grid .round-card { padding: 14px 16px; }
+.round-cards.stage-grid .round-card { padding: 16px 22px 18px; }
+/* the number boxes and the equation keep clear of the card edge */
+.round-parts, .round-eq { padding-inline: 6px; }
+/* Double-elimination modal: 3 columns x 4 rows (rounds 1-3 upper / lower,
+   rounds 4-6 upper / lower); cards are placed explicitly, round 1 has no
+   lower-bracket cell and the grand final spans both rows of round 6. */
+.round-cards.stage-grid.double-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: stretch; }
+.round-cards.stage-grid.double-grid .round-card { flex: none; min-width: 0; }
 .round-card .round-opps .round-opp-name { font-size: 13px; }
 
 /* Four-wide bracket cards: tighter opponent table so names keep their room */
@@ -3696,3 +3756,202 @@ button:disabled {
 .chip.mini { padding: 2px 8px; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; }
 .chip.mini.active.in { border-color: #3fbf7f; color: #3fbf7f; }
 .chip.mini.active.out { border-color: #e0705a; color: #e0705a; }
+
+/* Round cards size to their column: on narrower cards the number boxes, the
+   equation strip and the opponent table shrink and the booster detail wraps
+   instead of colliding or clipping. */
+.round-card { container-type: inline-size; }
+@container (max-width: 430px) {
+  .round-part-value { font-size: 15px; }
+  .round-part-value.accent { font-size: 18px; }
+  .round-part-label { font-size: 9px; letter-spacing: 0.04em; }
+  .round-parts { gap: 4px; }
+  .round-eq { gap: 2px; }
+  .round-eq-op { font-size: 13px; padding-bottom: 18px; }
+  .round-info-name { white-space: normal; }
+  .round-info-name em { white-space: normal; letter-spacing: 0.03em; }
+  .round-trow { font-size: 11px; }
+  .round-table { column-gap: 16px; }
+  .round-info-value { font-size: 15px; }
+}
+@container (max-width: 350px) {
+  .round-part-value { font-size: 14px; }
+  .round-part-value.accent { font-size: 16px; }
+  .round-part-label { font-size: 8.5px; letter-spacing: 0.02em; }
+  .round-eq { flex-wrap: wrap; row-gap: 4px; justify-content: flex-start; }
+  .round-eq .round-part { flex: 1 1 auto; }
+  .round-table { column-gap: 10px; }
+}
+
+/* Best-bracket view in the Point Sources modal: one row per stage, each match
+   as "winner beat loser", the player's own matches highlighted */
+.outcome-bracket { display: flex; flex-direction: column; gap: 6px; }
+.outcome-bracket-row { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 12px; align-items: start; }
+.outcome-bracket-stage {
+  font-family: var(--display);
+  font-stretch: condensed;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 12px;
+  color: #8fa3bf;
+  padding-top: 4px;
+}
+.outcome-bracket-matches { display: flex; flex-wrap: wrap; gap: 6px 10px; }
+.outcome-bracket-match {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border: 1px solid #2c3441;
+  background: #171c24;
+  font-size: 12.5px;
+  color: #c6d0dc;
+  white-space: nowrap;
+}
+.outcome-bracket-match em { font-style: normal; color: #6d7d95; font-size: 11px; }
+.outcome-bracket-match.mine { border-color: #3a4657; color: #e9edf3; }
+.outcome-bracket-match.mine.won { border-left: 3px solid #3fbf7f; }
+.outcome-bracket-match.mine.lost { border-left: 3px solid #e0705a; }
+
+/* Resolved-outcome bracket cards: winner marked, loser muted, own team barred */
+.playoff-team-row.outcome-row { grid-template-columns: 28px minmax(0, 1fr) auto; }
+.playoff-team-row.outcome-row.winner { color: #f2f5f9; font-weight: 600; }
+.playoff-team-row.outcome-row.loser { opacity: 0.5; }
+.playoff-team-row.outcome-row.mine { box-shadow: inset 3px 0 0 #ff6b1a; }
+.outcome-row-mark {
+  margin-left: auto;
+  font-family: var(--display);
+  font-stretch: condensed;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: #3fbf7f;
+}
+
+
+/* Match Sources: one row per match, component numbers in the display face,
+   the detail (rating used, role, booster) under each, a totals row last */
+.match-table {
+  display: grid;
+  grid-template-columns: 140px minmax(0, 1.6fr) minmax(0, 0.8fr) minmax(0, 1fr) minmax(0, 0.9fr) minmax(0, 1fr) minmax(0, 1.5fr) minmax(0, 1fr) minmax(0, 1fr);
+  border: 1px solid #242b35;
+  background: #12161d;
+}
+.match-trow {
+  display: grid;
+  grid-template-columns: subgrid;
+  grid-column: 1 / -1;
+  align-items: center;
+  column-gap: 14px;
+  padding: 9px 16px;
+  border-top: 1px solid #1e252f;
+}
+.match-trow.head {
+  padding: 7px 16px;
+  border-top: 0;
+  background: #171c24;
+  color: #8fa3bf;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.match-trow.head .num { text-align: right; }
+.match-trow.adjust { background: #141922; }
+.match-trow.total { background: #171c24; border-top: 1px solid #2c3441; }
+.match-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.match-cell.num { align-items: flex-end; text-align: right; }
+.match-cell.opp { flex-direction: row; align-items: center; gap: 9px; }
+.match-cell-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.match-v {
+  font-family: var(--display);
+  font-stretch: condensed;
+  font-weight: 700;
+  font-size: 17px;
+  line-height: 1.1;
+  color: #e9edf3;
+  font-variant-numeric: tabular-nums;
+}
+.match-v.small { font-family: var(--body); font-stretch: normal; font-weight: 600; font-size: 13px; }
+.match-v.neg { color: #e0705a; }
+.match-v.strong { color: #f2f5f9; }
+.match-v.accent { color: #ff6b1a; font-size: 19px; }
+.match-sub { color: #8fa3bf; font-size: 10.5px; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.match-sub.pos { color: #3fbf7f; }
+.match-sub.neg { color: #e0705a; }
+
+/* Most Likely Winner: finishing-position bars per team over the roster's winning brackets */
+.combo-team .event-team-row { grid-template-columns: 320px 1fr; }
+.combo-team .combo-cost { white-space: nowrap; }
+.pattern-bars { display: flex; flex-direction: column; gap: 6px; margin: 4px 0 8px; }
+.pattern-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin-bottom: 4px;
+  color: #8fa3bf;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.pattern-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.pattern-swatch { display: inline-block; width: 10px; height: 10px; }
+.pattern-bar-row { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 12px; align-items: center; }
+.pattern-bar { display: flex; height: 24px; background: #12161d; border: 1px solid #242b35; overflow: hidden; }
+.pattern-seg {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  font-family: var(--display);
+  font-stretch: condensed;
+  font-weight: 700;
+  font-size: 12.5px;
+  color: #0f1216;
+  font-variant-numeric: tabular-nums;
+}
+.pattern-seg.c0, .pattern-swatch.c0 { background: #ff6b1a; }
+.pattern-seg.c1, .pattern-swatch.c1 { background: #f0a06a; }
+.pattern-seg.c2, .pattern-swatch.c2 { background: #9fb3cc; }
+.pattern-seg.c3, .pattern-swatch.c3 { background: #5b6b82; }
+.pattern-seg.c3 { color: #e9edf3; }
+.pattern-seg.c4, .pattern-swatch.c4 { background: #3a4657; }
+.pattern-seg.c4 { color: #c6d0dc; }
+.pattern-seg.c5, .pattern-swatch.c5 { background: #242b35; }
+.pattern-seg.c5 { color: #8fa3bf; }
+.pattern-seg.c6, .pattern-swatch.c6 { background: #1a2029; }
+.pattern-seg.c6 { color: #6d7d95; }
+
+/* Roster card pager */
+.combo-pager { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 0 0 12px; }
+.combo-pager .muted { font-variant-numeric: tabular-nums; }
+.combo-pager .combo-sort { margin-left: auto; width: auto; flex: none; }
+.combo-sort-dir { margin-left: 6px; color: #ff8a47; }
+.combo-pager > button { min-width: 72px; }
+
+/* Title bar extras in the public build: version tag and the update prompt */
+.titlebar-version {
+  margin-left: 10px;
+  color: #6d7d95;
+  font-family: var(--mono, Consolas, monospace);
+  font-size: 11px;
+  -webkit-app-region: no-drag;
+}
+.titlebar-update {
+  margin-left: auto;
+  margin-right: 150px;
+  -webkit-app-region: no-drag;
+  background: #ff6b1a;
+  color: #0f1216;
+  border: 0;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.titlebar-update.muted { background: transparent; color: #8fa3bf; font-weight: 600; cursor: default; }

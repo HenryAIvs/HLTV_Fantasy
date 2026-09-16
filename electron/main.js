@@ -1,12 +1,14 @@
 import { app, BrowserWindow, ipcMain, shell } from "electron";
 import path from "path";
 import { fileURLToPath } from "url";
+import { createRequire } from "module";
 import { spawn } from "child_process";
 import http from "http";
 import fs from "fs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const require = createRequire(import.meta.url);
 
 const repoRoot = path.join(__dirname, "..");
 // The backend picks a free port at startup (memorized one first, else the next
@@ -15,6 +17,30 @@ const repoRoot = path.join(__dirname, "..");
 const PORT_FILE = path.join(repoRoot, ".runtime", "backend-port.json");
 const DEFAULT_PORT = 8000;
 const APP_ID = "hltv-fantasy";
+
+// ---------------------------------------------------------------------------
+// Public build: the installed app distributed from the website. It never runs
+// a backend of its own; it talks to the operator's hosted backend, whose URL
+// comes from the website's api.json (so the server can move without a new
+// release), falling back to the URL bundled in public-config.json. Set
+// HLTV_PUBLIC=1 to run the repo checkout in public mode, HLTV_API_BASE to
+// point it at any backend.
+const publicBuild = app.isPackaged || process.env.HLTV_PUBLIC === "1";
+const readPublicConfig = () => {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(__dirname, "public-config.json"), "utf8"));
+  } catch {
+    return {};
+  }
+};
+const PUBLIC_CONFIG = readPublicConfig();
+
+let autoUpdater = null;
+try {
+  autoUpdater = require("electron-updater").autoUpdater;
+} catch {
+  autoUpdater = null; // dev checkout without the dependency installed
+}
 
 let backendProcess = null;
 // Only true when THIS app started the backend. When the always-on backend
@@ -29,64 +55,62 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const resolvePython = () => {
   // Prefer repo-local venv python if it exists; fall back to system python.
   const venvPython = path.join(repoRoot, ".venv", "Scripts", "python.exe");
-  if (fs.existsSync(venvPython)) {
-    return venvPython;
-  }
+  if (fs.existsSync(venvPython)) return venvPython;
   return "python";
 };
 
-const readPortInfo = () => {
+const readPortFile = () => {
   try {
-    const info = JSON.parse(fs.readFileSync(PORT_FILE, "utf8"));
-    if (info && Number.isInteger(info.port)) return info;
+    const raw = fs.readFileSync(PORT_FILE, "utf8");
+    const info = JSON.parse(raw);
+    const port = Number(info.port);
+    return Number.isFinite(port) && port > 0 ? port : null;
   } catch {
-    // missing or half-written file: treat as "no memorized port"
+    return null;
   }
-  return null;
 };
 
-// GET /health and only accept an answer that identifies as OUR backend, so a
-// stranger owning the port is never mistaken for a running backend.
-const probeBackend = (port) =>
+const probeHealth = (port) =>
   new Promise((resolve) => {
-    const req = http.get(`http://127.0.0.1:${port}/health`, { timeout: 1500 }, (res) => {
+    const req = http.get({ host: "127.0.0.1", port, path: "/health", timeout: 1500 }, (res) => {
       let body = "";
-      res.setEncoding("utf8");
-      res.on("data", (chunk) => {
-        body += chunk;
-      });
+      res.on("data", (chunk) => (body += chunk));
       res.on("end", () => {
         try {
           const data = JSON.parse(body);
-          resolve(res.statusCode === 200 && data?.app === APP_ID ? data : null);
+          resolve(res.statusCode === 200 && data.app === APP_ID);
         } catch {
-          resolve(null);
+          resolve(false);
         }
       });
     });
-    req.on("error", () => resolve(null));
+    req.on("error", () => resolve(false));
     req.on("timeout", () => {
       req.destroy();
-      resolve(null);
+      resolve(false);
     });
   });
 
 const findRunningBackend = async () => {
-  const info = readPortInfo();
-  const ports = [...new Set([info?.port, DEFAULT_PORT].filter(Number.isInteger))];
-  for (const port of ports) {
-    if (await probeBackend(port)) return port;
+  const candidates = [];
+  const memorized = readPortFile();
+  if (memorized) candidates.push(memorized);
+  for (let p = DEFAULT_PORT; p < DEFAULT_PORT + 100; p++) {
+    if (!candidates.includes(p)) candidates.push(p);
+  }
+  for (const port of candidates) {
+    if (await probeHealth(port)) return port;
   }
   return null;
 };
 
 // After spawning, the backend writes the port it actually bound to the port
-// file; wait for that entry to answer /health.
-const waitForBackend = async (attempts = 60) => {
-  for (let i = 0; i < attempts; i += 1) {
-    const info = readPortInfo();
-    if (info && (await probeBackend(info.port))) return info.port;
-    await sleep(500);
+// file; poll that (and /health) until it answers.
+const waitForBackend = async () => {
+  for (let i = 0; i < 100; i++) {
+    const port = readPortFile();
+    if (port && (await probeHealth(port))) return port;
+    await sleep(300);
   }
   return null;
 };
@@ -119,6 +143,55 @@ const ensureBackend = async () => {
   weStartedBackend = backendProcess !== null;
 };
 
+const fetchJsonWithTimeout = async (url, ms) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    const res = await fetch(url, { signal: controller.signal, cache: "no-store" });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+const resolvePublicApiBase = async () => {
+  const override = String(process.env.HLTV_API_BASE || "").trim();
+  if (override) return override.replace(/\/+$/, "");
+  const configUrl = String(PUBLIC_CONFIG.configUrl || "").trim();
+  if (configUrl) {
+    const remote = await fetchJsonWithTimeout(configUrl, 6000);
+    const base = String(remote?.apiBase || "").trim();
+    if (base) return base.replace(/\/+$/, "");
+  }
+  return String(PUBLIC_CONFIG.apiBase || `http://127.0.0.1:${DEFAULT_PORT}`).replace(/\/+$/, "");
+};
+
+let mainWindow = null;
+const sendUpdateStatus = (status) => {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("update-status", status);
+};
+
+// electron-updater against the GitHub release feed (package.json "publish").
+// Downloads in the background; the renderer shows a "restart to update"
+// prompt once the new version is ready.
+const setupUpdater = () => {
+  if (!app.isPackaged || !autoUpdater) return;
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.on("checking-for-update", () => sendUpdateStatus({ status: "checking" }));
+  autoUpdater.on("update-available", (info) => sendUpdateStatus({ status: "available", version: info?.version }));
+  autoUpdater.on("update-not-available", () => sendUpdateStatus({ status: "none" }));
+  autoUpdater.on("download-progress", (p) => sendUpdateStatus({ status: "downloading", percent: Math.round(p?.percent || 0) }));
+  autoUpdater.on("update-downloaded", (info) => sendUpdateStatus({ status: "downloaded", version: info?.version }));
+  autoUpdater.on("error", (err) => sendUpdateStatus({ status: "error", message: String(err?.message || err) }));
+  const check = () => autoUpdater.checkForUpdates().catch(() => {});
+  setTimeout(check, 10 * 1000);
+  setInterval(check, 6 * 60 * 60 * 1000);
+};
+
 const createWindow = () => {
   // Minimum sized so the player/team modals (fixed-height cards) always fit
   // without needing an internal scrollbar.
@@ -136,7 +209,7 @@ const createWindow = () => {
     titleBarOverlay: { color: "#0a0c10", symbolColor: "#c6d0dc", height: 36 },
     autoHideMenuBar: true,
     webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
+      preload: path.join(__dirname, "preload.cjs"),
     },
   });
 
@@ -146,6 +219,8 @@ const createWindow = () => {
   } else {
     win.loadFile(path.join(__dirname, "dist", "index.html"));
   }
+  mainWindow = win;
+  return win;
 };
 
 app.whenReady().then(async () => {
@@ -158,9 +233,39 @@ app.whenReady().then(async () => {
   ipcMain.on("api-base", (event) => {
     event.returnValue = apiBase;
   });
+  ipcMain.on("app-info", (event) => {
+    event.returnValue = {
+      publicBuild,
+      version: app.getVersion(),
+      siteUrl: String(PUBLIC_CONFIG.siteUrl || ""),
+      packaged: app.isPackaged,
+    };
+  });
+  ipcMain.handle("install-update", () => {
+    if (autoUpdater) autoUpdater.quitAndInstall();
+    return { status: "ok" };
+  });
+  ipcMain.handle("check-updates", async () => {
+    if (!app.isPackaged || !autoUpdater) return { status: "unavailable" };
+    try {
+      await autoUpdater.checkForUpdates();
+      return { status: "ok" };
+    } catch (e) {
+      return { status: "error", message: String(e?.message || e) };
+    }
+  });
 
-  await ensureBackend();
+  if (publicBuild) {
+    apiBase = await resolvePublicApiBase();
+  } else {
+    await ensureBackend();
+  }
   createWindow();
+  setupUpdater();
+});
+
+app.on("window-all-closed", () => {
+  app.quit();
 });
 
 app.on("will-quit", () => {

@@ -1,25 +1,75 @@
 {
   "name": "cs-fantasy",
+  "productName": "CS Fantasy Toolkit",
   "version": "0.1.0",
+  "description": "Counter-Strike fantasy valuations, brackets and roster optimisation.",
+  "author": "HenryAIvs",
+  "license": "UNLICENSED",
+  "private": true,
   "main": "main.js",
   "type": "module",
   "scripts": {
     "start": "electron .",
+    "public": "cross-env HLTV_PUBLIC=1 electron .",
     "dev": "cross-env VITE_DEV_SERVER=true electron .",
     "renderer:dev": "vite",
     "renderer:build": "vite build",
-    "app": "npm run renderer:build && electron ."
+    "app": "npm run renderer:build && electron .",
+    "dist": "npm run renderer:build && electron-builder --win --publish never",
+    "dist:dir": "npm run renderer:build && electron-builder --win --dir",
+    "release": "npm run renderer:build && electron-builder --win --publish always"
+  },
+  "build": {
+    "appId": "uk.aivs.csfantasy",
+    "productName": "CS Fantasy Toolkit",
+    "artifactName": "CS-Fantasy-Toolkit-Setup.${ext}",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.js",
+      "preload.cjs",
+      "public-config.json",
+      "package.json",
+      "dist/**/*"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "shortcutName": "CS Fantasy Toolkit"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "HenryAIvs",
+        "repo": "HLTV_Fantasy",
+        "releaseType": "release"
+      }
+    ]
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.2.0",
     "cross-env": "^7.0.3",
     "electron": "^30.0.0",
-    "vite": "^5.0.0"
-  },
-  "dependencies": {
+    "electron-builder": "^26.0.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "recharts": "^3.7.0",
-    "regression": "^2.0.1"
+    "regression": "^2.0.1",
+    "vite": "^5.0.0"
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.0"
   }
 }

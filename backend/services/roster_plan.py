@@ -350,12 +350,16 @@ def plan_metrics(
     role_scores_by_pid: Dict[int, Dict[int, float]],
     chunk: int = 16,
     progress_callback=None,
+    RT=None,
 ) -> List[Dict[str, Any]]:
     """For each candidate roster (a tuple of pids): its plan, expected points
     under the plan, its ceiling (best outcome), that outcome's probability and
     index, each player's score in it, and the share of outcomes the roster
-    tops among the candidates. Vectorised in chunks over the outcome tables."""
+    tops among the candidates. A fused compiled kernel scores every candidate
+    in every outcome (numpy chunks over the outcome tables without numba)."""
     import numpy as np
+
+    from backend.services import roster_kernels as rk
 
     C = len(keys)
     N = RW.shape[1]
@@ -372,43 +376,89 @@ def plan_metrics(
             sr = plan["slot_rates"].get(int(pid))
             if sr:
                 tables[i, p] = booster_prefix_table(sr, max_slot)
-    best_val = np.full(N, -np.inf)
-    best_i = np.full(N, -1, dtype=np.int64)
-    avg = np.empty(C)
-    ceil = np.empty(C)
-    ceil_p = np.empty(C)
-    argmax = np.empty(C, dtype=np.int64)
-    for st in range(0, C, chunk):
-        R = rows[st:st + chunk]
-        S = RW[R].sum(axis=1)
-        S += (role_pm[st:st + chunk, :, None] * MR[R]).sum(axis=1)
-        S += np.take_along_axis(tables[st:st + chunk], MP[R].astype(np.int64), axis=2).sum(axis=1)
-        avg[st:st + chunk] = S @ probs
-        mx = S.max(axis=1)
-        ceil[st:st + chunk] = mx
-        argmax[st:st + chunk] = S.argmax(axis=1)
-        ceil_p[st:st + chunk] = ((S >= mx[:, None] - 1e-9) * probs).sum(axis=1)
-        cb = S.max(axis=0)
-        ca = S.argmax(axis=0)
-        better = cb > best_val + 1e-9
-        best_val[better] = cb[better]
-        best_i[better] = st + ca[better]
+    stats = rk.plan_block_stats(RW, MP, MR, probs, rows, role_pm, tables) if C else None
+    if stats is not None:
+        avg, ceil, argmax, ceil_p, best_i = stats
         if progress_callback:
-            progress_callback(min(C, st + chunk), C)
-    wins_prob = np.zeros(C)
-    wins_count = np.zeros(C)
-    for c in range(N):
-        i = best_i[c]
-        if i >= 0:
-            wins_prob[i] += probs[c]
-            wins_count[i] += 1
+            progress_callback(C, C)
+    else:
+        best_val = np.full(N, -np.inf)
+        best_i = np.full(N, -1, dtype=np.int64)
+        avg = np.empty(C)
+        ceil = np.empty(C)
+        ceil_p = np.empty(C)
+        argmax = np.empty(C, dtype=np.int64)
+        for st in range(0, C, chunk):
+            R = rows[st:st + chunk]
+            S = RW[R].sum(axis=1)
+            S += (role_pm[st:st + chunk, :, None] * MR[R]).sum(axis=1)
+            S += np.take_along_axis(tables[st:st + chunk], MP[R].astype(np.int64), axis=2).sum(axis=1)
+            avg[st:st + chunk] = S @ probs
+            mx = S.max(axis=1)
+            ceil[st:st + chunk] = mx
+            argmax[st:st + chunk] = S.argmax(axis=1)
+            ceil_p[st:st + chunk] = ((S >= mx[:, None] - 1e-9) * probs).sum(axis=1)
+            cb = S.max(axis=0)
+            ca = S.argmax(axis=0)
+            better = cb > best_val + 1e-9
+            best_val[better] = cb[better]
+            best_i[better] = st + ca[better]
+            if progress_callback:
+                progress_callback(min(C, st + chunk), C)
+    won = best_i >= 0
+    wins_prob = np.bincount(best_i[won], weights=probs[won], minlength=C)[:C].astype(np.float64) if C else np.zeros(0)
+    wins_count = np.bincount(best_i[won], minlength=C)[:C].astype(np.float64) if C else np.zeros(0)
+    # the outcomes each candidate tops, most probable first
+    wins_idx: List[List[int]] = [[] for _ in range(C)]
+    won_cols = np.nonzero(won)[0]
+    for c in won_cols[np.argsort(-probs[won_cols], kind="stable")]:
+        wins_idx[int(best_i[c])].append(int(c))
+    # expected components given the roster wins (over the outcomes it tops)
+    win_parts: List[Dict[int, Dict[str, Any]]] = [dict() for _ in range(C)]
+    for i in range(C):
+        cols = wins_idx[i]
+        if not cols:
+            continue
+        cols_arr = np.asarray(cols, dtype=np.int64)
+        w = probs[cols_arr]
+        tot = float(w.sum())
+        if tot <= 0:
+            continue
+        w = w / tot
+        for p, pid in enumerate(keys[i]):
+            j = rows[i, p]
+            rw_v = float(RW[j, cols_arr] @ w)
+            rating_v = float(RT[j, cols_arr] @ w) if RT is not None else None
+            role_v = float(role_pm[i, p] * (MR[j, cols_arr] @ w))
+            boost_v = float(tables[i, p][MP[j, cols_arr].astype(np.int64)] @ w)
+            win_parts[i][int(pid)] = {
+                "rating": rating_v,
+                "win": (rw_v - rating_v) if rating_v is not None else None,
+                "rating_win": rw_v,
+                "role": role_v,
+                "booster": boost_v,
+                "total": rw_v + role_v + boost_v,
+            }
     out = []
     for i, key in enumerate(keys):
         o = int(argmax[i])
         peak = {}
+        peak_parts = {}
         for p, pid in enumerate(key):
             j = rows[i, p]
-            peak[int(pid)] = float(RW[j, o]) + role_pm[i, p] * float(MR[j, o]) + float(tables[i, p, int(MP[j, o])])
+            rw_v = float(RW[j, o])
+            role_v = role_pm[i, p] * float(MR[j, o])
+            boost_v = float(tables[i, p, int(MP[j, o])])
+            peak[int(pid)] = rw_v + role_v + boost_v
+            rating_v = float(RT[j, o]) if RT is not None else None
+            peak_parts[int(pid)] = {
+                "rating": rating_v,
+                "win": (rw_v - rating_v) if rating_v is not None else None,
+                "rating_win": rw_v,
+                "role": role_v,
+                "booster": boost_v,
+                "total": rw_v + role_v + boost_v,
+            }
         out.append({
             "plan": plans[i],
             "avg": float(avg[i]),
@@ -416,7 +466,10 @@ def plan_metrics(
             "ceiling_p": float(ceil_p[i]),
             "argmax": o,
             "peak": peak,
+            "peak_parts": peak_parts,
+            "win_parts": win_parts[i],
             "wins_prob": float(wins_prob[i]),
             "wins_count": float(wins_count[i]),
+            "wins_idx": wins_idx[i],
         })
     return out

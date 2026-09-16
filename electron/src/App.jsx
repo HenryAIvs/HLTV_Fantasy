@@ -88,6 +88,16 @@ const STAGE_SHORT = {
   semis: "SF",
   final: "Final",
   third_place: "3rd",
+  ub_r1: "UB R1",
+  ub_sf: "UB SF",
+  ub_final: "UB Final",
+  lb_r1: "LB R1",
+  lb_sf: "LB SF",
+  lb_final: "LB Final",
+  cons_final: "Cons. Final",
+  grand_final: "Grand Final",
+  bye_r3: "Bye R3",
+  bye_r5: "Bye R5",
 };
 const STAGE_FULL = {
   round_of_32: "Round of 32",
@@ -96,6 +106,16 @@ const STAGE_FULL = {
   semis: "Semi-final",
   final: "Final",
   third_place: "3rd place",
+  ub_r1: "Upper round 1",
+  ub_sf: "Upper semi-finals",
+  ub_final: "Upper final",
+  lb_r1: "Lower round 1",
+  lb_sf: "Lower semi-finals",
+  lb_final: "Lower final",
+  cons_final: "Consolidation final",
+  grand_final: "Grand final",
+  bye_r3: "Round 3 bye",
+  bye_r5: "Round 5 bye",
 };
 
 // booster_sprites.png — 5x4 (18 icons, last two cells empty), booster-id order
@@ -185,6 +205,55 @@ function PlayerPhoto({ playerId, name, size = 26, className = "" }) {
   );
 }
 
+// Roster cards are paged rather than tabled: this many per page.
+const COMBO_PAGE_SIZE = 10;
+// Sort fields for the roster pager: key prefix, label, first direction on click
+// (a second click on the active field flips it).
+const COMBO_SORT_FIELDS = [
+  ["ev", "Score", "desc"],
+  ["cost", "Cost", "asc"],
+  ["cpp", "Value", "desc"],
+];
+function ComboPager({ page, pageSize, total, onPage, sortKey = null, onSort = null }) {
+  const count = Number(total || 0);
+  const pages = Math.max(1, Math.ceil(count / pageSize));
+  const first = count > 0 ? page * pageSize + 1 : 0;
+  const last = Math.min(count, (page + 1) * pageSize);
+  return (
+    <div className="combo-pager">
+      <button className="secondary" onClick={() => onPage(Math.max(0, page - 1))} disabled={page <= 0}>
+        Prev
+      </button>
+      <span className="muted">
+        {first.toLocaleString()}–{last.toLocaleString()} of {count.toLocaleString()} · page {page + 1} of {pages}
+      </span>
+      <button className="secondary" onClick={() => onPage(page + 1)} disabled={page + 1 >= pages}>
+        Next
+      </button>
+      {onSort && (
+        <div className="combo-sort seg">
+          {COMBO_SORT_FIELDS.map(([field, label, firstDir]) => {
+            const current = String(sortKey || "ev_desc");
+            const active = current.startsWith(`${field}_`);
+            const desc = !current.endsWith("_asc");
+            return (
+              <button
+                type="button"
+                key={field}
+                className={`seg-btn${active ? " on" : ""}`}
+                onClick={() => onSort(active ? `${field}_${desc ? "asc" : "desc"}` : `${field}_${firstDir}`)}
+              >
+                {label}
+                {active ? <span className="combo-sort-dir">{desc ? "↓" : "↑"}</span> : null}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function BreakdownHero({ playerId, name, teamName, hltvTeamId, roleId, stats, total, note = null }) {
   return (
     <div className="breakdown-hero">
@@ -233,13 +302,45 @@ function BreakdownHero({ playerId, name, teamName, hltvTeamId, roleId, stats, to
   );
 }
 
-const tabs = [
+const APP_INFO = (typeof window !== "undefined" && window.api?.appInfo) || null;
+// Public build: the installed app distributed from the website (see
+// electron/main.js). Operator-only tabs and every control that scrapes HLTV
+// or rewrites the stored runs are hidden; the backend refuses them anyway
+// (backend/services/public_access.py). `?public` on the dev URL previews it.
+const PUBLIC_BUILD =
+  Boolean(APP_INFO?.publicBuild) || (typeof window !== "undefined" && new URLSearchParams(window.location.search).has("public"));
+const APP_VERSION = APP_INFO?.version || "dev";
+const ALL_TABS = [
   { key: "view", label: "Database" },
   { key: "events", label: "Events" },
   { key: "tournament", label: "Tournament" },
   { key: "devlab", label: "Dev Lab" },
   { key: "scheduling", label: "Scheduling" },
 ];
+const tabs = PUBLIC_BUILD ? ALL_TABS.filter((t) => t.key === "view" || t.key === "tournament") : ALL_TABS;
+const NOT_PUBLISHED = "Valuations for this event have not been published yet.";
+
+// Update prompt in the title bar (public build): electron-updater downloads in
+// the background and the user restarts when it is ready.
+function UpdateBanner() {
+  const [status, setStatus] = useState(null);
+  useEffect(() => {
+    if (!window.api?.onUpdateStatus) return;
+    window.api.onUpdateStatus((s) => setStatus(s));
+  }, []);
+  if (!status) return null;
+  if (status.status === "downloaded") {
+    return (
+      <button type="button" className="titlebar-update" onClick={() => window.api?.installUpdate?.()}>
+        Update {status.version ? `v${status.version} ` : ""}ready · restart to install
+      </button>
+    );
+  }
+  if (status.status === "downloading") {
+    return <span className="titlebar-update muted">Downloading update {status.percent ? `${status.percent}%` : ""}</span>;
+  }
+  return null;
+}
 
 const ACTIVE_MAP_POOL = ["Mirage", "Inferno", "Nuke", "Ancient", "Anubis", "Dust2", "Cache"];
 
@@ -702,6 +803,23 @@ const assignRosterBoostersFromBreakdowns = (rosterBreakdowns) => {
     if (state.score > best.score + 1e-9) best = state;
   });
   return best.choices;
+};
+
+// Roster context for the shared modal: the roster's assigned role with its
+// trigger rates (from the player's roles JSON) and the roster's booster plan
+// rows for this player.
+const rosterRoleContext = (players, ctx, pid) => {
+  const prow = (players || []).find((x) => Number(x.player_id) === Number(pid));
+  let rolesObj = {};
+  try {
+    rolesObj = prow?.roles_json ? JSON.parse(prow.roles_json) : {};
+  } catch {
+    rolesObj = {};
+  }
+  const rr = rolesObj[String(ctx.role_id)] || {};
+  const major = Number(rr.major || 0);
+  const minor = Number(rr.minor || 0);
+  return { ...ctx, major, minor, per_match: 5 * major + 2 * minor - 2 * (1 - major - minor) };
 };
 
 const rosterAssignedBoosterPlayer = (player, rosterPlayers) => {
@@ -1394,7 +1512,8 @@ function GroupPlayerBreakdownModal({ player, teamLookup, teams, onClose }) {
     const oppAvg = (key) => (oppPlay > 0 ? opponents.reduce((a, o) => a + o.play * o[key], 0) / oppPlay : 0);
     const avgRow = oppPlay > 0.0005 ? { play: oppPlay, win: oppAvg("win"), winPts: oppAvg("winPts"), rating: oppAvg("rating") } : null;
     const covered = play + bye + elimProb;
-    const elsewhere = s.phase === "group" && covered < 0.9995 ? 1 - covered : 0;
+    const elsewhere = (s.phase === "group" || s.bracket) && covered < 0.9995 ? 1 - covered : 0;
+    const elsewhereLabel = s.bracket === "lower" ? "Upper bracket" : s.phase === "group" ? "Lower bracket" : "Lower bracket or out";
     const perMatch = {
       rating: play > 0.0005 ? Number(cell.rating || 0) / play : 0,
       win: play > 0.0005 ? (Number(cell.win || 0) - elimPts) / play : 0,
@@ -1440,9 +1559,7 @@ function GroupPlayerBreakdownModal({ player, teamLookup, teams, onClose }) {
           ? [{ key: "others", muted: true, name: `Others (${rest.length})`, play: restPlay, win: wavg(rest, "win"), winPts: wavg(rest, "winPts"), rating: wavg(rest, "rating"), total: wavg(rest, "total") }]
           : []),
         ...(elimProb > 0.0005 ? [{ key: "elim", muted: true, name: "Out earlier", play: elimProb, winPts: elimPts / elimProb, total: elimPts / elimProb }] : []),
-        ...(elsewhere > 0.0005
-          ? [{ key: "else", muted: true, name: s.bracket === "lower" ? "Upper bracket" : "Lower bracket", play: elsewhere, total: 0 }]
-          : []),
+        ...(elsewhere > 0.0005 ? [{ key: "else", muted: true, name: elsewhereLabel, play: elsewhere, total: 0 }] : []),
       ],
       avgRow,
       ledger: {
@@ -1498,17 +1615,42 @@ function GroupPlayerBreakdownModal({ player, teamLookup, teams, onClose }) {
   const paddingCard = padCard("padding", "Padding", padFor(player.padding || null), Number(player.padding_prob || 0));
   const playoffPadCard = padCard("po_padding", "Padding", padFor(player.playoff_padding || null), Number(player.playoff_pad_prob || 0));
   const sideOf = (s) => s.bracket || (s.phase === "playoff" ? "playoff" : "upper");
-  const groupStages = stageList.filter((s) => s.phase === "group");
-  const openerStage = groupStages.find((s) => s.opener) || groupStages[0] || null;
-  const opener = openerStage ? matchCard(openerStage) : null;
-  const upper = groupStages.filter((s) => s !== openerStage && sideOf(s) === "upper").map(matchCard).filter(Boolean);
-  const lower = groupStages.filter((s) => s !== openerStage && sideOf(s) === "lower").map(matchCard).filter(Boolean);
-  const playoff = stageList.filter((s) => s.phase === "playoff").map(matchCard).filter(Boolean);
-  if (paddingCard && (upper.length > 0 || opener)) upper.splice(Math.min(1, upper.length), 0, paddingCard);
-  if (playoffPadCard && playoff.length > 0) playoff.splice(Math.min(1, playoff.length), 0, playoffPadCard);
-  const groupCols = (opener ? 1 : 0) + Math.max(upper.length, lower.length);
-  const playoffCols = Math.max(1, playoff.length);
-  const hasStages = Boolean(opener) || upper.length > 0 || lower.length > 0 || playoff.length > 0;
+  // A stage flagged `pad` is a bye / padding credit shown as a vertical pad
+  // card (the stage's points and the chance it applies); anything else is a
+  // match card.
+  const cardFor = (s) =>
+    s.pad
+      ? padCard(s.key, s.full || STAGE_FULL[s.key] || s.key, padFor(stageEv[s.key] || null), Number(teamRounds[s.key]?.bye || 0))
+      : matchCard(s);
+  // Sections: explicit `section` ids on the stages, else the classic group /
+  // playoff split. A section is a bracket grid (an opener spanning both rows,
+  // then an upper and a lower row) when any stage names a bracket side.
+  const sections = [];
+  stageList.forEach((s) => {
+    const id = s.section || (s.phase === "playoff" ? "playoff" : "group");
+    let sec = sections.find((x) => x.id === id);
+    if (!sec) {
+      sec = { id, title: s.section_title || (id === "playoff" ? "Playoffs" : "Group Stage"), stages: [] };
+      sections.push(sec);
+    }
+    sec.stages.push(s);
+  });
+  const built = sections.map((sec) => {
+    const isBracket = sec.id === "group" || sec.stages.some((st) => st.bracket || st.opener);
+    if (!isBracket) {
+      const cards = sec.stages.map(cardFor).filter(Boolean);
+      if (sec.id === "playoff" && playoffPadCard && cards.length > 0) cards.splice(Math.min(1, cards.length), 0, playoffPadCard);
+      return { ...sec, isBracket: false, cards };
+    }
+    const openerStage = sec.stages.find((st) => st.opener) || (sec.id === "group" ? sec.stages[0] : null);
+    const opener = openerStage ? cardFor(openerStage) : null;
+    const upper = sec.stages.filter((st) => st !== openerStage && sideOf(st) === "upper").map(cardFor).filter(Boolean);
+    const lower = sec.stages.filter((st) => st !== openerStage && sideOf(st) === "lower").map(cardFor).filter(Boolean);
+    if (sec.id === "group" && paddingCard && (upper.length > 0 || opener)) upper.splice(Math.min(1, upper.length), 0, paddingCard);
+    return { ...sec, isBracket: true, opener, upper, lower, cols: (opener ? 1 : 0) + Math.max(upper.length, lower.length) };
+  });
+  const hasStages = built.some((sec) => (sec.isBracket ? Boolean(sec.opener) || sec.upper.length > 0 || sec.lower.length > 0 : sec.cards.length > 0));
+  const matchRows = Array.isArray(player.match_rows) ? player.match_rows : [];
   const dash = <span className="round-cell-dash">—</span>;
   const renderCard = (c) => (
     <div className={`round-card${c.extra ? " extra" : ""}`} key={c.key}>
@@ -1680,49 +1822,170 @@ function GroupPlayerBreakdownModal({ player, teamLookup, teams, onClose }) {
             hltvTeamId={player.team_id ? teamInfo(player.team_id)?.hltv_team_id : null}
             roleId={roster ? roster.role_id : player.role_id}
             note={
-              roster
+              player.hero_note ||
+              (roster
                 ? `in this roster · best role ${ROLE_NAMES[player.role_id] || (player.role_id != null ? `Role ${player.role_id}` : "—")}`
-                : null
+                : null)
             }
             stats={heroStats}
             total={total}
           />
           {player.note && <p className="muted">{player.note}</p>}
-          {!hasStages && !player.note && (
-            <p className="muted">
-              Expected points across every exact group outcome, weighted by its probability. Re-run the
-              valuation to see the per-round split.
-            </p>
+          {!hasStages && !player.note && matchRows.length === 0 && (
+            <p className="muted">Re-run the valuation to see the per-round split.</p>
           )}
-          {(opener || upper.length > 0 || lower.length > 0) && (
-            <div className="stack round-row">
-              <h4>Group Stage</h4>
-              <div className="round-cards stage-grid bracket-grid" style={gridStyle(groupCols)}>
-                {opener && (
-                  <div className="bracket-cell opener" style={{ gridColumn: 1, gridRow: "1 / span 2" }}>
-                    {renderCard(opener)}
+          {built.map((sec) =>
+            sec.isBracket ? (
+              (sec.opener || sec.upper.length > 0 || sec.lower.length > 0) && (
+                <div className="stack round-row" key={sec.id}>
+                  <h4>{sec.title}</h4>
+                  <div className="round-cards stage-grid bracket-grid" style={gridStyle(sec.cols)}>
+                    {sec.opener && (
+                      <div className="bracket-cell opener" style={{ gridColumn: 1, gridRow: "1 / span 2" }}>
+                        {renderCard(sec.opener)}
+                      </div>
+                    )}
+                    {sec.upper.map((c, i) => (
+                      <div className="bracket-cell" style={{ gridColumn: i + (sec.opener ? 2 : 1), gridRow: 1 }} key={`u-${c.key}`}>
+                        {renderCard(c)}
+                      </div>
+                    ))}
+                    {sec.lower.map((c, i) => (
+                      <div className="bracket-cell" style={{ gridColumn: i + (sec.opener ? 2 : 1), gridRow: 2 }} key={`l-${c.key}`}>
+                        {renderCard(c)}
+                      </div>
+                    ))}
                   </div>
-                )}
-                {upper.map((c, i) => (
-                  <div className="bracket-cell" style={{ gridColumn: i + (opener ? 2 : 1), gridRow: 1 }} key={`u-${c.key}`}>
-                    {renderCard(c)}
-                  </div>
-                ))}
-                {lower.map((c, i) => (
-                  <div className="bracket-cell" style={{ gridColumn: i + (opener ? 2 : 1), gridRow: 2 }} key={`l-${c.key}`}>
-                    {renderCard(c)}
-                  </div>
-                ))}
-              </div>
+                </div>
+              )
+            ) : (
+              sec.cards.length > 0 && (
+                <div className="stack round-row" key={sec.id}>
+                  <h4>{sec.title}</h4>
+                  <div className="round-cards stage-grid" style={gridStyle(Math.max(1, sec.cards.length))}>{sec.cards.map(renderCard)}</div>
+                </div>
+              )
+            )
+          )}
+          {player.outcome_bracket && (
+            <div className="stack">
+              <h4>Bracket</h4>
+              <OutcomeBracketVisual bracket={player.outcome_bracket} teamLookup={teamLookup} teams={teams} highlightTeamId={player.team_id} />
             </div>
           )}
-          {playoff.length > 0 && (
-            <div className="stack round-row">
-              <h4>Playoffs</h4>
-              <div className="round-cards stage-grid" style={gridStyle(playoffCols)}>{playoff.map(renderCard)}</div>
-            </div>
-          )}
-          {!hasStages && (
+          {matchRows.length > 0 &&
+            (() => {
+              const sums = matchRows.reduce(
+                (a, r) => ({
+                  rating: a.rating + Number(r.rating_points || 0),
+                  win: a.win + Number(r.win_points || 0),
+                  role: a.role + Number(r.role_points || 0),
+                  booster: a.booster + Number(r.booster_points || 0),
+                  total: a.total + Number(r.total_points || 0),
+                }),
+                { rating: 0, win: 0, role: 0, booster: 0, total: 0 }
+              );
+              const played = matchRows.filter((r) => r.match_number != null).length;
+              const padded = matchRows.filter((r) => String(r.match_type || "").toUpperCase() === "PADDING").length;
+              const rated = matchRows.filter((r) => r.rating_used != null);
+              const ratingAvg = rated.length ? rated.reduce((a, r) => a + Number(r.rating_used || 0), 0) / rated.length : null;
+              const cellNum = (v, extra = "", sub = null) => (
+                <span className="match-cell num">
+                  <span className={`match-v${Number(v) < -0.005 ? " neg" : ""}${extra ? ` ${extra}` : ""}`}>{Number(v || 0).toFixed(2)}</span>
+                  {sub ? <span className="match-sub">{sub}</span> : null}
+                </span>
+              );
+              return (
+                <div className="stack">
+                  <h4>Match Sources</h4>
+                  <div className="match-table">
+                    <div className="match-trow head">
+                      <span>Match</span>
+                      <span>Opponent</span>
+                      <span className="num">Rating</span>
+                      <span className="num">Rating pts</span>
+                      <span className="num">Win</span>
+                      <span className="num">Role</span>
+                      <span className="num">Booster</span>
+                      <span className="num">Booster pts</span>
+                      <span className="num">Total</span>
+                    </div>
+                    {matchRows.map((row, idx) => {
+                      const type = String(row.match_type || "").toUpperCase();
+                      const isPad = type === "PADDING";
+                      const isElim = type === "ELIMINATION";
+                      const opponentId = Number(row.opponent_team_id || 0);
+                      const info = opponentId > 0 ? teamInfo(opponentId) : null;
+                      const label = row.match_number ? `Match ${row.match_number}` : isPad ? "Padding" : isElim ? "Elimination" : "Adjustment";
+                      const labelSub = row.match_number ? row.match_type || "BO3" : "";
+                      const missed = isElim ? String(row.note || "").match(/(\d+) unplayed/) : null;
+                      const oppText = opponentId > 0 ? `${teamLookup[opponentId] || opponentId}${teamRank(opponentId)}` : isPad ? "N/A" : isElim ? "Knocked out" : "—";
+                      const oppSub =
+                        opponentId > 0 && row.did_win != null
+                          ? `${row.did_win ? "Win" : "Loss"} · ${(Number(row.win_probability || 0) * 100).toFixed(0)}% chance`
+                          : isPad
+                            ? ""
+                            : isElim
+                              ? `${missed ? missed[1] : ""} round${missed && missed[1] === "1" ? "" : "s"} missed · −3 each`
+                              : row.note || "";
+                      const roleName = row.role_id == null ? "" : ROLE_NAMES[row.role_id] || `Role ${row.role_id}`;
+                      const rate = Number(row.booster_trigger_rate || 0);
+                      const boosterName = row.booster_name || (row.booster_slot ? `Booster slot ${row.booster_slot}` : "");
+                      return (
+                        <div className={`match-trow${isPad || isElim ? " adjust" : ""}`} key={`${row.match_number || "adj"}-${idx}`}>
+                          <span className="match-cell">
+                            <span className="match-v small">{label}</span>
+                            {labelSub ? <span className="match-sub">{labelSub}</span> : null}
+                          </span>
+                          <span className="match-cell opp">
+                            {info ? <TeamLogo hltvTeamId={info?.hltv_team_id} name={teamLookup[opponentId]} size={22} /> : null}
+                            <span className="match-cell-text">
+                              <span className="match-v small">{oppText}</span>
+                              {oppSub ? (
+                                <span className={`match-sub${opponentId > 0 && row.did_win != null ? (row.did_win ? " pos" : " neg") : ""}`}>{oppSub}</span>
+                              ) : null}
+                            </span>
+                          </span>
+                          <span className="match-cell num">
+                            <span className="match-v">{row.rating_used != null ? Number(row.rating_used).toFixed(2) : "—"}</span>
+                          </span>
+                          {cellNum(row.rating_points)}
+                          {cellNum(row.win_points)}
+                          {cellNum(row.role_points, "", roleName || null)}
+                          <span className="match-cell num">
+                            <span className="match-v small">{boosterName || "—"}</span>
+                            {rate > 0 ? <span className="match-sub">{(rate * 100).toFixed(0)}% trigger</span> : null}
+                          </span>
+                          {cellNum(row.booster_points)}
+                          {cellNum(row.total_points, "strong")}
+                        </div>
+                      );
+                    })}
+                    <div className="match-trow total">
+                      <span className="match-cell">
+                        <span className="match-v small">Total</span>
+                        <span className="match-sub">
+                          {played} match{played === 1 ? "" : "es"}
+                          {padded ? ` · ${padded} padded` : ""}
+                        </span>
+                      </span>
+                      <span />
+                      <span className="match-cell num">
+                        <span className="match-v">{ratingAvg != null ? ratingAvg.toFixed(2) : "—"}</span>
+                        {ratingAvg != null ? <span className="match-sub">average</span> : null}
+                      </span>
+                      {cellNum(sums.rating)}
+                      {cellNum(sums.win)}
+                      {cellNum(sums.role)}
+                      <span />
+                      {cellNum(sums.booster)}
+                      {cellNum(sums.total, "accent")}
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+          {!hasStages && matchRows.length === 0 && (
             <table>
               <thead>
                 <tr>
@@ -1816,7 +2079,7 @@ function GroupStageTab({
   };
 
   const run = async () => {
-    if (selected.length < 2) return;
+    if (PUBLIC_BUILD || selected.length < 2) return;
     setBusy(true);
     setRunMessage("");
     setProcessedSims(0);
@@ -1987,9 +2250,9 @@ function GroupStageTab({
           <Input label="# Sims" value={sims} onChange={setSims} />
           <div className="field">
             <span>Run</span>
-            <button className="primary" onClick={run} disabled={busy || selected.length < 2}>
+            {!PUBLIC_BUILD && (<button className="primary" onClick={run} disabled={busy || selected.length < 2}>
               {busy ? "Running..." : "Run Swiss Group Stage"}
-            </button>
+            </button>)}
           </div>
         </div>
         {eventSwissInfo && (
@@ -2002,9 +2265,9 @@ function GroupStageTab({
           </p>
         )}
         <div className="actions" style={{ marginTop: 8 }}>
-          <button className="danger" onClick={onResetSimulation} disabled={busy || !results}>
+          {!PUBLIC_BUILD && (<button className="danger" onClick={onResetSimulation} disabled={busy || !results}>
             Reset Stored Simulation
-          </button>
+          </button>)}
           {simUpdatedAt && <p className="muted">Stored: {new Date(simUpdatedAt).toLocaleString()}</p>}
         </div>
         {busy && (
@@ -2246,7 +2509,7 @@ function TopTeamsTab({ teamLookup, selected, bo, sims, results, onOpenPlayer }) 
         search: comboSearch,
         sort_key: sortKey,
         page: targetPage,
-        page_size: 200,
+        page_size: COMBO_PAGE_SIZE,
       });
       if (res?.detail) {
         setMessage(String(res.detail));
@@ -2343,6 +2606,7 @@ function TopTeamsTab({ teamLookup, selected, bo, sims, results, onOpenPlayer }) 
       }
     };
     try {
+      if (PUBLIC_BUILD) return;
       const start = await api.post("/best-team/from-latest/start", {});
       if (start?.detail) {
         setMessage(String(start.detail));
@@ -2478,7 +2742,7 @@ function TopTeamsTab({ teamLookup, selected, bo, sims, results, onOpenPlayer }) 
       <div className="stack">
         {!results && (
           <div className="card sub">
-            <p className="muted">Run Swiss Group Stage in the Group Stage tab first.</p>
+            <p className="muted">{PUBLIC_BUILD ? NOT_PUBLISHED : "Run Swiss Group Stage in the Group Stage tab first."}</p>
           </div>
         )}
         {results && (
@@ -2589,10 +2853,11 @@ function TopTeamsTab({ teamLookup, selected, bo, sims, results, onOpenPlayer }) 
                 </div>
               </div>
             </div>
-            {topTeams.map((team, idx) => (
+            <ComboPager page={page} pageSize={COMBO_PAGE_SIZE} total={filteredCount} onPage={queryStoredTeams} sortKey={sortKey} onSort={setSortKey} />
+            {(pageTeams && pageTeams.length > 0 ? pageTeams : topTeams).map((team, idx) => (
               <div key={idx} className="card sub">
                 <h4>
-                  #{idx + 1} EV {team.total_ev.toFixed(2)} | Cost {team.cost}
+                  #{idx + 1 + page * COMBO_PAGE_SIZE} EV {team.total_ev.toFixed(2)} | Cost {team.cost}
                 </h4>
                 {Array.isArray(team.booster_assignments) && team.booster_assignments.length > 0 && (
                   <p className="muted">
@@ -2676,78 +2941,6 @@ function TopTeamsTab({ teamLookup, selected, bo, sims, results, onOpenPlayer }) 
                 )}
               </div>
             ))}
-          </div>
-        )}
-        {cacheId && filteredCount > 0 && (
-          <div className="card sub">
-            <h3>All Filtered Teams ({filteredCount})</h3>
-            <div className="actions">
-              <button
-                className="secondary"
-                onClick={() => {
-                  const prev = Math.max(0, page - 1);
-                  if (prev !== page) queryStoredTeams(prev);
-                }}
-                disabled={page === 0}
-              >
-                Prev 200
-              </button>
-              <button
-                className="secondary"
-                onClick={() => {
-                  const next = (page + 1) * 200 < filteredCount ? page + 1 : page;
-                  if (next !== page) queryStoredTeams(next);
-                }}
-                disabled={(page + 1) * 200 >= filteredCount}
-              >
-                Next 200
-              </button>
-              <p className="muted">
-                Page {page + 1} showing {Math.min(200, Math.max(0, filteredCount - page * 200))} of {filteredCount}
-              </p>
-            </div>
-            <table>
-              <thead>
-                <tr>
-                  <th>#</th>
-                  <SortHeader sortValue={sortKey} asc="ev_asc" desc="ev_desc" defaultDirection="desc" onChange={setSortKey}>EV</SortHeader>
-                  <SortHeader sortValue={sortKey} asc="cost_asc" desc="cost_desc" onChange={setSortKey}>Cost</SortHeader>
-                  <SortHeader sortValue={sortKey} asc="cpp_asc" desc="cpp_desc" defaultDirection="desc" onChange={setSortKey}>Value</SortHeader>
-                  <th>Players</th>
-                </tr>
-              </thead>
-              <tbody>
-                {pageTeams.map((team, idx) => (
-                  <tr key={idx + page * 200}>
-                    <td>{idx + 1 + page * 200}</td>
-                    <td>{team.total_ev.toFixed(2)}</td>
-                    <td>{team.cost}</td>
-                    <td>{(team.total_ev / (team.cost || 1)).toFixed(4)}</td>
-                    <td>
-                      {(team.players || []).map((p, playerIdx) => (
-                        <span key={`${idx}-${p.player_id}`}>
-                          {playerIdx > 0 && ", "}
-                          <button
-                            className="inline-link-btn"
-                            onClick={() =>
-                              openSourceBreakdown({
-                                ...p,
-                                booster_odds: (team.booster_assignments || []).filter(
-                                  (assignment) => Number(assignment.player_id) === Number(p.player_id)
-                                ),
-                              })
-                            }
-                          >
-                            {p.name}
-                          </button>
-                          {` (${teamLookup[p.team_id] || p.team_id}, ${roleLabel(p.role_name)})`}
-                        </span>
-                      ))}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
           </div>
         )}
         {cacheId && filteredCount === 0 && (
@@ -3902,7 +4095,94 @@ function MapsTab({ teams }) {
   );
 }
 
-function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpenPlayer, variant = "main", detectedBracketSize = null }) {
+// Whole-event 8-team double elimination (StarLadder StarSeries): the 14
+// matches in play order with their feeders, mirroring the backend's
+// _DOUBLE8_MATCHES (lower semis crossed: each upper-semi loser meets the other
+// side's lower-round-1 winner; consolidation final = upper-final loser v
+// lower-final winner).
+const DOUBLE8_MATCHES = [
+  ["ub_r1_1", "ub_r1", ["seed", 0], ["seed", 1]],
+  ["ub_r1_2", "ub_r1", ["seed", 2], ["seed", 3]],
+  ["ub_r1_3", "ub_r1", ["seed", 4], ["seed", 5]],
+  ["ub_r1_4", "ub_r1", ["seed", 6], ["seed", 7]],
+  ["ub_sf_1", "ub_sf", ["win", "ub_r1_1"], ["win", "ub_r1_2"]],
+  ["ub_sf_2", "ub_sf", ["win", "ub_r1_3"], ["win", "ub_r1_4"]],
+  ["lb_r1_1", "lb_r1", ["lose", "ub_r1_1"], ["lose", "ub_r1_2"]],
+  ["lb_r1_2", "lb_r1", ["lose", "ub_r1_3"], ["lose", "ub_r1_4"]],
+  ["lb_sf_1", "lb_sf", ["lose", "ub_sf_2"], ["win", "lb_r1_1"]],
+  ["lb_sf_2", "lb_sf", ["lose", "ub_sf_1"], ["win", "lb_r1_2"]],
+  ["ub_final", "ub_final", ["win", "ub_sf_1"], ["win", "ub_sf_2"]],
+  ["lb_final", "lb_final", ["win", "lb_sf_1"], ["win", "lb_sf_2"]],
+  ["cons_final", "cons_final", ["lose", "ub_final"], ["win", "lb_final"]],
+  ["grand_final", "grand_final", ["win", "ub_final"], ["win", "cons_final"]],
+];
+const DOUBLE8_BY_KEY = Object.fromEntries(DOUBLE8_MATCHES.map((m) => [m[0], m]));
+const DOUBLE8_MATCH_TITLE = {
+  ub_r1_1: "UB 1",
+  ub_r1_2: "UB 2",
+  ub_r1_3: "UB 3",
+  ub_r1_4: "UB 4",
+  ub_sf_1: "UB SF 1",
+  ub_sf_2: "UB SF 2",
+  ub_final: "UB Final",
+  grand_final: "Grand Final",
+  lb_r1_1: "LB 1",
+  lb_r1_2: "LB 2",
+  lb_sf_1: "LB SF 1",
+  lb_sf_2: "LB SF 2",
+  lb_final: "LB Final",
+  cons_final: "Cons. Final",
+};
+// Columns of each bracket: [stage, match keys, straight]. "straight" rounds
+// have one feeder card level with the card it feeds (no two-feeder bar).
+const DOUBLE8_UPPER_ROUNDS = [
+  ["ub_r1", ["ub_r1_1", "ub_r1_2", "ub_r1_3", "ub_r1_4"], false],
+  ["ub_sf", ["ub_sf_1", "ub_sf_2"], false],
+  ["ub_final", ["ub_final"], false],
+  ["grand_final", ["grand_final"], true],
+];
+const DOUBLE8_LOWER_ROUNDS = [
+  ["lb_r1", ["lb_r1_1", "lb_r1_2"], false],
+  ["lb_sf", ["lb_sf_1", "lb_sf_2"], true],
+  ["lb_final", ["lb_final"], false],
+  ["cons_final", ["cons_final"], true],
+];
+// Player modal round cards for the double elimination: 3 columns x 4 rows,
+// rounds 1-3 (upper row, lower row) then rounds 4-6 (upper row, lower row).
+// [row, column, row span]; round 1 has no lower-bracket match, the grand final
+// spans both rows of round 6.
+const DOUBLE8_ROUND_LAYOUT = {
+  ub_r1: [1, 1],
+  ub_sf: [1, 2],
+  bye_r3: [1, 3],
+  lb_r1: [2, 2],
+  lb_sf: [2, 3],
+  ub_final: [3, 1],
+  bye_r5: [3, 2],
+  grand_final: [3, 3, 2],
+  lb_final: [4, 1],
+  cons_final: [4, 2],
+};
+const DOUBLE8_PADDING_RULE_TEXT =
+  "Six scheduled rounds: upper-semi winners sit out round 3 and are padded with the per-match average of their first two games; the upper-final winner sits out round 5 and is padded with the average of its three real games (rating, win, role, no booster). A team knocked out in round r is charged -3 for each of the 6 - r rounds it misses.";
+const double8FeederLabel = (feeder) =>
+  feeder[0] === "seed"
+    ? `Seed ${Number(feeder[1]) + 1}`
+    : `${feeder[0] === "win" ? "Winner" : "Loser"} ${DOUBLE8_MATCH_TITLE[feeder[1]] || feeder[1]}`;
+
+function PlayoffTab({
+  teams,
+  teamLookup,
+  players,
+  sortTeams,
+  applyFilters,
+  onOpenPlayer,
+  variant = "main",
+  detectedBracketSize = null,
+  detectedBracketKind = "single",
+  grandFinalBo = 3,
+  routingError = "",
+}) {
   const isBounty = variant === "bounty";
   const [playoffTab, setPlayoffTab] = useState("stage");
   const [events, setEvents] = useState([]);
@@ -3912,8 +4192,14 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   const [updatedAt, setUpdatedAt] = useState("");
   const [slots, setSlots] = useState(Array(8).fill(""));
   const [bracketSize, setBracketSize] = useState(8); // every size up to 16 is enumerated exactly
+  // "single" (knock-out) or "double" (whole-event double elimination, 8 teams)
+  const [bracketKind, setBracketKind] = useState(detectedBracketKind === "double" ? "double" : "single");
+  const isDouble = bracketKind === "double";
   // null = stored-sim hydration pending, 0 = no stored sim, else its size.
   const [storedSize, setStoredSize] = useState(null);
+  const [storedKind, setStoredKind] = useState(null);
+  // completed double-elimination picks: match key -> winner team id (string)
+  const [completedDouble, setCompletedDouble] = useState({});
   const [mcSims, setMcSims] = useState(5000); // Monte-Carlo samples, only used for fields beyond 16 teams
   // Self-loading bracket: once the stored-sim hydration has resolved, seed
   // the page from the event automatically whenever the stored sim doesn't
@@ -3924,15 +4210,17 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     if (storedSize === null) return; // hydration still pending
     const size = Number(detectedBracketSize);
     if (![6, 8, 16].includes(size)) return;
-    if (storedSize === size) return; // stored sim already fits this format
+    const wantKind = detectedBracketKind === "double" ? "double" : "single";
+    if (storedSize === size && (storedKind || "single") === wantKind) return; // stored sim already fits this format
     autoSeededRef.current = true;
     autofillPlayoffFromEvent();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [storedSize, detectedBracketSize]);
+  }, [storedSize, storedKind, detectedBracketSize, detectedBracketKind]);
 
   // Fill the seed slots + bracket size straight from the linked HLTV event's
   // single-elimination playoff bracket (16/8), in bracket order.
   const autofillPlayoffFromEvent = async () => {
+    if (PUBLIC_BUILD) return;
     setPlayoffAutofillBusy(true);
     setPlayoffAutofillMessage("");
     try {
@@ -3953,19 +4241,21 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
         return;
       }
       setBracketSize(size);
+      setBracketKind(data.bracket_kind === "double" ? "double" : "single");
       setSlots([...ids, ...Array(size).fill("")].slice(0, size));
       setResults(null);
       setTopTeams(null);
       setAllTeams(null);
       setBaseTeams(null);
       setCompletedBracket({ rounds: emptyCompletedRounds(size), third: "" });
+      setCompletedDouble({});
       setCompletedBracketResult(null);
       setCompletedBracketMessage("");
       const tbd = names.filter((_, i) => !Number(ids[i]));
       setPlayoffAutofillMessage(
         tbd.length
           ? `Filled ${size}-team bracket; ${tbd.length} seed(s) not matched to a team yet (${tbd.join(", ")}).`
-          : `Filled ${size}-team bracket from the event.`
+          : `Filled ${size}-team ${data.bracket_kind === "double" ? "double-elimination " : ""}bracket from the event.`
       );
     } catch (e) {
       setPlayoffAutofillMessage(e?.message || "Autofill from HLTV event failed.");
@@ -4246,6 +4536,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   // muted winner placeholders. Auto-distributed via .pb-bracket for any size.
   const renderSeedingBracket = () => {
     const n = bracketSize;
+    if (isDouble) return renderDoubleBracket("seed");
     if (n === 6) {
       // Byes bracket: slots [SF bye 1, QF1a, QF1b, QF2a, QF2b, SF bye 2].
       return (
@@ -4488,11 +4779,267 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       points: Number(row.points ?? row.total_ev ?? row.mode_score ?? 0),
     });
   };
-  const openProjectedRosterBreakdown = (player, rosterPlayers) => {
-    openScoringBreakdown({
-      ...player,
-      playoff_booster_usage: aggregatePlayoffBoosterUsage(player, rosterPlayers || [], results?.outcomes || []),
+  const openProjectedRosterBreakdown = (player, team) => {
+    const roleNum = Number(player.role_name);
+    const roleId =
+      player.role_name != null && player.role_name !== "" && Number.isFinite(roleNum) ? roleNum : roleIdFromName(player.role_name);
+    const assignments = (team?.booster_assignments || []).filter((a) => Number(a.player_id) === Number(player.player_id));
+    const rosterCtx =
+      (team?.booster_assignments || []).length > 0
+        ? rosterRoleContext(
+            players,
+            { role_id: roleId, role_ev: Number(player.role_ev || 0), booster_ev: Number(player.booster_ev || 0), boosters: assignments },
+            player.player_id
+          )
+        : null;
+    if (playoffBestMode === "most_outcomes" && Array.isArray(team?.winning_outcome_indexes) && team.winning_outcome_indexes.length > 0) {
+      api
+        .post(
+          "/playoff/winning-player-detail",
+          {
+            variant,
+            outcome_indexes: team.winning_outcome_indexes,
+            player_id: Number(player.player_id),
+            role_id: roleId,
+            booster_assignments: team.booster_assignments || [],
+          },
+          120000
+        )
+        .then((data) => {
+          if (data?.detail) {
+            openScoringBreakdown({ ...player, roster: rosterCtx });
+            return;
+          }
+          openScoringBreakdown({ ...player, roster: rosterCtx, win_detail: data, win_odds: team.outcome_win_probability });
+        })
+        .catch(() => openScoringBreakdown({ ...player, roster: rosterCtx }));
+      return;
+    }
+    if (playoffBestMode === "single_outcome" && team?.ceiling_outcome_index != null) {
+      api
+        .post(
+          "/playoff/outcome-player-detail",
+          {
+            variant,
+            outcome_index: Number(team.ceiling_outcome_index),
+            player_id: Number(player.player_id),
+            role_id: roleId,
+            booster_assignments: team.booster_assignments || [],
+          },
+          60000
+        )
+        .then((data) => {
+          if (data?.detail) {
+            openScoringBreakdown({ ...player, roster: rosterCtx });
+            return;
+          }
+          openScoringBreakdown({ ...player, roster: rosterCtx, ceiling_detail: data, ceiling_odds: team.ceiling_probability });
+        })
+        .catch(() => openScoringBreakdown({ ...player, roster: rosterCtx }));
+      return;
+    }
+    openScoringBreakdown({ ...player, roster: rosterCtx });
+  };
+  // The stored run's stage stats in the shared modal's contract. The
+  // double-elimination run stores it directly (stages / rounds / layout); the
+  // knock-out runs' per-stage cells (opponent list, most likely booster) are
+  // converted here, the elimination credit being the residual over the
+  // opponents' conditional points.
+  const adaptPlayoffBreakdown = (row) => {
+    if (!row) return null;
+    const stageStats = results?.stage_stats || null;
+    const pid = Number(row.player_id);
+    const tid = Number(row.team_id || 0);
+    const stageRow = stageStats?.players?.[String(pid)] || null;
+    const teamRow = stageStats?.teams?.[String(tid)] || null;
+    const stageKeys = Array.isArray(stageStats?.stages) ? stageStats.stages : [];
+    const layout = Array.isArray(stageStats?.layout) ? stageStats.layout : [];
+    const compRow = results?.teams?.[String(tid)]?.players?.[String(pid)] || null;
+    const roleInfo = row.role_info || compRow?.role_info || stageRow?.role || null;
+    const slotByBooster = {};
+    (row.booster_slots || compRow?.booster_slots || []).forEach((b) => {
+      if (b.booster_id != null) slotByBooster[Number(b.booster_id)] = b.slot;
     });
+    const team_ranks = {};
+    Object.entries(stageStats?.teams || {}).forEach(([k, t]) => {
+      if (t?.rank != null) team_ranks[k] = t.rank;
+    });
+    let stage_list = [];
+    let stage_ev = {};
+    let team_rounds = {};
+    if (stageRow?.stages) {
+      stage_ev = stageRow.stages;
+      team_rounds = teamRow?.rounds || {};
+      stage_list = stageKeys
+        .filter((k) => stage_ev[k] || team_rounds[k])
+        .map((k) => {
+          const m = layout.find((l) => l.key === k) || {};
+          return {
+            key: k,
+            label: k,
+            full: m.full || STAGE_FULL[k] || k,
+            phase: "playoff",
+            section: m.section || "playoff",
+            section_title: m.section_title || "Playoffs",
+            bracket: m.bracket || null,
+            opener: Boolean(m.opener),
+            pad: Boolean(m.pad),
+          };
+        });
+    } else if (stageRow) {
+      stageKeys.forEach((k) => {
+        const cell = stageRow[k];
+        if (!cell || typeof cell !== "object") return;
+        const opps = Array.isArray(cell.opponents) ? cell.opponents : [];
+        const play = opps.reduce((a, o) => a + Number(o.prob || 0), 0);
+        const winMass = opps.reduce((a, o) => a + Number(o.prob || 0) * Number(o.win_chance || 0), 0);
+        const oppEv = opps.reduce((a, o) => a + Number(o.prob || 0) * Number(o.total || 0), 0);
+        const reach = Number(teamRow?.reach?.[k] ?? play);
+        const isBye = reach < 0.0005 && Math.abs(Number(cell.total || 0)) > 0.005;
+        const elimPts = isBye ? 0 : Number(cell.total || 0) - oppEv;
+        const elimProb = isBye ? 0 : Math.max(0, 1 - play);
+        const opponentsEv = {};
+        const opponentsRound = {};
+        opps.forEach((o) => {
+          const t = String(o.team_id);
+          const p = Number(o.prob || 0);
+          opponentsEv[t] = {
+            rating: p * Number(o.rating || 0),
+            win: p * Number(o.win || 0),
+            role: p * Number(o.role || 0),
+            booster: p * Number(o.booster || 0),
+            total: p * Number(o.total || 0),
+          };
+          opponentsRound[t] = { play: p, win: Number(o.win_chance || 0) };
+          if (o.rank != null) team_ranks[t] = o.rank;
+        });
+        stage_ev[k] = {
+          rating: Number(cell.rating || 0),
+          win: Number(cell.win || 0),
+          role: Number(cell.role || 0),
+          booster: Number(cell.booster || 0),
+          total: Number(cell.total || 0),
+          boosters:
+            cell.booster_id != null
+              ? [
+                  {
+                    booster_id: cell.booster_id,
+                    booster_name: cell.booster_name,
+                    booster_rate: Number(cell.booster_rate || 0),
+                    slot: slotByBooster[Number(cell.booster_id)] ?? null,
+                    share: 1,
+                  },
+                ]
+              : [],
+          opponents: opponentsEv,
+        };
+        team_rounds[k] = {
+          play,
+          win: play > 0 ? winMass / play : 0,
+          opponents: opponentsRound,
+          elim_before: { prob: Math.abs(elimPts) > 0.005 ? elimProb : 0, points: Math.abs(elimPts) > 0.005 ? elimPts : 0 },
+          bye: isBye ? 1 : 0,
+        };
+        stage_list.push({ key: k, label: k, full: STAGE_FULL[k] || k, phase: "playoff", section: "playoff", section_title: "Playoffs", pad: isBye });
+      });
+    }
+    const wd = row.win_detail || null;
+    if (wd) {
+      const c = wd.components || {};
+      const layout = Array.isArray(wd.layout) ? wd.layout : [];
+      const list = (wd.stages || [])
+        .filter((k) => wd.stage_ev?.[k] || wd.team_rounds?.[k])
+        .map((k) => {
+          const m = layout.find((l) => l.key === k) || {};
+          return {
+            key: k,
+            label: k,
+            full: m.full || STAGE_FULL[k] || k,
+            phase: "playoff",
+            section: m.section || "playoff",
+            section_title: m.section_title || "Playoffs",
+            bracket: m.bracket || null,
+            opener: Boolean(m.opener),
+            pad: Boolean(m.pad),
+          };
+        });
+      const pct = Number(row.win_odds || wd.mass || 0) * 100;
+      return {
+        player_id: pid,
+        name: row.name || playerLookup[pid] || `Player ${pid}`,
+        team_id: tid,
+        role_id: row.roster?.role_id ?? row.role_id ?? compRow?.role_id ?? null,
+        rating: Number(c.rating || 0),
+        win: Number(c.win || 0),
+        role: Number(c.role || 0),
+        booster: Number(c.booster || 0),
+        total: Number(c.total || 0),
+        stage_list: list,
+        stage_ev: wd.stage_ev || {},
+        team_rounds: wd.team_rounds || {},
+        team_ranks: { ...team_ranks, ...(wd.team_ranks || {}) },
+        role_info: roleInfo,
+        hero_note: `in the ${Number(wd.n_outcomes || 0).toLocaleString()} brackets this roster wins · ${pct.toFixed(1)}%`,
+        padding: null,
+        padding_prob: 0,
+        playoff_padding: null,
+        playoff_pad_prob: 0,
+      };
+    }
+    const detail = row.ceiling_detail || null;
+    if (detail) {
+      const pct = Number(row.ceiling_odds || detail.probability || 0) * 100;
+      const shown = pct >= 1 ? pct.toFixed(1) : pct >= 0.1 ? pct.toFixed(2) : pct.toFixed(3);
+      const c = detail.components || {};
+      return {
+        player_id: pid,
+        name: row.name || playerLookup[pid] || `Player ${pid}`,
+        team_id: tid,
+        role_id: row.roster?.role_id ?? row.role_id ?? compRow?.role_id ?? null,
+        rating: Number(c.rating || 0),
+        win: Number(c.win || 0),
+        role: Number(c.role || 0),
+        booster: Number(c.booster || 0),
+        total: Number(c.total || 0),
+        stage_list: [],
+        stage_ev: {},
+        team_rounds: {},
+        team_ranks,
+        role_info: roleInfo,
+        hero_note: `this roster's best bracket · ${shown}% chance`,
+        outcome_bracket: detail.bracket || null,
+        match_rows: Array.isArray(detail.rows) ? detail.rows : [],
+      };
+    }
+    const matchRows = Array.isArray(row.point_breakdown) && row.point_breakdown.length > 0 ? row.point_breakdown : [];
+    return {
+      player_id: pid,
+      name: row.name || playerLookup[pid] || `Player ${pid}`,
+      team_id: tid,
+      role_id: row.role_id ?? compRow?.role_id ?? roleInfo?.role_id ?? null,
+      rating: completedBreakdownValue(row, "rating"),
+      win: completedBreakdownValue(row, "win"),
+      role: completedBreakdownValue(row, "role"),
+      booster: completedBreakdownValue(row, "booster"),
+      total: completedBreakdownValue(row, "total"),
+      stage_list: matchRows.length > 0 ? [] : stage_list,
+      stage_ev,
+      team_rounds,
+      team_ranks,
+      role_info: roleInfo,
+      padding: null,
+      padding_prob: 0,
+      playoff_padding: null,
+      playoff_pad_prob: 0,
+      roster: row.roster || null,
+      note:
+        row.components_available === false
+          ? "This stored bracket was generated before source components were saved. Re-run the playoff bracket to see the split."
+          : matchRows.length > 0
+            ? "Points for this exact bracket."
+            : row.note || null,
+      match_rows: matchRows,
+    };
   };
   const seedIndexById = useMemo(() => {
     const m = {};
@@ -4595,11 +5142,140 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     }
     return { roundsPairs, thirdPair, semiRoundIdx, complete };
   }, [slots, completedBracket, hasThirdPlaceDecider, isBounty, draftedQfPairs, sfPicks, seedIndexById]);
+  // Double elimination: the teams in every match follow from the seeds and the
+  // picks so far (a pick that is no longer one of its match's teams is dropped).
+  const doubleDerived = useMemo(() => {
+    const winners = {};
+    const losers = {};
+    const pairs = {};
+    let complete = true;
+    DOUBLE8_MATCHES.forEach(([key, _stage, fa, fb]) => {
+      const feed = (f) => (f[0] === "seed" ? slots[f[1]] || "" : (f[0] === "win" ? winners[f[1]] : losers[f[1]]) || "");
+      const a = String(feed(fa) || "");
+      const b = String(feed(fb) || "");
+      pairs[key] = [a, b];
+      const pick = String(completedDouble[key] || "");
+      if (pick && a && b && (pick === a || pick === b)) {
+        winners[key] = pick;
+        losers[key] = pick === a ? b : a;
+      } else {
+        winners[key] = "";
+        losers[key] = "";
+        complete = false;
+      }
+    });
+    return { pairs, winners, losers, complete };
+  }, [slots, completedDouble]);
+  const completedComplete = isDouble ? doubleDerived.complete : completedBracketDerived["complete"];
+  const setDoublePick = (key, value) => {
+    setCompletedDouble((prev) => {
+      const next = { ...prev, [key]: value };
+      // every match fed (directly or through others) by this one depended on its result
+      const dependents = new Set([key]);
+      let grew = true;
+      while (grew) {
+        grew = false;
+        DOUBLE8_MATCHES.forEach(([k, _s, fa, fb]) => {
+          if (dependents.has(k)) return;
+          if ((fa[0] !== "seed" && dependents.has(fa[1])) || (fb[0] !== "seed" && dependents.has(fb[1]))) {
+            dependents.add(k);
+            grew = true;
+          }
+        });
+      }
+      dependents.forEach((k) => {
+        if (k !== key) delete next[k];
+      });
+      return next;
+    });
+    setCompletedBracketResult(null);
+    setCompletedBracketMessage("");
+  };
+  const hydrateCompletedDoubleFromBracket = (bracket) => {
+    if (!bracket) return;
+    const picks = {};
+    Object.values(bracket).forEach((matches) => {
+      (matches || []).forEach((m) => {
+        if (m?.key && m?.winner) picks[m.key] = String(m.winner);
+      });
+    });
+    if (Object.keys(picks).length > 0) setCompletedDouble(picks);
+  };
+  // Upper and lower brackets of the double elimination, as the seeding view
+  // (mode "seed": seeds + muted feeder placeholders) or the completed-bracket
+  // picker (mode "pick": clickable winners).
+  const renderDoubleBracket = (mode) => {
+    const picker = mode === "pick";
+    const metaFor = (key) => (key === "grand_final" ? `BO${grandFinalBo || 5}` : "BO3");
+    const rowFor = (key, feeder, i) => {
+      if (picker) {
+        const teamId = (doubleDerived.pairs[key] || ["", ""])[i];
+        return (
+          <CompletedBracketTeamRow
+            key={`${key}-${i}`}
+            teamId={teamId}
+            selected={Boolean(teamId) && String(completedDouble[key] || "") === String(teamId)}
+            onSelect={(val) => setDoublePick(key, val)}
+            placeholder={double8FeederLabel(feeder)}
+          />
+        );
+      }
+      if (feeder[0] === "seed") return <BracketTeamRow key={`${key}-${i}`} slotIndex={feeder[1]} />;
+      return <BracketTeamRow key={`${key}-${i}`} placeholder={double8FeederLabel(feeder)} muted />;
+    };
+    const bracket = (rounds) => (
+      <div className="pb-bracket">
+        {rounds.map(([stage, keys, straight]) => (
+          <div className={`pb-round${straight ? " straight" : ""}`} key={`${mode}-${stage}`}>
+            <div className="pb-round-title">{STAGE_FULL[stage] || stage}</div>
+            <div className="pb-matches">
+              {keys.map((key) => {
+                const m = DOUBLE8_BY_KEY[key];
+                return (
+                  <div className="pb-match-wrap" key={`${mode}-${key}`}>
+                    <BracketMatchCard
+                      title={DOUBLE8_MATCH_TITLE[key] || key}
+                      meta={metaFor(key)}
+                      rows={
+                        <>
+                          {rowFor(key, m[2], 0)}
+                          {rowFor(key, m[3], 1)}
+                        </>
+                      }
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+    return (
+      <div className="group-brackets">
+        <div>
+          <div className="group-bracket-title">Upper bracket</div>
+          {bracket(DOUBLE8_UPPER_ROUNDS)}
+        </div>
+        <div>
+          <div className="group-bracket-title">Lower bracket</div>
+          {bracket(DOUBLE8_LOWER_ROUNDS)}
+        </div>
+      </div>
+    );
+  };
   // Request fields describing the picked bracket. The backend computes the
-  // bracket deterministically from `round_winners` (any field size); the bounty
+  // bracket deterministically from `round_winners` (any field size) or, for
+  // double elimination, from the 14 `match_winners` in play order; the bounty
   // variant is still looked up among stored 8-team outcomes, so send the legacy
   // qf/sf/final fields for it too.
   const completedBracketPayloadFields = () => {
+    if (isDouble) {
+      return {
+        match_winners: DOUBLE8_MATCHES.map(([key]) => Number(completedDouble[key] || 0)),
+        third_place_winner: 0,
+      };
+    }
     const rounds = (completedBracket.rounds || []).map((r) => r.map((id) => Number(id)));
     const fields = {
       round_winners: rounds,
@@ -4621,6 +5297,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     setTotalCombos(0);
     setCompletedEtaSeconds(null);
     try {
+      if (PUBLIC_BUILD) return;
       const start = await api.post("/playoff/best-team/bracket-from-latest/start", {
         ...completedBracketPayloadFields(),
         include_player_ids: Array.from(effectiveAppliedFilters.include),
@@ -4722,6 +5399,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   };
   const playoffPlayerModeScore = (player) => {
     if (playoffBestMode === "single_outcome") return Number(player?.ceiling_score ?? player?.mode_score ?? player?.total_ev ?? 0);
+    if (playoffBestMode === "most_outcomes") return Number(player?.win_score ?? player?.mode_score ?? player?.total_ev ?? 0);
     return Number(player?.mode_score ?? player?.total_ev ?? 0);
   };
   const playoffOutcomeCount = Number(results?.outcomes_count || (hasThirdPlaceDecider ? 256 : 128));
@@ -4730,33 +5408,194 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     if (!Number.isFinite(n)) return "0";
     return Math.abs(n - Math.round(n)) < 1e-9 ? String(Math.round(n)) : n.toFixed(1);
   };
+  // Roster card head: the mode's metric on the name line, its detail on a
+  // second muted line (the head column is narrow, so no long single label).
   const playoffTeamMetricLabel = (team) => {
-    if (playoffBestMode === "single_outcome") {
-      return `Ceiling ${Number(team?.ceiling_points || 0).toFixed(2)} | Outcome prob ${(
-        Number(team?.ceiling_probability || 0) * 100
-      ).toFixed(1)}%`;
-    }
-    if (playoffBestMode === "most_outcomes") {
-      return `Win chance ${(Number(team?.outcome_win_probability || 0) * 100).toFixed(1)}% | Wins ${formatOutcomeWins(
-        team?.outcome_wins
-      )} of ${playoffOutcomeCount.toLocaleString()} outcomes`;
-    }
+    if (playoffBestMode === "single_outcome") return `Ceiling ${Number(team?.ceiling_points || 0).toFixed(2)}`;
+    if (playoffBestMode === "most_outcomes") return `Win chance ${(Number(team?.outcome_win_probability || 0) * 100).toFixed(1)}%`;
     return `EV ${Number(team?.total_ev || 0).toFixed(2)}`;
   };
-  const playoffOutcomeDescriptor = (outcomeIdx) => {
-    const outcome = (results?.outcomes || [])[outcomeIdx];
-    if (!outcome) return null;
-    const bracket = outcome.bracket || {};
-    const finalRow = (bracket.final || [])[0] || {};
-    const name = (id) => teamLookup[id] || String(id);
-    return {
-      probability: Number(outcome.probability || 0),
-      champion: name(finalRow.winner),
-      runnerUp: name(finalRow.loser),
-      sfWinners: (bracket.semis || []).map((m) => name(m.winner)).join(", "),
-      qfWinners: (bracket.quarters || []).map((m) => name(m.winner)).join(", "),
-      third: (bracket.third_place || [])[0] ? name(bracket.third_place[0].winner) : "",
+  // Detail lines under the roster's metric (each on its own line).
+  const playoffTeamMetricSub = (team) => {
+    if (playoffBestMode === "single_outcome") {
+      const pct = Number(team?.ceiling_probability || 0) * 100;
+      const shown = pct >= 1 ? pct.toFixed(1) : pct >= 0.1 ? pct.toFixed(2) : pct.toFixed(3);
+      return [`Bracket odds ${shown}%`];
+    }
+    if (playoffBestMode === "most_outcomes") {
+      const cond = Number(team?.win_conditional_ev || 0);
+      const lines = [`${formatOutcomeWins(team?.outcome_wins)} of ${playoffOutcomeCount.toLocaleString()} brackets`];
+      if (cond > 0) lines.push(`${cond.toFixed(1)} pts when it wins`);
+      return lines;
+    }
+    return [];
+  };
+  // Exact enumerations store an outcome as a result code (one bit per match in
+  // play order, 0 = the first-listed team wins); rebuild its bracket from the
+  // stored template: the double-elimination match list, or halving rounds.
+  const decodeCodeOutcome = (code, template) => {
+    const slots = (template?.team_slots || []).map(Number);
+    const bitAt = (pos) => Math.floor(code / 2 ** pos) % 2;
+    if (template?.kind === "double") {
+      const winners = {};
+      const losers = {};
+      const byStage = {};
+      const nM = DOUBLE8_MATCHES.length;
+      DOUBLE8_MATCHES.forEach(([key, stage, fa, fb], m) => {
+        const feed = (f) => (f[0] === "seed" ? slots[f[1]] : f[0] === "win" ? winners[f[1]] : losers[f[1]]);
+        const a = feed(fa);
+        const b = feed(fb);
+        const bit = bitAt(nM - 1 - m);
+        winners[key] = bit ? b : a;
+        losers[key] = bit ? a : b;
+        (byStage[stage] = byStage[stage] || []).push({ winner: winners[key], loser: losers[key], teams: [a, b] });
+      });
+      return byStage;
+    }
+    const nMatches = Math.max(0, slots.length - 1) + (template?.third_place ? 1 : 0);
+    let alive = slots.slice();
+    let m = 0;
+    const byRound = {};
+    const semiLosers = [];
+    while (alive.length > 1) {
+      const winners = [];
+      const matches = [];
+      for (let i = 0; i + 1 < alive.length; i += 2) {
+        const a = alive[i];
+        const b = alive[i + 1];
+        const bit = bitAt(nMatches - 1 - m);
+        m += 1;
+        const w = bit ? b : a;
+        const l = bit ? a : b;
+        winners.push(w);
+        matches.push({ winner: w, loser: l, teams: [a, b] });
+        if (alive.length === 4) semiLosers.push(l);
+      }
+      byRound[roundNameForTeams(alive.length)] = matches;
+      alive = winners;
+    }
+    if (template?.third_place && semiLosers.length === 2) {
+      const bit = bitAt(nMatches - 1 - m);
+      byRound.third_place = [{ winner: bit ? semiLosers[1] : semiLosers[0], loser: bit ? semiLosers[0] : semiLosers[1] }];
+    }
+    return byRound;
+  };
+  // Finishing position of every team in one decoded bracket, by bucket label.
+  const outcomeFinishBuckets = (bracket) => {
+    const out = {};
+    const put = (id, label) => {
+      if (id != null && out[id] === undefined) out[id] = label;
     };
+    if (bracket.grand_final) {
+      const gf = bracket.grand_final[0] || {};
+      put(gf.winner, "Champion");
+      put(gf.loser, "Final");
+      const cf = (bracket.cons_final || [])[0];
+      if (cf) put(cf.loser, "3rd");
+      const lf = (bracket.lb_final || [])[0];
+      if (lf) put(lf.loser, "4th");
+      (bracket.lb_sf || []).forEach((m) => put(m.loser, "5th–6th"));
+      (bracket.lb_r1 || []).forEach((m) => put(m.loser, "7th–8th"));
+      return out;
+    }
+    const fin = (bracket.final || [])[0] || {};
+    put(fin.winner, "Champion");
+    put(fin.loser, "Final");
+    const third = (bracket.third_place || [])[0];
+    if (third) {
+      put(third.winner, "3rd");
+      put(third.loser, "4th");
+    }
+    (bracket.semis || []).forEach((m) => put(m.loser, "Semis"));
+    (bracket.quarters || []).forEach((m) => put(m.loser, "Quarters"));
+    (bracket.round_of_16 || []).forEach((m) => put(m.loser, "R16"));
+    (bracket.round_of_32 || []).forEach((m) => put(m.loser, "R32"));
+    return out;
+  };
+  const FINISH_ORDER = ["Champion", "Final", "3rd", "4th", "Semis", "5th–6th", "Quarters", "7th–8th", "R16", "R32"];
+  // The pattern behind a roster's winning brackets: each team's finishing
+  // position, weighted by bracket probability, across the outcomes it wins.
+  const winningPatterns = (team) => {
+    const idxs = Array.isArray(team?.winning_outcome_indexes) ? team.winning_outcome_indexes : [];
+    const outcomes = results?.outcomes || [];
+    const template = results?.bracket_template || null;
+    if (idxs.length === 0 || outcomes.length === 0) return null;
+    const mass = {};
+    const labels = new Set();
+    let total = 0;
+    idxs.forEach((i) => {
+      const o = outcomes[i];
+      if (!o) return;
+      const p = Number(o.probability || 0);
+      const bracket = o.bracket || (o.code != null && template ? decodeCodeOutcome(Number(o.code), template) : null);
+      if (!bracket) return;
+      total += p;
+      Object.entries(outcomeFinishBuckets(bracket)).forEach(([tid, label]) => {
+        labels.add(label);
+        const by = (mass[tid] = mass[tid] || {});
+        by[label] = (by[label] || 0) + p;
+      });
+    });
+    if (total <= 0) return null;
+    const columns = FINISH_ORDER.filter((l) => labels.has(l));
+    const rows = Object.entries(mass).map(([tid, by]) => ({
+      team_id: Number(tid),
+      shares: columns.map((c) => (by[c] || 0) / total),
+    }));
+    rows.sort((a, b) => {
+      for (let k = 0; k < columns.length; k += 1) {
+        const d = b.shares[k] - a.shares[k];
+        if (Math.abs(d) > 1e-9) return d;
+      }
+      return 0;
+    });
+    return { columns, rows, count: idxs.length, total };
+  };
+
+  // Double elimination: a team's odds as an aligned grid — round headers
+  // across, one row for the upper bracket and one for the lower, then the
+  // grand final and the title spanning both rows.
+  const renderDoubleReach = (teamStage) => {
+    const pct = (v) => (Number(v || 0) >= 0.0005 ? `${Math.round(Number(v) * 100)}%` : "–");
+    const r = teamStage.reach || {};
+    const cell = (key, value, row, col, bye = false, extra = "") => (
+      <div className={`reach-v${bye ? " bye" : ""}${extra ? ` ${extra}` : ""}`} key={key} style={{ gridRow: row, gridColumn: col }} title={STAGE_FULL[key] || ""}>
+        {pct(value)}
+      </div>
+    );
+    const heads = ["R1", "R2", "R3", "R4", "R5"];
+    return (
+      <div className="reach-grid">
+        {heads.map((h, i) => (
+          <span className="reach-h" key={h} style={{ gridRow: 1, gridColumn: i + 2 }}>
+            {h}
+          </span>
+        ))}
+        <span className="reach-h" style={{ gridRow: 1, gridColumn: 7 }}>
+          Final
+        </span>
+        <span className="reach-h" style={{ gridRow: 1, gridColumn: 8 }}>
+          Title
+        </span>
+        <span className="reach-h side" style={{ gridRow: 2, gridColumn: 1 }}>
+          Upper
+        </span>
+        <span className="reach-h side" style={{ gridRow: 3, gridColumn: 1 }}>
+          Lower
+        </span>
+        {cell("ub_r1", r.ub_r1, 2, 2)}
+        {cell("ub_sf", r.ub_sf, 2, 3)}
+        {cell("bye_r3", r.bye_r3, 2, 4, true)}
+        {cell("ub_final", r.ub_final, 2, 5)}
+        {cell("bye_r5", r.bye_r5, 2, 6, true)}
+        {cell("lb_r1", r.lb_r1, 3, 3)}
+        {cell("lb_sf", r.lb_sf, 3, 4)}
+        {cell("lb_final", r.lb_final, 3, 5)}
+        {cell("cons_final", r.cons_final, 3, 6)}
+        {cell("grand_final", r.grand_final, "2 / span 2", 7, false, "final")}
+        {cell("title", teamStage.champion, "2 / span 2", 8, false, "final title")}
+      </div>
+    );
   };
 
   const loadEventsForPlayoff = async (retriesLeft = 3) => {
@@ -4800,8 +5639,11 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     setLatestPayload(payload);
     setSlots((payload.team_slots || []).map((x) => String(x)));
     const loadedSize = (payload.team_slots || []).length;
+    const loadedKind = payload.bracket_kind === "double" ? "double" : "single";
     setBracketSize([6, 8, 16].includes(loadedSize) ? loadedSize : 8);
+    setBracketKind(loadedKind);
     setStoredSize(loadedSize);
+    setStoredKind(loadedKind);
     setMcSims(Number(payload.mc_sims) || 5000);
     setHasThirdPlaceDecider(Boolean(payload.has_third_place_decider));
     if (isBounty) {
@@ -4817,7 +5659,9 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
       setSfPicks(restored);
     }
     setResults(data.results || null);
-    if (loadedSize !== 6) {
+    if (loadedKind === "double") {
+      hydrateCompletedDoubleFromBracket(data.results?.bracket);
+    } else if (loadedSize !== 6) {
       // The completed-bracket picker doesn't model the 6-team byes shape.
       hydrateCompletedBracketFromBracket(data.results?.bracket, loadedSize || bracketSize);
     }
@@ -4873,6 +5717,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   }, [filteredTeams]);
 
   const run = async () => {
+    if (PUBLIC_BUILD) return;
     const ids = slots.map((s) => Number(s));
     if (ids.some((id) => !id)) return;
     if (isBounty && !draftedQfPairs) return;
@@ -4880,7 +5725,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     setBusy(true);
     setRunMessage("");
     setProcessedSims(0);
-    setTotalSims(slots.length >= 16 ? sims : !isBounty && hasThirdPlaceDecider ? 256 : 128);
+    setTotalSims(isDouble ? 16384 : slots.length >= 16 ? sims : !isBounty && hasThirdPlaceDecider ? 256 : 128);
     setEtaSeconds(null);
 
     const pollPlayoffJob = async (jobId, startedAtMs) => {
@@ -4914,7 +5759,8 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
           if (status.status === "completed") {
             const data = status.result || null;
             setResults(data);
-            setLatestPayload({ team_slots: ids, has_third_place_decider: hasThirdPlaceDecider });
+            setLatestPayload({ team_slots: ids, has_third_place_decider: !isDouble && hasThirdPlaceDecider, bracket_kind: bracketKind });
+            setStoredKind(bracketKind);
             setUpdatedAt(new Date().toISOString());
             setTopTeams(null);
             setAllTeams(null);
@@ -4933,7 +5779,8 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     try {
       const start = await api.post("/playoff/start", {
         team_slots: ids,
-        has_third_place_decider: isBounty ? false : hasThirdPlaceDecider,
+        bracket_kind: isBounty ? "single" : bracketKind,
+        has_third_place_decider: isBounty || isDouble ? false : hasThirdPlaceDecider,
         mc_sims: sims,
         ...(isBounty ? { variant: "bounty", qf_pairs: draftedQfPairs, sf_picks: bountySfPicksPayload() } : {}),
       });
@@ -4962,12 +5809,14 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     if (storedSize === null) return; // stored-sim hydration pending
     const ids = slots.map((s) => Number(s));
     if (ids.length === 0 || ids.some((id) => !id)) return;
-    const sig = ids.join("-") + (hasThirdPlaceDecider ? ":3rd" : "");
+    const sig = ids.join("-") + (!isDouble && hasThirdPlaceDecider ? ":3rd" : "") + (isDouble ? ":double" : "");
     if (lastAutoRunRef.current === sig) return;
     const storedIds = (latestPayload?.team_slots || []).map((x) => Number(x));
     const storedSig =
       storedIds.length > 0 && storedIds.every(Boolean)
-        ? storedIds.join("-") + (latestPayload?.has_third_place_decider ? ":3rd" : "")
+        ? storedIds.join("-") +
+          (latestPayload?.has_third_place_decider ? ":3rd" : "") +
+          (latestPayload?.bracket_kind === "double" ? ":double" : "")
         : null;
     // stage_stats gate: stored results from before the round-source feature
     // are recomputed once so the popup has its data.
@@ -4978,9 +5827,10 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
     lastAutoRunRef.current = sig;
     run();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [slots, hasThirdPlaceDecider, busy, storedSize, isBounty, results, latestPayload]);
+  }, [slots, hasThirdPlaceDecider, bracketKind, busy, storedSize, isBounty, results, latestPayload]);
 
   const runSharedCombinations = async () => {
+    if (PUBLIC_BUILD) return;
     setBusy(true);
     setTopMessage("");
     setAllTeams(null);
@@ -5082,6 +5932,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
   }, [busy, results, updatedAt, sharedCombosUpdatedAt, storedSize]);
 
   const resetStoredPlayoff = async () => {
+    if (PUBLIC_BUILD) return;
     await api.delete(`/playoff/latest?variant=${variant}`);
     setLatestPayload(null);
     setResults(null);
@@ -5132,12 +5983,12 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
 
   useEffect(() => {
     if (!baseTeams || playoffTab !== "top5") return;
-    if (playoffTopSubtab === "completed" && !completedBracketDerived.complete) {
+    if (playoffTopSubtab === "completed" && !completedComplete) {
       setCompletedBracketResult(null);
       return;
     }
     querySharedCombinations(0);
-  }, [playoffTopSubtab, completedBracket, completedBracketDerived.complete, hasThirdPlaceDecider, playoffTab]);
+  }, [playoffTopSubtab, completedBracket, completedDouble, completedComplete, hasThirdPlaceDecider, playoffTab]);
 
   const querySharedCombinations = async (nextPage = 0) => {
     if (!baseTeams) return;
@@ -5155,11 +6006,11 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
         search: comboSearch,
         sort: sortKey,
         page: nextPage,
-        page_size: 200,
+        page_size: COMBO_PAGE_SIZE,
         variant,
       };
       if (playoffTopSubtab === "completed") {
-        if (!completedBracketDerived.complete) return;
+        if (!completedComplete) return;
         Object.assign(body, completedBracketPayloadFields());
       }
       const data = await api.post(endpoint, body, 120000);
@@ -5426,12 +6277,12 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
               </div>
             )}
             <div className="actions">
-              <button className="primary" onClick={run} disabled={busy || !draftedQfPairs}>
+              {!PUBLIC_BUILD && (<button className="primary" onClick={run} disabled={busy || !draftedQfPairs}>
                 {busy ? "Running..." : "Run Bounty Playoffs And Store Valuations"}
-              </button>
-              <button className="danger" onClick={resetStoredPlayoff} disabled={busy || !results}>
+              </button>)}
+              {!PUBLIC_BUILD && (<button className="danger" onClick={resetStoredPlayoff} disabled={busy || !results}>
                 Reset Stored Valuations
-              </button>
+              </button>)}
               {updatedAt && <p className="muted">Stored: {new Date(updatedAt).toLocaleString()}</p>}
             </div>
           </>
@@ -5440,7 +6291,8 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
           <>
             {playoffAutofillMessage && <p className="muted">{playoffAutofillMessage}</p>}
             {renderSeedingBracket()}
-            {bracketSize !== 6 && (
+            {routingError && <p className="muted">{routingError}</p>}
+            {!PUBLIC_BUILD && bracketSize !== 6 && !isDouble && (
               <div className="actions">
                 <label className="checkbox-inline">
                   <input
@@ -5460,18 +6312,11 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
           <>
             {!results && (
               <div className="card sub">
-                <p className="muted">Run Playoff Bracket in the Bracket Stage tab first.</p>
+                <p className="muted">{PUBLIC_BUILD ? NOT_PUBLISHED : "Run Playoff Bracket in the Bracket Stage tab first."}</p>
               </div>
             )}
             {results && (
               <>
-                {combosApproximate && (
-                  <p className="muted">
-                    Large field: every outcome is enumerated exactly, and Most Likely Winner counts the true best roster of each
-                    one. Average Value lists the strongest {sharedComboCount.toLocaleString()} rosters exactly; Best Single Outcome is
-                    exact for its top roster and ranked among those candidates below it.
-                  </p>
-                )}
                 {busy && (
                   <div className="card sub">
                     {comboPhase === "saving" ? (
@@ -5653,12 +6498,14 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
           <div className="stack">
             {!results && (
               <div className="card sub">
-                <p className="muted">Run Playoff Bracket in the Bracket Stage tab first.</p>
+                <p className="muted">{PUBLIC_BUILD ? NOT_PUBLISHED : "Run Playoff Bracket in the Bracket Stage tab first."}</p>
               </div>
             )}
             {results && (
               <>
-                {slots.length === 6 ? (
+                {isDouble ? (
+                  renderDoubleBracket("pick")
+                ) : slots.length === 6 ? (
                   <p className="muted">
                     Completed-bracket scoring isn't supported for the 6-team byes bracket yet.
                   </p>
@@ -5666,9 +6513,13 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                   renderCompletedPicker()
                 )}
                 <div className="actions">
-                  {!baseTeams && <p className="muted">Run Combinations once above to score this bracket.</p>}
-                  {baseTeams && !completedBracketDerived.complete && <p className="muted">Complete the bracket to score the saved combinations.</p>}
-                  {baseTeams && completedBracketDerived.complete && (
+                  {!baseTeams && (
+                    <p className="muted">
+                      {PUBLIC_BUILD ? "Roster rankings for this bracket have not been published yet." : "Run Combinations once above to score this bracket."}
+                    </p>
+                  )}
+                  {baseTeams && !completedComplete && <p className="muted">Complete the bracket to score the saved combinations.</p>}
+                  {!PUBLIC_BUILD && baseTeams && completedComplete && (
                     <>
                       <button className="primary" onClick={runCompletedBracket} disabled={busy}>
                         {busy
@@ -5882,12 +6733,13 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                 (a, b) => Number(b[1].total_points ?? 0) - Number(a[1].total_points ?? 0)
               );
               return (
-                <div className="event-team-row" key={tid}>
+                <div className={`event-team-row${stageList.includes("bye_r3") ? " double-head" : ""}`} key={tid}>
                   <div className="event-team-head">
                     <TeamLogo hltvTeamId={info?.hltv_team_id} name={teamLookup[Number(tid)]} size={42} />
                     <div className="event-team-headtext">
                       <span className="event-team-name">{teamLookup[Number(tid)] || `Team ${tid}`}</span>
-                      {teamStage && (
+                      {teamStage && stageList.includes("bye_r3") && renderDoubleReach(teamStage)}
+                      {teamStage && !stageList.includes("bye_r3") && (
                         <div className="event-team-reach">
                           {stageList
                             .filter((s) => Number(teamStage.reach?.[s] || 0) > 0.0005)
@@ -5969,17 +6821,23 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
           </div>
         </div>
       )}
-      {playoffTab === "top5" && playoffTopSubtab !== "completed" && topTeams && topTeams.length > 0 && (
+      {playoffTab === "top5" && playoffTopSubtab !== "completed" && (allTeams || topTeams) && (allTeams || topTeams).length > 0 && (
         <div className="card sub">
           <h3>Top Teams</h3>
+          <ComboPager page={page} pageSize={COMBO_PAGE_SIZE} total={filteredCount} onPage={querySharedCombinations} sortKey={sortKey} onSort={setSortKey} />
           <div className="event-team-rows">
-            {topTeams.map((team, idx) => (
+            {(allTeams && allTeams.length > 0 ? allTeams : topTeams).map((team, idx) => (
               <div key={idx} className="stack combo-team">
                 <div className="event-team-row">
                   <div className="event-team-head">
-                    <div className="combo-rank">#{idx + 1}</div>
+                    <div className="combo-rank">#{idx + 1 + page * COMBO_PAGE_SIZE}</div>
                     <div className="event-team-headtext">
                       <span className="event-team-name">{playoffTeamMetricLabel(team)}</span>
+                      {playoffTeamMetricSub(team).map((line) => (
+                        <span className="combo-cost" key={line}>
+                          {line}
+                        </span>
+                      ))}
                       <span className="combo-cost">Cost ${Number(team.cost || 0).toLocaleString()}</span>
                     </div>
                   </div>
@@ -5992,7 +6850,7 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                         <div
                           className="event-player-card clickable"
                           key={p.player_id}
-                          onClick={() => openProjectedRosterBreakdown(p, team.players || [])}
+                          onClick={() => openProjectedRosterBreakdown(p, team)}
                         >
                           <PlayerPhoto playerId={Number(p.player_id)} name={p.name} size={52} />
                           <div className="event-player-name">{p.name}</div>
@@ -6003,12 +6861,27 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                           </div>
                           <div className="event-player-rating">{playoffPlayerModeScore(p).toFixed(2)}</div>
                           <div className="event-player-stats ev-mini">
-                            {[
-                              ["Rating", p.rating_ev],
-                              ["Win", p.win_ev],
-                              ["Role", p.role_ev],
-                              ["Boost", p.booster_ev],
-                            ].map(([label, value]) => (
+                            {(playoffBestMode === "single_outcome" && p.ceiling_parts && p.ceiling_parts.rating != null
+                              ? [
+                                  ["Rating", p.ceiling_parts.rating],
+                                  ["Win", p.ceiling_parts.win],
+                                  ["Role", p.ceiling_parts.role],
+                                  ["Boost", p.ceiling_parts.booster],
+                                ]
+                              : playoffBestMode === "most_outcomes" && p.win_parts && p.win_parts.rating != null
+                                ? [
+                                    ["Rating", p.win_parts.rating],
+                                    ["Win", p.win_parts.win],
+                                    ["Role", p.win_parts.role],
+                                    ["Boost", p.win_parts.booster],
+                                  ]
+                              : [
+                                  ["Rating", p.rating_ev],
+                                  ["Win", p.win_ev],
+                                  ["Role", p.role_ev],
+                                  ["Boost", p.booster_ev],
+                                ]
+                            ).map(([label, value]) => (
                               <div className="event-player-stat" key={label}>
                                 <div className="event-player-mini">{Number(value || 0).toFixed(1)}</div>
                                 <div className="event-player-stat-label">{label}</div>
@@ -6022,89 +6895,52 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
                   </div>
                 </div>
                 {playoffBestMode === "most_outcomes" &&
-                  (Array.isArray(team.winning_outcome_indexes) &&
-                  team.winning_outcome_indexes.length > 0 &&
-                  (results?.outcomes || []).length > 0 ? (
-                    <div className="combo-outcomes">
-                      <p className="muted">Bracket outcomes this roster wins ({team.winning_outcome_indexes.length}):</p>
-                      <ul className="muted">
-                        {team.winning_outcome_indexes
-                          .map((outcomeIdx) => playoffOutcomeDescriptor(outcomeIdx))
-                          .filter(Boolean)
-                          .sort((a, b) => b.probability - a.probability)
-                          .slice(0, 12)
-                          .map((o, i) => (
-                            <li key={i}>
-                              {(o.probability * 100).toFixed(2)}% — {o.champion} beats {o.runnerUp} in the final
-                              {o.third ? ` | 3rd: ${o.third}` : ""} | SF winners: {o.sfWinners} | QF winners: {o.qfWinners}
-                            </li>
+                  (() => {
+                    const pat = winningPatterns(team);
+                    if (!pat) return null;
+                    return (
+                      <div className="combo-outcomes">
+                        <p className="muted">
+                          Finishing positions when this roster wins · {pat.count.toLocaleString()} brackets · {(pat.total * 100).toFixed(1)}%
+                        </p>
+                        <div className="pattern-bars">
+                          <div className="pattern-legend">
+                            {pat.columns.map((c, k) => (
+                              <span className="pattern-legend-item" key={c}>
+                                <i className={`pattern-swatch c${k}`} />
+                                {c}
+                              </span>
+                            ))}
+                          </div>
+                          {pat.rows.map((r) => (
+                            <div className="pattern-bar-row" key={r.team_id}>
+                              <span className="pattern-team">
+                                <TeamBadge teamId={r.team_id} />
+                                <span>{teamLookup[r.team_id] || r.team_id}</span>
+                              </span>
+                              <div className="pattern-bar">
+                                {r.shares.map((share, k) =>
+                                  share > 0.0005 ? (
+                                    <span
+                                      className={`pattern-seg c${k}`}
+                                      style={{ width: `${share * 100}%` }}
+                                      title={`${pat.columns[k]} ${Math.round(share * 100)}%`}
+                                      key={k}
+                                    >
+                                      {share >= 0.07 ? `${Math.round(share * 100)}%` : ""}
+                                    </span>
+                                  ) : null
+                                )}
+                              </div>
+                            </div>
                           ))}
-                      </ul>
-                      {team.winning_outcome_indexes.length > 12 && (
-                        <p className="muted">+{team.winning_outcome_indexes.length - 12} more lower-probability outcomes</p>
-                      )}
-                    </div>
-                  ) : (
-                    <p className="muted">Re-run Combinations to see which bracket outcomes this roster wins.</p>
-                  ))}
+                        </div>
+                      </div>
+                    );
+                  })()}
               </div>
             ))}
           </div>
-        </div>
-      )}
-      {playoffTab === "top5" && playoffTopSubtab !== "completed" && allTeams && allTeams.length > 0 && (
-        <div className="card sub">
-          <h3>All Filtered Teams ({filteredCount})</h3>
-          <div className="actions">
-            <button className="secondary" onClick={() => querySharedCombinations(Math.max(0, page - 1))} disabled={page === 0}>
-              Prev 200
-            </button>
-            <button
-              className="secondary"
-              onClick={() => querySharedCombinations((page + 1) * 200 < filteredCount ? page + 1 : page)}
-              disabled={(page + 1) * 200 >= filteredCount}
-            >
-              Next 200
-            </button>
-            <p className="muted">
-              Page {page + 1} showing {Math.min(200, Math.max(0, filteredCount - page * 200))} of {filteredCount}
-            </p>
-          </div>
-          <table>
-            <thead>
-              <tr>
-                <th>#</th>
-                <SortHeader sortValue={sortKey} asc="ev_asc" desc="ev_desc" defaultDirection="desc" onChange={setSortKey}>Mode Score</SortHeader>
-                <SortHeader sortValue={sortKey} asc="cost_asc" desc="cost_desc" onChange={setSortKey}>Cost</SortHeader>
-                <SortHeader sortValue={sortKey} asc="cpp_asc" desc="cpp_desc" defaultDirection="desc" onChange={setSortKey}>Value</SortHeader>
-                <th>Players</th>
-              </tr>
-            </thead>
-            <tbody>
-              {allTeams.map((team, idx) => (
-                <tr key={idx + page * 200}>
-                  <td>{idx + 1 + page * 200}</td>
-                  <td>{playoffTeamMetric(team).toFixed(2)}</td>
-                  <td>{team.cost}</td>
-                  <td>{(playoffTeamMetric(team) / (team.cost || 1)).toFixed(4)}</td>
-                  <td>
-                    {(team.players || []).map((p, playerIdx) => (
-                      <span key={`${idx}-${p.player_id}`}>
-                        {playerIdx > 0 && ", "}
-                        <button
-                          className="inline-link-btn"
-                          onClick={() => openProjectedRosterBreakdown(p, team.players || [])}
-                        >
-                          {p.name}
-                        </button>
-                        {` (${teamLookup[p.team_id] || p.team_id}, ${roleLabel(p.role_name)})`}
-                      </span>
-                    ))}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
         </div>
       )}
       {playoffTab === "top5" && playoffTopSubtab !== "completed" && baseTeams && filteredCount === 0 && (
@@ -6223,213 +7059,13 @@ function PlayoffTab({ teams, teamLookup, players, sortTeams, applyFilters, onOpe
           </div>
         </div>
       )}
-      {completedPlayerBreakdown && (
-        <div className="modal-backdrop" onClick={() => setCompletedPlayerBreakdown(null)}>
-          <div className="modal player-sources-modal" onClick={(e) => e.stopPropagation()}>
-            <header className="modal-header">
-              <h3>Point Sources</h3>
-              <button className="close" onClick={() => setCompletedPlayerBreakdown(null)}>
-                &times;
-              </button>
-            </header>
-            <div className="modal-body">
-              <BreakdownHero
-                playerId={completedPlayerBreakdown.player_id}
-                name={completedPlayerBreakdown.name || `Player ${completedPlayerBreakdown.player_id}`}
-                teamName={
-                  completedPlayerBreakdown.team_id
-                    ? teamLookup[completedPlayerBreakdown.team_id] || String(completedPlayerBreakdown.team_id)
-                    : null
-                }
-                hltvTeamId={hltvIdByTeamId[Number(completedPlayerBreakdown.team_id)]}
-                roleId={completedPlayerBreakdown.role_id}
-                stats={[
-                  ["Rating", completedBreakdownValue(completedPlayerBreakdown, "rating")],
-                  ["Win", completedBreakdownValue(completedPlayerBreakdown, "win")],
-                  ["Role", completedBreakdownValue(completedPlayerBreakdown, "role")],
-                  ["Booster", completedBreakdownValue(completedPlayerBreakdown, "booster")],
-                ]}
-                total={completedBreakdownValue(completedPlayerBreakdown, "total")}
-              />
-              {completedPlayerBreakdown.stage_ev &&
-                Array.isArray(completedPlayerBreakdown.stage_list) &&
-                completedPlayerBreakdown.stage_list.length > 0 && (
-                <div className="stack">
-                  <h4>Round Sources</h4>
-                  <div className="round-cards">
-                    {completedPlayerBreakdown.stage_list.map((s) => {
-                      const cell = completedPlayerBreakdown.stage_ev[s];
-                      if (!cell || typeof cell !== "object") return null;
-                      const reach = Number(completedPlayerBreakdown.team_reach?.reach?.[s] ?? NaN);
-                      const isBye = Number.isFinite(reach) && reach < 0.0005 && Math.abs(Number(cell.total || 0)) > 0.005;
-                      const slotInfo = (completedPlayerBreakdown.booster_slots || []).find(
-                        (b) => Number(b.booster_id) === Number(cell.booster_id)
-                      );
-                      const opps = Array.isArray(cell.opponents) ? cell.opponents : [];
-                      const playSum = opps.reduce((a, o) => a + Number(o.prob || 0), 0);
-                      const winUncond = opps.reduce(
-                        (a, o) => a + Number(o.prob || 0) * Number(o.win_chance || 0),
-                        0
-                      );
-                      const wWin = playSum > 0 ? winUncond / playSum : 0;
-                      const oppEV = opps.reduce((a, o) => a + Number(o.prob || 0) * Number(o.total || 0), 0);
-                      const elimContrib = Number(cell.total || 0) - oppEV;
-                      const missProb = Math.max(0, 1 - playSum);
-                      const showMiss = missProb > 0.0005 && Math.abs(elimContrib) > 0.005;
-                      const missPts = showMiss ? elimContrib / missProb : 0;
-                      return (
-                        <div className="round-card" key={s}>
-                          <div className="round-card-top">
-                            <span className="round-card-name">{STAGE_FULL[s] || s}</span>
-                            <span className="round-card-play">
-                              <span className="round-card-chance">
-                                {isBye ? "Bye" : opps.length > 0 ? `${Math.round(wWin * 100)}%` : "-"}
-                              </span>
-                              {!isBye && <span className="event-player-stat-label">Match win</span>}
-                            </span>
-                          </div>
-                          <div className="event-player-rating">{Number(cell.total || 0).toFixed(2)}</div>
-                          <div className="event-player-stats ev-mini">
-                            {[
-                              ["Rating", cell.rating],
-                              ["Win", cell.win],
-                              ["Role", cell.role],
-                              ["Boost", cell.booster],
-                            ].map(([label, value]) => (
-                              <div className="event-player-stat" key={label}>
-                                <div className="event-player-mini">{Number(value || 0).toFixed(1)}</div>
-                                <div className="event-player-stat-label">{label}</div>
-                              </div>
-                            ))}
-                          </div>
-                          {cell.booster_id != null && (
-                            <div className="round-card-boost">
-                              <BoosterBadge boosterId={cell.booster_id} size={20} />
-                              <span className="round-card-boost-name">{cell.booster_name || `Booster ${cell.booster_id}`}</span>
-                              <span className="round-card-boost-rate">
-                                {(Number(cell.booster_rate || 0) * 100).toFixed(0)}%
-                              </span>
-                              {slotInfo?.edge != null && (
-                                <span className="round-card-boost-edge">
-                                  {Number(slotInfo.edge) >= 0 ? "+" : ""}
-                                  {(Number(slotInfo.edge) * 100).toFixed(0)}% vs avg
-                                </span>
-                              )}
-                            </div>
-                          )}
-                          {Array.isArray(cell.opponents) && cell.opponents.length > 0 && (
-                            <div className="round-opps">
-                              <div className="round-opp head">
-                                <span className="round-opp-name">Opponent</span>
-                                <span className="round-opp-prob">Play</span>
-                                <span className="round-opp-win">Win</span>
-                                <span className="round-opp-pts">Pts</span>
-                              </div>
-                              {cell.opponents.map((o) => {
-                                const oinfo = (teams || []).find((t) => Number(t.team_id) === Number(o.team_id));
-                                return (
-                                  <div className="round-opp" key={o.team_id}>
-                                    <TeamLogo hltvTeamId={oinfo?.hltv_team_id} name={teamLookup[o.team_id]} size={16} />
-                                    <span className="round-opp-name">
-                                      {teamLookup[o.team_id] || o.team_id}
-                                      {o.rank ? ` (#${o.rank})` : ""}
-                                    </span>
-                                    <span className="round-opp-prob">{Math.round(Number(o.prob || 0) * 100)}%</span>
-                                    <span className="round-opp-win">{Math.round(Number(o.win_chance || 0) * 100)}%</span>
-                                    <span className="round-opp-pts">{Number(o.total || 0).toFixed(1)}</span>
-                                  </div>
-                                );
-                              })}
-                              {showMiss && (
-                                <div className="round-opp miss">
-                                  <span className="round-opp-name">Eliminated earlier</span>
-                                  <span className="round-opp-prob">{Math.round(missProb * 100)}%</span>
-                                  <span className="round-opp-win">—</span>
-                                  <span className="round-opp-pts">{missPts.toFixed(1)}</span>
-                                </div>
-                              )}
-                              <div className="round-opp total">
-                                <span className="round-opp-name">Total</span>
-                                <span className="round-opp-prob">
-                                  {Math.round((playSum + (showMiss ? missProb : 0)) * 100)}%
-                                </span>
-                                <span className="round-opp-win">{Math.round(wWin * 100)}%</span>
-                                <span className="round-opp-pts">{Number(cell.total || 0).toFixed(1)}</span>
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-              {Array.isArray(completedPlayerBreakdown.point_breakdown) && completedPlayerBreakdown.point_breakdown.length > 0 && (
-                <div className="stack">
-                  <h4>Match Sources</h4>
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Match</th>
-                        <th>Opponent</th>
-                        <th>Rating</th>
-                        <th>Win</th>
-                        <th>Role</th>
-                        <th>Booster</th>
-                        <th>Total</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {completedPlayerBreakdown.point_breakdown.map((row, idx) => {
-                        const opponentId = Number(row.opponent_team_id || 0);
-                        const matchLabel = row.match_number ? `M${row.match_number} ${row.match_type || ""}` : row.match_type || "Adjustment";
-                        const opponentLabel = opponentId > 0 ? `${teamLookup[opponentId] || opponentId} (#${row.opponent_rank ?? "-"})` : row.note || "-";
-                        const roleName = row.role_id == null ? "Stored role" : roleLabel(row.role_id);
-                        const boosterName = row.booster_name || (row.booster_slot ? `Booster slot ${row.booster_slot}` : "None");
-                        return (
-                          <tr key={`${row.match_number || "adj"}-${idx}`}>
-                            <td>{matchLabel}</td>
-                            <td>{opponentLabel}</td>
-                            <td>
-                              {Number(row.rating_points || 0).toFixed(2)}
-                              {row.rating_used != null && <div className="muted">rating {Number(row.rating_used || 0).toFixed(2)}</div>}
-                            </td>
-                            <td>
-                              {Number(row.win_points || 0).toFixed(2)}
-                              <div className="muted">{row.did_win ? "Win" : "Loss"} {Number((row.win_probability || 0) * 100).toFixed(1)}%</div>
-                            </td>
-                            <td>
-                              {Number(row.role_points || 0).toFixed(2)}
-                              <div className="muted">
-                                {roleName} major {Number((row.role_major_pct || 0) * 100).toFixed(1)}%, minor {Number((row.role_minor_pct || 0) * 100).toFixed(1)}%
-                              </div>
-                            </td>
-                            <td>
-                              {Number(row.booster_points || 0).toFixed(2)}
-                              <div className="muted">
-                                {boosterName} {Number((row.booster_trigger_rate || 0) * 100).toFixed(1)}%
-                                {row.booster_assigned === false && row.raw_booster_name && (
-                                  <div>raw: {row.raw_booster_name} {(Number(row.raw_booster_trigger_rate || 0) * 100).toFixed(1)}%</div>
-                                )}
-                              </div>
-                            </td>
-                            <td>{Number(row.total_points || 0).toFixed(2)}</td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-              {completedPlayerBreakdown.components_available === false && (
-                  <p className="muted">
-                    This stored bracket was generated before source components were saved. Re-run the playoff bracket to see rating, win, role, and booster split accurately.
-                  </p>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
+      <GroupPlayerBreakdownModal
+        player={adaptPlayoffBreakdown(completedPlayerBreakdown)}
+        teamLookup={teamLookup}
+        teams={teams}
+        onClose={() => setCompletedPlayerBreakdown(null)}
+      />
+
     </Section>
   );
 }
@@ -6547,6 +7183,65 @@ function FormatsPanel() {
                   <span className="fmt-node loss">Out — elim &amp; decider losers</span>
                 </div>
               </div>
+            </div>
+            <div className="card sub">
+              <h4>Double-Elimination Playoff (8 teams, whole event — StarLadder StarSeries)</h4>
+              <div className="fmt-diagram">
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Upper round 1</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Upper semi-finals</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Upper final</span>
+                  <span className="fmt-node">Match</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Grand final (BO5)</span>
+                  <span className="fmt-node win">Champion</span>
+                </div>
+              </div>
+              <div className="fmt-diagram">
+                <span className="fmt-drop">losers drop ↓</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Lower round 1</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node loss">Losers out</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Lower semi-finals</span>
+                  <span className="fmt-node muted-node">Upper-SF losers join (crossed)</span>
+                  <span className="fmt-node">Match</span>
+                  <span className="fmt-node">Match</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Lower final</span>
+                  <span className="fmt-node">Match</span>
+                </div>
+                <span className="fmt-arrow">→</span>
+                <div className="fmt-col">
+                  <span className="fmt-col-label">Consolidation final</span>
+                  <span className="fmt-node muted-node">Upper-final loser joins</span>
+                  <span className="fmt-node win">Winner → grand final</span>
+                </div>
+              </div>
+              <p className="muted">
+                All 14 matches are enumerated exactly (16,384 outcomes). Teams play between two and six matches;
+                {" "}{DOUBLE8_PADDING_RULE_TEXT}
+              </p>
             </div>
             <div className="card sub">
               <h4>Double-Elimination Groups (8 teams, top 4 qualify — EWC)</h4>
@@ -11898,6 +12593,7 @@ function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
   }, [filteredTeams]);
 
   const resetStoredSimulation = async () => {
+    if (PUBLIC_BUILD) return;
     await api.delete("/simulate/latest");
     setSelectedTeamIds([]);
     setBoMode("elim_qual");
@@ -11960,7 +12656,7 @@ function SwissTab({ teams, teamLookup, players, onOpenPlayer }) {
       )}
       {swissTab === "value" && <SwissPlayerValueTab results={simResults} players={players} />}
       {swissTab === "single" && <BracketTab teams={filteredTeams} teamLookup={teamLookup} />}
-      {swissTab === "hltv" && (
+      {swissTab === "hltv" && !PUBLIC_BUILD && (
         <HltvReplicaSimulatorPanel
           eventId={selectedEventId}
           hltvEventId={selectedEventMeta?.hltv_event_id}
@@ -12008,6 +12704,100 @@ function GroupMatchCard({ title, meta, rows, places }) {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+// One resolved outcome drawn as a bracket (the Playoff tab's card + connector
+// system): every match card shows both teams, the winner marked, the loser
+// muted, and the highlighted team's matches carry an orange bar. Double
+// elimination draws the upper and lower brackets; knock-outs one ladder plus
+// the third-place decider below it.
+function OutcomeBracketVisual({ bracket, teamLookup, teams, highlightTeamId }) {
+  if (!bracket) return null;
+  const hltvIdByTeamId = {};
+  (teams || []).forEach((t) => {
+    hltvIdByTeamId[Number(t.team_id)] = t.hltv_team_id;
+  });
+  const name = (id) => teamLookup[id] || String(id);
+  const row = (tid, won, key) => (
+    <div
+      className={`playoff-team-row outcome-row${won ? " winner" : " loser"}${Number(tid) === Number(highlightTeamId) ? " mine" : ""}`}
+      key={key}
+    >
+      <TeamLogo hltvTeamId={hltvIdByTeamId[Number(tid)]} name={name(tid)} size={24} />
+      <span>{name(tid)}</span>
+      {won && <span className="outcome-row-mark">W</span>}
+    </div>
+  );
+  const card = (m, title, meta) => {
+    const [a, b] = Array.isArray(m.teams) && m.teams.length === 2 ? m.teams : [m.winner, m.loser];
+    return (
+      <GroupMatchCard
+        title={title}
+        meta={meta}
+        rows={[row(a, Number(a) === Number(m.winner), "a"), row(b, Number(b) === Number(m.winner), "b")]}
+      />
+    );
+  };
+  if (bracket.grand_final) {
+    const columns = (rounds) => (
+      <div className="pb-bracket">
+        {rounds.map(([stage, keys, straight]) => {
+          const matches = bracket[stage] || [];
+          return (
+            <div className={`pb-round${straight ? " straight" : ""}`} key={stage}>
+              <div className="pb-round-title">{STAGE_FULL[stage] || stage}</div>
+              <div className="pb-matches">
+                {keys.map((key, i) => {
+                  const m = matches.find((x) => x.key === key) || matches[i];
+                  if (!m) return null;
+                  return (
+                    <div className="pb-match-wrap" key={key}>
+                      {card(m, DOUBLE8_MATCH_TITLE[key] || key, key === "grand_final" ? "BO5" : "BO3")}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+    return (
+      <div className="group-brackets">
+        <div>
+          <div className="group-bracket-title">Upper bracket</div>
+          {columns(DOUBLE8_UPPER_ROUNDS)}
+        </div>
+        <div>
+          <div className="group-bracket-title">Lower bracket</div>
+          {columns(DOUBLE8_LOWER_ROUNDS)}
+        </div>
+      </div>
+    );
+  }
+  const rounds = Object.keys(bracket).filter((k) => k !== "third_place" && (bracket[k] || []).length > 0);
+  const third = (bracket.third_place || [])[0];
+  return (
+    <div className="group-brackets">
+      <div>
+        <div className="pb-bracket">
+          {rounds.map((stage) => (
+            <div className="pb-round" key={stage}>
+              <div className="pb-round-title">{STAGE_FULL[stage] || stage}</div>
+              <div className="pb-matches">
+                {(bracket[stage] || []).map((m, i) => (
+                  <div className="pb-match-wrap" key={`${stage}-${i}`}>
+                    {card(m, (bracket[stage] || []).length === 1 ? STAGE_FULL[stage] || stage : `${STAGE_SHORT[stage] || stage} ${i + 1}`, stage === "final" ? "BO5" : "BO3")}
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+        {third && <div className="pb-thirdplace">{card(third, "Third place", "BO3")}</div>}
+      </div>
     </div>
   );
 }
@@ -12438,6 +13228,7 @@ function GroupsTab({
   }, [slots, groupCount, seedsPerGroup]);
 
   const autofillFromHltv = async () => {
+    if (PUBLIC_BUILD) return;
     setAutofillBusy(true);
     setAutofillMessage("");
     try {
@@ -12581,7 +13372,7 @@ function GroupsTab({
   }, [selectedEventId]);
 
   const run = async () => {
-    if (!allSlotsFilled) return;
+    if (PUBLIC_BUILD || !allSlotsFilled) return;
     setBusy(true);
     setRunMessage("");
     setRunProgress({ done: 0, total: 0 });
@@ -12628,6 +13419,7 @@ function GroupsTab({
   };
 
   const resetStored = async () => {
+    if (PUBLIC_BUILD) return;
     await api.delete("/groups/latest");
     setResults(null);
     setUpdatedAt("");
@@ -12646,6 +13438,7 @@ function GroupsTab({
     setTopMessage("");
     setComboProgress({ done: 0, total: 0 });
     try {
+      if (PUBLIC_BUILD) return;
       const start = await api.post("/groups/best-team/start", {});
       if (start?.detail) {
         setTopMessage(String(start.detail));
@@ -12698,7 +13491,7 @@ function GroupsTab({
           search: comboSearch,
           sort: sortKey,
           page: nextPage,
-          page_size: 200,
+          page_size: COMBO_PAGE_SIZE,
           include_player_ids: Array.from(includeSet),
           exclude_player_ids: Array.from(excludeSet),
         },
@@ -13266,7 +14059,7 @@ function GroupsTab({
           <>
             {!results && (
               <div className="card sub">
-                <p className="muted">Run the group stage first.</p>
+                <p className="muted">{PUBLIC_BUILD ? NOT_PUBLISHED : "Run the group stage first."}</p>
               </div>
             )}
             {results && (
@@ -13285,7 +14078,7 @@ function GroupsTab({
                 {groupsTopSubtab !== "completed" && (
                 <>
                 <div className="actions">
-                  {!liveMode && (
+                  {!liveMode && !PUBLIC_BUILD && (
                     <button className="primary" onClick={runCombinations} disabled={busy}>
                       {busy && comboProgress.total > 0
                         ? `Running Combinations... ${comboProgress.done.toLocaleString()} / ${comboProgress.total.toLocaleString()}`
@@ -13338,15 +14131,16 @@ function GroupsTab({
                     </button>
                   </div>
                 )}
-                {topTeams && topTeams.length > 0 && (
+                {(allTeams || topTeams) && (allTeams || topTeams).length > 0 && (
                   <div className="card sub">
                     <h3>Top Teams</h3>
+                    <ComboPager page={page} pageSize={COMBO_PAGE_SIZE} total={filteredCount} onPage={queryCombos} sortKey={sortKey} onSort={setSortKey} />
                     {/* Same roster strips as the Playoff tab's Top Teams: rank,
                         metric, cost, then one card per player with the EV split.
                         The roster's booster assignment (when the query returns
                         one) is folded into each player's Boost. */}
                     <div className="event-team-rows">
-                      {topTeams.map((team, idx) => {
+                      {(allTeams && allTeams.length > 0 ? allTeams : topTeams).map((team, idx) => {
                         const boostByPid = {};
                         (team.booster_assignments || []).forEach((a) => {
                           const pid = Number(a.player_id);
@@ -13356,7 +14150,7 @@ function GroupsTab({
                           <div key={idx} className="stack combo-team">
                             <div className="event-team-row">
                               <div className="event-team-head">
-                                <div className="combo-rank">#{idx + 1}</div>
+                                <div className="combo-rank">#{idx + 1 + page * COMBO_PAGE_SIZE}</div>
                                 <div className="event-team-headtext">
                                   <span className="event-team-name">{metricLabel(team)}</span>
                                   <span className="combo-cost">Cost ${Number(team.cost || 0).toLocaleString()}</span>
@@ -13401,12 +14195,20 @@ function GroupsTab({
                                       </div>
                                       <div className="event-player-rating">{score.toFixed(2)}</div>
                                       <div className="event-player-stats ev-mini">
-                                        {[
-                                          ["Rating", p.rating_ev],
-                                          ["Win", p.win_ev],
-                                          ["Role", p.role_ev],
-                                          ["Boost", boost],
-                                        ].map(([label, value]) => (
+                                        {(comboMode === "single_outcome" && p.ceiling_parts && p.ceiling_parts.rating != null
+                                          ? [
+                                              ["Rating", p.ceiling_parts.rating],
+                                              ["Win", p.ceiling_parts.win],
+                                              ["Role", p.ceiling_parts.role],
+                                              ["Boost", p.ceiling_parts.booster],
+                                            ]
+                                          : [
+                                              ["Rating", p.rating_ev],
+                                              ["Win", p.win_ev],
+                                              ["Role", p.role_ev],
+                                              ["Boost", boost],
+                                            ]
+                                        ).map(([label, value]) => (
                                           <div className="event-player-stat" key={label}>
                                             <div className="event-player-mini">{Number(value || 0).toFixed(1)}</div>
                                             <div className="event-player-stat-label">{label}</div>
@@ -13447,54 +14249,6 @@ function GroupsTab({
                         );
                       })}
                     </div>
-                  </div>
-                )}
-                {allTeams && allTeams.length > 0 && (
-                  <div className="card sub">
-                    <h3>All Filtered Teams ({filteredCount.toLocaleString()})</h3>
-                    <div className="actions">
-                      <button className="secondary" onClick={() => queryCombos(Math.max(0, page - 1))} disabled={page === 0}>
-                        Prev 200
-                      </button>
-                      <button
-                        className="secondary"
-                        onClick={() => queryCombos((page + 1) * 200 < filteredCount ? page + 1 : page)}
-                        disabled={(page + 1) * 200 >= filteredCount}
-                      >
-                        Next 200
-                      </button>
-                      <p className="muted">Page {page + 1}</p>
-                    </div>
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>#</th>
-                          <th>
-                            {comboMode === "single_outcome" ? "Ceiling" : comboMode === "most_outcomes" ? "Win %" : "Avg EV"}
-                          </th>
-                          <th>Cost</th>
-                          <th>Players</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {allTeams.map((team, idx) => (
-                          <tr key={idx + page * 200}>
-                            <td>{idx + 1 + page * 200}</td>
-                            <td>
-                              {comboMode === "most_outcomes"
-                                ? `${(Number(team.outcome_win_probability || 0) * 100).toFixed(1)}%`
-                                : Number(
-                                    comboMode === "single_outcome"
-                                      ? team.ceiling_points || 0
-                                      : team.average_ev ?? team.total_ev ?? 0
-                                  ).toFixed(2)}
-                            </td>
-                            <td>{team.cost}</td>
-                            <td>{renderPlayerLinks(team.players)}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
                   </div>
                 )}
                 {topMessage && <p className="muted">{topMessage}</p>}
@@ -13631,7 +14385,7 @@ function GroupsTab({
         )}
         {groupsTab === "value" && !results && (
           <div className="card sub">
-            <p className="muted">Run the group stage first.</p>
+            <p className="muted">{PUBLIC_BUILD ? NOT_PUBLISHED : "Run the group stage first."}</p>
           </div>
         )}
         </>
@@ -13709,7 +14463,7 @@ function TournamentTab({ teams, teamLookup, players, sortTeams, applyFilters, on
     <div className="stack">
       {message && <p className="muted">{message}</p>}
       {!kind && !message && <p className="muted">Loading tournament...</p>}
-      {kind && !["swiss", "groups", "playoff", "bounty"].includes(kind) && (
+      {kind && !["swiss", "groups", "playoff", "bounty", "double_elim"].includes(kind) && (
         <p className="muted">
           Detected format: {kindInfo?.label || kind} — no simulator supports this format yet.
         </p>
@@ -13731,6 +14485,15 @@ function TournamentTab({ teams, teamLookup, players, sortTeams, applyFilters, on
         />
       )}
       {kind === "playoff" && <PlayoffTab {...sharedProps} detectedBracketSize={kindInfo?.playoff_size} />}
+      {kind === "double_elim" && (
+        <PlayoffTab
+          {...sharedProps}
+          detectedBracketSize={Number(kindInfo?.playoff_size || 8)}
+          detectedBracketKind="double"
+          grandFinalBo={Number(kindInfo?.grand_final_bo || 5)}
+          routingError={kindInfo?.routing_error ? `This event's bracket routing is not supported: ${kindInfo.routing_error}` : ""}
+        />
+      )}
       {kind === "bounty" && <BountyTab {...sharedProps} />}
     </div>
   );
@@ -13888,6 +14651,8 @@ export default function App() {
         <span className="titlebar-brand">
           CS Fantasy <em>Toolkit</em>
         </span>
+        {PUBLIC_BUILD && <span className="titlebar-version">v{APP_VERSION}</span>}
+        <UpdateBanner />
       </div>
       <div className="layout">
         <nav className="tab-bar">

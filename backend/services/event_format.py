@@ -87,8 +87,11 @@ def _collect_teams(node: Any, out: Dict[int, str]) -> None:
             inner = node["teamId"].get("teamId")
             tid = inner.get("teamId") if isinstance(inner, dict) else inner
             _put_team(out, tid, node.get("teamName"))
-        # Multi-stage SlotTeam.Known: {"id": {"teamId": N}, "name": "X", "logo": {...}}
-        if node.get("name") and isinstance(node.get("id"), dict) and node.get("logo"):
+        # SlotTeam.Known: {"id": {"teamId": N}, "name": "X", "logo": {...}} (multi-stage
+        # blobs) or {"type": "...SlotTeam.Known", "id": {"teamId": N}, "name": "X"} (2026 brackets)
+        if node.get("name") and isinstance(node.get("id"), dict) and (
+            node.get("logo") or str(node.get("type") or "").endswith("SlotTeam.Known")
+        ):
             _put_team(out, node["id"].get("teamId"), node.get("name"))
         for value in node.values():
             _collect_teams(value, out)
@@ -167,11 +170,102 @@ def parse_swiss_stages(html: str) -> List[Dict[str, Any]]:
 _AUX_BRACKET_RE = re.compile(r"3rd|third|decider", re.IGNORECASE)
 
 
+def _de_slots(section: Any) -> List[Dict[str, Any]]:
+    """A DE bracket section's slots in order. HLTV embeds them either as a
+    `slots` list (older pages) or as `slot1`, `slot2`, ... keys (2026 pages,
+    e.g. StarLadder StarSeries Fall 2026)."""
+    if not isinstance(section, dict):
+        return []
+    slots = section.get("slots")
+    if isinstance(slots, list):
+        return [s for s in slots if isinstance(s, dict)]
+    keyed = []
+    for key, value in section.items():
+        m = re.fullmatch(r"slot(\d+)", str(key))
+        if m and isinstance(value, dict):
+            keyed.append((int(m.group(1)), value))
+    keyed.sort(key=lambda kv: kv[0])
+    return [v for _n, v in keyed]
+
+
+# How HLTV routes a whole-event 8-team double-elimination bracket
+# (section, slot number) -> the two feeders (slotEntry type, source slot id).
+# Lower semis are crossed (each upper-semi loser meets the OTHER side's
+# lower-round-1 winner); the consolidation final is the upper-final loser v
+# the lower-final winner. The simulator plays exactly this layout, so a page
+# routed any other way is refused rather than mis-simulated.
+_DE8_FULL_ROUTING = {
+    ("upperRound2", 1): (("WinnerOf", "UpperQuarters1"), ("WinnerOf", "UpperQuarters2")),
+    ("upperRound2", 2): (("WinnerOf", "UpperQuarters3"), ("WinnerOf", "UpperQuarters4")),
+    ("upperFinal", 1): (("WinnerOf", "UpperSemis1"), ("WinnerOf", "UpperSemis2")),
+    ("lowerRound1", 1): (("LoserOf", "UpperQuarters1"), ("LoserOf", "UpperQuarters2")),
+    ("lowerRound1", 2): (("LoserOf", "UpperQuarters3"), ("LoserOf", "UpperQuarters4")),
+    ("lowerDropdown1", 1): (("LoserOf", "UpperSemis2"), ("WinnerOf", "LowerRound1Match1")),
+    ("lowerDropdown1", 2): (("LoserOf", "UpperSemis1"), ("WinnerOf", "LowerRound1Match2")),
+    ("lowerRound2", 1): (("WinnerOf", "LowerSemis1"), ("WinnerOf", "LowerSemis2")),
+    ("consolidationFinal", 1): (("LoserOf", "UpperFinal"), ("WinnerOf", "LowerFinal")),
+    ("grandFinal", 1): (("WinnerOf", "UpperFinal"), ("WinnerOf", "ConsolidationFinal")),
+}
+
+
+def _slot_side_team(slot: Dict[str, Any], side: str) -> Optional[Dict[str, Any]]:
+    """{id, name} of a known team on one side of a slot (2026 schema keeps the
+    sides under `matchup`; older pages at the slot level), else None."""
+    matchup = slot.get("matchup") if isinstance(slot.get("matchup"), dict) else {}
+    t = matchup.get(side) or slot.get(side) or {}
+    if not isinstance(t, dict):
+        return None
+    raw_id = t.get("id")
+    tid = raw_id.get("teamId") if isinstance(raw_id, dict) else raw_id
+    if isinstance(t.get("team"), dict):  # older FixedTeam: {"team": {"id": N, "name": ...}}
+        tid = t["team"].get("id", tid)
+        name = t["team"].get("name")
+    else:
+        name = t.get("name")
+    try:
+        tid_int = int(tid)
+    except (TypeError, ValueError):
+        return None
+    if tid_int <= 0 or not name:
+        return None
+    return {"id": tid_int, "name": str(name)}
+
+
+def parse_double8_full(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Seeds (upper-round-1 slot order) and the grand-final Bo of a whole-event
+    8-team double-elimination bracket, after checking the page routes every
+    match the way the simulator plays it (_DE8_FULL_ROUTING). Raises
+    ValueError on any other routing."""
+
+    def entry(slot: Dict[str, Any], n: int) -> tuple:
+        e = slot.get(f"slotEntry{n}") or {}
+        return (str(e.get("type") or ""), str(((e.get("slotId") or {}).get("id")) or ""))
+
+    for (section, idx), expected in _DE8_FULL_ROUTING.items():
+        slots = _de_slots(data.get(section))
+        if len(slots) < idx:
+            raise ValueError(f"DE8 bracket has no {section} slot {idx}")
+        got = (entry(slots[idx - 1], 1), entry(slots[idx - 1], 2))
+        if got != expected:
+            raise ValueError(f"DE8 routing at {section}[{idx}] is {got}, expected {expected}")
+    seeds: List[Optional[Dict[str, Any]]] = []
+    for slot in _de_slots(data.get("upperRound1"))[:4]:
+        seeds.append(_slot_side_team(slot, "team1"))
+        seeds.append(_slot_side_team(slot, "team2"))
+    seeds = (seeds + [None] * 8)[:8]
+    gf_slots = _de_slots(data.get("grandFinal"))
+    gf_match = ((gf_slots[0].get("matchup") or {}).get("match") or {}) if gf_slots else {}
+    try:
+        gf_bo = int(gf_match.get("numberOfMaps") or 0)
+    except (TypeError, ValueError):
+        gf_bo = 0
+    return {"seeds": seeds, "grand_final_bo": gf_bo}
+
+
 def _de_section_state(data: Dict[str, Any], key: str) -> Optional[Dict[str, Any]]:
     """A DE bracket section's visibility + winner/loser routing, or None when
     the section has no slots at all."""
-    section = data.get(key)
-    slots = (section or {}).get("slots") or []
+    slots = _de_slots(data.get(key))
     if not slots:
         return None
     return {
@@ -201,9 +295,7 @@ def _classify_de_group(data: Dict[str, Any], type_name: str, name: str, size: in
     # consolidation final qualify, grand final never played).
     qualify_count = 0
     for section in data.values():
-        if not isinstance(section, dict) or "slots" not in section:
-            continue
-        for slot in section.get("slots") or []:
+        for slot in _de_slots(section):
             if slot.get("hidden"):
                 continue
             if (slot.get("winnerType") or {}).get("type") == "Qualifies":
@@ -250,10 +342,19 @@ def parse_bracket_stages(html: str) -> List[Dict[str, Any]]:
             except ValueError:
                 size = 0
             variant, advance = _classify_de_group(data, type_name, name, size)
-            brackets.append(
-                {"bracket": "double_elim", "size": size, "name": name, "teams": teams,
-                 "aux": False, "variant": variant, "advance": advance, "source": "slotted"}
-            )
+            entry = {
+                "bracket": "double_elim", "size": size, "name": name, "teams": teams,
+                "aux": False, "variant": variant, "advance": advance, "source": "slotted",
+            }
+            if variant == "de8_full":
+                # a whole-event bracket the playoff simulator can play: seeds in
+                # slot order, grand-final Bo, or the reason its routing is refused
+                try:
+                    full = parse_double8_full(data)
+                    entry.update({"bracket_kind": "double", "seeds": full["seeds"], "grand_final_bo": full["grand_final_bo"]})
+                except ValueError as exc:
+                    entry.update({"bracket_kind": "double", "seeds": None, "routing_error": str(exc)})
+            brackets.append(entry)
         elif type_name.startswith("SingleElimination"):
             rounds = data.get("rounds") or []
             first = (rounds[0].get("slots") or []) if rounds else []

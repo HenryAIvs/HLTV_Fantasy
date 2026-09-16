@@ -347,3 +347,210 @@ def _solve_one_py(scores, prices, team_of, allowed, forced, budget, cap, k, out_
         out_scores[r] = score
         out_rosters[r, :] = forced_idx + [pool[i] for i in picks]
     return len(ranked)
+
+
+# ---------------------------------------------------------------------------
+# Batched top-k rosters (ceiling search), per-outcome roster bounds and the
+# fused roster-plan statistics used by Best Single Outcome / Most Likely Winner.
+# ---------------------------------------------------------------------------
+
+
+@njit(parallel=True, cache=True)
+def _top_batch(M, prices, team_of, n_teams, allowed, forced, budget, cap, k, out_scores, out_rosters, out_found):
+    """k best rosters per outcome column of M (players x outcomes), parallel
+    over columns -> out_scores (outcomes x k), out_rosters (outcomes x k x 5),
+    out_found (outcomes)."""
+    n_out = M.shape[1]
+    for c in prange(n_out):
+        scores = M[:, c].copy()
+        sc = np.empty(k, dtype=np.float64)
+        ro = np.empty((k, ROSTER_SIZE), dtype=np.int64)
+        found = _solve_one(scores, prices, team_of, n_teams, allowed, forced, budget, cap, k, sc, ro)
+        out_found[c] = found
+        for r in range(found):
+            out_scores[c, r] = sc[r]
+            for d in range(ROSTER_SIZE):
+                out_rosters[c, r, d] = ro[r, d]
+
+
+def top_rosters_batch(
+    M: np.ndarray, prices: np.ndarray, team_of: np.ndarray, budget: int, cap: int, k: int,
+    forced: Optional[np.ndarray] = None, excluded: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The k best legal rosters of every outcome column of M, best first:
+    (scores (outcomes x k), player-index rosters (outcomes x k x 5), found
+    count per outcome). Entries past the found count are undefined."""
+    M = np.ascontiguousarray(M, dtype=np.float64)
+    n_players = M.shape[0]
+    n_out = M.shape[1]
+    prices = np.asarray(prices, dtype=np.int64)
+    team_of = np.asarray(team_of, dtype=np.int64)
+    forced_arr = np.zeros(n_players, dtype=np.bool_) if forced is None else np.asarray(forced, dtype=np.bool_)
+    excluded_arr = np.zeros(n_players, dtype=np.bool_) if excluded is None else np.asarray(excluded, dtype=np.bool_)
+    allowed = ~(forced_arr | excluded_arr)
+    n_teams = int(team_of.max()) + 1 if n_players else 1
+    out_scores = np.empty((n_out, k), dtype=np.float64)
+    out_rosters = np.empty((n_out, k, ROSTER_SIZE), dtype=np.int64)
+    out_found = np.zeros(n_out, dtype=np.int64)
+    if HAVE_NUMBA:
+        _top_batch(M, prices, team_of, n_teams, allowed, forced_arr, int(budget), int(cap), int(k), out_scores, out_rosters, out_found)
+        return out_scores, out_rosters, out_found
+    for c in range(n_out):
+        res = top_rosters_one(M[:, c], prices, team_of, budget, cap, k, forced_arr, excluded_arr)
+        out_found[c] = len(res)
+        for r, (s, roster) in enumerate(res):
+            out_scores[c, r] = s
+            out_rosters[c, r] = roster
+    return out_scores, out_rosters, out_found
+
+
+@njit(parallel=True, cache=True)
+def _lagrangian_bound_cols(M, prices, lams, budget, out):
+    """Per outcome column: min over lambda of (sum of the five largest
+    M[:, c] - lambda * price) + lambda * budget, an upper bound on any
+    five-player roster within budget (lambda = 0 is the plain five-best sum)."""
+    n_players = M.shape[0]
+    n_out = M.shape[1]
+    n_lam = lams.shape[0]
+    for c in prange(n_out):
+        best = 1e300
+        top = np.empty(ROSTER_SIZE, dtype=np.float64)
+        for li in range(n_lam):
+            lam = lams[li]
+            for d in range(ROSTER_SIZE):
+                top[d] = -1e300
+            for j in range(n_players):
+                v = M[j, c] - lam * prices[j]
+                if v > top[ROSTER_SIZE - 1]:
+                    slot = ROSTER_SIZE - 1
+                    while slot > 0 and top[slot - 1] < v:
+                        top[slot] = top[slot - 1]
+                        slot -= 1
+                    top[slot] = v
+            s = lam * budget
+            for d in range(ROSTER_SIZE):
+                s += top[d]
+            if s < best:
+                best = s
+        out[c] = best
+
+
+def lagrangian_bound_cols(M: np.ndarray, prices: np.ndarray, lams, budget: float) -> np.ndarray:
+    """Upper bound of the best roster in every outcome column (see
+    _lagrangian_bound_cols); lams should include 0."""
+    M = np.ascontiguousarray(M, dtype=np.float64)
+    prices_f = np.asarray(prices, dtype=np.float64)
+    lams_arr = np.asarray(list(lams), dtype=np.float64)
+    out = np.empty(M.shape[1], dtype=np.float64)
+    if HAVE_NUMBA:
+        _lagrangian_bound_cols(M, prices_f, lams_arr, float(budget), out)
+        return out
+    out[:] = np.inf
+    for lam in lams_arr:
+        adj = M - lam * prices_f[:, None]
+        out = np.minimum(out, np.partition(adj, -ROSTER_SIZE, axis=0)[-ROSTER_SIZE:].sum(axis=0) + lam * float(budget))
+    return out
+
+
+@njit(parallel=True, cache=True)
+def _plan_block_stats(RW, MP, MR, probs, rows, role_pm, tables, block, avg_b, max_b, argmax_b, mass_b, best_i):
+    """Fused statistics of every candidate roster's plan score
+        S[i, c] = sum_p RW[j_p, c] + role_pm[i, p] * MR[j_p, c] + tables[i, p, MP[j_p, c]]
+    over blocks of outcome columns (parallel over blocks, so each block's slice
+    of the player tables stays in cache across all rosters). Per block b and
+    roster i: the probability-weighted sum, the max and its first outcome,
+    and the probability mass tied at that max; per outcome, the first roster
+    beating the previous best by more than 1e-9 (best_i)."""
+    C = rows.shape[0]
+    N = RW.shape[1]
+    nb = (N + block - 1) // block
+    for b in prange(nb):
+        c0 = b * block
+        c1 = min(N, c0 + block)
+        w = c1 - c0
+        bv = np.full(w, -1e300)
+        bi = np.full(w, -1, dtype=np.int64)
+        sb = np.empty(w, dtype=np.float64)
+        for i in range(C):
+            j0 = rows[i, 0]
+            j1 = rows[i, 1]
+            j2 = rows[i, 2]
+            j3 = rows[i, 3]
+            j4 = rows[i, 4]
+            r0 = role_pm[i, 0]
+            r1 = role_pm[i, 1]
+            r2 = role_pm[i, 2]
+            r3 = role_pm[i, 3]
+            r4 = role_pm[i, 4]
+            a = 0.0
+            mx = -1e300
+            am = -1
+            for c in range(c0, c1):
+                s = (
+                    RW[j0, c] + r0 * MR[j0, c] + tables[i, 0, MP[j0, c]]
+                    + RW[j1, c] + r1 * MR[j1, c] + tables[i, 1, MP[j1, c]]
+                    + RW[j2, c] + r2 * MR[j2, c] + tables[i, 2, MP[j2, c]]
+                    + RW[j3, c] + r3 * MR[j3, c] + tables[i, 3, MP[j3, c]]
+                    + RW[j4, c] + r4 * MR[j4, c] + tables[i, 4, MP[j4, c]]
+                )
+                sb[c - c0] = s
+                a += s * probs[c]
+                if s > mx:
+                    mx = s
+                    am = c
+                if s > bv[c - c0] + 1e-9:
+                    bv[c - c0] = s
+                    bi[c - c0] = i
+            # probability mass tied at the block max, and the first tied
+            # outcome (deterministic argmax whatever the summation order)
+            m = 0.0
+            am = -1
+            for c in range(c0, c1):
+                if sb[c - c0] >= mx - 1e-9:
+                    m += probs[c]
+                    if am < 0:
+                        am = c
+            avg_b[b, i] = a
+            max_b[b, i] = mx
+            argmax_b[b, i] = am
+            mass_b[b, i] = m
+        for c in range(c0, c1):
+            best_i[c] = bi[c - c0]
+
+
+def plan_block_stats(RW, MP, MR, probs, rows, role_pm, tables, block: int = 512):
+    """For candidate rosters (rows: C x 5 player indices) with plan parameters
+    role_pm (C x 5) and booster prefix tables (C x 5 x slots): (avg, ceiling,
+    argmax outcome, ceiling probability, best roster per outcome) over the
+    outcome tables RW / MP / MR (players x outcomes) and the outcome
+    probabilities. Returns None without numba (callers keep their numpy path)."""
+    if not HAVE_NUMBA:
+        return None
+    RW = np.ascontiguousarray(RW, dtype=np.float64)
+    MR = np.ascontiguousarray(MR, dtype=np.float64)
+    MP = np.ascontiguousarray(MP)
+    if not np.issubdtype(MP.dtype, np.integer):
+        MP = MP.astype(np.int64)
+    probs = np.ascontiguousarray(probs, dtype=np.float64)
+    rows = np.ascontiguousarray(rows, dtype=np.int64)
+    role_pm = np.ascontiguousarray(role_pm, dtype=np.float64)
+    tables = np.ascontiguousarray(tables, dtype=np.float64)
+    C = rows.shape[0]
+    N = RW.shape[1]
+    best_i = np.full(N, -1, dtype=np.int64)
+    if C == 0 or N == 0:
+        return np.zeros(C), np.zeros(C), np.full(C, -1, dtype=np.int64), np.zeros(C), best_i
+    block = max(1, min(int(block), N))
+    nb = (N + block - 1) // block
+    avg_b = np.zeros((nb, C), dtype=np.float64)
+    max_b = np.full((nb, C), -1e300, dtype=np.float64)
+    argmax_b = np.full((nb, C), -1, dtype=np.int64)
+    mass_b = np.zeros((nb, C), dtype=np.float64)
+    _plan_block_stats(RW, MP, MR, probs, rows, role_pm, tables, int(block), avg_b, max_b, argmax_b, mass_b, best_i)
+    avg = avg_b.sum(axis=0)
+    ceil = max_b.max(axis=0)
+    tied = max_b >= ceil[None, :] - 1e-9
+    bsel = tied.argmax(axis=0)  # first block within 1e-9 of the ceiling
+    argmax = argmax_b[bsel, np.arange(C)]
+    ceil_p = (mass_b * tied).sum(axis=0)
+    return avg, ceil, argmax, ceil_p, best_i
