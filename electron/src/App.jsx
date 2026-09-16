@@ -7732,7 +7732,7 @@ function EventsTab({ refreshData, notify, players, teams = [], onOpenPlayer, onO
                     <th>Type</th>
                     <th>Teams</th>
                     <th>Valuation</th>
-                    <th>{PUBLIC_BUILD ? "Status" : "Actions"}</th>
+                    <th>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -7750,9 +7750,13 @@ function EventsTab({ refreshData, notify, players, teams = [], onOpenPlayer, onO
                             title={ev.valuation.label}
                           >
                             {PUBLIC_BUILD
-                              ? ev.valuation.published
-                                ? "Published"
-                                : "Not published yet"
+                              ? ev.valuation.finished
+                                ? ev.valuation.published
+                                  ? "Finished"
+                                  : "Finished, not published"
+                                : ev.valuation.published
+                                  ? "Published"
+                                  : "Not published yet"
                               : ev.valuation.label}
                           </span>
                         ) : (
@@ -7761,18 +7765,14 @@ function EventsTab({ refreshData, notify, players, teams = [], onOpenPlayer, onO
                       </td>
                       <td>
                         {PUBLIC_BUILD ? (
-                          <div className="event-status-cell">
-                            {activeEventId === ev.event_id && <span className="event-active-badge">Current</span>}
-                            {shownEventId === ev.event_id ? (
-                              <span className="event-viewing-badge">Viewing</span>
-                            ) : (
-                              <button
-                                className="secondary"
-                                onClick={() => onViewEvent && onViewEvent(ev.event_id === activeEventId ? null : ev.event_id)}
-                              >
-                                View
-                              </button>
-                            )}
+                          <div className="actions" style={{ marginTop: 0 }}>
+                            <button
+                              className={shownEventId === ev.event_id ? "primary" : "secondary"}
+                              onClick={() => onViewEvent && onViewEvent(ev.event_id === activeEventId ? null : ev.event_id)}
+                              disabled={shownEventId === ev.event_id}
+                            >
+                              {shownEventId === ev.event_id ? "Active" : "Set Active"}
+                            </button>
                           </div>
                         ) : (
                           <div className="actions" style={{ marginTop: 0 }}>
@@ -14659,7 +14659,7 @@ function TournamentTab({ teams, teamLookup, players, sortTeams, applyFilters, on
     <div className="stack">
       {PUBLIC_BUILD && eventList.length > 1 && (
         <div className="event-picker">
-          <span className="event-picker-label">Event</span>
+          <span className="event-picker-label">Active event</span>
           <select
             id="tournament-event-picker"
             value={viewedId ?? ""}
@@ -14671,7 +14671,6 @@ function TournamentTab({ teams, teamLookup, players, sortTeams, applyFilters, on
             {eventList.map((ev) => (
               <option key={ev.event_id} value={ev.event_id}>
                 {ev.name || `Event ${ev.event_id}`}
-                {ev.event_id === serverActive ? " (current)" : ""}
               </option>
             ))}
           </select>

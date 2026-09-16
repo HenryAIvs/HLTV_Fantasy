@@ -133,11 +133,16 @@ decides when valuations change:
 2. **Until its first match:** refreshed by the nightly run with that night's
    ratings, rankings, roles and boosters.
 3. **From its first match:** frozen. Nothing automatic touches it again.
+   An event is *active* until it has finished (its last day plus a day's
+   grace); every active event gets steps 1 to 3 each night, finished events
+   are archive and never touched.
 4. **Stored per event.** Another event's run never replaces it.
 5. **Run buttons in the operator app are manual overrides,** allowed at any
    time.
-6. **The public app reads exactly the stored run** and can view any imported
-   event.
+6. **Each public user has their own active event**, chosen with the same Set
+   Active button as the operator (Events tab) or the Active event dropdown on
+   the Tournament page, remembered on their machine and defaulting to the
+   operator's active event. They read exactly the stored run.
 
 Groups and playoff (single and double elimination) events are automated
 today. Swiss and Bounty events are registered as *manual*: the nightly run

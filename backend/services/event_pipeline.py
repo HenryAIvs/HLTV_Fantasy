@@ -9,6 +9,8 @@ Every fantasy event, whatever its format, is handled the same way:
 2. Until its first match: refreshed by the nightly run with that night's
    ratings, rankings, roles and boosters.
 3. From its first match: frozen. Nothing automatic touches it again.
+   An event is ACTIVE until it has finished (its last day, plus a day's
+   grace); every active event gets this treatment, finished ones are archive.
 4. Stored per event. Another event's run never replaces it.
 5. The operator's Run buttons are manual overrides, allowed at any time.
 6. The public app reads exactly the stored run and can view any imported event.
@@ -95,6 +97,63 @@ def has_started(event_id: int) -> Optional[bool]:
     return time.time() >= float(start)
 
 
+# The page's end stamp is the last day's start; matches run into that night.
+FINISH_GRACE_SECONDS = 24 * 3600
+# Without an end stamp, an event that started this long ago is treated as over.
+ASSUMED_LENGTH_SECONDS = 14 * 24 * 3600
+
+
+def _finished(detected: Dict[str, Any], now: Optional[float] = None) -> Optional[bool]:
+    now = now or time.time()
+    end = detected.get("end_at")
+    if end:
+        return now > float(end) + FINISH_GRACE_SECONDS
+    start = detected.get("start_at")
+    if start:
+        return now > float(start) + ASSUMED_LENGTH_SECONDS
+    return None
+
+
+def is_finished(event_id: int) -> Optional[bool]:
+    _, detected = detect_kind(event_id)
+    return _finished(detected)
+
+
+def live_events() -> list:
+    """Ids of every event that has not finished (unknown dates count as
+    live), soonest start first. These are the events the nightly run tends."""
+    from backend.data.event_db import list_events
+
+    live = []
+    for row in list_events():
+        eid = int(row.get("event_id") or 0)
+        if not eid:
+            continue
+        _, detected = detect_kind(eid)
+        if _finished(detected) is True:
+            continue
+        live.append((float(detected.get("start_at") or 0), eid))
+    return [eid for _, eid in sorted(live)]
+
+
+def refresh_live_events(trigger: str) -> list:
+    """The contract applied to every live event: bake what is missing (retry),
+    refresh with tonight's inputs what has not started, leave started events
+    alone. Returns one outcome dict per event."""
+    outcomes = []
+    for eid in live_events():
+        baked = has_stored_run(eid)
+        started = has_started(eid)
+        if baked and started is not False:
+            outcomes.append({"status": "frozen", "event_id": eid, "reason": "started; left alone"})
+            continue
+        if baked:
+            outcomes.append(bake_event(eid, trigger=trigger, only_if_missing=False, refresh_inputs=True))
+        else:
+            outcomes.append(bake_event(eid, trigger=trigger, only_if_missing=True))
+    return outcomes
+
+
 def bake_event(event_id: int, trigger: str = "import", only_if_missing: bool = False, refresh_inputs: bool = False) -> Dict[str, Any]:
     """Run the event's format baker. Never raises; returns a status dict the
     scheduler records ("ok", "exists", "skipped", "pending", "manual",
@@ -124,10 +183,15 @@ def event_status(event_id: int) -> Dict[str, Any]:
     hooks = _hooks_for(kind)
     baked = bool(hooks and hooks["exists"](event_id))
     start_at = detected.get("start_at")
+    end_at = detected.get("end_at")
     started: Optional[bool] = (time.time() >= float(start_at)) if start_at else None
+    finished = _finished(detected)
     automated = bool(hooks and hooks["bake"])
     if not hooks:
         status, label = "unsupported", "Format not supported"
+    elif finished:
+        status = "finished"
+        label = "Finished, published" if baked else "Finished, not published"
     elif not automated:
         status = "manual"
         label = "Published (run manually)" if baked else "Not automated: run from the operator app"
@@ -144,7 +208,10 @@ def event_status(event_id: int) -> Dict[str, Any]:
         "automated": automated,
         "baked": baked,
         "started": started,
+        "finished": bool(finished),
+        "active": finished is not True,
         "start_at": float(start_at) if start_at else None,
+        "end_at": float(end_at) if end_at else None,
         "status": status,
         "label": label,
         "published": bool(baked),

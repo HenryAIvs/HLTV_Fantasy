@@ -269,53 +269,37 @@ class DataScheduler:
             self._set_state(running=False, current_task=None, trigger=None, processed=0, total=0)
 
     def _bake_valuations(self, trigger: str, only_if_missing: bool = False) -> None:
-        """Run + store the ACTIVE event's valuation: exact groups (and the
-        combined playoff when detected) for a groups event, the enumerated
-        bracket plus roster combinations for a playoff event. Recorded as its
-        own run row; a skip (draw or bracket not published) is a warning. With
-        only_if_missing (the nightly pass) an already-baked event is refreshed
-        with the night's inputs until it starts and left alone from then on."""
-        from backend.data.event_db import get_active_event_id
+        """Apply the event behaviour contract to every unfinished event (see
+        backend.services.event_pipeline): bake what is missing, refresh with
+        tonight's inputs what has not started, leave started events alone,
+        never touch finished ones. One run row summarises all of them.
+        `only_if_missing` is kept for callers; the contract decides."""
         from backend.services import event_pipeline as pipeline
 
-        active = get_active_event_id()
-        refresh_inputs = False
-        if only_if_missing and active and pipeline.has_stored_run(int(active)):
-            # Already baked. Until the event starts, tonight's rating / ranking
-            # imports should flow into it (fresh inputs, re-bake); from the
-            # start on — or when the start is unknown — it is left alone.
-            if pipeline.has_started(int(active)) is False:
-                only_if_missing = False
-                refresh_inputs = True
-            else:
-                logger.debug("Valuations for event %s already baked and the event has started; left alone", active)
-                return
         run_id = schedule_db.start_run("valuations", trigger)
         self._set_state(running=True, current_task="valuations", trigger=trigger, started_at=time.time(),
                         processed=0, total=0, message="Baking event valuations...")
         try:
-            if not active:
-                schedule_db.finish_run(run_id, "warning", "no active event")
+            outcomes = pipeline.refresh_live_events(trigger)
+            if not outcomes:
+                schedule_db.finish_run(run_id, "warning", "no unfinished events")
                 return
-            outcome = pipeline.bake_event(
-                int(active), trigger=trigger, only_if_missing=only_if_missing, refresh_inputs=refresh_inputs
-            )
-            status = {
-                "ok": "success",
-                "exists": "success",
-                "skipped": "warning",
-                "pending": "warning",
-                "manual": "warning",
-                "unsupported": "warning",
-            }.get(str(outcome.get("status")), "error")
-            schedule_db.finish_run(run_id, status, _short(outcome))
-            logger.info("Valuation bake (%s): %s", trigger, _short(outcome))
+            rank = {"error": 2, "skipped": 1, "pending": 1, "manual": 1, "unsupported": 1, "missing": 1}
+            worst = max(rank.get(str(o.get("status")), 0) for o in outcomes)
+            status = {0: "success", 1: "warning", 2: "error"}[worst]
+            parts = []
+            for o in outcomes:
+                extra = o.get("reason") or (f"{o.get('seconds')}s" if o.get("seconds") is not None else "")
+                parts.append(f"{o.get('event_id')}: {o.get('status')}{' ' + str(extra) if extra else ''}")
+            summary = "; ".join(parts)
+            schedule_db.finish_run(run_id, status, summary[:2000])
+            logger.info("Valuation pass (%s): %s", trigger, summary[:500])
         except Exception as exc:  # noqa: BLE001 — never let the bake break a batch
             schedule_db.finish_run(run_id, "error", f"bake failed: {exc}")
-            logger.exception("Valuation bake failed")
+            logger.exception("Valuation pass failed")
 
     def _run_bake_only(self, trigger: str) -> None:
-        # Manual run-now: always (re)bake the active event.
+        # Manual run-now: the same pass as the nightly one, over every unfinished event.
         if not self._run_lock.acquire(blocking=False):
             return
         try:
