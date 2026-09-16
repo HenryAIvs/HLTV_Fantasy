@@ -1,12 +1,17 @@
 # Builds the Windows installer and publishes it (plus latest.yml for the
 # in-app updater) to a GitHub Release whenever a version tag is pushed:
 #
-#   git tag v0.1.0 && git push origin v0.1.0
+#   git tag v0.1.1 && git push origin v0.1.1
 #
-# The tag must match electron/package.json "version" (electron-builder names
-# the release after it). The website's download button points at
-# releases/latest/download/CS-Fantasy-Toolkit-Setup.exe, so nothing else
-# changes between releases.
+# The tag must match electron/package.json "version". The website's download
+# button points at releases/latest/download/CS-Fantasy-Toolkit-Setup.exe, so
+# nothing else changes between releases.
+#
+# electron-builder only builds here (--publish never); the upload is done by
+# action-gh-release, which creates or updates exactly one release per tag.
+# electron-builder's own GitHub publisher raced itself on the first release
+# and produced two releases for the same tag, which broke the download URL.
+# Do not create the release by hand before the workflow runs.
 name: Release
 
 on:
@@ -37,7 +42,17 @@ jobs:
         run: |
           v=$(node -p "require('./package.json').version")
           [ "v$v" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} != package version v$v"; exit 1; }
-      - name: Build and publish
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npm run release
+      - name: Build installer
+        run: npm run dist
+      - name: Show build output
+        shell: bash
+        run: ls -la release
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            electron/release/CS-Fantasy-Toolkit-Setup.exe
+            electron/release/CS-Fantasy-Toolkit-Setup.exe.blockmap
+            electron/release/latest.yml
+          fail_on_unmatched_files: true
+          generate_release_notes: true

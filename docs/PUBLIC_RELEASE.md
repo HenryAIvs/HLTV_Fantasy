@@ -50,8 +50,11 @@ together, and the steps that only the operator (you) can do.
 1. Bump `version` in `electron/package.json`.
 2. Commit, then `git tag v0.1.1 && git push origin main v0.1.1`.
 3. The `Release` workflow builds `CS-Fantasy-Toolkit-Setup.exe` and
-   `latest.yml` and attaches them to the release. The download button always
-   points at `releases/latest/download/CS-Fantasy-Toolkit-Setup.exe`.
+   `latest.yml` and attaches them to the release (one release per tag, created
+   by the workflow's upload step; never create it by hand first). The download
+   button always points at `releases/latest/download/CS-Fantasy-Toolkit-Setup.exe`.
+   If a tag ever ends up with two releases, the download URL breaks: delete
+   both releases and push a new tag.
 4. Installed apps pick the update up within six hours (or at next start).
 
 To build locally instead: `cd electron && npm run dist` (installer in
