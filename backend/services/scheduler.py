@@ -269,17 +269,21 @@ class DataScheduler:
             self._set_state(running=False, current_task=None, trigger=None, processed=0, total=0)
 
     def _bake_valuations(self, trigger: str, only_if_missing: bool = False) -> None:
-        """Run + store the groups valuation for the ACTIVE event (exact groups
-        and, when detected, the exact combined playoff). Recorded as its own
-        run row; a skip (not a groups event, draw not published) is a warning.
-        With only_if_missing (the nightly pass) an already-baked event is left
-        alone and no run row is written."""
+        """Run + store the ACTIVE event's valuation: exact groups (and the
+        combined playoff when detected) for a groups event, the enumerated
+        bracket plus roster combinations for a playoff event. Recorded as its
+        own run row; a skip (draw or bracket not published) is a warning. With
+        only_if_missing (the nightly pass) an already-baked event is refreshed
+        with the night's inputs until it starts and left alone from then on."""
         from backend.data.event_db import get_active_event_id
-        from backend.routes import groups
+        from backend.routes import groups, playoff
 
         active = get_active_event_id()
         refresh_inputs = False
-        if only_if_missing and active and groups._GROUPS_STATE.load(key=int(active)):
+        already_baked = bool(active) and (
+            bool(groups._GROUPS_STATE.load(key=int(active))) or bool(playoff.load_latest_playoff("main", int(active)))
+        )
+        if only_if_missing and already_baked:
             # Already baked. Until the event starts, tonight's rating / ranking
             # imports should flow into it (fresh inputs, re-bake); from the
             # start on — or when the start is unknown — it is left alone.

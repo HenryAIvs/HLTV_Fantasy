@@ -1311,6 +1311,14 @@ def bake_event_valuations(
     except Exception as exc:  # noqa: BLE001
         return {"status": "skipped", "event_id": event_id, "reason": f"kind detection failed: {exc}"}
     kind = get_event_tournament_kind(event_id) or detected.get("kind")
+    if kind in ("playoff", "double_elim"):
+        # Same pipeline, playoff shape: bracket from the event page, exact
+        # enumeration, stored roster combinations (see playoff.bake_event_playoff).
+        from backend.routes import playoff as playoff_routes
+
+        return playoff_routes.bake_event_playoff(
+            event_id, trigger=trigger, only_if_missing=only_if_missing, refresh_inputs=refresh_inputs
+        )
     if kind != "groups":
         return {"status": "skipped", "event_id": event_id, "reason": f"not a groups event ({kind})"}
 

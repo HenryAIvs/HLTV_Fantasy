@@ -174,6 +174,80 @@ def seed_playoff_queries(variant: str = "main", event_id=None) -> dict:
     return timings
 
 
+def bake_event_playoff(
+    event_id: int, trigger: str = "import", only_if_missing: bool = False, refresh_inputs: bool = False
+) -> dict:
+    """Playoff counterpart of groups.bake_event_valuations, called through it:
+    fill the bracket from the event page, enumerate it and store the roster
+    combinations, so a playoff event is published the same way a groups event
+    is - at import, refreshed nightly until it starts, frozen after. With
+    only_if_missing an already-baked event is left alone. Never raises; the
+    scheduler records the returned status."""
+    from backend.data.event_db import get_event_detail, get_event_tournament_kind
+    from backend.routes import events as events_routes
+    from backend.routes.groups import autofill_event_playoff
+
+    started = time.time()
+    event_id = int(event_id)
+    if only_if_missing and load_latest_playoff("main", event_id):
+        return {"status": "exists", "event_id": event_id, "reason": "already baked; not refreshed"}
+    event = get_event_detail(event_id)
+    if not event:
+        return {"status": "skipped", "event_id": event_id, "reason": "event not found"}
+    try:
+        detected = events_routes._detect_event_tournament_kind_cached(event)
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "skipped", "event_id": event_id, "reason": f"kind detection failed: {exc}"}
+    kind = get_event_tournament_kind(event_id) or detected.get("kind")
+    if kind not in ("playoff", "double_elim"):
+        return {"status": "skipped", "event_id": event_id, "reason": f"not a playoff event ({kind})"}
+    if detected.get("routing_error"):
+        return {"status": "unsupported", "event_id": event_id, "reason": f"bracket routing: {detected.get('routing_error')}"}
+    try:
+        auto = autofill_event_playoff(hltv_event_id=event.get("hltv_event_id"), fantasy_event_id=event_id)
+    except Exception as exc:  # noqa: BLE001
+        detail = getattr(exc, "detail", None) or str(exc)
+        return {"status": "skipped", "event_id": event_id, "reason": f"bracket unavailable: {str(detail)[:200]}"}
+    ids = [int(t or 0) for t in (auto.get("team_ids") or [])]
+    if not ids or any(t <= 0 for t in ids):
+        return {"status": "skipped", "event_id": event_id, "reason": "bracket not published yet (TBD slots)"}
+    try:
+        payload = _normalize_playoff_payload(
+            {"team_slots": ids, "bracket_kind": auto.get("bracket_kind") or "single", "has_third_place_decider": False}
+        )
+    except HTTPException as exc:
+        return {"status": "skipped", "event_id": event_id, "reason": f"invalid bracket: {exc.detail}"}
+    payload["event_id"] = event_id
+    payload["baked"] = {"trigger": trigger, "at": started, "refresh_inputs": bool(refresh_inputs)}
+    try:
+        result = _compute_playoff_result(payload)
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "event_id": event_id, "reason": f"bracket run failed: {str(exc)[:300]}"}
+    save_latest_playoff(payload, result, "main", event_id)
+    bracket_seconds = round(time.time() - started, 1)
+    # Roster combinations: what the Top 5 tabs read. Same options as the app's
+    # Run Combinations button; one run serves all three ranking modes.
+    body = {"mode": "most_outcomes", "variant": "main", "event_id": event_id}
+    try:
+        options = parse_optimizer_payload(body)
+        players_info = _build_players_info_from_sim_results(result.get("teams", {}) or {}, options["exclude"])
+        combos = _optimize_playoff_teams_by_outcomes(
+            players_info, result, options["include"], options["budget"], options["max_per_team"], "most_outcomes"
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "event_id": event_id, "reason": f"combinations failed: {str(exc)[:300]}", "bracket_seconds": bracket_seconds}
+    save_latest_playoff_best_team(body, combos, "main", event_id)
+    return {
+        "status": "ok",
+        "event_id": event_id,
+        "kind": kind,
+        "teams": len(ids),
+        "rosters": len(combos.get("all_teams") or []),
+        "bracket_seconds": bracket_seconds,
+        "seconds": round(time.time() - started, 1),
+    }
+
+
 def _saved_combo_metric(team: dict, mode: str) -> float:
     if mode == "single_outcome":
         return float(team.get("ceiling_points") or 0.0)

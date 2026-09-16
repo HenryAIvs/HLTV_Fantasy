@@ -122,6 +122,11 @@ startup and after each run.
 
 ## What the public app needs published
 
-The scheduler bakes the active event's valuations nightly; the Top 5 queries
-run live against them. Playoff and Swiss combinations still come from the
-stored runs on this machine, so run them from the operator app once per event.
+Groups and playoff events follow the same pipeline: the valuation is baked
+when the event is imported (groups draw or playoff bracket from the event
+page, exact enumeration, roster combinations, Top 5 caches warmed), refreshed
+by the nightly run with that night's ratings until the event's first match,
+and frozen from then on. If the draw or bracket is not published yet the
+nightly run keeps retrying. Run Groups / Run Playoff Bracket / Run
+Combinations in the operator app are manual overrides only. Swiss events are
+still manual: run them from the operator app once per event.
