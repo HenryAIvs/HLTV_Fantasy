@@ -18,7 +18,7 @@ together, and the steps that only the operator (you) can do.
 
 1. **GitHub Pages**: repository Settings → Pages → Source: *GitHub Actions*. The
    `Website` workflow deploys `site/` on every push to `main` that touches it.
-   The site lives at `https://henryaivs.github.io/HLTV_Fantasy/`.
+   The site lives at `https://csfantasy.co.uk/` (custom domain set in Settings → Pages; `site/CNAME` carries it; the github.io address redirects there).
 2. **Domain + Cloudflare**: add your domain to Cloudflare (free plan), then run
    `scripts/install-tunnel.ps1 -Hostname api.your-domain.com` in an elevated
    PowerShell. It installs `cloudflared` as a service that forwards the
