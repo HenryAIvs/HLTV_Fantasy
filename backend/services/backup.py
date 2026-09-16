@@ -6,8 +6,18 @@ backend is running, gzip-compressed into a folder that OneDrive syncs, keeping
 the last N days. Runs as the last step of the scheduler's nightly batch and
 on demand (POST /schedule/run-now {"task": "backup"}).
 
+Two sources with different policies (the config can override the numbers):
+
+* fantasy_players.db: every night, gzip-compressed (2 GB -> ~180 MB), keep the
+  last `keep_days` copies (default 7).
+* page_snapshots.db (archived HLTV pages): once a week, stored as-is (its
+  pages are already compressed inside the file; gzip gained nothing), keep
+  `snapshots_keep` copies (default 1). Losing a week of archived pages costs
+  a re-scrape of recent pages, not the valuations.
+
 Configuration: .runtime/backup.json
-    {"dir": "C:\\\\Users\\\\you\\\\OneDrive\\\\CS Fantasy Backups", "keep_days": 7}
+    {"dir": "C:/Users/you/OneDrive/CS Fantasy Backups", "keep_days": 7,
+     "snapshots_every_days": 7, "snapshots_keep": 1}
 or HLTV_BACKUP_DIR / HLTV_BACKUP_KEEP_DAYS in the environment. Without a
 directory the task records a warning and does nothing.
 """
@@ -41,14 +51,27 @@ SOURCES: Dict[str, Path] = {
 }
 
 
+def _policies(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Per-source: how often (days between copies), how many to keep, gzip?"""
+    return {
+        "fantasy_players": {"every_days": 1, "keep": int(cfg["keep_days"]), "compress": True},
+        "page_snapshots": {
+            "every_days": int(cfg.get("snapshots_every_days") or 7),
+            "keep": int(cfg.get("snapshots_keep") or 1),
+            "compress": False,
+        },
+    }
+
+
 def backup_config() -> Dict[str, Any]:
-    cfg: Dict[str, Any] = {"dir": None, "keep_days": DEFAULT_KEEP_DAYS}
+    cfg: Dict[str, Any] = {"dir": None, "keep_days": DEFAULT_KEEP_DAYS, "snapshots_every_days": 7, "snapshots_keep": 1}
     try:
         raw = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
         if raw.get("dir"):
             cfg["dir"] = str(raw["dir"])
-        if raw.get("keep_days"):
-            cfg["keep_days"] = int(raw["keep_days"])
+        for key in ("keep_days", "snapshots_every_days", "snapshots_keep"):
+            if raw.get(key):
+                cfg[key] = max(1, int(raw[key]))
     except Exception:  # noqa: BLE001 - missing or malformed file = not configured
         pass
     if os.getenv("HLTV_BACKUP_DIR"):
@@ -88,20 +111,24 @@ def _compress(tmp_db: Path, target: Path) -> None:
     os.replace(part, target)
 
 
-def prune(dest: Path, keep_days: int) -> List[str]:
-    """Delete backups older than keep_days (always keeping the newest of each
-    source) and any abandoned .part files. Returns the names removed."""
+def _existing(dest: Path, name: str) -> List[Path]:
+    """This source's backups, newest first (compressed or not)."""
+    files = list(dest.glob(f"{name}.*.db.gz")) + list(dest.glob(f"{name}.*.db"))
+    return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def prune(dest: Path, policies: Dict[str, Dict[str, Any]]) -> List[str]:
+    """Keep the newest `keep` copies of each source, delete the rest and any
+    abandoned .part files. Returns the names removed."""
     removed: List[str] = []
-    cutoff = time.time() - keep_days * 86400
     for name in SOURCES:
-        files = sorted(dest.glob(f"{name}.*.db.gz"), key=lambda p: p.stat().st_mtime, reverse=True)
-        for old in files[1:]:
-            if old.stat().st_mtime < cutoff:
-                try:
-                    old.unlink()
-                    removed.append(old.name)
-                except OSError as exc:
-                    logger.warning("Could not delete old backup %s: %s", old, exc)
+        keep = max(1, int(policies[name]["keep"]))
+        for old in _existing(dest, name)[keep:]:
+            try:
+                old.unlink()
+                removed.append(old.name)
+            except OSError as exc:
+                logger.warning("Could not delete old backup %s: %s", old, exc)
     for part in dest.glob("*.part"):
         try:
             part.unlink()
@@ -117,7 +144,9 @@ def run_backup(dest_dir: Optional[str] = None, keep_days: Optional[int] = None, 
     an error (and the heartbeat reports a failed night)."""
     cfg = backup_config()
     dest_dir = dest_dir or cfg["dir"]
-    keep_days = int(keep_days or cfg["keep_days"])
+    if keep_days:
+        cfg["keep_days"] = int(keep_days)
+    policies = _policies(cfg)
     if not dest_dir:
         return {"status": "skipped", "reason": "no backup directory configured (.runtime/backup.json or HLTV_BACKUP_DIR)"}
     dest = Path(dest_dir)
@@ -127,18 +156,29 @@ def run_backup(dest_dir: Optional[str] = None, keep_days: Optional[int] = None, 
     stamp = date.today().isoformat()
     files: List[Dict[str, Any]] = []
     for name, src in SOURCES.items():
+        policy = policies[name]
         if not src.exists():
             files.append({"name": name, "status": "missing"})
+            continue
+        newest = _existing(dest, name)
+        if newest and (time.time() - newest[0].stat().st_mtime) < (policy["every_days"] - 0.5) * 86400:
+            due = datetime.fromtimestamp(newest[0].stat().st_mtime) + timedelta(days=policy["every_days"])
+            files.append({"name": name, "status": f"not due until {due.date().isoformat()}"})
             continue
         t0 = time.time()
         if progress:
             progress(f"Backing up {name}...")
         tmp_db = _TMP_DIR / f"{name}.{stamp}.db"
-        target = dest / f"{name}.{stamp}.db.gz"
+        target = dest / (f"{name}.{stamp}.db.gz" if policy["compress"] else f"{name}.{stamp}.db")
         try:
             _snapshot_to(src, tmp_db)
             copied = time.time()
-            _compress(tmp_db, target)
+            if policy["compress"]:
+                _compress(tmp_db, target)
+            else:
+                part = target.with_suffix(target.suffix + ".part")
+                shutil.copyfile(tmp_db, part)
+                os.replace(part, target)
         finally:
             try:
                 tmp_db.unlink()
@@ -154,8 +194,8 @@ def run_backup(dest_dir: Optional[str] = None, keep_days: Optional[int] = None, 
                 "seconds": round(time.time() - t0, 1),
             }
         )
-    removed = prune(dest, keep_days)
-    total_kept = sum(p.stat().st_size for p in dest.glob("*.db.gz"))
+    removed = prune(dest, policies)
+    total_kept = sum(p.stat().st_size for name in SOURCES for p in _existing(dest, name))
     summary = "; ".join(
         f"{f['name']}: {_fmt_mb(f['source_bytes'])} -> {_fmt_mb(f['backup_bytes'])} in {f['seconds']}s" if f.get("file") else f"{f['name']}: {f['status']}"
         for f in files
@@ -167,7 +207,7 @@ def run_backup(dest_dir: Optional[str] = None, keep_days: Optional[int] = None, 
         "files": files,
         "removed": removed,
         "kept_bytes": total_kept,
-        "keep_days": keep_days,
+        "policies": policies,
         "seconds": round(time.time() - started, 1),
         "summary": f"{summary}; folder {_fmt_mb(total_kept)}" + (f"; pruned {len(removed)}" if removed else ""),
     }
@@ -181,7 +221,7 @@ def latest_backups(dest_dir: Optional[str] = None) -> List[Dict[str, Any]]:
         return []
     out = []
     for name in SOURCES:
-        files = sorted(Path(dest_dir).glob(f"{name}.*.db.gz"), key=lambda p: p.stat().st_mtime, reverse=True)
+        files = _existing(Path(dest_dir), name)
         if files:
             st = files[0].stat()
             out.append({"name": name, "file": files[0].name, "bytes": st.st_size, "at": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="minutes")})

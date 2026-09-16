@@ -174,14 +174,18 @@ Two free checks cover the whole chain:
 
 ## Database backup
 
-Both SQLite files (`fantasy_players.db` and the archived pages in
-`page_snapshots.db`) are copied every night as the last step of the scheduler
-batch: a consistent online-backup snapshot, gzip-compressed, into the folder
-in `.runtime/backup.json`, keeping the last `keep_days` days (the newest copy
-of each is always kept):
+The last step of every scheduler batch backs up into the folder in
+`.runtime/backup.json`, as consistent online-backup snapshots:
+
+* `fantasy_players.db` every night, gzip-compressed (2 GB -> about 180 MB),
+  keeping the last `keep_days` copies (default 7, about 1.3 GB).
+* `page_snapshots.db` (archived HLTV pages) once a week, stored as-is because
+  its pages are already compressed inside the file, keeping `snapshots_keep`
+  copies (default 1, about 2 GB).
 
 ```json
-{"dir": "C:\\Users\\you\\OneDrive\\CS Fantasy Backups", "keep_days": 7}
+{"dir": "C:/Users/you/OneDrive/CS Fantasy Backups", "keep_days": 7,
+ "snapshots_every_days": 7, "snapshots_keep": 1}
 ```
 
 OneDrive uploads whatever lands in that folder. The Scheduling tab's run
