@@ -149,6 +149,60 @@ _QUERY_CACHE_MAX = 256
 def _query_cache_clear() -> None:
     with _QUERY_CACHE_LOCK:
         _QUERY_CACHE.clear()
+        _CONSTRAINED_CACHE.clear()
+
+
+# Most-likely-winner rosters recomputed for a filter set (include/exclude):
+# (variant, event, stored-run stamp, include, exclude) -> all_teams. A roster
+# only "wins" an outcome against the other rosters the user can still pick, so
+# the odds must be re-scored among those, not filtered from the stored list.
+# Few entries: each holds every roster of a constrained pool.
+_CONSTRAINED_CACHE: dict = {}
+_CONSTRAINED_CACHE_MAX = 8
+
+
+def _constrained_most_outcomes(variant: str, key: int, options: dict) -> list:
+    """Rosters of the constrained pool scored in most-likely-winner mode, from
+    the cache or recomputed against the stored outcome table (~6 s for an
+    8-team double elimination; one compute at a time, like the groups page)."""
+    from backend.routes import groups as groups_routes
+
+    latest_playoff = load_latest_playoff(variant, key)
+    if not latest_playoff:
+        raise HTTPException(status_code=404, detail="No stored playoff simulation found.")
+    include = {int(x) for x in options["include"]}
+    exclude = {int(x) for x in options["exclude"]}
+    cache_key = (
+        _variant(variant),
+        int(key),
+        str(latest_playoff["updated_at"]),
+        tuple(sorted(include)),
+        tuple(sorted(exclude)),
+        int(options["budget"]),
+        int(options["max_per_team"]),
+    )
+    with _QUERY_CACHE_LOCK:
+        cached = _CONSTRAINED_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    with groups_routes._LIVE_COMPUTE_LOCK:
+        with _QUERY_CACHE_LOCK:
+            cached = _CONSTRAINED_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        latest_results = latest_playoff.get("results", {}) or {}
+        players_info = _build_players_info_from_sim_results(latest_results.get("teams", {}) or {}, exclude)
+        result = _optimize_playoff_teams_by_outcomes(
+            players_info, latest_results, include, options["budget"], options["max_per_team"], "most_outcomes"
+        )
+        if isinstance(result, dict) and result.get("error"):
+            raise HTTPException(status_code=400, detail=str(result["error"]))
+        teams = list(result.get("all_teams") or [])
+        with _QUERY_CACHE_LOCK:
+            if len(_CONSTRAINED_CACHE) >= _CONSTRAINED_CACHE_MAX:
+                _CONSTRAINED_CACHE.pop(next(iter(_CONSTRAINED_CACHE)))
+            _CONSTRAINED_CACHE[cache_key] = teams
+        return teams
 
 
 def _query_cache_key(variant: str, key: int, updated_at, body: dict) -> tuple:
@@ -4156,12 +4210,21 @@ def _query_saved_combos(body: dict, latest: dict) -> dict:
         mode = "average"
     result = latest["result"] or {}
     teams = list(result.get("all_teams") or [])
-    filtered = _filter_saved_combo_teams(
-        teams,
-        options["include"],
-        options["exclude"],
-        str(body.get("search") or ""),
-    )
+    constrained = mode == "most_outcomes" and bool(options["include"] or options["exclude"])
+    if constrained:
+        # Average and ceiling are per-roster facts, so filtering the stored
+        # list is exact; winner odds depend on the field, so re-score the
+        # rosters the filters leave (excluded players cannot be picked, the
+        # odds sum to 100% over what can).
+        teams = _constrained_most_outcomes(body.get("variant"), _event_key(body.get("event_id")), options)
+        filtered = _filter_saved_combo_teams(teams, set(), set(), str(body.get("search") or ""))
+    else:
+        filtered = _filter_saved_combo_teams(
+            teams,
+            options["include"],
+            options["exclude"],
+            str(body.get("search") or ""),
+        )
     sorted_teams = _sort_saved_combo_teams(filtered, mode, str(body.get("sort") or "ev_desc"))
     page = int(body.get("page") or 0)
     page_size = int(body.get("page_size") or 200)
