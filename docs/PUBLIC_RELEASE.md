@@ -172,3 +172,20 @@ Two free checks cover the whole chain:
    is needed; the file is read at each batch. `HLTV_HEARTBEAT_URL` in the
    environment works too. Test with `POST /schedule/heartbeat-test`.
 
+## Database backup
+
+Both SQLite files (`fantasy_players.db` and the archived pages in
+`page_snapshots.db`) are copied every night as the last step of the scheduler
+batch: a consistent online-backup snapshot, gzip-compressed, into the folder
+in `.runtime/backup.json`, keeping the last `keep_days` days (the newest copy
+of each is always kept):
+
+```json
+{"dir": "C:\\Users\\you\\OneDrive\\CS Fantasy Backups", "keep_days": 7}
+```
+
+OneDrive uploads whatever lands in that folder. The Scheduling tab's run
+history shows a `backup` row per night; a failed copy is an error and trips
+the heartbeat. Run one by hand with `POST /schedule/run-now {"task": "backup"}`.
+Restore = stop the backend, gunzip the file over the database, start it.
+

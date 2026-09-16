@@ -25,6 +25,16 @@ from backend.data import schedule_db
 # fail ping arrives). The URL comes from HLTV_HEARTBEAT_URL or
 # .runtime/heartbeat.json {"url": "https://hc-ping.com/<uuid>"}; nothing is
 # pinged when neither is set. Failures to ping never affect the batch.
+def _backup_status() -> Dict[str, Any]:
+    from backend.services import backup
+
+    try:
+        cfg = backup.backup_config()
+        return {"dir": cfg.get("dir"), "keep_days": cfg.get("keep_days"), "latest": backup.latest_backups()}
+    except Exception as exc:  # noqa: BLE001
+        return {"dir": None, "error": str(exc)}
+
+
 def heartbeat_url() -> str:
     import json
     import os
@@ -255,6 +265,9 @@ class DataScheduler:
         elif task == "valuations":
             threading.Thread(target=self._run_bake_only, args=("manual",), name="scheduler-bake", daemon=True).start()
             return {"status": "started", "tasks": ["valuations"]}
+        elif task == "backup":
+            threading.Thread(target=self._run_backup_only, args=("manual",), name="scheduler-backup", daemon=True).start()
+            return {"status": "started", "tasks": ["backup"]}
         else:
             return {"status": "error", "detail": f"Unknown task '{task}'."}
         threading.Thread(
@@ -279,6 +292,8 @@ class DataScheduler:
             # Every batch ends with a login-health check so a dying HLTV
             # remember-me cookie is flagged weeks ahead in the run history.
             self._check_hltv_session(trigger)
+            # ...and a backup of both databases (see backend/services/backup.py).
+            self._run_backup(trigger)
             statuses = [str(r.get("status")) for r in schedule_db.list_runs(limit=40) if float(r.get("started_at") or 0) >= batch_started]
             outcome = "fail" if "error" in statuses else "success"
         finally:
@@ -302,6 +317,33 @@ class DataScheduler:
         except Exception as exc:  # noqa: BLE001 — never let the check break a batch
             schedule_db.finish_run(run_id, "error", f"check failed: {exc}")
             logger.exception("HLTV session check failed")
+
+    def _run_backup(self, trigger: str) -> None:
+        """Consistent, compressed copies of both databases into the configured
+        folder (OneDrive), keeping the last N days. Its own run row: warning
+        when no folder is configured, error when the copy fails."""
+        from backend.services import backup
+
+        run_id = schedule_db.start_run("backup", trigger)
+        self._set_state(running=True, current_task="backup", trigger=trigger, started_at=time.time(),
+                        processed=0, total=0, message="Backing up databases...")
+        try:
+            outcome = backup.run_backup(progress=lambda msg: self._set_state(message=msg))
+            status = "success" if outcome.get("status") == "ok" else "warning"
+            schedule_db.finish_run(run_id, status, str(outcome.get("summary") or outcome.get("reason") or ""))
+            logger.info("Backup (%s): %s", trigger, outcome.get("summary") or outcome.get("reason"))
+        except Exception as exc:  # noqa: BLE001 - never let the backup break a batch
+            schedule_db.finish_run(run_id, "error", f"backup failed: {exc}")
+            logger.exception("Backup failed")
+
+    def _run_backup_only(self, trigger: str) -> None:
+        if not self._run_lock.acquire(blocking=False):
+            return
+        try:
+            self._run_backup(trigger)
+        finally:
+            self._run_lock.release()
+            self._set_state(running=False, current_task=None, trigger=None, processed=0, total=0)
 
     def _run_session_check_only(self, trigger: str) -> None:
         if not self._run_lock.acquire(blocking=False):
@@ -472,6 +514,7 @@ class DataScheduler:
             "hltv_session": hltv_session.load_snapshot(),
             # Shapes/formats refused as unsupported and flagged for development.
             "dev_flags": dev_flags.list_flags(),
+            "backup": _backup_status(),
         }
 
 
