@@ -1,11 +1,11 @@
 # Builds the Windows installer and publishes it (plus latest.yml for the
-# in-app updater) to a GitHub Release whenever a version tag is pushed:
+# in-app updater) to a GitHub Release.
 #
-#   git tag v0.1.1 && git push origin v0.1.1
-#
-# The tag must match electron/package.json "version". The website's download
-# button points at releases/latest/download/CS-Fantasy-Toolkit-Setup.exe, so
-# nothing else changes between releases.
+# Trigger: any push to main. If electron/package.json's version has no release
+# yet, the installer is built and a release named v<version> is created (the
+# tag is created from the pushed commit). Pushes where that version is already
+# released do nothing. So a release is: bump "version", commit, push.
+# Pushing a v* tag by hand still works and must match the package version.
 #
 # electron-builder only builds here (--publish never); the upload is done by
 # action-gh-release, which creates or updates exactly one release per tag.
@@ -16,11 +16,17 @@ name: Release
 
 on:
   push:
+    branches: [main]
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   windows:
@@ -30,26 +36,46 @@ jobs:
         working-directory: electron
     steps:
       - uses: actions/checkout@v4
+      - name: Decide whether this push is a release
+        id: decide
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          v=$(node -p "require('./package.json').version")
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != package version v$v"; exit 1; }
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          elif gh release view "v$v" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "v$v is already released; nothing to do"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$v has no release yet; building"
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/setup-node@v4
+        if: steps.decide.outputs.go == 'true'
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: electron/package-lock.json
       - name: Install
+        if: steps.decide.outputs.go == 'true'
         run: npm ci
-      - name: Check the tag matches package.json
-        shell: bash
-        run: |
-          v=$(node -p "require('./package.json').version")
-          [ "v$v" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} != package version v$v"; exit 1; }
       - name: Build installer
+        if: steps.decide.outputs.go == 'true'
         run: npm run dist
       - name: Show build output
+        if: steps.decide.outputs.go == 'true'
         shell: bash
         run: ls -la release
       - name: Publish release
+        if: steps.decide.outputs.go == 'true'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.decide.outputs.version }}
+          name: v${{ steps.decide.outputs.version }}
           files: |
             electron/release/CS-Fantasy-Toolkit-Setup.exe
             electron/release/CS-Fantasy-Toolkit-Setup.exe.blockmap

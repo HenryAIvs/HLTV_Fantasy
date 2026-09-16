@@ -47,15 +47,21 @@ together, and the steps that only the operator (you) can do.
 
 ## Releasing a version
 
-1. Bump `version` in `electron/package.json`.
-2. Commit, then `git tag v0.1.1 && git push origin main v0.1.1`.
-3. The `Release` workflow builds `CS-Fantasy-Toolkit-Setup.exe` and
-   `latest.yml` and attaches them to the release (one release per tag, created
-   by the workflow's upload step; never create it by hand first). The download
-   button always points at `releases/latest/download/CS-Fantasy-Toolkit-Setup.exe`.
-   If a tag ever ends up with two releases, the download URL breaks: delete
-   both releases and push a new tag.
-4. Installed apps pick the update up within six hours (or at next start).
+1. Bump `version` in `electron/package.json` (`cd electron && npm version 0.1.4 --no-git-tag-version`).
+2. Commit and push `main`.
+
+That is all. The `Release` workflow runs on every push to `main`; when the
+package version has no release yet it builds `CS-Fantasy-Toolkit-Setup.exe`
+and `latest.yml`, creates the `v<version>` tag and the release, and attaches
+the files (one release per tag, created by the workflow's upload step; never
+create it by hand first). Pushes where the version is already released do
+nothing. The download button always points at
+`releases/latest/download/CS-Fantasy-Toolkit-Setup.exe`, and installed apps
+pick the update up at their next check (every 30 minutes, on window focus,
+or 10 s after launch) and offer a restart.
+
+If a tag ever ends up with two releases, the download URL breaks: delete both
+releases and push a new version.
 
 To build locally instead: `cd electron && npm run dist` (installer in
 `electron/release/`), or `npm run dist:dir` for an unpacked folder.
