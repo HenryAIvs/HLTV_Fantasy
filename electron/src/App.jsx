@@ -207,14 +207,8 @@ function PlayerPhoto({ playerId, name, size = 26, className = "" }) {
 
 // Roster cards are paged rather than tabled: this many per page.
 const COMBO_PAGE_SIZE = 10;
-// Sort fields for the roster pager: key prefix, label, first direction on click
-// (a second click on the active field flips it).
-const COMBO_SORT_FIELDS = [
-  ["ev", "Score", "desc"],
-  ["cost", "Cost", "asc"],
-  ["cpp", "Value", "desc"],
-];
-function ComboPager({ page, pageSize, total, onPage, sortKey = null, onSort = null }) {
+// Rosters are always listed by score, best first (sort_key "ev_desc").
+function ComboPager({ page, pageSize, total, onPage }) {
   const count = Number(total || 0);
   const pages = Math.max(1, Math.ceil(count / pageSize));
   const first = count > 0 ? page * pageSize + 1 : 0;
@@ -230,26 +224,6 @@ function ComboPager({ page, pageSize, total, onPage, sortKey = null, onSort = nu
       <button className="secondary" onClick={() => onPage(page + 1)} disabled={page + 1 >= pages}>
         Next
       </button>
-      {onSort && (
-        <div className="combo-sort seg">
-          {COMBO_SORT_FIELDS.map(([field, label, firstDir]) => {
-            const current = String(sortKey || "ev_desc");
-            const active = current.startsWith(`${field}_`);
-            const desc = !current.endsWith("_asc");
-            return (
-              <button
-                type="button"
-                key={field}
-                className={`seg-btn${active ? " on" : ""}`}
-                onClick={() => onSort(active ? `${field}_${desc ? "asc" : "desc"}` : `${field}_${firstDir}`)}
-              >
-                {label}
-                {active ? <span className="combo-sort-dir">{desc ? "↓" : "↑"}</span> : null}
-              </button>
-            );
-          })}
-        </div>
-      )}
     </div>
   );
 }
@@ -3004,7 +2978,7 @@ function TopTeamsTab({ teamLookup, selected, bo, sims, results, onOpenPlayer }) 
                 </div>
               </div>
             </div>
-            <ComboPager page={page} pageSize={COMBO_PAGE_SIZE} total={filteredCount} onPage={queryStoredTeams} sortKey={sortKey} onSort={setSortKey} />
+            <ComboPager page={page} pageSize={COMBO_PAGE_SIZE} total={filteredCount} onPage={queryStoredTeams} />
             {(pageTeams && pageTeams.length > 0 ? pageTeams : topTeams).map((team, idx) => (
               <div key={idx} className="card sub">
                 <h4>
@@ -6975,7 +6949,7 @@ function PlayoffTab({
       {playoffTab === "top5" && playoffTopSubtab !== "completed" && (allTeams || topTeams) && (allTeams || topTeams).length > 0 && (
         <div className="card sub">
           <h3>Top Teams</h3>
-          <ComboPager page={page} pageSize={COMBO_PAGE_SIZE} total={filteredCount} onPage={querySharedCombinations} sortKey={sortKey} onSort={setSortKey} />
+          <ComboPager page={page} pageSize={COMBO_PAGE_SIZE} total={filteredCount} onPage={querySharedCombinations} />
           <div className="event-team-rows">
             {(allTeams && allTeams.length > 0 ? allTeams : topTeams).map((team, idx) => (
               <div key={idx} className="stack combo-team">
@@ -13973,6 +13947,63 @@ function GroupsTab({
     });
     return m;
   }, [players]);
+  // Same Include/Exclude block as the Playoff tab's Top 5: exclude whole
+  // teams, search with Include/Exclude suggestions, applied filters as chips.
+  const groupsTeamsForFilters = useMemo(() => {
+    const raw = results?.teams;
+    const ids = (Array.isArray(raw) ? raw.map((t) => t?.team_id) : Object.keys(raw || {}))
+      .map(Number)
+      .filter((id) => Number.isFinite(id) && id > 0);
+    const byId = new Map((teams || []).map((t) => [Number(t.team_id), t]));
+    return Array.from(new Set(ids))
+      .map((id) => byId.get(id))
+      .filter(Boolean)
+      .sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+  }, [results, teams]);
+  const teamPlayerIds = (teamId) => {
+    const team = (teams || []).find((t) => Number(t.team_id) === Number(teamId));
+    if (!team) return [];
+    return [team.player1_id, team.player2_id, team.player3_id, team.player4_id, team.player5_id]
+      .map((pid) => Number(pid))
+      .filter((pid) => Number.isFinite(pid) && pid > 0);
+  };
+  const comboSearchPidByName = useMemo(() => {
+    const m = {};
+    groupsTeamsForFilters.forEach((t) => {
+      teamPlayerIds(t.team_id).forEach((pid) => {
+        const nm = playerNameById[pid];
+        if (nm) m[String(nm)] = pid;
+      });
+    });
+    return m;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groupsTeamsForFilters, playerNameById, teams]);
+  const comboSearchNames = useMemo(
+    () => Object.keys(comboSearchPidByName).sort((a, b) => a.localeCompare(b)),
+    [comboSearchPidByName]
+  );
+  const addPlayerFilterByName = (name, kind) => {
+    const pid = comboSearchPidByName[name];
+    if (!pid) return;
+    const already = kind === "include" ? includeSet.has(pid) : excludeSet.has(pid);
+    if (!already) toggleFilter(pid, kind);
+  };
+  const toggleTeamExclude = (teamId) => {
+    const pids = teamPlayerIds(teamId);
+    const allOut = pids.length > 0 && pids.every((pid) => excludeSet.has(pid));
+    setExcludeSet((prev) => {
+      const next = new Set(prev);
+      pids.forEach((pid) => (allOut ? next.delete(pid) : next.add(pid)));
+      return next;
+    });
+    if (!allOut) {
+      setIncludeSet((prev) => {
+        const next = new Set(prev);
+        pids.forEach((pid) => next.delete(pid));
+        return next;
+      });
+    }
+  };
   // Strip order: title odds first (when there is a playoff), then the best
   // group-place odds, so the favourites read top-down like the Playoff tab.
   const valuationTeamOrder = useMemo(() => {
@@ -14285,11 +14316,33 @@ function GroupsTab({
                     </p>
                   )}
                 </div>
-                <div className="grid two">
-                  <Input label="Search Combos" value={comboSearch} onChange={setComboSearch} placeholder="Player name" className="search-field" />
-                </div>
+                <div className="card sub">
+                  <h3>Top Teams - {(groupsTopSubtabs.find((t) => t.key === groupsTopSubtab) || {}).label || "Best Average Value"}</h3>
+                  <div className="top5-filters">
+                    <div className="field">
+                      <span>Teams</span>
+                      <div className="filter-team-grid">
+                        {groupsTeamsForFilters.length === 0 && <span className="muted">No teams stored yet.</span>}
+                        {groupsTeamsForFilters.map((t) => {
+                          const tid = Number(t.team_id);
+                          const pids = teamPlayerIds(tid);
+                          const isExcluded = pids.length > 0 && pids.every((pid) => excludeSet.has(pid));
+                          return (
+                            <div key={`filter-team-${tid}`} className={`filter-team-card${isExcluded ? " exc" : ""}`}>
+                              <TeamLogo hltvTeamId={t.hltv_team_id} name={t.name} size={26} />
+                              <span className="filter-team-name">{t.name}</span>
+                              <div className="filter-team-toggles">
+                                <button className={`filter-toggle out${isExcluded ? " on" : ""}`} onClick={() => toggleTeamExclude(tid)}>
+                                  {isExcluded ? "Excluded" : "Exclude"}
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
                 {(includeSet.size > 0 || excludeSet.size > 0) && (
-                  <div className="filter-groups">
+                  <div className="grid two">
                     {includeSet.size > 0 && (
                       <div className="filter-group in">
                         <div className="filter-group-title">Included Players</div>
@@ -14316,15 +14369,29 @@ function GroupsTab({
                         </div>
                       </div>
                     )}
-                    <button type="button" className="chip filter-clear" onClick={clearFilters}>
-                      Clear filters
-                    </button>
                   </div>
                 )}
+                    <div className="top5-controls-row">
+                      <div className="top5-search">
+                        <SuggestInput
+                          label="Search / Filter Players"
+                          value={comboSearch}
+                          onChange={setComboSearch}
+                          placeholder="Player name"
+                          suggestions={comboSearchNames}
+                          actions={[
+                            { key: "in", label: "Include", onPick: (name) => addPlayerFilterByName(name, "include") },
+                            { key: "out", label: "Exclude", onPick: (name) => addPlayerFilterByName(name, "exclude") },
+                          ]}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
                 {(allTeams || topTeams) && (allTeams || topTeams).length > 0 && (
                   <div className="card sub">
                     <h3>Top Teams</h3>
-                    <ComboPager page={page} pageSize={COMBO_PAGE_SIZE} total={filteredCount} onPage={queryCombos} sortKey={sortKey} onSort={setSortKey} />
+                    <ComboPager page={page} pageSize={COMBO_PAGE_SIZE} total={filteredCount} onPage={queryCombos} />
                     {/* Same roster strips as the Playoff tab's Top Teams: rank,
                         metric, cost, then one card per player with the EV split.
                         The roster's booster assignment (when the query returns
@@ -14407,28 +14474,6 @@ function GroupsTab({
                                       </div>
                                       <div className="event-player-price combo-price">
                                         ${Math.round(Number(p.price || 0) / 1000)}k
-                                      </div>
-                                      <div className="event-player-filters">
-                                        <button
-                                          type="button"
-                                          className={`chip mini${includeSet.has(Number(p.player_id)) ? " active in" : ""}`}
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            toggleFilter(p.player_id, "include");
-                                          }}
-                                        >
-                                          {includeSet.has(Number(p.player_id)) ? "Included" : "Include"}
-                                        </button>
-                                        <button
-                                          type="button"
-                                          className={`chip mini${excludeSet.has(Number(p.player_id)) ? " active out" : ""}`}
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            toggleFilter(p.player_id, "exclude");
-                                          }}
-                                        >
-                                          {excludeSet.has(Number(p.player_id)) ? "Excluded" : "Exclude"}
-                                        </button>
                                       </div>
                                     </div>
                                   );

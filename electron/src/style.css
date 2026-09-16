@@ -3928,8 +3928,6 @@ button:disabled {
 /* Roster card pager */
 .combo-pager { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 0 0 12px; }
 .combo-pager .muted { font-variant-numeric: tabular-nums; }
-.combo-pager .combo-sort { margin-left: auto; width: auto; flex: none; }
-.combo-sort-dir { margin-left: 6px; color: #ff8a47; }
 .combo-pager > button { min-width: 72px; }
 
 /* Title bar extras in the public build: version tag and the update prompt */
