@@ -69,12 +69,20 @@ previews the trimmed renderer.
 
 ## Operator access from elsewhere
 
-Public callers only reach `GET` data endpoints and the Top 5 queries. To use
-the full API from another machine send `X-Admin-Token: <token>`; the token is
-`HLTV_ADMIN_TOKEN` if set, else `.runtime/admin-token.txt` (created on first
-start). Per-client rate limits and the concurrency cap are
-`HLTV_PUBLIC_RATE_LIMIT` (per minute, default 60) and
-`HLTV_PUBLIC_MAX_CONCURRENT` (default 3).
+Public callers reach read-only `GET` data under `/players`, `/teams`,
+`/events` and `/assets` (everything the Database tab and the modals read),
+the stored Tournament results, and the Top 5 queries. `PUBLIC_GET_DENY` in
+`backend/services/public_access.py` keeps the exceptions operator-only: routes
+that fetch from HLTV live, model training, page snapshots and job status. New
+read-only endpoints under those prefixes are public automatically; anything
+that writes or scrapes must be `POST` or go on the deny list.
+
+To use the full API from another machine send `X-Admin-Token: <token>`; the
+token is `HLTV_ADMIN_TOKEN` if set, else `.runtime/admin-token.txt` (created
+on first start). Limits per public client: heavy queries
+`HLTV_PUBLIC_RATE_LIMIT` per minute (default 60) with
+`HLTV_PUBLIC_MAX_CONCURRENT` running at once (default 3); everything else
+except assets `HLTV_PUBLIC_LIGHT_RATE_LIMIT` per minute (default 600).
 
 ## What the public app needs published
 

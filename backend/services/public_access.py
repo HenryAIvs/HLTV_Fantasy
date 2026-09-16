@@ -35,23 +35,12 @@ _PROXY_HEADERS = ("cf-connecting-ip", "x-forwarded-for", "x-real-ip")
 
 # (method, path pattern) the public app may call. Paths are matched whole,
 # without the query string.
+# Everything the distributed app reads. Read-only GET data under the prefixes
+# in _PUBLIC_GET_PREFIX (players, teams, events, assets) is public unless it is
+# in PUBLIC_GET_DENY; the routes below live outside those prefixes.
 PUBLIC_ROUTES: List[Tuple[str, str]] = [
     ("GET", r"/health"),
     ("GET", r"/public/config"),
-    ("GET", r"/players/?"),
-    ("GET", r"/players/\d+"),
-    ("GET", r"/players/\d+/rating-curve"),
-    ("GET", r"/players/average-rating-curve"),
-    ("GET", r"/players/topx-window"),
-    ("GET", r"/teams/?"),
-    ("GET", r"/teams/\d+"),
-    ("GET", r"/teams/map-stats-import/latest"),
-    ("GET", r"/events/?"),
-    ("GET", r"/events/active"),
-    ("GET", r"/events/\d+"),
-    ("GET", r"/events/\d+/kind"),
-    ("GET", r"/events/hltv-results/stored"),
-    ("GET", r"/assets/.*"),
     ("GET", r"/playoff/latest"),
     ("GET", r"/playoff/best-team/from-latest/latest"),
     ("GET", r"/playoff/best-team/bracket-from-latest/latest"),
@@ -68,6 +57,25 @@ PUBLIC_ROUTES: List[Tuple[str, str]] = [
     ("GET", r"/best-team/latest"),
     ("POST", r"/best-team/query"),
 ]
+
+# Read-only data the Database tab, the player/team modals and the Tournament
+# page fetch: public by default so a new read-only endpoint does not silently
+# 403 in the distributed app (the recent-form modal did exactly that)...
+_PUBLIC_GET_PREFIX = re.compile(r"^/(players|teams|events|assets)(/|$)")
+# ...except GETs that fetch from HLTV live, compute for a long time, or report
+# operator import jobs. POST/DELETE, /admin, /schedule and the run starters are
+# never public.
+PUBLIC_GET_DENY: List[str] = [
+    r"/events/hltv-recent-results",  # live HLTV fetch
+    r"/events/hltv-results/match-details",  # live HLTV fetch + DB write (use /stored)
+    r"/teams/(hltv|vrs)-ranking/by-date",  # live HLTV fetch
+    r"/events/hltv-results/map-model-lab",  # model training (Dev Lab)
+    r"/events/hltv-results/winrate-model-current-points",  # model fitting
+    r"/events/page-snapshots(/.*)?",
+    r"/events/\d+/swiss-context",
+    r".*/job/.*",  # operator job status
+]
+_PUBLIC_GET_DENY_COMPILED = [re.compile(f"^{p}$") for p in PUBLIC_GET_DENY]
 _PUBLIC_COMPILED = [(m, re.compile(f"^{p}$")) for m, p in PUBLIC_ROUTES]
 
 # Endpoints that compute on request: per-client rate limit + global concurrency cap.
@@ -75,6 +83,9 @@ _HEAVY = re.compile(r"^/(playoff/best-team/from-latest/(query|completed-query)|p
 _RATE_WINDOW_SECONDS = 60.0
 _RATE_LIMIT = int(os.getenv("HLTV_PUBLIC_RATE_LIMIT", "60"))
 _MAX_CONCURRENT = int(os.getenv("HLTV_PUBLIC_MAX_CONCURRENT", "3"))
+# Light routes (lists, modals, stored brackets): generous per-client cap so a
+# flood is still bounded. Assets are exempt (Cloudflare caches them anyway).
+_LIGHT_RATE_LIMIT = int(os.getenv("HLTV_PUBLIC_LIGHT_RATE_LIMIT", "600"))
 
 _rate_lock = threading.Lock()
 _rate_hits: Dict[str, List[float]] = {}
@@ -124,14 +135,16 @@ def is_operator(request) -> bool:
 
 
 def is_public_route(method: str, path: str) -> bool:
+    if method == "GET" and _PUBLIC_GET_PREFIX.match(path):
+        return not any(rx.match(path) for rx in _PUBLIC_GET_DENY_COMPILED)
     return any(m == method and rx.match(path) for m, rx in _PUBLIC_COMPILED)
 
 
-def _rate_limited(key: str) -> bool:
+def _rate_limited(key: str, limit: int = _RATE_LIMIT) -> bool:
     now = time.monotonic()
     with _rate_lock:
         hits = [t for t in _rate_hits.get(key, []) if now - t < _RATE_WINDOW_SECONDS]
-        if len(hits) >= _RATE_LIMIT:
+        if len(hits) >= limit:
             _rate_hits[key] = hits
             return True
         hits.append(now)
@@ -150,7 +163,7 @@ class PublicAccessMiddleware(BaseHTTPMiddleware):
         if not is_public_route(request.method, path):
             return JSONResponse({"detail": "This action is only available to the server operator."}, status_code=403)
         if _HEAVY.match(path):
-            if _rate_limited(client_key(request)):
+            if _rate_limited("heavy:" + client_key(request)):
                 return JSONResponse({"detail": "Too many requests. Please wait a moment."}, status_code=429)
             if not _inflight.acquire(blocking=False):
                 return JSONResponse({"detail": "The server is busy. Please try again in a few seconds."}, status_code=503)
@@ -158,4 +171,6 @@ class PublicAccessMiddleware(BaseHTTPMiddleware):
                 return await call_next(request)
             finally:
                 _inflight.release()
+        if not path.startswith("/assets/") and _rate_limited("light:" + client_key(request), _LIGHT_RATE_LIMIT):
+            return JSONResponse({"detail": "Too many requests. Please wait a moment."}, status_code=429)
         return await call_next(request)

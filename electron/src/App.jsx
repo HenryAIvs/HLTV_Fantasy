@@ -8099,6 +8099,9 @@ function MatchesDataPanel({ notify, mode = "full", teams = [], players = [], onO
     setSelectedMatchUrl(url);
     setSelectedMatchRow(row || null);
     setShowMatchModal(true);
+    // The live detail refresh fetches the match page from HLTV; the public
+    // build only reads what the server has stored (the row already carries it).
+    if (PUBLIC_BUILD) return;
     try {
       const details = await api.get(`/events/hltv-results/match-details?match_url=${encodeURIComponent(url)}`);
       const maps = Array.isArray(details?.maps) ? details.maps : [];
