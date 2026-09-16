@@ -120,13 +120,28 @@ groups event only until its first match, and playoff runs only change when
 you press Run Combinations. Playoff Top 5 queries are cached and warmed at
 startup and after each run.
 
-## What the public app needs published
+## The event behaviour contract
 
-Groups and playoff events follow the same pipeline: the valuation is baked
-when the event is imported (groups draw or playoff bracket from the event
-page, exact enumeration, roster combinations, Top 5 caches warmed), refreshed
-by the nightly run with that night's ratings until the event's first match,
-and frozen from then on. If the draw or bracket is not published yet the
-nightly run keeps retrying. Run Groups / Run Playoff Bracket / Run
-Combinations in the operator app are manual overrides only. Swiss events are
-still manual: run them from the operator app once per event.
+One lifecycle for every format, implemented in
+`backend/services/event_pipeline.py`; formats plug into it and nothing else
+decides when valuations change:
+
+1. **Imported:** baked straight away. Draw or bracket read from the event
+   page, every outcome enumerated, roster combinations stored, Top 5 caches
+   warmed. If the draw or bracket is not published yet the event is
+   *pending* and the nightly run retries it.
+2. **Until its first match:** refreshed by the nightly run with that night's
+   ratings, rankings, roles and boosters.
+3. **From its first match:** frozen. Nothing automatic touches it again.
+4. **Stored per event.** Another event's run never replaces it.
+5. **Run buttons in the operator app are manual overrides,** allowed at any
+   time.
+6. **The public app reads exactly the stored run** and can view any imported
+   event.
+
+Groups and playoff (single and double elimination) events are automated
+today. Swiss and Bounty events are registered as *manual*: the nightly run
+reports them as such instead of silently skipping, and they are run from the
+operator app once per event until their bakers are written. The Events tab's
+Valuation column shows each event's state (published and refreshing, frozen,
+pending, manual). `POST /groups/bake?event_id=` re-bakes any event by hand.

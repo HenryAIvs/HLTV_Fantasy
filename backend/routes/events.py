@@ -376,9 +376,17 @@ def list_all_events():
         _backfill_event_names()
     except Exception:
         logger.info("Event name backfill failed", exc_info=True)
+    from backend.services import event_pipeline
+
+    rows = list_events()
+    for row in rows:
+        try:
+            row["valuation"] = event_pipeline.event_status(int(row["event_id"]))
+        except Exception:  # noqa: BLE001 - the list must never fail on status
+            row["valuation"] = None
     return {
         "active_event_id": get_active_event_id(),
-        "events": list_events(),
+        "events": rows,
     }
 
 

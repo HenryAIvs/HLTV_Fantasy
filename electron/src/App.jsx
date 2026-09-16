@@ -7731,6 +7731,7 @@ function EventsTab({ refreshData, notify, players, teams = [], onOpenPlayer, onO
                     <th>HLTV Event</th>
                     <th>Type</th>
                     <th>Teams</th>
+                    <th>Valuation</th>
                     <th>{PUBLIC_BUILD ? "Status" : "Actions"}</th>
                   </tr>
                 </thead>
@@ -7742,6 +7743,22 @@ function EventsTab({ refreshData, notify, players, teams = [], onOpenPlayer, onO
                       <td>{ev.hltv_event_id ?? "-"}</td>
                       <td>{describeEventFormat(eventKinds[ev.event_id])?.short || "..."}</td>
                       <td>{ev.team_count ?? 0}</td>
+                      <td>
+                        {ev.valuation ? (
+                          <span
+                            className={`valuation-badge ${ev.valuation.published ? "ok" : "pending"}`}
+                            title={ev.valuation.label}
+                          >
+                            {PUBLIC_BUILD
+                              ? ev.valuation.published
+                                ? "Published"
+                                : "Not published yet"
+                              : ev.valuation.label}
+                          </span>
+                        ) : (
+                          <span className="muted">-</span>
+                        )}
+                      </td>
                       <td>
                         {PUBLIC_BUILD ? (
                           <div className="event-status-cell">

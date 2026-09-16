@@ -114,6 +114,18 @@ class SingletonState:
         finally:
             conn.close()
 
+    def exists(self, key: Optional[int] = None) -> bool:
+        """Whether a row is stored for the key, without parsing the blob."""
+        k = self._key(key)
+        with self._cache_lock:
+            if k in self._cache:
+                return self._cache[k] is not None
+        conn = connect()
+        try:
+            return conn.execute(f"SELECT 1 FROM {self.table} WHERE singleton_id = ?", (k,)).fetchone() is not None
+        finally:
+            conn.close()
+
     def migrate_legacy_row(self, to_key: int) -> bool:
         """Re-key the single-row era row (key 1) as `to_key` when no row for
         that key exists yet: when a table becomes keyed, the run it holds

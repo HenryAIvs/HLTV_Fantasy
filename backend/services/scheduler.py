@@ -276,18 +276,15 @@ class DataScheduler:
         only_if_missing (the nightly pass) an already-baked event is refreshed
         with the night's inputs until it starts and left alone from then on."""
         from backend.data.event_db import get_active_event_id
-        from backend.routes import groups, playoff
+        from backend.services import event_pipeline as pipeline
 
         active = get_active_event_id()
         refresh_inputs = False
-        already_baked = bool(active) and (
-            bool(groups._GROUPS_STATE.load(key=int(active))) or bool(playoff.load_latest_playoff("main", int(active)))
-        )
-        if only_if_missing and already_baked:
+        if only_if_missing and active and pipeline.has_stored_run(int(active)):
             # Already baked. Until the event starts, tonight's rating / ranking
             # imports should flow into it (fresh inputs, re-bake); from the
             # start on — or when the start is unknown — it is left alone.
-            if groups.event_has_started(int(active)) is False:
+            if pipeline.has_started(int(active)) is False:
                 only_if_missing = False
                 refresh_inputs = True
             else:
@@ -300,10 +297,17 @@ class DataScheduler:
             if not active:
                 schedule_db.finish_run(run_id, "warning", "no active event")
                 return
-            outcome = groups.bake_event_valuations(
+            outcome = pipeline.bake_event(
                 int(active), trigger=trigger, only_if_missing=only_if_missing, refresh_inputs=refresh_inputs
             )
-            status = {"ok": "success", "exists": "success", "skipped": "warning"}.get(str(outcome.get("status")), "error")
+            status = {
+                "ok": "success",
+                "exists": "success",
+                "skipped": "warning",
+                "pending": "warning",
+                "manual": "warning",
+                "unsupported": "warning",
+            }.get(str(outcome.get("status")), "error")
             schedule_db.finish_run(run_id, status, _short(outcome))
             logger.info("Valuation bake (%s): %s", trigger, _short(outcome))
         except Exception as exc:  # noqa: BLE001 — never let the bake break a batch
@@ -360,11 +364,11 @@ class DataScheduler:
                     notes.append(f"{fid}: {outcome}")
                 result["trigger_backfill"] = "; ".join(notes)
                 # Bake each new event's valuation straight away (stored per
-                # event), so it is ready the moment it is made active. This is
-                # the one and only automatic bake; nothing refreshes it later.
-                from backend.routes import groups
+                # event), so it is ready the moment it is made active; the
+                # nightly pass refreshes it until the event starts.
+                from backend.services import event_pipeline
 
-                baked = [groups.bake_event_valuations(int(fid), trigger="import") for fid in sorted(result["imported"])]
+                baked = [event_pipeline.bake_event(int(fid), trigger="import") for fid in sorted(result["imported"])]
                 result["valuations"] = "; ".join(f"{b.get('event_id')}: {b.get('status')} {b.get('reason') or b.get('seconds', '')}" for b in baked)
             else:
                 _prices, missing, _cov = admin._missing_trigger_players(None)

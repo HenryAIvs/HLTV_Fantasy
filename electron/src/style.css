@@ -3980,3 +3980,8 @@ button:disabled {
 .event-picker select { background: #12161c; color: #f2f5f9; border: 1px solid #2c3441; padding: 8px 12px; font-size: 14px; min-width: 320px; max-width: 100%; }
 .event-status-cell { display: flex; align-items: center; gap: 8px; }
 .event-viewing-badge { display: inline-block; padding: 3px 10px; border: 1px solid #ff6b1a; color: #ff8a47; font-family: var(--display); font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+
+/* Events table: where each event sits in the valuation lifecycle */
+.valuation-badge { display: inline-block; padding: 3px 9px; font-size: 12px; border: 1px solid #2c3441; color: #c6d0dc; white-space: nowrap; }
+.valuation-badge.ok { border-color: #2f7a4f; color: #7fd8a0; }
+.valuation-badge.pending { border-color: #6b4a1e; color: #ffb27a; }

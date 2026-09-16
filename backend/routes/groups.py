@@ -1311,15 +1311,8 @@ def bake_event_valuations(
     except Exception as exc:  # noqa: BLE001
         return {"status": "skipped", "event_id": event_id, "reason": f"kind detection failed: {exc}"}
     kind = get_event_tournament_kind(event_id) or detected.get("kind")
-    if kind in ("playoff", "double_elim"):
-        # Same pipeline, playoff shape: bracket from the event page, exact
-        # enumeration, stored roster combinations (see playoff.bake_event_playoff).
-        from backend.routes import playoff as playoff_routes
-
-        return playoff_routes.bake_event_playoff(
-            event_id, trigger=trigger, only_if_missing=only_if_missing, refresh_inputs=refresh_inputs
-        )
     if kind != "groups":
+        # backend.services.event_pipeline routes other formats to their bakers.
         return {"status": "skipped", "event_id": event_id, "reason": f"not a groups event ({kind})"}
 
     def _draw_ids(stored) -> List[List[int]]:
@@ -2433,8 +2426,10 @@ def bake_groups_event(event_id: Optional[int] = None, refresh_inputs: bool = Fal
     scheduler runs at import; useful after a scoring change. Once the event
     has started its inputs (ratings, roles, boosters, ranks) stay frozen at
     the pre-event snapshot; refresh_inputs=1 deliberately re-reads them."""
+    from backend.services import event_pipeline
+
     key = int(event_id) if event_id else _state_key()
-    return bake_event_valuations(key, trigger="manual", refresh_inputs=bool(refresh_inputs))
+    return event_pipeline.bake_event(key, trigger="manual", refresh_inputs=bool(refresh_inputs))
 
 
 @router.delete("/latest")
