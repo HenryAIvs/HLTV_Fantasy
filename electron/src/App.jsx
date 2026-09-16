@@ -14654,28 +14654,8 @@ function TournamentTab({ teams, teamLookup, players, sortTeams, applyFilters, on
 
   const kind = kindInfo?.kind || null;
   const sharedProps = { teams, teamLookup, players, sortTeams, applyFilters, onOpenPlayer };
-  const viewedId = eventId ?? serverActive;
   return (
     <div className="stack">
-      {PUBLIC_BUILD && eventList.length > 1 && (
-        <div className="event-picker">
-          <span className="event-picker-label">Active event</span>
-          <select
-            id="tournament-event-picker"
-            value={viewedId ?? ""}
-            onChange={(e) => {
-              const id = Number(e.target.value);
-              if (onSelectEvent) onSelectEvent(id === serverActive ? null : id);
-            }}
-          >
-            {eventList.map((ev) => (
-              <option key={ev.event_id} value={ev.event_id}>
-                {ev.name || `Event ${ev.event_id}`}
-              </option>
-            ))}
-          </select>
-        </div>
-      )}
       {message && <p className="muted">{message}</p>}
       {!kind && !message && <p className="muted">Loading tournament...</p>}
       {kind && !["swiss", "groups", "playoff", "bounty", "double_elim"].includes(kind) && (
