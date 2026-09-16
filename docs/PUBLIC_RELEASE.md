@@ -22,8 +22,15 @@ together, and the steps that only the operator (you) can do.
 2. **Domain + Cloudflare**: add your domain to Cloudflare (free plan), then run
    `scripts/install-tunnel.ps1 -Hostname api.your-domain.com` in an elevated
    PowerShell. It installs `cloudflared` as a service that forwards the
-   hostname to the backend on this machine. For a quick test without a domain,
-   `scripts/quick-tunnel.ps1` prints a temporary `trycloudflare.com` URL.
+   hostname to the backend on this machine. When the browser asks which zone
+   to authorise, pick the domain that owns the hostname. The script is safe to
+   re-run. The service uses `C:\ProgramData\HLTVFantasy\cloudflared\config.yml`
+   and logs to `C:\ProgramData\HLTVFantasy\logs\cloudflared.log`; "Registered
+   tunnel connection" in that log means it is up. For a quick test without a
+   domain, `scripts/quick-tunnel.ps1` prints a temporary `trycloudflare.com` URL.
+
+   Live since 2026-09-16: `https://api.csfantasy.co.uk` (zone csfantasy.co.uk,
+   tunnel `hltv-fantasy`).
 3. **Point the apps at the backend**: put the public URL in `site/api.json`
    (`apiBase`) and in `electron/public-config.json` (the bundled fallback),
    commit, push. Installed apps read `api.json` at every start, so the backend
