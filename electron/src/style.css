@@ -3970,3 +3970,6 @@ button:disabled {
 .server-gate-meta { font-size: 12px; margin-top: 12px; }
 /* Operator notice from /public/config "message" (maintenance windows etc.) */
 .server-notice { background: #1b212b; border: 1px solid #2c3441; border-left: 3px solid #ff6b1a; color: #ffb27a; padding: 8px 14px; font-size: 13px; }
+
+/* Events table in the public build: the active event is a badge, not a button */
+.event-active-badge { display: inline-block; padding: 3px 10px; background: #ff6b1a; color: #0f1216; font-family: var(--display); font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }

@@ -317,7 +317,7 @@ const ALL_TABS = [
   { key: "devlab", label: "Dev Lab" },
   { key: "scheduling", label: "Scheduling" },
 ];
-const tabs = PUBLIC_BUILD ? ALL_TABS.filter((t) => t.key === "view" || t.key === "tournament") : ALL_TABS;
+const tabs = PUBLIC_BUILD ? ALL_TABS.filter((t) => ["view", "events", "tournament"].includes(t.key)) : ALL_TABS;
 const NOT_PUBLISHED = "Valuations for this event have not been published yet.";
 
 // Update prompt in the title bar (public build): electron-updater downloads in
@@ -7666,6 +7666,7 @@ function EventsTab({ refreshData, notify, players, teams = [], onOpenPlayer, onO
   }, [activeEventDetail, teams, players]);
 
   const activateEvent = async (targetEventId) => {
+    if (PUBLIC_BUILD) return;
     setBusy(true);
     setMessage("");
     try {
@@ -7696,7 +7697,7 @@ function EventsTab({ refreshData, notify, players, teams = [], onOpenPlayer, onO
                     <th>HLTV Event</th>
                     <th>Type</th>
                     <th>Teams</th>
-                    <th>Actions</th>
+                    <th>{PUBLIC_BUILD ? "Status" : "Actions"}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -7708,15 +7709,19 @@ function EventsTab({ refreshData, notify, players, teams = [], onOpenPlayer, onO
                       <td>{describeEventFormat(eventKinds[ev.event_id])?.short || "..."}</td>
                       <td>{ev.team_count ?? 0}</td>
                       <td>
-                        <div className="actions" style={{ marginTop: 0 }}>
-                          <button
-                            className={activeEventId === ev.event_id ? "primary" : "secondary"}
-                            onClick={() => activateEvent(ev.event_id)}
-                            disabled={busy || activeEventId === ev.event_id}
-                          >
-                            {activeEventId === ev.event_id ? "Active" : "Set Active"}
-                          </button>
-                        </div>
+                        {PUBLIC_BUILD ? (
+                          activeEventId === ev.event_id ? <span className="event-active-badge">Active</span> : <span className="muted">-</span>
+                        ) : (
+                          <div className="actions" style={{ marginTop: 0 }}>
+                            <button
+                              className={activeEventId === ev.event_id ? "primary" : "secondary"}
+                              onClick={() => activateEvent(ev.event_id)}
+                              disabled={busy || activeEventId === ev.event_id}
+                            >
+                              {activeEventId === ev.event_id ? "Active" : "Set Active"}
+                            </button>
+                          </div>
+                        )}
                       </td>
                     </tr>
                   ))}
