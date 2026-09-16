@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import path from "path";
 import { fileURLToPath } from "url";
 import { createRequire } from "module";
@@ -170,8 +170,50 @@ const resolvePublicApiBase = async () => {
 };
 
 let mainWindow = null;
+
+// Updater log: %APPDATA%/CS Fantasy Toolkit/updater.log. electron-updater's
+// own messages plus our lifecycle events, so "it restarted on its own" can be
+// traced after the fact.
+const updaterLogPath = () => path.join(app.getPath("userData"), "updater.log");
+const ulog = (level, ...parts) => {
+  const line = `${new Date().toISOString()} ${level.padEnd(5)} ${parts.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ")}\n`;
+  try {
+    fs.appendFileSync(updaterLogPath(), line);
+  } catch {
+    /* logging must never break the app */
+  }
+};
+const updaterLogger = {
+  info: (...a) => ulog("info", ...a),
+  warn: (...a) => ulog("warn", ...a),
+  error: (...a) => ulog("error", ...a),
+  debug: (...a) => ulog("debug", ...a),
+};
+
 const sendUpdateStatus = (status) => {
+  ulog("info", "status", status);
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("update-status", status);
+};
+
+// The title-bar banner is easy to miss; when the download is ready ask once
+// with a native dialog. "Later" leaves the banner in place, and the update
+// still installs on the next quit.
+let askedToRestart = false;
+const offerRestart = async (version) => {
+  if (askedToRestart || !mainWindow || mainWindow.isDestroyed()) return;
+  askedToRestart = true;
+  const { response } = await dialog.showMessageBox(mainWindow, {
+    type: "info",
+    title: "Update ready",
+    message: `CS Fantasy Toolkit ${version ? `v${version} ` : ""}has been downloaded.`,
+    detail: "Restart now to install it, or keep working and it installs when you next close the app.",
+    buttons: ["Restart now", "Later"],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true,
+  });
+  ulog("info", "restart dialog answered", response === 0 ? "restart now" : "later");
+  if (response === 0 && autoUpdater) autoUpdater.quitAndInstall();
 };
 
 // electron-updater against the GitHub release feed (package.json "publish").
@@ -181,11 +223,16 @@ const setupUpdater = () => {
   if (!app.isPackaged || !autoUpdater) return;
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.logger = updaterLogger;
+  ulog("info", "app start", { version: app.getVersion(), packaged: app.isPackaged });
   autoUpdater.on("checking-for-update", () => sendUpdateStatus({ status: "checking" }));
   autoUpdater.on("update-available", (info) => sendUpdateStatus({ status: "available", version: info?.version }));
   autoUpdater.on("update-not-available", () => sendUpdateStatus({ status: "none" }));
   autoUpdater.on("download-progress", (p) => sendUpdateStatus({ status: "downloading", percent: Math.round(p?.percent || 0) }));
-  autoUpdater.on("update-downloaded", (info) => sendUpdateStatus({ status: "downloaded", version: info?.version }));
+  autoUpdater.on("update-downloaded", (info) => {
+    sendUpdateStatus({ status: "downloaded", version: info?.version });
+    offerRestart(info?.version);
+  });
   autoUpdater.on("error", (err) => sendUpdateStatus({ status: "error", message: String(err?.message || err) }));
   // Check shortly after launch, then every 30 minutes, and whenever the window
   // regains focus (at most once every 10 minutes) so a release published while
@@ -277,7 +324,13 @@ app.whenReady().then(async () => {
 });
 
 app.on("window-all-closed", () => {
+  ulog("info", "window-all-closed -> quit");
   app.quit();
+});
+
+app.on("before-quit", () => ulog("info", "before-quit"));
+process.on("uncaughtException", (err) => {
+  ulog("error", "uncaughtException", String(err?.stack || err));
 });
 
 app.on("will-quit", () => {
