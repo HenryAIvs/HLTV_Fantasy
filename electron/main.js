@@ -187,9 +187,19 @@ const setupUpdater = () => {
   autoUpdater.on("download-progress", (p) => sendUpdateStatus({ status: "downloading", percent: Math.round(p?.percent || 0) }));
   autoUpdater.on("update-downloaded", (info) => sendUpdateStatus({ status: "downloaded", version: info?.version }));
   autoUpdater.on("error", (err) => sendUpdateStatus({ status: "error", message: String(err?.message || err) }));
-  const check = () => autoUpdater.checkForUpdates().catch(() => {});
+  // Check shortly after launch, then every 30 minutes, and whenever the window
+  // regains focus (at most once every 10 minutes) so a release published while
+  // the app sits open is picked up within minutes rather than hours.
+  let lastCheck = 0;
+  const check = () => {
+    lastCheck = Date.now();
+    autoUpdater.checkForUpdates().catch(() => {});
+  };
   setTimeout(check, 10 * 1000);
-  setInterval(check, 6 * 60 * 60 * 1000);
+  setInterval(check, 30 * 60 * 1000);
+  app.on("browser-window-focus", () => {
+    if (Date.now() - lastCheck > 10 * 60 * 1000) check();
+  });
 };
 
 const createWindow = () => {
