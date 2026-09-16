@@ -150,3 +150,25 @@ reports them as such instead of silently skipping, and they are run from the
 operator app once per event until their bakers are written. The Events tab's
 Valuation column shows each event's state (published and refreshing, frozen,
 pending, manual). `POST /groups/bake?event_id=` re-bakes any event by hand.
+
+## Uptime alerts
+
+Two free checks cover the whole chain:
+
+1. **Is the API reachable?** UptimeRobot (free): New Monitor, type *Keyword*,
+   URL `https://api.csfantasy.co.uk/health`, keyword `hltv-fantasy`, interval
+   5 minutes, alert contact your email. Fires when the tunnel, the backend or
+   this PC is down.
+2. **Did the nightly run happen and succeed?** healthchecks.io (free): Add
+   Check, name "CS Fantasy nightly", period 1 day, grace 3 hours, then copy
+   its ping URL into `.runtime/heartbeat.json`:
+
+   ```json
+   {"url": "https://hc-ping.com/<your-uuid>"}
+   ```
+
+   The scheduler pings `/start` when the batch begins, the URL itself when
+   every task finished without an error, and `/fail` otherwise. No restart
+   is needed; the file is read at each batch. `HLTV_HEARTBEAT_URL` in the
+   environment works too. Test with `POST /schedule/heartbeat-test`.
+

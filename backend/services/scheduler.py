@@ -18,6 +18,45 @@ from typing import Any, Dict, List, Optional
 
 from backend.data import schedule_db
 
+
+# ---------------------------------------------------------------------------
+# Heartbeat: a healthchecks.io-style URL pinged when the nightly batch starts,
+# succeeds or fails (the service alerts when the success ping is late or a
+# fail ping arrives). The URL comes from HLTV_HEARTBEAT_URL or
+# .runtime/heartbeat.json {"url": "https://hc-ping.com/<uuid>"}; nothing is
+# pinged when neither is set. Failures to ping never affect the batch.
+def heartbeat_url() -> str:
+    import json
+    import os
+    from pathlib import Path
+
+    url = str(os.getenv("HLTV_HEARTBEAT_URL") or "").strip()
+    if url:
+        return url
+    path = Path(__file__).resolve().parents[2] / ".runtime" / "heartbeat.json"
+    try:
+        return str(json.loads(path.read_text(encoding="utf-8")).get("url") or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def heartbeat(kind: str) -> bool:
+    """kind: "start" | "success" | "fail". Returns True when a ping was sent."""
+    import urllib.request
+
+    base = heartbeat_url()
+    if not base:
+        return False
+    url = base.rstrip("/") + {"start": "/start", "fail": "/fail"}.get(kind, "")
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, method="POST", data=b""), timeout=10) as resp:
+            ok = 200 <= int(resp.status) < 300
+        logger.info("Heartbeat %s -> %s", kind, "ok" if ok else "rejected")
+        return ok
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Heartbeat %s failed: %s", kind, exc)
+        return False
+
 logger = logging.getLogger(__name__)
 
 _TICK_SECONDS = 30
@@ -228,19 +267,24 @@ class DataScheduler:
             return
         if not self._run_lock.acquire(blocking=False):
             return
+        batch_started = time.time()
+        outcome = "fail"
+        heartbeat("start")
         try:
             for task in tasks:
                 self._run_task(task, trigger, cfg)
-            # Valuations are baked ONCE at import. The nightly pass only fills
-            # in an active event that could not be baked then (draw not yet
-            # published); it never refreshes an existing valuation.
+            # The event behaviour contract for every unfinished event: bake
+            # what is missing, refresh what has not started, leave the rest.
             self._bake_valuations(trigger, only_if_missing=True)
             # Every batch ends with a login-health check so a dying HLTV
             # remember-me cookie is flagged weeks ahead in the run history.
             self._check_hltv_session(trigger)
+            statuses = [str(r.get("status")) for r in schedule_db.list_runs(limit=40) if float(r.get("started_at") or 0) >= batch_started]
+            outcome = "fail" if "error" in statuses else "success"
         finally:
             self._run_lock.release()
             self._set_state(running=False, current_task=None, trigger=None, processed=0, total=0)
+            heartbeat(outcome)
 
     def _check_hltv_session(self, trigger: str) -> None:
         """Is the scraper browser still signed in to HLTV, and for how long?

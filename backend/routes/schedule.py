@@ -25,6 +25,18 @@ def update_config(payload: dict | None = None) -> dict:
     return scheduler.status()
 
 
+@router.post("/heartbeat-test")
+def heartbeat_test() -> dict:
+    """Send one success ping to the configured heartbeat URL (see
+    docs/PUBLIC_RELEASE.md, Uptime alerts) and report what happened."""
+    from backend.services.scheduler import heartbeat, heartbeat_url
+
+    url = heartbeat_url()
+    if not url:
+        return {"configured": False, "sent": False, "detail": "No heartbeat URL: set HLTV_HEARTBEAT_URL or .runtime/heartbeat.json"}
+    return {"configured": True, "url": url, "sent": heartbeat("success")}
+
+
 @router.post("/run-now")
 def run_now(payload: dict | None = None) -> dict:
     task = str((payload or {}).get("task") or "all").strip().lower()
