@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>CS Fantasy Toolkit</title>
   <meta name="description" content="Free Windows app for Counter-Strike fantasy: every bracket outcome enumerated, every player valued, the best five-player rosters found." />
+  <link rel="icon" type="image/png" href="favicon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" />
   <style>
@@ -19,7 +20,8 @@
     body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--body); font-size: 16px; line-height: 1.55; padding-block: 0 64px; padding-inline: 20px; }
     .wrap { max-width: 1100px; margin: 0 auto; }
     header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 0; border-bottom: 1px solid var(--line-soft); }
-    .brand { font-family: var(--display); font-weight: 700; font-size: 20px; letter-spacing: 0.06em; text-transform: uppercase; }
+    .brand { display: flex; align-items: center; gap: 10px; font-family: var(--display); font-weight: 700; font-size: 20px; letter-spacing: 0.06em; text-transform: uppercase; }
+    .brand img { display: block; width: 28px; height: 28px; }
     .brand em { font-style: normal; color: var(--accent); }
     .links a { color: var(--muted); text-decoration: none; margin-left: 20px; font-family: var(--display); font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; font-size: 14px; }
     .links a:hover { color: var(--accent); }
@@ -49,7 +51,7 @@
 <body>
   <div class="wrap">
     <header>
-      <div class="brand">CS Fantasy <em>Toolkit</em></div>
+      <div class="brand"><img src="img/icon.png" alt="" width="28" height="28" /> CS Fantasy <em>Toolkit</em></div>
       <nav class="links">
         <a href="#shots">Screenshots</a>
         <a href="https://github.com/HenryAIvs/HLTV_Fantasy/releases">Releases</a>

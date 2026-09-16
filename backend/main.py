@@ -106,8 +106,13 @@ def create_app() -> FastAPI:
 
     @app.get("/public/config")
     def public_config() -> dict:
-        """What the distributed app needs to know about this server."""
+        """What the distributed app needs to know about this server. The
+        operator can raise the minimum client version or post a notice
+        without a restart via .runtime/public-config.json, e.g.
+        {"min_client_version": "0.1.2", "message": "Maintenance 22:00 UTC"}.
+        An app older than min_client_version shows an update screen."""
         from backend.data.event_db import get_active_event_id
+        from backend.services.public_access import public_config_overrides
 
         try:
             active = get_active_event_id()
@@ -120,6 +125,7 @@ def create_app() -> FastAPI:
             "min_client_version": "0.1.0",
             "active_event_id": active,
             "message": "",
+            **public_config_overrides(),
         }
 
     @app.get("/health")

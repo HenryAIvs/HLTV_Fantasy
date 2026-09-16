@@ -84,6 +84,22 @@ on first start). Limits per public client: heavy queries
 `HLTV_PUBLIC_MAX_CONCURRENT` running at once (default 3); everything else
 except assets `HLTV_PUBLIC_LIGHT_RATE_LIMIT` per minute (default 600).
 
+## Forcing an update, posting a notice
+
+`GET /public/config` carries `min_client_version` and `message`. To change
+either without restarting the backend, write `.runtime/public-config.json`:
+
+```json
+{"min_client_version": "0.1.2", "message": "Maintenance tonight 22:00 UK"}
+```
+
+An installed app older than `min_client_version` shows an "Update required"
+screen (with Check for updates and a website link) instead of the tabs; a
+non-empty `message` shows as a notice bar above the tabs. The app probes
+`/public/config` every 30 s, so changes take effect within a minute, and the
+same probe drives the "Can't reach the server" screen during an outage.
+Delete the file to go back to the defaults.
+
 ## What the public app needs published
 
 The scheduler bakes the active event's valuations nightly; the Top 5 queries

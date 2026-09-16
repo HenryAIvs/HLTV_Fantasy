@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Bar,
   BarChart,
@@ -414,6 +414,125 @@ const api = window.api || {
 };
 
 const TOP_RATING_TIERS = [5, 10, 20, 30, 50];
+
+// "0.1.2" vs "0.1.10" -> -1. Only digits matter.
+const compareVersions = (a, b) => {
+  const pa = String(a || "0").split(".").map((x) => parseInt(x, 10) || 0);
+  const pb = String(b || "0").split(".").map((x) => parseInt(x, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d < 0 ? -1 : 1;
+  }
+  return 0;
+};
+
+// Public build: is the server reachable, and is this app new enough for it?
+// Probes /public/config on start and every 30 s. Anything but "ok" replaces
+// the tabs with ServerGate, so an outage or an outdated app reads as a plain
+// message instead of empty pages and failed requests.
+const SERVER_PROBE_MS = 30000;
+function useServerStatus() {
+  const [state, setState] = useState({ status: PUBLIC_BUILD ? "checking" : "ok", config: null, error: null, checkedAt: null, failures: 0 });
+  const probe = useCallback(async () => {
+    if (!PUBLIC_BUILD) return;
+    try {
+      const cfg = await api.get("/public/config", 10000);
+      const min = cfg?.min_client_version;
+      const outdated = APP_VERSION !== "dev" && Boolean(min) && compareVersions(APP_VERSION, min) < 0;
+      setState({ status: outdated ? "outdated" : "ok", config: cfg, error: null, checkedAt: Date.now(), failures: 0 });
+    } catch (e) {
+      setState((prev) => {
+        const failures = (prev.failures || 0) + 1;
+        // A single miss while running is tolerated (one slow probe should not
+        // hide the app); on start, or after two misses in a row, say so.
+        const unreachable = prev.status !== "ok" || failures >= 2;
+        return { ...prev, status: unreachable ? "unreachable" : prev.status, error: String(e?.message || e), checkedAt: Date.now(), failures };
+      });
+    }
+  }, []);
+  useEffect(() => {
+    if (!PUBLIC_BUILD) return undefined;
+    probe();
+    const timer = setInterval(probe, SERVER_PROBE_MS);
+    return () => clearInterval(timer);
+  }, [probe]);
+  return { ...state, retry: probe };
+}
+
+const apiHost = (() => {
+  try {
+    return new URL(API_BASE).host;
+  } catch {
+    return API_BASE;
+  }
+})();
+
+function ServerGate({ status, config, error, checkedAt, retry }) {
+  const [busy, setBusy] = useState(false);
+  const onRetry = async () => {
+    setBusy(true);
+    try {
+      await retry();
+    } finally {
+      setBusy(false);
+    }
+  };
+  if (status === "checking") {
+    return (
+      <div className="server-gate">
+        <div className="server-gate-card">
+          <p className="server-gate-kicker">Connecting</p>
+          <h1>Reaching the valuation server</h1>
+          <p className="muted">{apiHost}</p>
+        </div>
+      </div>
+    );
+  }
+  if (status === "outdated") {
+    return (
+      <div className="server-gate">
+        <div className="server-gate-card">
+          <p className="server-gate-kicker">Update required</p>
+          <h1>This version is too old for the server</h1>
+          <p>
+            You have v{APP_VERSION}; the server needs v{config?.min_client_version} or newer. Updates download in the
+            background and install when you restart the app.
+          </p>
+          <div className="server-gate-actions">
+            <button className="primary" onClick={() => window.api?.checkForUpdates?.()}>
+              Check for updates
+            </button>
+            {APP_INFO?.siteUrl && <button onClick={() => window.api?.openExternal?.(APP_INFO.siteUrl)}>Download from the website</button>}
+          </div>
+          <div className="server-gate-update">
+            <UpdateBanner />
+          </div>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="server-gate">
+      <div className="server-gate-card">
+        <p className="server-gate-kicker">Can't reach the server</p>
+        <h1>The valuation server isn't responding</h1>
+        <p>
+          CS Fantasy Toolkit could not reach {apiHost}. It may be down for maintenance, or this PC may be offline. The app
+          keeps trying every 30 seconds.
+        </p>
+        <div className="server-gate-actions">
+          <button className="primary" onClick={onRetry} disabled={busy}>
+            {busy ? "Checking..." : "Retry now"}
+          </button>
+        </div>
+        <p className="muted server-gate-meta">
+          Last checked {checkedAt ? new Date(checkedAt).toLocaleTimeString() : "just now"}
+          {error ? ` \u00b7 ${error}` : ""}
+        </p>
+      </div>
+    </div>
+  );
+}
 
 const TabButton = ({ active, onClick, children }) => (
   <button className={active ? "tab active" : "tab"} onClick={onClick}>
@@ -14509,6 +14628,15 @@ export default function App() {
   const [teams, setTeams] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const server = useServerStatus();
+  // When the server comes back after an outage the tabs' first loads have
+  // already failed; fetch again as soon as the gate lifts.
+  const serverWasOk = useRef(server.status === "ok");
+  useEffect(() => {
+    if (server.status === "ok" && !serverWasOk.current) load();
+    serverWasOk.current = server.status === "ok";
+  }, [server.status]);
+
   const load = async () => {
     setLoading(true);
     setError("");
@@ -14657,17 +14785,22 @@ export default function App() {
         {PUBLIC_BUILD && <span className="titlebar-version">v{APP_VERSION}</span>}
         <UpdateBanner />
       </div>
-      <div className="layout">
-        <nav className="tab-bar">
-          {tabs.map((t) => (
-            <TabButton key={t.key} active={t.key === active} onClick={() => setActive(t.key)}>
-              {t.label}
-            </TabButton>
-          ))}
-        </nav>
+      {PUBLIC_BUILD && server.status !== "ok" ? (
+        <ServerGate {...server} />
+      ) : (
+        <div className="layout">
+          {PUBLIC_BUILD && server.config?.message && <div className="server-notice">{server.config.message}</div>}
+          <nav className="tab-bar">
+            {tabs.map((t) => (
+              <TabButton key={t.key} active={t.key === active} onClick={() => setActive(t.key)}>
+                {t.label}
+              </TabButton>
+            ))}
+          </nav>
 
-        <main className="content">{contentMap[active]}</main>
-      </div>
+          <main className="content">{contentMap[active]}</main>
+        </div>
+      )}
     </>
   );
 }

@@ -3955,3 +3955,18 @@ button:disabled {
   cursor: pointer;
 }
 .titlebar-update.muted { background: transparent; color: #8fa3bf; font-weight: 600; cursor: default; }
+
+
+/* Public build gate: shown instead of the tabs while the server is unreachable
+   or this app is older than the server's minimum client version. */
+.server-gate { min-height: calc(100vh - 36px); display: grid; place-items: center; padding: 40px 20px; }
+.server-gate-card { width: 100%; max-width: 560px; background: #12161c; border: 1px solid #2c3441; border-top: 3px solid #ff6b1a; padding: 26px 30px 24px; }
+.server-gate-kicker { margin: 0 0 8px; font-family: var(--display); font-size: 12px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; color: #ff6b1a; }
+.server-gate h1 { margin: 0 0 12px; font-family: var(--display); font-size: 30px; line-height: 1.05; text-transform: uppercase; letter-spacing: 0.02em; color: #f2f5f9; }
+.server-gate p { margin: 0 0 8px; color: #c6d0dc; font-size: 15px; line-height: 1.5; }
+.server-gate-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+.server-gate-update { margin-top: 14px; display: flex; }
+.server-gate-update .titlebar-update { margin: 0; }
+.server-gate-meta { font-size: 12px; margin-top: 12px; }
+/* Operator notice from /public/config "message" (maintenance windows etc.) */
+.server-notice { background: #1b212b; border: 1px solid #2c3441; border-left: 3px solid #ff6b1a; color: #ffb27a; padding: 8px 14px; font-size: 13px; }

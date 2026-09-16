@@ -205,6 +205,8 @@ const createWindow = () => {
     // native minimise / maximise / close controls drawn dark by the overlay.
     // The menu bar stays out of sight (Alt reveals it; its shortcuts still work).
     backgroundColor: "#0a0c10",
+    // Dev/unpacked runs only; the installed app carries the icon in the exe.
+    icon: app.isPackaged ? undefined : path.join(__dirname, "build", "icon.ico"),
     titleBarStyle: "hidden",
     titleBarOverlay: { color: "#0a0c10", symbolColor: "#c6d0dc", height: 36 },
     autoHideMenuBar: true,

@@ -114,6 +114,31 @@ def admin_token() -> str:
     return token
 
 
+_OVERRIDES_FILE = _TOKEN_FILE.parent / "public-config.json"
+_overrides_cache: dict = {"mtime": None, "data": {}}
+
+
+def public_config_overrides() -> dict:
+    """Operator overrides for /public/config (min_client_version, message),
+    re-read whenever .runtime/public-config.json changes. Only those two keys
+    are honoured; a malformed file is ignored."""
+    try:
+        mtime = _OVERRIDES_FILE.stat().st_mtime
+    except OSError:
+        _overrides_cache.update(mtime=None, data={})
+        return {}
+    if _overrides_cache["mtime"] != mtime:
+        try:
+            import json
+
+            raw = json.loads(_OVERRIDES_FILE.read_text(encoding="utf-8"))
+            data = {k: str(raw[k]) for k in ("min_client_version", "message") if raw.get(k) is not None}
+        except Exception:
+            data = {}
+        _overrides_cache.update(mtime=mtime, data=data)
+    return dict(_overrides_cache["data"])
+
+
 def client_key(request) -> str:
     for header in _PROXY_HEADERS:
         value = request.headers.get(header)
