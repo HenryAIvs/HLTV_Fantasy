@@ -23,7 +23,7 @@ import secrets
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
@@ -41,6 +41,8 @@ _PROXY_HEADERS = ("cf-connecting-ip", "x-forwarded-for", "x-real-ip")
 PUBLIC_ROUTES: List[Tuple[str, str]] = [
     ("GET", r"/health"),
     ("GET", r"/public/config"),
+    ("GET", r"/auth/.*"),
+    ("POST", r"/auth/.*"),
     ("GET", r"/playoff/latest"),
     ("GET", r"/playoff/best-team/from-latest/latest"),
     ("GET", r"/playoff/best-team/bracket-from-latest/latest"),
@@ -180,6 +182,21 @@ def _rate_limited(key: str, limit: int = _RATE_LIMIT) -> bool:
     return False
 
 
+# Public routes a signed-out app may still call: liveness, the server config
+# (which says sign-in is required), the sign-in flow itself, and images
+# (<img> tags cannot send a bearer header).
+_AUTH_EXEMPT = re.compile(r"^/(health|public/config|auth(/.*)?|assets/.*)$")
+
+
+def session_user_id(request) -> Optional[int]:
+    """The signed-in user behind a public request's bearer token, else None."""
+    from backend.data import auth_db
+
+    header = request.headers.get("authorization") or ""
+    token = header[7:].strip() if header.lower().startswith("bearer ") else None
+    return auth_db.user_id_for_token(token)
+
+
 class PublicAccessMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         if request.method == "OPTIONS" or is_operator(request):
@@ -187,6 +204,13 @@ class PublicAccessMiddleware(BaseHTTPMiddleware):
         path = request.url.path
         if not is_public_route(request.method, path):
             return JSONResponse({"detail": "This action is only available to the server operator."}, status_code=403)
+        from backend.routes.auth import sign_in_required
+
+        if sign_in_required() and not _AUTH_EXEMPT.match(path):
+            user_id = session_user_id(request)
+            if not user_id:
+                return JSONResponse({"detail": "Sign in to use CS Fantasy Toolkit."}, status_code=401)
+            request.state.user_id = user_id
         if _HEAVY.match(path):
             if _rate_limited("heavy:" + client_key(request)):
                 return JSONResponse({"detail": "Too many requests. Please wait a moment."}, status_code=429)

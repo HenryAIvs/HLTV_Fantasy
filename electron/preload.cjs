@@ -10,6 +10,9 @@ const { contextBridge, ipcRenderer } = require("electron");
 // renderer's first request.
 const API_BASE = ipcRenderer.sendSync("api-base") || "http://127.0.0.1:8000";
 const APP_INFO = ipcRenderer.sendSync("app-info") || { publicBuild: false, version: "dev", siteUrl: "", packaged: false };
+// Session token for the hosted backend (public build): loaded once, sent as
+// a bearer header on every request, replaced/cleared by the sign-in flow.
+let AUTH_TOKEN = APP_INFO.publicBuild ? ipcRenderer.sendSync("auth-token-get") || null : null;
 
 const parseJsonSafe = async (res) => {
   const text = await res.text();
@@ -29,6 +32,7 @@ const requestJson = async (path, init = {}, timeoutMs = 60000) => {
   // The public app is treated as public by the backend even on the operator's
   // own machine (backend/services/public_access.py).
   if (APP_INFO.publicBuild) headers["X-Public-Client"] = "1";
+  if (AUTH_TOKEN) headers.Authorization = `Bearer ${AUTH_TOKEN}`;
   try {
     res = await fetch(`${API_BASE}${path}`, { ...init, headers, signal: controller.signal });
   } catch (e) {
@@ -77,5 +81,16 @@ contextBridge.exposeInMainWorld("api", {
     ipcRenderer.on("update-status", (_event, status) => callback(status));
   },
   installUpdate: () => ipcRenderer.invoke("install-update"),
+  auth: {
+    get: () => AUTH_TOKEN,
+    set: (token) => {
+      AUTH_TOKEN = String(token || "") || null;
+      return ipcRenderer.invoke("auth-token-set", AUTH_TOKEN);
+    },
+    clear: () => {
+      AUTH_TOKEN = null;
+      return ipcRenderer.invoke("auth-token-clear");
+    },
+  },
   checkForUpdates: () => ipcRenderer.invoke("check-updates"),
 });

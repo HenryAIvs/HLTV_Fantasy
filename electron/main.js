@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, safeStorage, shell } from "electron";
 import path from "path";
 import { fileURLToPath } from "url";
 import { createRequire } from "module";
@@ -291,6 +291,35 @@ app.whenReady().then(async () => {
   // makes its first request.
   ipcMain.on("api-base", (event) => {
     event.returnValue = apiBase;
+  });
+  // Session token for the hosted backend, encrypted with the OS user store
+  // (Windows DPAPI) so it never sits in plain text on disk.
+  const tokenFile = () => path.join(app.getPath("userData"), "session.bin");
+  const readToken = () => {
+    try {
+      const raw = fs.readFileSync(tokenFile());
+      return safeStorage.isEncryptionAvailable() ? safeStorage.decryptString(raw) : raw.toString("utf8");
+    } catch {
+      return null;
+    }
+  };
+  ipcMain.on("auth-token-get", (event) => {
+    event.returnValue = readToken();
+  });
+  ipcMain.handle("auth-token-set", (_event, token) => {
+    const text = String(token || "");
+    if (!text) return { status: "ok" };
+    const data = safeStorage.isEncryptionAvailable() ? safeStorage.encryptString(text) : Buffer.from(text, "utf8");
+    fs.writeFileSync(tokenFile(), data);
+    return { status: "ok" };
+  });
+  ipcMain.handle("auth-token-clear", () => {
+    try {
+      fs.unlinkSync(tokenFile());
+    } catch {
+      /* nothing stored */
+    }
+    return { status: "ok" };
   });
   ipcMain.on("app-info", (event) => {
     event.returnValue = {

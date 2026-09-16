@@ -18,6 +18,8 @@ from backend.data.team_db import ensure_team_schema
 from backend.data.schedule_db import ensure_schedule_schema
 from backend.services.scheduler import scheduler
 from backend.services.public_access import PublicAccessMiddleware, admin_token
+from backend.routes import auth as auth_routes
+from backend.data.auth_db import ensure_auth_schema
 
 SCHEMA_INITIALIZERS = (
     ensure_schema,
@@ -36,6 +38,7 @@ SCHEMA_INITIALIZERS = (
     events.ensure_map_sb_job_schema,
     admin.ensure_trigger_backfill_schema,
     ensure_schedule_schema,
+    ensure_auth_schema,
 )
 
 ROUTERS = (
@@ -50,6 +53,7 @@ ROUTERS = (
     (events.router, "/events", "events"),
     (schedule.router, "/schedule", "schedule"),
     (assets.router, "/assets", "assets"),
+    (auth_routes.router, "/auth", "auth"),
 )
 
 
@@ -129,6 +133,8 @@ def create_app() -> FastAPI:
             "min_client_version": "0.1.0",
             "active_event_id": active,
             "message": "",
+            # Sign-in the distributed app must complete before reading data.
+            "auth": {"provider": "google", "required": auth_routes.sign_in_required(), "configured": auth_routes.google_configured()},
             **public_config_overrides(),
         }
 

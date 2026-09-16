@@ -193,3 +193,36 @@ history shows a `backup` row per night; a failed copy is an error and trips
 the heartbeat. Run one by hand with `POST /schedule/run-now {"task": "backup"}`.
 Restore = stop the backend, gunzip the file over the database, start it.
 
+## Accounts (sign in with Google)
+
+The public app signs users in with Google; the operator app on this PC never
+needs to. Sessions are 90-day bearer tokens stored hashed in the database and
+kept encrypted on the user's machine; every public data route requires one,
+except the health check, the public config, the sign-in routes and images.
+Enforcement switches on automatically once a Google client is configured, so
+the order is: ship an app version that can sign in, then add the credentials.
+
+Setup (Google Cloud Console, once):
+
+1. Create a project (e.g. "CS Fantasy Toolkit").
+2. APIs & Services, OAuth consent screen: External, app name, support email,
+   developer email. Scopes: email, profile, openid (non-sensitive, no
+   verification needed). Publish the app (Testing mode only admits listed
+   test users).
+3. Credentials, Create credentials, OAuth client ID, type **Web application**,
+   Authorised redirect URI `https://api.csfantasy.co.uk/auth/google/callback`.
+4. Put the client ID and secret in `.runtime/google-oauth.json`:
+
+   ```json
+   {"client_id": "....apps.googleusercontent.com", "client_secret": "...",
+    "redirect_base": "https://api.csfantasy.co.uk"}
+   ```
+
+   No restart needed; `/public/config` then reports `auth.required: true`
+   and the app shows its sign-in screen.
+
+Flow: the app opens the browser at `/auth/google/start` with a random state
+and a challenge, the server does the Google exchange and verifies the ID
+token, the app collects its session with `/auth/poll` (one-shot, verifier
+checked). `/auth/me`, `/auth/signout`. Users are in the `users` table.
+

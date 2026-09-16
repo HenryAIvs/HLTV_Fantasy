@@ -473,6 +473,134 @@ const apiHost = (() => {
   }
 })();
 
+// ---- Accounts (public build): Google sign-in through the server ------------
+// The app opens the browser at the server's sign-in URL with a random state
+// and a challenge; the server does Google; the app polls for its session
+// token with the verifier (see backend/routes/auth.py). The token lives in
+// Electron's safe storage and rides on every request as a bearer header.
+const randomToken = (bytes = 32) => {
+  const arr = new Uint8Array(bytes);
+  crypto.getRandomValues(arr);
+  return btoa(String.fromCharCode(...arr)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+};
+const sha256Base64Url = async (text) => {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return btoa(String.fromCharCode(...new Uint8Array(digest))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+};
+const AUTH_POLL_MS = 2000;
+const AUTH_TIMEOUT_MS = 5 * 60 * 1000;
+
+function useAuth(serverOk, required) {
+  const [state, setState] = useState({ status: PUBLIC_BUILD ? "checking" : "signed_in", user: null, error: null });
+  const pollRef = useRef(null);
+  const stopPolling = () => {
+    if (pollRef.current) clearInterval(pollRef.current);
+    pollRef.current = null;
+  };
+  useEffect(() => {
+    if (!PUBLIC_BUILD || !serverOk) return undefined;
+    if (!required) {
+      // The server is not asking for sign-in (no Google client configured yet).
+      setState({ status: "signed_in", user: null, error: null });
+      return undefined;
+    }
+    let cancelled = false;
+    (async () => {
+      if (!window.api?.auth?.get?.()) {
+        setState({ status: "signed_out", user: null, error: null });
+        return;
+      }
+      try {
+        const me = await api.get("/auth/me", 15000);
+        if (!cancelled) setState({ status: "signed_in", user: me?.user || null, error: null });
+      } catch (e) {
+        if (cancelled) return;
+        // A rejected token is gone for good; anything else is a network blip.
+        if (/sign in|401/i.test(String(e?.message || ""))) window.api?.auth?.clear?.();
+        setState({ status: "signed_out", user: null, error: null });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [serverOk, required]);
+  useEffect(() => () => stopPolling(), []);
+  const signIn = async () => {
+    stopPolling();
+    const state = randomToken(24);
+    const verifier = randomToken(32);
+    const challenge = await sha256Base64Url(verifier);
+    setState({ status: "signing_in", user: null, error: null });
+    await window.api?.openExternal?.(`${API_BASE}/auth/google/start?state=${state}&challenge=${challenge}`);
+    const started = Date.now();
+    pollRef.current = setInterval(async () => {
+      if (Date.now() - started > AUTH_TIMEOUT_MS) {
+        stopPolling();
+        setState({ status: "signed_out", user: null, error: "Sign-in timed out. Try again." });
+        return;
+      }
+      try {
+        const res = await api.post("/auth/poll", { state, verifier }, 10000);
+        if (res?.status === "ok" && res.token) {
+          stopPolling();
+          await window.api?.auth?.set?.(res.token);
+          setState({ status: "signed_in", user: res.user || null, error: null });
+        } else if (res?.status === "unknown") {
+          stopPolling();
+          setState({ status: "signed_out", user: null, error: "That sign-in expired. Try again." });
+        }
+      } catch {
+        /* keep polling; the server gate handles a real outage */
+      }
+    }, AUTH_POLL_MS);
+  };
+  const cancelSignIn = () => {
+    stopPolling();
+    setState({ status: "signed_out", user: null, error: null });
+  };
+  const signOut = async () => {
+    try {
+      await api.post("/auth/signout", {}, 10000);
+    } catch {
+      /* the token is dropped locally regardless */
+    }
+    await window.api?.auth?.clear?.();
+    setState({ status: "signed_out", user: null, error: null });
+  };
+  return { ...state, signIn, cancelSignIn, signOut };
+}
+
+function SignInGate({ auth, configured }) {
+  return (
+    <div className="server-gate">
+      <div className="server-gate-card">
+        <p className="server-gate-kicker">Sign in</p>
+        <h1>Sign in to continue</h1>
+        {configured === false ? (
+          <p>This server has no sign-in set up yet. Try again later.</p>
+        ) : (
+          <p>CS Fantasy Toolkit signs you in with your Google account. It keeps only your name, email and picture.</p>
+        )}
+        {auth.status === "signing_in" ? (
+          <>
+            <p className="muted">Finish signing in in your browser, then come back here.</p>
+            <div className="server-gate-actions">
+              <button onClick={auth.cancelSignIn}>Cancel</button>
+            </div>
+          </>
+        ) : (
+          <div className="server-gate-actions">
+            <button className="primary" onClick={auth.signIn} disabled={configured === false || auth.status === "checking"}>
+              {auth.status === "checking" ? "Checking..." : "Continue with Google"}
+            </button>
+          </div>
+        )}
+        {auth.error && <p className="muted server-gate-meta">{auth.error}</p>}
+      </div>
+    </div>
+  );
+}
+
 function ServerGate({ status, config, error, checkedAt, retry }) {
   const [busy, setBusy] = useState(false);
   const onRetry = async () => {
@@ -14747,6 +14875,7 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const server = useServerStatus();
+  const auth = useAuth(server.status === "ok", Boolean(server.config?.auth?.required));
   // Public build: which event the user is looking at (null = the server's).
   const [viewEventId, setViewEventIdState] = useState(VIEW_EVENT_ID);
   const selectViewEvent = (id) => {
@@ -14757,9 +14886,16 @@ export default function App() {
   // already failed; fetch again as soon as the gate lifts.
   const serverWasOk = useRef(server.status === "ok");
   useEffect(() => {
-    if (server.status === "ok" && !serverWasOk.current) load();
+    if (server.status === "ok" && !serverWasOk.current && (!PUBLIC_BUILD || auth.status === "signed_in")) load();
     serverWasOk.current = server.status === "ok";
   }, [server.status]);
+  // Public build: the data endpoints need a session, so load after sign-in.
+  const authWasIn = useRef(false);
+  useEffect(() => {
+    if (!PUBLIC_BUILD) return;
+    if (auth.status === "signed_in" && !authWasIn.current) load();
+    authWasIn.current = auth.status === "signed_in";
+  }, [auth.status]);
 
   const load = async () => {
     setLoading(true);
@@ -14776,7 +14912,7 @@ export default function App() {
   };
 
   useEffect(() => {
-    load();
+    if (!PUBLIC_BUILD) load();
   }, []);
 
   const teamLookup = useMemo(() => {
@@ -14913,9 +15049,20 @@ export default function App() {
         </span>
         {PUBLIC_BUILD && <span className="titlebar-version">v{APP_VERSION}</span>}
         <UpdateBanner />
+        {PUBLIC_BUILD && auth.status === "signed_in" && auth.user && (
+          <span className="titlebar-user">
+            {auth.user.picture && <img src={auth.user.picture} alt="" referrerPolicy="no-referrer" />}
+            <span className="titlebar-user-name">{auth.user.name || auth.user.email}</span>
+            <button type="button" className="titlebar-signout" onClick={auth.signOut}>
+              Sign out
+            </button>
+          </span>
+        )}
       </div>
       {PUBLIC_BUILD && server.status !== "ok" ? (
         <ServerGate {...server} />
+      ) : PUBLIC_BUILD && auth.status !== "signed_in" ? (
+        <SignInGate auth={auth} configured={server.config?.auth ? Boolean(server.config.auth.configured) : null} />
       ) : (
         <div className="layout">
           {PUBLIC_BUILD && server.config?.message && <div className="server-notice">{server.config.message}</div>}
