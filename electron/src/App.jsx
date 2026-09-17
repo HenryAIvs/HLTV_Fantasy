@@ -11623,8 +11623,8 @@ const TopXCurveChart = ({ topx, height = 260 }) => (
   </ResponsiveContainer>
 );
 
-// The bucket table; `explain` adds the column-by-column explanation under it.
-const TopXCurveTable = ({ topx, explain = false }) => (
+// The bucket table.
+const TopXCurveTable = ({ topx }) => (
   <>
     <table className="topx-bucket-table">
       <thead>
@@ -11664,51 +11664,6 @@ const TopXCurveTable = ({ topx, explain = false }) => (
         ))}
       </tbody>
     </table>
-    {explain && (
-      <div className="topx-explain">
-        <span className="topx-explain-term">
-          <i style={{ background: TOPX_SERIES.predicted }} />
-          Predicted
-        </span>
-        <span>
-          The average-player curve applied to this overall rating. A typical player's rating against Top-N opponents is
-          their overall × (1 + the average deviation for that tier), fitted from every player with real per-tier data.
-          A player with no Top-X data gets exactly this.
-        </span>
-        <span className="topx-explain-term">
-          <i style={{ background: TOPX_SERIES.shifted }} />
-          + Shift
-        </span>
-        <span>
-          Predicted moved by the player's own offset: the maps-weighted amount their real tiers sit above or below the
-          average curve, trusted in proportion to their ranked maps (half trust at 25). Every tier is judged against
-          this, so a 3-map tier is measured against the player's demonstrated ranked level rather than the population's.
-        </span>
-        <span className="topx-explain-term">
-          <i style={{ background: TOPX_SERIES.actualDot }} />
-          Actual
-        </span>
-        <span>The rating HLTV reports against that tier, as imported. Blank where the player has no maps in the tier.</span>
-        <span className="topx-explain-term">
-          <i style={{ background: TOPX_SERIES.weighted }} />
-          Weighted
-        </span>
-        <span>
-          What the match engine uses. Actual pulled toward + Shift by the sample weight. With no maps it is + Shift
-          itself, and the row is marked est.
-        </span>
-        <span className="topx-explain-term">Sample weight</span>
-        <span>How much Actual counts: maps ÷ (maps + 20). About 7 maps is 25%, 20 maps is 50%, 60 maps is 75%.</span>
-        <span className="topx-explain-term">Maps</span>
-        <span>Maps the player has played against opponents ranked in that tier.</span>
-        <span className="topx-explain-note">
-          The inputs are HLTV's cumulative "vs Top-N" figures; the table splits them into bands (6-10 is Top 10 minus
-          Top 5), so a band's maps and rating differ from the input above it. The chart joins the bands at ranks 1, 5,
-          10, 20, 30 and 50 (rank 1 takes the Top 5 value); between them the engine reads straight off the line. Sample
-          maps is the total across the bands.
-        </span>
-      </div>
-    )}
   </>
 );
 
@@ -11961,7 +11916,7 @@ function RatingLabTab({ players }) {
 
           {hasCurve && (
             <div className="lab-table-wrap">
-              <TopXCurveTable topx={topx} explain />
+              <TopXCurveTable topx={topx} />
             </div>
           )}
         </div>
