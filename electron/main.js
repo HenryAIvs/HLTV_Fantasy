@@ -213,7 +213,8 @@ const offerRestart = async (version) => {
     noLink: true,
   });
   ulog("info", "restart dialog answered", response === 0 ? "restart now" : "later");
-  if (response === 0 && autoUpdater) autoUpdater.quitAndInstall();
+  // Silent install (no setup wizard), then relaunch the updated app.
+  if (response === 0 && autoUpdater) autoUpdater.quitAndInstall(true, true);
 };
 
 // electron-updater against the GitHub release feed (package.json "publish").
@@ -330,7 +331,7 @@ app.whenReady().then(async () => {
     };
   });
   ipcMain.handle("install-update", () => {
-    if (autoUpdater) autoUpdater.quitAndInstall();
+    if (autoUpdater) autoUpdater.quitAndInstall(true, true);
     return { status: "ok" };
   });
   ipcMain.handle("check-updates", async () => {

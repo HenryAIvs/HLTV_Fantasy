@@ -64,7 +64,13 @@ If a tag ever ends up with two releases, the download URL breaks: delete both
 releases and push a new version.
 
 To build locally instead: `cd electron && npm run dist` (installer in
-`electron/release/`), or `npm run dist:dir` for an unpacked folder.
+`electron/release/`), or `npm run dist:dir` for an unpacked folder. Use Node
+22+ (nvm on this PC has v24.13.1); the old 20.18 fails at the blockmap step.
+
+The installer is one-click (no pages, a small progress dialog with the app
+icon, installs per user, launches the app when done). Updates install
+silently and relaunch the app; the user only ever sees the "Update ready"
+prompt.
 
 ## Running the public build against your own machine
 

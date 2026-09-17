@@ -1,7 +1,7 @@
 {
   "name": "cs-fantasy",
   "productName": "CS Fantasy Toolkit",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "Counter-Strike fantasy valuations, brackets and roster optimisation.",
   "author": "HenryAIvs",
   "license": "UNLICENSED",
@@ -45,10 +45,14 @@
       ]
     },
     "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
+      "oneClick": true,
       "perMachine": false,
-      "shortcutName": "CS Fantasy Toolkit"
+      "runAfterFinish": true,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
+      "shortcutName": "CS Fantasy Toolkit",
+      "deleteAppDataOnUninstall": false
     },
     "publish": [
       {
