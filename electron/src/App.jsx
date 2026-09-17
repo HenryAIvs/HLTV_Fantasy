@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Bar,
   BarChart,
@@ -946,7 +946,9 @@ const Input = ({ label, value, onChange, type = "text", placeholder = "", classN
 
 // Text input with a suggestion dropdown filtered by the typed value. Optional
 // `actions` add per-row buttons (e.g. Include/Exclude) that receive the name.
-const SuggestInput = ({ label, value, onChange, placeholder = "", suggestions = [], actions = null }) => {
+// onEnter (optional) gets the current matches when Enter is pressed, so a
+// caller can accept a single match without a mouse.
+const SuggestInput = ({ label, value, onChange, placeholder = "", suggestions = [], actions = null, onEnter = null }) => {
   const [open, setOpen] = useState(false);
   const q = String(value || "").trim().toLowerCase();
   const matches = q ? suggestions.filter((s) => s.toLowerCase().includes(q)).slice(0, 8) : [];
@@ -961,6 +963,13 @@ const SuggestInput = ({ label, value, onChange, placeholder = "", suggestions = 
         }}
         onFocus={() => setOpen(true)}
         onBlur={() => setOpen(false)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && onEnter) {
+            e.preventDefault();
+            onEnter(matches);
+            setOpen(false);
+          }
+        }}
         type="text"
         placeholder={placeholder}
       />
@@ -11664,28 +11673,44 @@ const RATING_LAB_TIERS = [
 ];
 const TIER_COLORS = { 5: "#f97316", 10: "#eab308", 20: "#22d3ee", 30: "#a78bfa", 50: "#34d399" };
 
+const RATING_LAB_EXAMPLE = {
+  rating: "1.10",
+  rating_top5: "1.02",
+  maps_top5: "40",
+  rating_top10: "",
+  maps_top10: "",
+  rating_top20: "1.08",
+  maps_top20: "25",
+  rating_top30: "",
+  maps_top30: "",
+  rating_top50: "1.14",
+  maps_top50: "60",
+};
+
 function RatingLabTab({ players }) {
-  const [stats, setStats] = useState({
-    rating: "1.10",
-    rating_top5: "1.02",
-    maps_top5: "40",
-    rating_top10: "",
-    maps_top10: "",
-    rating_top20: "1.08",
-    maps_top20: "25",
-    rating_top30: "",
-    maps_top30: "",
-    rating_top50: "1.14",
-    maps_top50: "60",
-  });
+  const [stats, setStats] = useState(RATING_LAB_EXAMPLE);
   const [preview, setPreview] = useState(null);
   const [previewError, setPreviewError] = useState("");
   const [avg, setAvg] = useState(null);
   const [avgLoading, setAvgLoading] = useState(false);
   const [avgError, setAvgError] = useState("");
-  const [loadPid, setLoadPid] = useState("");
+  // Player search: the box text, the player whose stored numbers fill the
+  // form (null = the hand-entered example), and whether those were edited since.
+  const [loadQuery, setLoadQuery] = useState("");
+  const [loaded, setLoaded] = useState(null);
+  const [edited, setEdited] = useState(false);
+  const [loadError, setLoadError] = useState("");
 
-  const setStat = (key, val) => setStats((prev) => ({ ...prev, [key]: val }));
+  const setStat = (key, val) => {
+    setStats((prev) => ({ ...prev, [key]: val }));
+    setEdited(true);
+  };
+  const resetExample = () => {
+    setStats(RATING_LAB_EXAMPLE);
+    setLoaded(null);
+    setEdited(false);
+    setLoadError("");
+  };
 
   // Live preview: run the exact rating-curve system on the hand-entered stats.
   useEffect(() => {
@@ -11724,21 +11749,51 @@ function RatingLabTab({ players }) {
     loadAverage();
   }, []);
 
+  // Search labels ("name · team") that resolve back to a player id.
+  const playerOptions = useMemo(() => {
+    const byLabel = new Map();
+    (Array.isArray(players) ? players : []).forEach((p) => {
+      const id = Number(p.player_id ?? p.id);
+      const name = String(p.name || "").trim();
+      if (!Number.isFinite(id) || id <= 0 || !name) return;
+      const team = String(p.team || p.team_name || "").trim();
+      let label = team ? `${name} · ${team}` : name;
+      if (byLabel.has(label)) label = `${label} · #${id}`;
+      byLabel.set(label, { id, name, team, label });
+    });
+    return byLabel;
+  }, [players]);
+  const playerLabels = useMemo(() => Array.from(playerOptions.keys()), [playerOptions]);
+
   // Pull a real player's stored per-tier numbers into the form to inspect them.
-  const loadFromPlayer = async () => {
-    const pid = Number(loadPid);
-    if (!Number.isFinite(pid) || pid <= 0) return;
+  const loadFromPlayer = async (opt) => {
+    if (!opt) return;
+    setLoadError("");
     try {
-      const p = await api.get(`/players/${pid}`);
+      const p = await api.get(`/players/${opt.id}`);
       const next = { rating: p.rating != null ? String(p.rating) : "" };
       RATING_LAB_TIERS.forEach(({ tier }) => {
         next[`rating_top${tier}`] = p[`rating_top${tier}`] != null ? String(p[`rating_top${tier}`]) : "";
         next[`maps_top${tier}`] = p[`maps_top${tier}`] != null ? String(p[`maps_top${tier}`]) : "";
       });
       setStats(next);
-    } catch {
-      /* ignore */
+      setLoaded(opt);
+      setEdited(false);
+      setLoadQuery("");
+    } catch (e) {
+      setLoadError(e?.message || "Could not load that player.");
     }
+  };
+  // Picking a suggestion (or typing a full label) loads that player; Enter
+  // accepts the only remaining match.
+  const onLoadQueryChange = (text) => {
+    setLoadQuery(text);
+    const opt = playerOptions.get(text);
+    if (opt) loadFromPlayer(opt);
+  };
+  const onLoadEnter = (matches) => {
+    const opt = playerOptions.get(loadQuery) || (matches.length === 1 ? playerOptions.get(matches[0]) : null);
+    if (opt) loadFromPlayer(opt);
   };
 
   const predictedRows = useMemo(() => {
@@ -11772,9 +11827,11 @@ function RatingLabTab({ players }) {
     return rows.map((r) => ({ rank: Number(r.rank), pct: Number(r.pct) * 100 })).sort((a, b) => a.rank - b.rank);
   }, [avg]);
 
+  const signed = (v) => `${Number(v) >= 0 ? "+" : ""}${Number(v).toFixed(3)}`;
+
   return (
     <Section title="Rating Lab — Top-X Curve Diagnostics">
-      <div className="stack">
+      <div className="stack lab">
         <div className="card sub">
           <h3>Example Player</h3>
           <p className="muted">
@@ -11782,66 +11839,74 @@ function RatingLabTab({ players }) {
             rank-adjusted curve the match engine would use. Leave the tier fields blank to see the average-curve
             fallback the system applies when a player has no Top-X data.
           </p>
-          <div className="grid two">
-            <Input label="Overall rating" value={stats.rating} onChange={(v) => setStat("rating", v)} placeholder="1.10" />
-            <div className="field">
-              <span>Load a real player's numbers</span>
-              <div className="actions" style={{ margin: 0 }}>
-                <input
-                  value={loadPid}
-                  onChange={(e) => setLoadPid(e.target.value)}
-                  placeholder="player id"
-                  style={{ maxWidth: 120 }}
-                />
-                <button className="secondary" onClick={loadFromPlayer} disabled={!loadPid}>
-                  Load
-                </button>
-              </div>
+          <div className="lab-toolbar">
+            <div className="lab-player">
+              <SuggestInput
+                label="Load a real player"
+                value={loadQuery}
+                onChange={onLoadQueryChange}
+                onEnter={onLoadEnter}
+                placeholder="Player name"
+                suggestions={playerLabels}
+              />
+            </div>
+            <Input label="Overall rating" value={stats.rating} onChange={(v) => setStat("rating", v)} placeholder="1.10" className="lab-rating" />
+            <div className="lab-status">
+              {loaded ? (
+                <>
+                  Showing <strong>{loaded.name}</strong>
+                  {loaded.team ? ` (${loaded.team})` : ""}
+                  {edited ? ", edited by hand" : ""}.{" "}
+                  <button type="button" className="lab-link" onClick={resetExample}>
+                    Back to the example
+                  </button>
+                </>
+              ) : (
+                "Hand-entered example. Search a player to load their stored numbers."
+              )}
+              {loadError && <span className="lab-status-error"> {loadError}</span>}
             </div>
           </div>
-          <table>
-            <thead>
-              <tr>
-                <th>Tier</th>
-                <th>Rating vs Top-N</th>
-                <th>Maps vs Top-N</th>
-              </tr>
-            </thead>
-            <tbody>
+
+          <div className="lab-workbench">
+            <div className="lab-tiers">
+              <span className="lab-tier-head">Tier</span>
+              <span className="lab-tier-head">Rating vs Top-N</span>
+              <span className="lab-tier-head">Maps</span>
               {RATING_LAB_TIERS.map(({ tier, label }) => (
-                <tr key={`in-${tier}`}>
-                  <td style={{ color: TIER_COLORS[tier], fontWeight: 700 }}>{label}</td>
-                  <td>
-                    <input
-                      value={stats[`rating_top${tier}`]}
-                      onChange={(e) => setStat(`rating_top${tier}`, e.target.value)}
-                      placeholder="—"
-                      style={{ maxWidth: 120 }}
-                    />
-                  </td>
-                  <td>
-                    <input
-                      value={stats[`maps_top${tier}`]}
-                      onChange={(e) => setStat(`maps_top${tier}`, e.target.value)}
-                      placeholder="—"
-                      style={{ maxWidth: 120 }}
-                    />
-                  </td>
-                </tr>
+                <Fragment key={`in-${tier}`}>
+                  <span className="lab-tier-name" style={{ color: TIER_COLORS[tier] }}>
+                    {label}
+                  </span>
+                  <input
+                    value={stats[`rating_top${tier}`]}
+                    onChange={(e) => setStat(`rating_top${tier}`, e.target.value)}
+                    placeholder="—"
+                    inputMode="decimal"
+                  />
+                  <input
+                    value={stats[`maps_top${tier}`]}
+                    onChange={(e) => setStat(`maps_top${tier}`, e.target.value)}
+                    placeholder="—"
+                    inputMode="numeric"
+                  />
+                </Fragment>
               ))}
-            </tbody>
-          </table>
-          {previewError && <p className="muted">{previewError}</p>}
-          {preview && (
-            <>
-              <p className="muted">
-                {preview.used_average_fallback
-                  ? "No per-tier data → using the average degradation curve on top of the overall rating."
-                  : "Rank-adjusted from the entered Top-X buckets (with sample shrinkage toward the overall rating)."}
+              <p className="lab-note">
+                {previewError
+                  ? previewError
+                  : preview
+                    ? preview.used_average_fallback
+                      ? "No per-tier data: the average degradation curve is applied on top of the overall rating."
+                      : "Rank-adjusted from the entered Top-X buckets, with sample shrinkage toward the overall rating."
+                    : "Computing the preview..."}
               </p>
-              <div className="value-chart-wrap">
+            </div>
+
+            <div className="value-chart-wrap lab-chart">
+              {preview ? (
                 <ResponsiveContainer width="100%" height={340}>
-                  <ComposedChart data={predictedRows} margin={{ top: 12, right: 18, left: 6, bottom: 12 }}>
+                  <ComposedChart data={predictedRows} margin={{ top: 8, right: 18, left: 6, bottom: 26 }}>
                     <CartesianGrid stroke="#232a34" strokeDasharray="3 3" />
                     <XAxis
                       type="number"
@@ -11852,7 +11917,7 @@ function RatingLabTab({ players }) {
                       tick={{ fill: "#9fb2c9", fontSize: 12 }}
                       axisLine={{ stroke: "#3a4452" }}
                       tickLine={{ stroke: "#3a4452" }}
-                      label={{ value: "Opponent HLTV rank", position: "insideBottom", offset: -4, fill: "#7f97bd", fontSize: 11 }}
+                      label={{ value: "Opponent HLTV rank", position: "insideBottom", offset: -16, fill: "#7f97bd", fontSize: 11 }}
                     />
                     <YAxis
                       tick={{ fill: "#9fb2c9", fontSize: 12 }}
@@ -11861,13 +11926,14 @@ function RatingLabTab({ players }) {
                       domain={predictedAxis.domain}
                       ticks={predictedAxis.ticks}
                       tickFormatter={(v) => Number(v).toFixed(2)}
+                      width={44}
                     />
                     <Tooltip
                       contentStyle={{ background: "#14181f", border: "1px solid #3a4452", borderRadius: 10, color: "#e9edf3" }}
                       formatter={(value, name) => [value == null ? "—" : Number(value).toFixed(3), name]}
                       labelFormatter={(v) => `Rank ${v}`}
                     />
-                    <Legend wrapperStyle={{ color: "#9fb2c9" }} />
+                    <Legend verticalAlign="top" align="right" height={26} iconSize={10} wrapperStyle={{ color: "#9fb2c9", fontSize: 12 }} />
                     <Line
                       type="linear"
                       data={predictedRows}
@@ -11882,45 +11948,44 @@ function RatingLabTab({ players }) {
                     <Scatter data={anchorRows} dataKey="rating" name="Tier anchors" fill="#f97316" isAnimationActive={false} />
                   </ComposedChart>
                 </ResponsiveContainer>
-              </div>
-              <table>
-                <thead>
-                  <tr>
-                    <th>Bucket</th>
-                    <th>Raw rating</th>
-                    <th>Adjusted rating</th>
-                    <th>Raw delta</th>
-                    <th>Shrunk delta</th>
-                    <th>Sample weight</th>
-                    <th>Maps</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(preview.bucket_rows || [])
-                    .filter((r) => Number(r.tier) > 0 && Number(r.tier) < 100)
-                    .map((r) => (
-                      <tr key={`br-${r.tier}`} style={r.estimated ? { opacity: 0.6 } : undefined}>
-                        <td style={{ color: TIER_COLORS[Number(r.tier)], fontWeight: 700 }}>
-                          {r.tier_label}
-                          {r.estimated && <span className="muted" style={{ fontWeight: 400 }}> (est.)</span>}
-                        </td>
-                        <td>{Number(r.raw_bucket_rating).toFixed(3)}</td>
-                        <td>{Number(r.bucket_rating).toFixed(3)}</td>
-                        <td>
-                          {Number(r.raw_bucket_delta) >= 0 ? "+" : ""}
-                          {Number(r.raw_bucket_delta).toFixed(3)}
-                        </td>
-                        <td>
-                          {Number(r.bucket_delta) >= 0 ? "+" : ""}
-                          {Number(r.bucket_delta).toFixed(3)}
-                        </td>
-                        <td>{Math.round(Number(r.shrinkage_weight) * 100)}%</td>
-                        <td>{Math.round(Number(r.maps || 0))}</td>
-                      </tr>
-                    ))}
-                </tbody>
-              </table>
-            </>
+              ) : (
+                <div className="lab-chart-empty">{previewError || "Computing the preview..."}</div>
+              )}
+            </div>
+          </div>
+
+          {preview && (
+            <table className="lab-table">
+              <thead>
+                <tr>
+                  <th>Bucket</th>
+                  <th>Raw rating</th>
+                  <th>Adjusted rating</th>
+                  <th>Raw delta</th>
+                  <th>Shrunk delta</th>
+                  <th>Sample weight</th>
+                  <th>Maps</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(preview.bucket_rows || [])
+                  .filter((r) => Number(r.tier) > 0 && Number(r.tier) < 100)
+                  .map((r) => (
+                    <tr key={`br-${r.tier}`} className={r.estimated ? "est" : undefined}>
+                      <td className="lab-tier-name" style={{ color: TIER_COLORS[Number(r.tier)] }}>
+                        {r.tier_label}
+                        {r.estimated && <span className="lab-est">est.</span>}
+                      </td>
+                      <td>{Number(r.raw_bucket_rating).toFixed(3)}</td>
+                      <td>{Number(r.bucket_rating).toFixed(3)}</td>
+                      <td>{signed(r.raw_bucket_delta)}</td>
+                      <td>{signed(r.bucket_delta)}</td>
+                      <td>{Math.round(Number(r.shrinkage_weight) * 100)}%</td>
+                      <td>{Math.round(Number(r.maps || 0))}</td>
+                    </tr>
+                  ))}
+              </tbody>
+            </table>
           )}
         </div>
 
@@ -11945,9 +12010,9 @@ function RatingLabTab({ players }) {
           {avgError && <p className="muted">{avgError}</p>}
           {avg && (
             <>
-              <div className="value-chart-wrap">
+              <div className="value-chart-wrap lab-chart">
                 <ResponsiveContainer width="100%" height={360}>
-                  <ComposedChart margin={{ top: 12, right: 18, left: 6, bottom: 12 }}>
+                  <ComposedChart margin={{ top: 8, right: 18, left: 6, bottom: 26 }}>
                     <CartesianGrid stroke="#232a34" strokeDasharray="3 3" />
                     <XAxis
                       type="number"
@@ -11958,7 +12023,7 @@ function RatingLabTab({ players }) {
                       tick={{ fill: "#9fb2c9", fontSize: 12 }}
                       axisLine={{ stroke: "#3a4452" }}
                       tickLine={{ stroke: "#3a4452" }}
-                      label={{ value: "Opponent HLTV rank (tier midpoint)", position: "insideBottom", offset: -4, fill: "#7f97bd", fontSize: 11 }}
+                      label={{ value: "Opponent HLTV rank (tier midpoint)", position: "insideBottom", offset: -16, fill: "#7f97bd", fontSize: 11 }}
                     />
                     <YAxis
                       type="number"
@@ -12002,7 +12067,7 @@ function RatingLabTab({ players }) {
                         );
                       }}
                     />
-                    <Legend wrapperStyle={{ color: "#9fb2c9" }} />
+                    <Legend verticalAlign="top" align="right" height={26} iconSize={10} wrapperStyle={{ color: "#9fb2c9", fontSize: 12 }} />
                     {RATING_LAB_TIERS.map(({ tier, label }) => (
                       <Scatter
                         key={`sc-${tier}`}
@@ -12027,7 +12092,7 @@ function RatingLabTab({ players }) {
                   </ComposedChart>
                 </ResponsiveContainer>
               </div>
-              <table>
+              <table className="lab-table">
                 <thead>
                   <tr>
                     <th>Tier</th>
@@ -12043,7 +12108,9 @@ function RatingLabTab({ players }) {
                     const fmt = (v) => (v == null ? "—" : `${v >= 0 ? "+" : ""}${(v * 100).toFixed(1)}%`);
                     return (
                       <tr key={`avt-${t.tier}`}>
-                        <td style={{ color: TIER_COLORS[t.tier], fontWeight: 700 }}>{t.tier_label}</td>
+                        <td className="lab-tier-name" style={{ color: TIER_COLORS[t.tier] }}>
+                          {t.tier_label}
+                        </td>
                         <td>{t.count}</td>
                         <td>{fmt(t.weighted_mean_pct)}</td>
                         <td>{fmt(t.mean_pct)}</td>

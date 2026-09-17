@@ -4000,3 +4000,119 @@ button:disabled {
 .update-modal { width: min(520px, 92vw); background: #12161c; border: 1px solid #2c3441; border-top: 3px solid #ff6b1a; padding: 24px 28px 22px; }
 .update-modal h1 { margin: 0 0 10px; font-family: var(--display); font-size: 26px; line-height: 1.05; text-transform: uppercase; letter-spacing: 0.02em; color: #f2f5f9; }
 .update-modal p { margin: 0 0 6px; color: #c6d0dc; font-size: 15px; line-height: 1.5; }
+
+/* Rating Lab: the example-player workbench. Inputs sit beside the chart
+   instead of every control stretching across the window. */
+.lab { max-width: 1480px; }
+.lab-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px 18px;
+  margin: 6px 0 16px;
+}
+.lab-toolbar .field { margin-bottom: 0; }
+.lab-toolbar .lab-player { width: 340px; max-width: 100%; }
+.lab-toolbar .lab-rating { width: 150px; }
+.lab-toolbar .lab-rating input {
+  font-family: var(--display);
+  font-stretch: condensed;
+  font-size: 22px;
+  font-weight: 700;
+  padding: 3px 10px;
+  font-variant-numeric: tabular-nums;
+}
+.lab-status {
+  color: #8fa3bf;
+  font-size: 12.5px;
+  line-height: 1.5;
+  padding-bottom: 9px;
+  flex: 1 1 260px;
+}
+.lab-status strong { color: #e9edf3; }
+.lab-status-error { color: #fca5a5; }
+.lab-link {
+  background: none;
+  border: none;
+  padding: 0;
+  color: #ff8a47;
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.lab-link:hover { color: #ffb184; }
+
+.lab-workbench {
+  display: grid;
+  grid-template-columns: 380px minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+@media (max-width: 1150px) {
+  .lab-workbench { grid-template-columns: 1fr; }
+}
+
+/* Tier inputs: label | rating | maps, with the tier name in the broadcast face */
+.lab-tiers {
+  display: grid;
+  grid-template-columns: 76px 1fr 1fr;
+  gap: 8px 10px;
+  align-items: center;
+  background: #10141a;
+  border: 1px solid #242b35;
+  padding: 12px 14px 14px;
+}
+.lab-tier-head {
+  color: #8fa3bf;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding-bottom: 2px;
+}
+.lab-tier-name {
+  font-family: var(--display);
+  font-stretch: condensed;
+  font-weight: 700;
+  font-size: 18px;
+  letter-spacing: 0.01em;
+}
+.lab-tiers input {
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  padding: 7px 8px;
+}
+.lab-tiers input::placeholder { color: #3a4452; }
+.lab-note {
+  grid-column: 1 / -1;
+  margin: 8px 0 0;
+  color: #8fa3bf;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.value-chart-wrap.lab-chart { height: auto; min-height: 340px; }
+.lab-chart-empty {
+  min-height: 328px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #8fa3bf;
+}
+
+/* Compact diagnostic tables */
+.lab-table { margin-top: 16px; }
+.lab-table th, .lab-table td {
+  padding: 7px 12px;
+  font-variant-numeric: tabular-nums;
+}
+.lab-table tr.est td { color: #8fa3bf; }
+.lab-est {
+  margin-left: 6px;
+  font-family: var(--body, inherit);
+  font-weight: 400;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #6b7f9b;
+}
