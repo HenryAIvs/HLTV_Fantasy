@@ -785,6 +785,48 @@ function ServerGate({ status, config, error, checkedAt, retry }) {
   );
 }
 
+// A component error used to unmount the whole page (blank window). Now it
+// stays inside the tab that threw, is reported to the app log, and can be
+// retried in place.
+class TabErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+  componentDidCatch(error, info) {
+    try {
+      window.api?.reportError?.({ where: this.props.name || "tab", message: String(error?.message || error), stack: String(error?.stack || ""), component: String(info?.componentStack || "").slice(0, 2000) });
+    } catch {
+      /* reporting must never throw */
+    }
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="card">
+          <header>
+            <h2>This page hit an error</h2>
+          </header>
+          <p className="muted">{String(this.state.error?.message || this.state.error)}</p>
+          <div className="actions">
+            <button className="primary" onClick={() => this.setState({ error: null })}>
+              Try again
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+if (typeof window !== "undefined") {
+  window.addEventListener("error", (e) => window.api?.reportError?.({ where: "window", message: String(e?.message || ""), stack: String(e?.error?.stack || "") }));
+  window.addEventListener("unhandledrejection", (e) => window.api?.reportError?.({ where: "promise", message: String(e?.reason?.message || e?.reason || ""), stack: String(e?.reason?.stack || "") }));
+}
+
 const TabButton = ({ active, onClick, children }) => (
   <button className={active ? "tab active" : "tab"} onClick={onClick}>
     {children}
@@ -11925,6 +11967,147 @@ function RatingLabTab({ players }) {
   );
 }
 
+function useBackfillJob(basePath, jobLabel) {
+  const [status, setStatus] = useState("idle");
+  const [jobId, setJobId] = useState("");
+  const [processed, setProcessed] = useState(0);
+  const [total, setTotal] = useState(0);
+  const [ok, setOk] = useState(0);
+  const [failed, setFailed] = useState(0);
+  const [current, setCurrent] = useState("");
+  const [lastError, setLastError] = useState("");
+  const [etaSeconds, setEtaSeconds] = useState(null);
+  // True only once the user acts on the job in THIS mounted session, so a
+  // stale error hydrated from a previous run stays hidden.
+  const [interacted, setInteracted] = useState(false);
+  const pollingRef = useRef(false);
+  const onSettledRef = useRef(null);
+
+  const apply = (data, jobIdOverride = "") => {
+    const id = String(jobIdOverride || data?.job_id || "");
+    const nextStatus = String(data?.status || "queued");
+    const nextProcessed = Number(data?.processed_items || 0);
+    const nextTotal = Number(data?.total_items || 0);
+    setStatus(nextStatus);
+    setJobId(id);
+    setProcessed(nextProcessed);
+    setTotal(nextTotal);
+    setOk(Number(data?.ok || 0));
+    setFailed(Number(data?.failed || 0));
+    setCurrent(String(data?.current_item || ""));
+    setLastError(String(data?.last_error || data?.error || ""));
+    const startedAtMs = getBatchStartedAtMs(data);
+    if (nextProcessed > 0 && nextTotal > nextProcessed && ["queued", "running", "pausing", "canceling"].includes(nextStatus)) {
+      const elapsedSeconds = Math.max(1, (Date.now() - startedAtMs) / 1000);
+      const rate = nextProcessed / elapsedSeconds;
+      setEtaSeconds(rate > 0 ? (nextTotal - nextProcessed) / rate : null);
+    } else {
+      setEtaSeconds(null);
+    }
+    return { jobId: id, nextStatus };
+  };
+
+  const poll = async (id) => {
+    if (!id || pollingRef.current) return;
+    pollingRef.current = true;
+    try {
+      let done = false;
+      let pollFailures = 0;
+      while (!done) {
+        let data;
+        try {
+          data = await api.get(`${basePath}/job/${id}`, 60000);
+          pollFailures = 0;
+        } catch (pollError) {
+          pollFailures += 1;
+          if (pollFailures >= 5) throw pollError;
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+          continue;
+        }
+        const applied = apply(data, id);
+        if (["completed", "failed", "paused", "canceled"].includes(applied.nextStatus)) {
+          if (onSettledRef.current) onSettledRef.current();
+          done = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+    } catch (e) {
+      setStatus("failed");
+      setLastError(String(e?.message || `Failed to poll ${jobLabel} job.`));
+    } finally {
+      pollingRef.current = false;
+    }
+  };
+
+  const start = async () => {
+    setInteracted(true);
+    setStatus("queued");
+    setProcessed(0);
+    setTotal(0);
+    setOk(0);
+    setFailed(0);
+    setLastError("");
+    setCurrent("");
+    try {
+      const res = await api.post(`${basePath}/start`, {});
+      const id = String(res?.job_id || "");
+      if (!id) throw new Error(`Failed to start ${jobLabel} job.`);
+      setJobId(id);
+      await poll(id);
+    } catch (e) {
+      setStatus("failed");
+      setLastError(String(e?.message || `Failed to start ${jobLabel} job.`));
+    }
+  };
+
+  const control = async (action) => {
+    if (!jobId) return;
+    setInteracted(true);
+    try {
+      const res = await api.post(`${basePath}/job/${jobId}/${action}`, {});
+      const applied = apply(res, jobId);
+      if (["queued", "running", "pausing", "canceling"].includes(applied.nextStatus)) poll(jobId);
+    } catch (e) {
+      setLastError(String(e?.message || `Failed to ${action} ${jobLabel} job.`));
+    }
+  };
+
+  const hydrate = async () => {
+    try {
+      const latest = await api.get(`${basePath}/latest`);
+      if (!latest?.exists) return;
+      if (["completed", "canceled"].includes(String(latest?.status || ""))) return;
+      const applied = apply(latest);
+      if (["queued", "running", "pausing", "canceling"].includes(applied.nextStatus)) poll(applied.jobId);
+    } catch {
+      // Optional panel; ignore startup failures.
+    }
+  };
+
+  return {
+    status,
+    jobId,
+    processed,
+    total,
+    ok,
+    failed,
+    current,
+    lastError,
+    interacted,
+    etaSeconds,
+    active: ["queued", "running", "pausing", "canceling"].includes(status),
+    resumable: ["paused", "failed"].includes(status),
+    pctDone: total > 0 ? Math.min(100, Math.max(0, (processed / total) * 100)) : 0,
+    start,
+    pause: () => control("pause"),
+    cancel: () => control("cancel"),
+    resume: () => control("resume"),
+    hydrate,
+    onSettledRef,
+  };
+}
+
 function ModelLabTab() {
   const [trainLimit, setTrainLimit] = useState("0");
   const [testLimit, setTestLimit] = useState("0");
@@ -15193,7 +15376,11 @@ export default function App() {
             ))}
           </nav>
 
-          <main className="content">{contentMap[active]}</main>
+          <main className="content">
+            <TabErrorBoundary key={active} name={active}>
+              {contentMap[active]}
+            </TabErrorBoundary>
+          </main>
         </div>
       )}
     </>

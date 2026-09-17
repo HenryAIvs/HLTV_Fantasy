@@ -81,6 +81,8 @@ contextBridge.exposeInMainWorld("api", {
     ipcRenderer.on("update-status", (_event, status) => callback(status));
   },
   installUpdate: () => ipcRenderer.invoke("install-update"),
+  // Renderer-side errors go to the app log (updater.log in the data folder).
+  reportError: (info) => ipcRenderer.send("renderer-error", info),
   auth: {
     get: () => AUTH_TOKEN,
     set: (token) => {

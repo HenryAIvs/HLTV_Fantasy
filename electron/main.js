@@ -359,6 +359,9 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => ulog("info", "before-quit"));
+ipcMain.on("renderer-error", (_event, info) => ulog("error", "renderer", info));
+app.on("render-process-gone", (_event, _contents, details) => ulog("error", "render-process-gone", details));
+app.on("child-process-gone", (_event, details) => ulog("error", "child-process-gone", details));
 process.on("uncaughtException", (err) => {
   ulog("error", "uncaughtException", String(err?.stack || err));
 });
