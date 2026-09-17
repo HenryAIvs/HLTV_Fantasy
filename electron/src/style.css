@@ -4140,7 +4140,10 @@ button:disabled {
 }
 .pool-legend span { display: inline-flex; align-items: center; gap: 7px; }
 .pool-legend i.dot { width: 9px; height: 9px; border-radius: 50%; background: #8fa3bf; opacity: 0.6; }
-.pool-legend i.line { width: 18px; height: 3px; background: #ff6b1a; }
+.pool-legend i.box { width: 12px; height: 11px; border: 1.5px solid #8fa3bf; background: rgba(143, 163, 191, 0.22); }
+.pool-legend i.tick { width: 14px; height: 2.5px; background: #f2f5f9; }
+.pool-legend i.whisker { width: 1.5px; height: 12px; background: #8fa3bf; }
+.pool-legend i.line { width: 18px; height: 2.5px; background: #f2f5f9; }
 .pool-tooltip {
   background: #14181f;
   border: 1px solid #3a4452;
@@ -4160,6 +4163,7 @@ button:disabled {
 }
 .pool-tiles { margin-top: 14px; }
 .pool-tiles .topx-tile-value { font-variant-numeric: tabular-nums; }
+.pool-tiles .topx-tile-label { font-weight: 700; }
 .pool-tile-rows {
   display: grid;
   grid-template-columns: auto 1fr;
