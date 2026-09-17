@@ -4027,7 +4027,7 @@ button:disabled {
   display: grid;
   grid-template-columns: 380px minmax(0, 1fr);
   gap: 18px;
-  align-items: start;
+  align-items: stretch;
 }
 @media (max-width: 1150px) {
   .lab-workbench { grid-template-columns: 1fr; }
@@ -4039,6 +4039,8 @@ button:disabled {
   grid-template-columns: 76px 1fr 1fr;
   gap: 8px 10px;
   align-items: center;
+  /* fills the column beside the chart: rows spread instead of leaving a gap */
+  align-content: space-between;
   background: #10141a;
   border: 1px solid #242b35;
   padding: 12px 14px 14px;

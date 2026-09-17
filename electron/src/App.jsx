@@ -11432,7 +11432,9 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
 // Top-X curve: the player card's "Top X" tab and the Rating Lab draw the same
 // chart and table from these, so the two can never drift apart. `curve` is the
 // /players/{id}/rating-curve payload (the lab preview has the same shape).
-const TOPX_SERIES = { predicted: "#8aa0c6", shifted: "#a78bfa", actual: "#f0a763", actualDot: "#f97316", weighted: "#22d3ee" };
+// Orange is the number the engine uses, white dots are what HLTV observed,
+// cyan is the player-adjusted baseline and grey the population baseline.
+const TOPX_SERIES = { predicted: "#6b7f9b", shifted: "#22d3ee", actual: "#f2f5f9", actualDot: "#f2f5f9", weighted: "#ff6b1a" };
 
 const deriveTopXCurve = (curve) => {
   const bucketRows = (Array.isArray(curve?.bucket_rows) ? curve.bucket_rows : [])
@@ -11556,7 +11558,7 @@ const TopXCurveChart = ({ topx, height = 260 }) => (
             >
               <div style={{ fontWeight: 700, marginBottom: 4 }}>Rank {label}</div>
               {rows.map((p, i) => {
-                const maps = p.name === "Actual (observed)" ? p.payload?.maps : null;
+                const maps = p.name === "Actual" ? p.payload?.maps : null;
                 return (
                   <div key={i} style={{ display: "flex", alignItems: "center", gap: 7 }}>
                     <span
@@ -11580,11 +11582,12 @@ const TopXCurveChart = ({ topx, height = 260 }) => (
           );
         }}
       />
-      <Legend wrapperStyle={{ color: "#9fb2c9" }} />
+      {/* itemSorter null: legend follows the series order below, which is the table's column order */}
+      <Legend itemSorter={null} wrapperStyle={{ color: "#9fb2c9" }} />
       <Line
         type="linear"
         dataKey="predictedRating"
-        name="Predicted (avg curve)"
+        name="Predicted"
         stroke={TOPX_SERIES.predicted}
         strokeWidth={1.8}
         strokeDasharray="5 4"
@@ -11596,7 +11599,7 @@ const TopXCurveChart = ({ topx, height = 260 }) => (
         <Line
           type="linear"
           dataKey="shiftedRating"
-          name={`Predicted + shift (${topx.shift >= 0 ? "+" : ""}${topx.shift.toFixed(3)})`}
+          name="+ Shift"
           stroke={TOPX_SERIES.shifted}
           strokeWidth={1.8}
           strokeDasharray="2 4"
@@ -11605,17 +11608,17 @@ const TopXCurveChart = ({ topx, height = 260 }) => (
           isAnimationActive={false}
         />
       )}
+      <Scatter data={topx.actualPoints} dataKey="rating" name="Actual" fill={TOPX_SERIES.actualDot} isAnimationActive={false} />
       <Line
         type="linear"
         dataKey="finalRating"
-        name="Weighted (used)"
+        name="Weighted"
         stroke={TOPX_SERIES.weighted}
         strokeWidth={2.4}
         dot={{ r: 3, fill: TOPX_SERIES.weighted, strokeWidth: 0 }}
         connectNulls={false}
         isAnimationActive={false}
       />
-      <Scatter data={topx.actualPoints} dataKey="rating" name="Actual (observed)" fill={TOPX_SERIES.actualDot} isAnimationActive={false} />
     </ComposedChart>
   </ResponsiveContainer>
 );
@@ -11943,7 +11946,7 @@ function RatingLabTab({ players }) {
                 <>
                   <TopXCurveSummary curve={curve} />
                   <div className="value-chart-wrap topx-chart">
-                    <TopXCurveChart topx={topx} height={300} />
+                    <TopXCurveChart topx={topx} height={260} />
                   </div>
                 </>
               ) : (
