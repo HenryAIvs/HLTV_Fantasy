@@ -951,7 +951,10 @@ const Input = ({ label, value, onChange, type = "text", placeholder = "", classN
 const SuggestInput = ({ label, value, onChange, placeholder = "", suggestions = [], actions = null, onEnter = null }) => {
   const [open, setOpen] = useState(false);
   const q = String(value || "").trim().toLowerCase();
-  const matches = q ? suggestions.filter((s) => s.toLowerCase().includes(q)).slice(0, 8) : [];
+  const found = q ? suggestions.filter((s) => s.toLowerCase().includes(q)).slice(0, 8) : [];
+  // A plain picker has nothing to offer once the box holds an exact entry;
+  // a box with actions keeps the row so Include/Exclude stay clickable.
+  const matches = actions ? found : found.filter((s) => s !== value);
   return (
     <label className="field suggest-field">
       <span>{label}</span>
@@ -11755,6 +11758,7 @@ function RatingLabTab({ players }) {
     setLoaded(null);
     setEdited(false);
     setLoadError("");
+    setLoadQuery("");
   };
 
   const ratingOk = Number.isFinite(Number(stats.rating)) && Number(stats.rating) > 0;
@@ -11847,15 +11851,20 @@ function RatingLabTab({ players }) {
       setStats(next);
       setLoaded(opt);
       setEdited(false);
-      setLoadQuery("");
+      setLoadQuery(opt.label);
     } catch (e) {
       setLoadError(e?.message || "Could not load that player.");
     }
   };
-  // Picking a suggestion (or typing a full label) loads that player; Enter
-  // accepts the only remaining match.
+  // Picking a suggestion (or typing a full label) loads that player and the
+  // name stays in the box; Enter accepts the only remaining match; emptying
+  // the box clears the lab.
   const onLoadQueryChange = (text) => {
     setLoadQuery(text);
+    if (text === "") {
+      clearAll();
+      return;
+    }
     const opt = playerOptions.get(text);
     if (opt) loadFromPlayer(opt);
   };
@@ -11891,11 +11900,6 @@ function RatingLabTab({ players }) {
       <div className="stack lab">
         <div className="card sub">
           <h3>Inspect a player</h3>
-          <p className="muted">
-            Search a player to see the Top-X curve their card shows and the match engine uses, or type an overall
-            rating and any "rating vs Top-N" values (with maps played) to test a hypothetical. Tiers left blank fall
-            back to the average curve.
-          </p>
           <div className="lab-toolbar">
             <div className="lab-player">
               <SuggestInput
@@ -11908,28 +11912,6 @@ function RatingLabTab({ players }) {
               />
             </div>
             <Input label="Overall rating" value={stats.rating} onChange={(v) => setStat("rating", v)} placeholder="1.10" className="lab-rating" />
-            <div className="lab-status">
-              {loaded ? (
-                <>
-                  Showing <strong>{loaded.name}</strong>
-                  {loaded.team ? ` (${loaded.team})` : ""}
-                  {edited ? ", edited by hand" : ", as on their card"}.{" "}
-                  <button type="button" className="lab-link" onClick={clearAll}>
-                    Clear
-                  </button>
-                </>
-              ) : ratingOk ? (
-                <>
-                  Hypothetical player.{" "}
-                  <button type="button" className="lab-link" onClick={clearAll}>
-                    Clear
-                  </button>
-                </>
-              ) : (
-                "Nothing loaded. Search a player, or type an overall rating to start a hypothetical."
-              )}
-              {loadError && <span className="lab-status-error"> {loadError}</span>}
-            </div>
           </div>
 
           <div className="lab-workbench">
@@ -11957,8 +11939,8 @@ function RatingLabTab({ players }) {
                 </Fragment>
               ))}
               <p className="lab-note">
-                {curveError
-                  ? curveError
+                {loadError || curveError
+                  ? loadError || curveError
                   : !loaded && !ratingOk
                     ? "Blank tiers use the average curve; a tier only pulls the curve toward its own rating once it has maps behind it."
                     : hasCurve

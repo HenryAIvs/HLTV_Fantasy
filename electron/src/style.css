@@ -4022,26 +4022,6 @@ button:disabled {
   padding: 3px 10px;
   font-variant-numeric: tabular-nums;
 }
-.lab-status {
-  color: #8fa3bf;
-  font-size: 12.5px;
-  line-height: 1.5;
-  padding-bottom: 9px;
-  flex: 1 1 260px;
-}
-.lab-status strong { color: #e9edf3; }
-.lab-status-error { color: #fca5a5; }
-.lab-link {
-  background: none;
-  border: none;
-  padding: 0;
-  color: #ff8a47;
-  font: inherit;
-  cursor: pointer;
-  text-decoration: underline;
-  text-underline-offset: 2px;
-}
-.lab-link:hover { color: #ffb184; }
 
 .lab-workbench {
   display: grid;
