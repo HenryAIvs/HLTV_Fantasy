@@ -10,6 +10,7 @@ import {
   Pie,
   PieChart,
   Rectangle,
+  ReferenceLine,
   ResponsiveContainer,
   Scatter,
   Tooltip,
@@ -11674,7 +11675,6 @@ const RATING_LAB_TIERS = [
   { tier: 30, label: "Top 30" },
   { tier: 50, label: "Top 50" },
 ];
-const TIER_COLORS = { 5: "#f97316", 10: "#eab308", 20: "#22d3ee", 30: "#a78bfa", 50: "#34d399" };
 
 const RATING_LAB_BLANK = {
   rating: "",
@@ -11834,18 +11834,11 @@ function RatingLabTab({ players }) {
   const topx = useMemo(() => deriveTopXCurve(curve), [curve]);
   const hasCurve = Boolean(curve) && topx.bucketRows.length > 0;
 
-  // Average population view: scatter every per-tier delta, one series per tier.
-  const scatterByTier = useMemo(() => {
+  // Average population view: every player's per-tier deviation as one dot at
+  // the tier's rank midpoint (fraction → percent for display).
+  const poolPoints = useMemo(() => {
     const pts = Array.isArray(avg?.points) ? avg.points : [];
-    const grouped = {};
-    RATING_LAB_TIERS.forEach(({ tier }) => (grouped[tier] = []));
-    pts.forEach((p) => {
-      const tier = Number(p.tier);
-      if (!grouped[tier]) grouped[tier] = [];
-      // percentage deviation vs overall (fraction → percent for display)
-      grouped[tier].push({ rank: Number(p.rank_midpoint), pct: Number(p.pct) * 100, name: p.name, maps: p.maps });
-    });
-    return grouped;
+    return pts.map((p) => ({ rank: Number(p.rank_midpoint), pct: Number(p.pct) * 100, name: p.name, maps: p.maps }));
   }, [avg]);
   const avgLineRows = useMemo(() => {
     const rows = Array.isArray(avg?.average_curve) ? avg.average_curve : [];
@@ -11921,30 +11914,41 @@ function RatingLabTab({ players }) {
           )}
         </div>
 
-        <div className="card sub">
-          <h3>Average Player Top-X (whole pool)</h3>
-          <div className="actions" style={{ marginTop: 0 }}>
-            <button className="secondary" onClick={loadAverage} disabled={avgLoading}>
-              {avgLoading ? "Loading..." : "Refresh"}
-            </button>
-            {avg && (
-              <span className="muted">
-                {avg.sampled_players} players · {avg.point_count} tier data points
-              </span>
-            )}
+        <div className="card sub pool">
+          <div className="pool-head">
+            <h3>Average Player Top-X (whole pool)</h3>
+            <div className="pool-head-right">
+              {avg && (
+                <div className="pool-stats">
+                  <div className="pool-stat">
+                    <span className="pool-stat-value">{Number(avg.sampled_players || 0).toLocaleString()}</span>
+                    <span className="pool-stat-label">Players</span>
+                  </div>
+                  <div className="pool-stat">
+                    <span className="pool-stat-value">{Number(avg.point_count || 0).toLocaleString()}</span>
+                    <span className="pool-stat-label">Tier points</span>
+                  </div>
+                </div>
+              )}
+              <button className="secondary" onClick={loadAverage} disabled={avgLoading}>
+                {avgLoading ? "Loading..." : "Refresh"}
+              </button>
+            </div>
           </div>
-          <p className="muted">
-            Every player's per-tier deviation as a <strong>percentage of their own overall rating</strong> (so a 1.30 and
-            a 0.90 player are comparable), colored by tier, with the maps-weighted average curve the model shrinks toward.
-            The prior for any player is <code>overall × (1 + this %)</code>. Wide spread or a thin point count in a tier
-            means the Top-X import there is noisy or sparse.
-          </p>
-          {avgError && <p className="muted">{avgError}</p>}
+          {avgError && <p className="error">{avgError}</p>}
           {avg && (
             <>
-              <div className="value-chart-wrap lab-chart">
-                <ResponsiveContainer width="100%" height={360}>
-                  <ComposedChart margin={{ top: 8, right: 18, left: 6, bottom: 26 }}>
+              <div className="value-chart-wrap pool-chart">
+                <div className="pool-legend">
+                  <span>
+                    <i className="dot" /> Player tier
+                  </span>
+                  <span>
+                    <i className="line" /> Average
+                  </span>
+                </div>
+                <ResponsiveContainer width="100%" height={340}>
+                  <ComposedChart margin={{ top: 26, right: 18, left: 6, bottom: 22 }}>
                     <CartesianGrid stroke="#232a34" strokeDasharray="3 3" />
                     <XAxis
                       type="number"
@@ -11955,7 +11959,7 @@ function RatingLabTab({ players }) {
                       tick={{ fill: "#9fb2c9", fontSize: 12 }}
                       axisLine={{ stroke: "#3a4452" }}
                       tickLine={{ stroke: "#3a4452" }}
-                      label={{ value: "Opponent HLTV rank (tier midpoint)", position: "insideBottom", offset: -16, fill: "#7f97bd", fontSize: 11 }}
+                      label={{ value: "Opponent HLTV rank (tier midpoint)", position: "insideBottom", offset: -14, fill: "#7f97bd", fontSize: 11 }}
                     />
                     <YAxis
                       type="number"
@@ -11963,9 +11967,11 @@ function RatingLabTab({ players }) {
                       tick={{ fill: "#9fb2c9", fontSize: 12 }}
                       axisLine={{ stroke: "#3a4452" }}
                       tickLine={{ stroke: "#3a4452" }}
-                      tickFormatter={(v) => `${Number(v).toFixed(0)}%`}
-                      label={{ value: "% deviation vs overall", angle: -90, position: "insideLeft", fill: "#7f97bd", fontSize: 11 }}
+                      tickFormatter={(v) => `${Number(v) > 0 ? "+" : ""}${Number(v).toFixed(0)}%`}
+                      width={52}
+                      label={{ value: "% vs overall rating", angle: -90, position: "insideLeft", fill: "#7f97bd", fontSize: 11 }}
                     />
+                    <ReferenceLine y={0} stroke="#3a4452" strokeDasharray="4 4" />
                     <Tooltip
                       cursor={{ stroke: "#3a4452", strokeDasharray: "3 3" }}
                       content={({ active, payload }) => {
@@ -11978,81 +11984,49 @@ function RatingLabTab({ players }) {
                         if (!tier) return null;
                         const pct = tier.pct;
                         return (
-                          <div
-                            style={{
-                              background: "#14181f",
-                              border: "1px solid #3a4452",
-                              borderRadius: 10,
-                              color: "#e9edf3",
-                              padding: "8px 11px",
-                              fontSize: 13,
-                              lineHeight: 1.6,
-                            }}
-                          >
-                            <div style={{ fontWeight: 700, color: TIER_COLORS[tier.tier] }}>{tier.tier_label}</div>
+                          <div className="pool-tooltip">
+                            <div className="pool-tooltip-title">{tier.tier_label}</div>
                             <div>
-                              Avg deviation:{" "}
-                              <strong>{pct == null ? "—" : `${pct >= 0 ? "+" : ""}${(pct * 100).toFixed(1)}%`}</strong>
+                              Average <strong>{pct == null ? "—" : `${pct >= 0 ? "+" : ""}${(pct * 100).toFixed(1)}%`}</strong>
                             </div>
-                            <div style={{ color: "#7f97bd" }}>{tier.count} players</div>
+                            <div className="muted">{tier.count} players</div>
                           </div>
                         );
                       }}
                     />
-                    <Legend verticalAlign="top" align="right" height={26} iconSize={10} wrapperStyle={{ color: "#9fb2c9", fontSize: 12 }} />
-                    {RATING_LAB_TIERS.map(({ tier, label }) => (
-                      <Scatter
-                        key={`sc-${tier}`}
-                        data={scatterByTier[tier] || []}
-                        dataKey="pct"
-                        name={label}
-                        fill={TIER_COLORS[tier]}
-                        fillOpacity={0.5}
-                        isAnimationActive={false}
-                      />
-                    ))}
+                    <Scatter data={poolPoints} dataKey="pct" name="Player tier" fill="#8fa3bf" fillOpacity={0.3} isAnimationActive={false} />
                     <Line
                       type="linear"
                       data={avgLineRows}
                       dataKey="pct"
                       name="Average"
-                      stroke="#f8fafc"
-                      strokeWidth={2.4}
-                      dot={{ r: 4, fill: "#f8fafc" }}
+                      stroke="#ff6b1a"
+                      strokeWidth={2.6}
+                      dot={{ r: 4.5, fill: "#ff6b1a", stroke: "#0a0c10", strokeWidth: 1.5 }}
+                      activeDot={{ r: 6, fill: "#ff8a47", stroke: "#0a0c10", strokeWidth: 1.5 }}
                       isAnimationActive={false}
                     />
                   </ComposedChart>
                 </ResponsiveContainer>
               </div>
-              <table className="lab-table">
-                <thead>
-                  <tr>
-                    <th>Tier</th>
-                    <th>Data points</th>
-                    <th>Avg % (maps-weighted)</th>
-                    <th>Mean %</th>
-                    <th>Median %</th>
-                    <th>Prior % used</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(avg.tiers || []).map((t) => {
-                    const fmt = (v) => (v == null ? "—" : `${v >= 0 ? "+" : ""}${(v * 100).toFixed(1)}%`);
-                    return (
-                      <tr key={`avt-${t.tier}`}>
-                        <td className="lab-tier-name" style={{ color: TIER_COLORS[t.tier] }}>
-                          {t.tier_label}
-                        </td>
-                        <td>{t.count}</td>
-                        <td>{fmt(t.weighted_mean_pct)}</td>
-                        <td>{fmt(t.mean_pct)}</td>
-                        <td>{fmt(t.median_pct)}</td>
-                        <td>{fmt(t.pct)}</td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+              <div className="topx-tile-row pool-tiles">
+                {(avg.tiers || []).map((t) => {
+                  const fmt = (v) => (v == null ? "—" : `${v >= 0 ? "+" : ""}${(v * 100).toFixed(1)}%`);
+                  return (
+                    <div key={`pool-${t.tier}`} className="topx-tile">
+                      <div className="topx-tile-label">{t.tier_label}</div>
+                      <div className="topx-tile-value">{fmt(t.pct)}</div>
+                      <div className="topx-tile-maps">{Number(t.count || 0).toLocaleString()} players</div>
+                      <div className="pool-tile-rows">
+                        <span>Mean</span>
+                        <span>{fmt(t.mean_pct)}</span>
+                        <span>Median</span>
+                        <span>{fmt(t.median_pct)}</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
             </>
           )}
         </div>

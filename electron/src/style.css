@@ -4088,3 +4088,97 @@ button:disabled {
 .lab-curve > p.muted { margin: 0 0 2px; font-size: 12.5px; }
 .lab-table-wrap { margin-top: 16px; }
 .lab-table-wrap .topx-bucket-table td:first-child { font-weight: 600; }
+
+/* Rating Lab, whole-pool card: stat tiles in the head, steel scatter with the
+   orange average, one tile per tier */
+.pool-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.pool-head h3 { margin: 0; }
+.pool-head-right { display: flex; align-items: center; gap: 14px; }
+.pool-stats { display: flex; gap: 10px; }
+.pool-stat {
+  background: #171c24;
+  border: 1px solid #2c3441;
+  border-left: 3px solid #ff6b1a;
+  padding: 6px 12px 7px;
+  min-width: 96px;
+}
+.pool-stat-value {
+  display: block;
+  font-family: var(--display);
+  font-stretch: condensed;
+  font-weight: 700;
+  font-size: 24px;
+  line-height: 1.05;
+  color: #f2f5f9;
+  font-variant-numeric: tabular-nums;
+}
+.pool-stat-label {
+  display: block;
+  margin-top: 2px;
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #8fa3bf;
+}
+.value-chart-wrap.pool-chart { height: auto; position: relative; }
+.pool-legend {
+  position: absolute;
+  top: 12px;
+  right: 18px;
+  z-index: 2;
+  display: flex;
+  gap: 16px;
+  font-size: 12px;
+  color: #8fa3bf;
+}
+.pool-legend span { display: inline-flex; align-items: center; gap: 7px; }
+.pool-legend i.dot { width: 9px; height: 9px; border-radius: 50%; background: #8fa3bf; opacity: 0.6; }
+.pool-legend i.line { width: 18px; height: 3px; background: #ff6b1a; }
+.pool-tooltip {
+  background: #14181f;
+  border: 1px solid #3a4452;
+  border-left: 3px solid #ff6b1a;
+  color: #e9edf3;
+  padding: 8px 11px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.pool-tooltip-title {
+  font-family: var(--display);
+  font-stretch: condensed;
+  font-weight: 700;
+  font-size: 15px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.pool-tiles { margin-top: 14px; }
+.pool-tiles .topx-tile-value { font-variant-numeric: tabular-nums; }
+.pool-tile-rows {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 3px 10px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid #242b35;
+  font-size: 12.5px;
+  color: #c6d0dc;
+  font-variant-numeric: tabular-nums;
+}
+.pool-tile-rows span:nth-child(odd) {
+  color: #8fa3bf;
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  align-self: center;
+}
+.pool-tile-rows span:nth-child(even) { text-align: right; }
+@media (max-width: 1100px) {
+  .pool-tiles { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+}
