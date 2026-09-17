@@ -336,7 +336,27 @@ const useUpdateStatus = () => {
 function UpdateModal() {
   const status = useUpdateStatus();
   const [dismissedVersion, setDismissedVersion] = useState(null);
-  if (!status || status.status !== "downloaded" || dismissedVersion === (status.version || "?")) return null;
+  if (!status || dismissedVersion === (status.version || "?")) return null;
+  if (status.status === "blocked") {
+    return (
+      <div className="modal-backdrop update-modal-backdrop">
+        <div className="update-modal">
+          <p className="server-gate-kicker">Update blocked</p>
+          <h1>Windows would not run the update</h1>
+          <p>
+            Smart App Control on this PC refused to start the installer for version {status.version || ""} because the
+            app is not code-signed yet. You can keep using this version; a signed release will install normally.
+          </p>
+          <div className="server-gate-actions">
+            <button className="primary" onClick={() => setDismissedVersion(status.version || "?")}>
+              OK
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+  if (status.status !== "downloaded") return null;
   return (
     <div className="modal-backdrop update-modal-backdrop">
       <div className="update-modal">
@@ -366,6 +386,9 @@ function UpdateBanner() {
   }
   if (status.status === "downloading") {
     return <span className="titlebar-update muted">Downloading update {status.percent ? `${status.percent}%` : ""}</span>;
+  }
+  if (status.status === "blocked") {
+    return <span className="titlebar-update muted">Update {status.version ? `v${status.version} ` : ""}blocked by Windows</span>;
   }
   return null;
 }

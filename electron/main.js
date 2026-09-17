@@ -183,8 +183,37 @@ const ulog = (level, ...parts) => {
     /* logging must never break the app */
   }
 };
+// Versions whose installer Windows refused to run (Smart App Control blocks
+// unsigned files it has no reputation for). Remembered so the app stops
+// offering that version and explains instead.
+const blockedFile = () => path.join(app.getPath("userData"), "update-blocked.json");
+const readBlocked = () => {
+  try {
+    return JSON.parse(fs.readFileSync(blockedFile(), "utf8")) || {};
+  } catch {
+    return {};
+  }
+};
+let installBlocked = false;
+let pendingVersion = null;
+const noteBlocked = () => {
+  installBlocked = true;
+  const data = readBlocked();
+  if (pendingVersion) data[pendingVersion] = Date.now();
+  try {
+    fs.writeFileSync(blockedFile(), JSON.stringify(data));
+  } catch {
+    /* best effort */
+  }
+  sendUpdateStatus({ status: "blocked", version: pendingVersion });
+};
 const updaterLogger = {
-  info: (...a) => ulog("info", ...a),
+  info: (...a) => {
+    ulog("info", ...a);
+    // electron-updater reports a refused installer here, then quits the app;
+    // before-quit below cancels that quit.
+    if (a.some((x) => typeof x === "string" && x.startsWith("Cannot run installer"))) noteBlocked();
+  },
   warn: (...a) => ulog("warn", ...a),
   error: (...a) => ulog("error", ...a),
   debug: (...a) => ulog("debug", ...a),
@@ -209,7 +238,15 @@ const setupUpdater = () => {
   autoUpdater.on("update-not-available", () => sendUpdateStatus({ status: "none" }));
   autoUpdater.on("download-progress", (p) => sendUpdateStatus({ status: "downloading", percent: Math.round(p?.percent || 0) }));
   // The renderer shows an in-app prompt (UpdateModal) on "downloaded".
-  autoUpdater.on("update-downloaded", (info) => sendUpdateStatus({ status: "downloaded", version: info?.version }));
+  autoUpdater.on("update-downloaded", (info) => {
+    pendingVersion = info?.version || null;
+    if (pendingVersion && readBlocked()[pendingVersion]) {
+      ulog("info", "update previously blocked by Windows; not offering again", { version: pendingVersion });
+      sendUpdateStatus({ status: "blocked", version: pendingVersion });
+      return;
+    }
+    sendUpdateStatus({ status: "downloaded", version: pendingVersion });
+  });
   autoUpdater.on("error", (err) => sendUpdateStatus({ status: "error", message: String(err?.message || err) }));
   // Check shortly after launch, then every 30 minutes, and whenever the window
   // regains focus (at most once every 10 minutes) so a release published while
@@ -339,7 +376,16 @@ app.on("window-all-closed", () => {
   app.quit();
 });
 
-app.on("before-quit", () => ulog("info", "before-quit"));
+app.on("before-quit", (event) => {
+  if (installBlocked) {
+    // The installer never started; stay open rather than vanish.
+    installBlocked = false;
+    event.preventDefault();
+    ulog("warn", "quit cancelled: the update installer was blocked by Windows");
+    return;
+  }
+  ulog("info", "before-quit");
+});
 ipcMain.on("renderer-error", (_event, info) => ulog("error", "renderer", info));
 app.on("render-process-gone", (_event, _contents, details) => ulog("error", "render-process-gone", details));
 app.on("child-process-gone", (_event, details) => ulog("error", "child-process-gone", details));
