@@ -72,6 +72,73 @@ icon, installs per user, launches the app when done). Updates install
 silently and relaunch the app; the user only ever sees the "Update ready"
 prompt.
 
+## Code signing
+
+Windows 11 PCs with Smart App Control on refuse to run an unsigned installer
+unless Microsoft's cloud already knows the file, which for a new build it never
+does. Any signature from a certificate authority in Microsoft's Trusted Root
+Program satisfies it, so releases are signed with a Certum Standard Code Signing
+certificate (cloud/SimplySign edition) issued in the operator's own name. The
+private key never leaves Certum; the build asks Certum to sign over HTTPS.
+Certificates last at most 459 days, so this is renewed yearly; signatures made
+while it was valid stay valid because every one carries a timestamp.
+
+**How a build gets signed.** `electron/scripts/sign-windows.cjs` is the
+electron-builder signing hook (`win.signtoolOptions.sign` in
+`electron/package.json`). electron-builder hands it the app exe, the NSIS
+helper `elevate.exe`, the uninstaller and the installer in turn (four signings
+per release); it runs `ssign`
+(https://github.com/Le-Syl21/ssign) on each, SHA-256 with an RFC 3161 timestamp
+from time.certum.pl. Credentials are read from the environment only:
+
+| Variable | Meaning |
+| --- | --- |
+| `CERTUM_EMAIL` | the SimplySign login (Certum store account e-mail) |
+| `CERTUM_OTP` | the TOTP seed behind the SimplySign QR code (`otpauth://...` text or the base32 secret) |
+| `CERTUM_TOKEN` | alternative to the seed for a one-off signing by hand: a current 6-digit code |
+| `SSIGN_PATH` | optional path to the ssign executable (default: found on PATH) |
+
+Without credentials the build is unsigned and prints
+`sign-windows: no Certum credentials...` for each file, so local builds keep
+working. With credentials, any signing failure fails the build.
+
+In `.github/workflows/release.yml` the two secrets are exposed as job
+environment variables. When `CERTUM_OTP` is set the workflow downloads ssign
+v0.1.6 (pinned by SHA-256), builds, then runs `Get-AuthenticodeSignature` on
+the installer and refuses to publish unless the status is `Valid` and a
+timestamp is present. When the secrets are absent those two steps are skipped.
+
+**Setting it up (once).**
+
+1. Buy Standard Code Signing, cloud edition, at https://shop.certum.eu/code-signing.html
+   with a personal e-mail you will keep. Activate it in the store under
+   "Data security products": name exactly as on your ID, home address, then
+   "automatic identity verification" (ID photo + selfie) and a recent utility
+   bill. Allow a few working days.
+2. When Certum sends the SimplySign activation QR code, scan it with the
+   phone's plain camera first and keep the `otpauth://totp/...` text somewhere
+   private: that is the seed. Then pair the SimplySign mobile app with it as
+   Certum instructs. Whoever holds the seed and the e-mail can sign as you.
+3. GitHub, repository Settings, Secrets and variables, Actions: add
+   `CERTUM_EMAIL` and `CERTUM_OTP` (the whole `otpauth://` text).
+4. Put the certificate's exact subject name in
+   `win.signtoolOptions.publisherName` in `electron/package.json`. electron-updater
+   checks downloaded installers against that name, so it must match to the letter.
+   Installed builds from before this setting have no name recorded and accept the
+   first signed update without it.
+5. Bump the version and push. The workflow log shows `sign-windows: signing`
+   four times and the signature check prints the signer.
+
+**Signing something by hand** (for example a one-off test build):
+
+    set CERTUM_EMAIL=you@example.com
+    set CERTUM_TOKEN=123456        (current code from the SimplySign app)
+    ssign "release\CS-Fantasy-Toolkit-Setup.exe"
+
+**If the seed leaks**, re-pair the SimplySign mobile app from your Certum
+account (a new QR code invalidates the old seed) and replace the `CERTUM_OTP`
+secret. Certum support can revoke the certificate if it was actually misused.
+
 ## Running the public build against your own machine
 
 `cd electron && npm run public` starts the checkout in public mode: no local

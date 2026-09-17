@@ -12,6 +12,13 @@
 # electron-builder's own GitHub publisher raced itself on the first release
 # and produced two releases for the same tag, which broke the download URL.
 # Do not create the release by hand before the workflow runs.
+#
+# Code signing: when the repository secrets CERTUM_EMAIL and CERTUM_OTP exist
+# (Certum SimplySign login + TOTP seed), the build downloads a pinned `ssign`
+# and electron/scripts/sign-windows.cjs signs the app exe, the uninstaller and
+# the installer; the "Check the installer is signed" step then refuses to
+# publish anything whose signature is not valid. Without the secrets the build
+# is unsigned, as before. See docs/PUBLIC_RELEASE.md, "Code signing".
 name: Release
 
 on:
@@ -31,6 +38,10 @@ concurrency:
 jobs:
   windows:
     runs-on: windows-latest
+    env:
+      # Empty until the Certum certificate is issued and the secrets are set.
+      CERTUM_EMAIL: ${{ secrets.CERTUM_EMAIL }}
+      CERTUM_OTP: ${{ secrets.CERTUM_OTP }}
     defaults:
       run:
         working-directory: electron
@@ -63,9 +74,34 @@ jobs:
       - name: Install
         if: steps.decide.outputs.go == 'true'
         run: npm ci
+      - name: Install the signing tool (ssign, pinned)
+        if: steps.decide.outputs.go == 'true' && env.CERTUM_OTP != ''
+        shell: pwsh
+        run: |
+          $url = "https://github.com/Le-Syl21/ssign/releases/download/v0.1.6/ssign-windows-x86_64.zip"
+          $expected = "8a2a16738f0e1f368b4640cc6cb53fac8072a38df9334a72a96e071169b730f0"
+          $dir = Join-Path $env:RUNNER_TEMP "ssign"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $zip = Join-Path $dir "ssign.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { throw "ssign download hash mismatch: $actual" }
+          Expand-Archive $zip -DestinationPath $dir -Force
+          Add-Content $env:GITHUB_PATH $dir
+          & (Join-Path $dir "ssign.exe") --version
       - name: Build installer
         if: steps.decide.outputs.go == 'true'
         run: npm run dist
+      - name: Check the installer is signed
+        if: steps.decide.outputs.go == 'true' && env.CERTUM_OTP != ''
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature "release/CS-Fantasy-Toolkit-Setup.exe"
+          "Status: $($sig.Status)"
+          "Signer: $($sig.SignerCertificate.Subject)"
+          "Timestamp: $($sig.TimeStamperCertificate.Subject)"
+          if ($sig.Status -ne "Valid") { throw "installer signature is $($sig.Status); refusing to publish" }
+          if (-not $sig.TimeStamperCertificate) { throw "installer signature has no timestamp; refusing to publish" }
       - name: Show build output
         if: steps.decide.outputs.go == 'true'
         shell: bash
