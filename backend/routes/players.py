@@ -990,10 +990,10 @@ def preview_rating_curve(payload: dict | None = None):
     for rank in range(1, 51):
         val = predict_rating_vs_rank(row, rank)
         predicted.append({"rank": rank, "rating": (round(float(val), 4) if val is not None else None)})
+    # The whole curve payload (sample maps, personal offset, ...) so the lab can
+    # draw exactly what a player card's Top X tab draws.
     return {
-        "base_rating": curve.get("base_rating"),
-        "bucket_rows": curve.get("bucket_rows"),
-        "graph_rows": curve.get("graph_rows"),
+        **curve,
         "predicted_curve": predicted,
         "used_average_fallback": not has_tier_data,
     }

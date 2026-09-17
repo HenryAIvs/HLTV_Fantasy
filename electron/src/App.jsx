@@ -9726,79 +9726,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     const n = Number(v);
     return Number.isFinite(n) ? n : fallback;
   };
-  const playerTopxBucketRows = useMemo(() => {
-    const rows = Array.isArray(playerCurve?.bucket_rows) ? playerCurve.bucket_rows : [];
-    return rows
-      .map((row) => ({
-        tier: Number(row?.tier),
-        tierLabel: String(row?.tier_label || `Top ${Number(row?.tier)}`),
-        rankMidpoint: Number(row?.rank_midpoint),
-        bucketRating: Number.isFinite(Number(row?.bucket_rating)) ? Number(row.bucket_rating) : null,
-        bucketDelta: Number.isFinite(Number(row?.bucket_delta)) ? Number(row.bucket_delta) : null,
-        rawBucketDelta: Number.isFinite(Number(row?.raw_bucket_delta)) ? Number(row.raw_bucket_delta) : null,
-        rawBucketRating: Number.isFinite(Number(row?.raw_bucket_rating)) ? Number(row.raw_bucket_rating) : null,
-        priorRating: Number.isFinite(Number(row?.prior_rating)) ? Number(row.prior_rating) : null,
-        adjustedPriorRating: Number.isFinite(Number(row?.adjusted_prior_rating)) ? Number(row.adjusted_prior_rating) : null,
-        shrinkageWeight: Number.isFinite(Number(row?.shrinkage_weight)) ? Number(row.shrinkage_weight) : null,
-        maps: Number(row?.maps || 0),
-        estimated: Boolean(row?.estimated),
-      }))
-      .filter((row) => Number.isFinite(row.tier) && row.tier > 0 && row.tier < 100)
-      .sort((a, b) => a.tier - b.tier);
-  }, [playerCurve]);
-  // The per-player vs-ranked shift baked into the weighted line; surfaced as
-  // its own dashed curve so "weighted below both predicted AND actual" is
-  // visibly the shift at work, not a glitch.
-  const playerTopxShift = useMemo(() => {
-    const v = Number(playerCurve?.personal_offset);
-    return Number.isFinite(v) ? v : 0;
-  }, [playerCurve]);
-  const playerTopxRows = useMemo(() => {
-    const rows = Array.isArray(playerCurve?.graph_rows) ? playerCurve.graph_rows : [];
-    if (rows.length === 0) {
-      return playerTopxBucketRows
-        .map((row) => ({
-          rank: row.tier,
-          rankLabel: String(row.tier),
-          finalRating: row.bucketRating,
-          predictedRating: row.priorRating,
-          shiftedRating: row.adjustedPriorRating,
-        }))
-        .filter((row) => Number.isFinite(row.rank) && row.rank > 0 && row.finalRating !== null);
-    }
-    return rows
-      .map((row) => {
-        const predicted = Number.isFinite(Number(row?.predicted_rating)) ? Number(row.predicted_rating) : null;
-        return {
-          rank: Number(row?.rank),
-          rankLabel: String(row?.rank_label || row?.rank || ""),
-          finalRating: Number.isFinite(Number(row?.final_rating)) ? Number(row.final_rating) : null,
-          predictedRating: predicted,
-          shiftedRating: predicted === null ? null : predicted + playerTopxShift,
-        };
-      })
-      .filter((row) => Number.isFinite(row.rank) && row.rank > 0 && row.finalRating !== null)
-      .sort((a, b) => a.rank - b.rank);
-  }, [playerCurve, playerTopxBucketRows, playerTopxShift]);
-  // Actual (observed) ratings — only at tiers with real map data, plotted as points.
-  const playerTopxActualPoints = useMemo(
-    () =>
-      playerTopxBucketRows
-        .filter((r) => !r.estimated && r.maps > 0 && Number.isFinite(r.rawBucketRating))
-        .map((r) => ({ rank: r.tier, rating: r.rawBucketRating, maps: r.maps, tierLabel: r.tierLabel })),
-    [playerTopxBucketRows]
-  );
-  const playerTopxRatingAxis = useMemo(() => {
-    return buildNiceStepAxis(
-      [
-        ...playerTopxRows.map((row) => row.finalRating),
-        ...playerTopxRows.map((row) => row.predictedRating),
-        ...playerTopxRows.map((row) => row.shiftedRating),
-        ...playerTopxActualPoints.map((p) => p.rating),
-      ].filter((v) => Number.isFinite(v)),
-      0.05
-    );
-  }, [playerTopxRows, playerTopxActualPoints]);
+  const playerTopx = useMemo(() => deriveTopXCurve(playerCurve), [playerCurve]);
   const filteredSortedPlayers = useMemo(() => {
     const q = playerSearch.trim().toLowerCase();
     const list = players.filter((p) => {
@@ -10078,183 +10006,16 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                 <div className="stack">
                   {playerCurveLoading && <p className="muted">Loading Top-X data...</p>}
                   {playerCurveError && <p className="error">{playerCurveError}</p>}
-                  {!playerCurveLoading && !playerCurveError && playerTopxBucketRows.length === 0 && (
+                  {!playerCurveLoading && !playerCurveError && playerTopx.bucketRows.length === 0 && (
                     <p className="muted">No adjusted Top-X bucket data available yet.</p>
                   )}
-                  {playerTopxBucketRows.length > 0 && (
+                  {playerTopx.bucketRows.length > 0 && (
                     <>
-                      <p className="muted">
-                        Overall rating: {Number(playerCurve?.base_rating || playerForm.rating || 0).toFixed(3)} | Sample maps:{" "}
-                        {Math.round(Number(playerCurve?.sample_maps || 0))} | Weight base:{" "}
-                        {Math.round(Number(playerCurve?.total_maps_proxy || 0))}
-                        {Number.isFinite(Number(playerCurve?.personal_offset)) && Math.abs(Number(playerCurve.personal_offset)) >= 0.005 ? (
-                          <>
-                            {" "}| vs-ranked shift:{" "}
-                            <span style={{ color: Number(playerCurve.personal_offset) < 0 ? "#f0a763" : "#34d399" }}>
-                              {Number(playerCurve.personal_offset) >= 0 ? "+" : ""}
-                              {Number(playerCurve.personal_offset).toFixed(3)}
-                            </span>
-                          </>
-                        ) : null}
-                      </p>
+                      <TopXCurveSummary curve={playerCurve} fallbackRating={playerForm.rating} />
                       <div className="value-chart-wrap topx-chart">
-                        <ResponsiveContainer width="100%" height={260}>
-                          <ComposedChart data={playerTopxRows} margin={{ top: 12, right: 18, left: 6, bottom: 12 }}>
-                            <CartesianGrid stroke="#232a34" strokeDasharray="3 3" />
-                            <XAxis
-                              type="number"
-                              dataKey="rank"
-                              domain={[1, 50]}
-                              ticks={[1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50]}
-                              interval={0}
-                              minTickGap={0}
-                              tick={{ fill: "#9fb2c9", fontSize: 12 }}
-                              axisLine={{ stroke: "#3a4452" }}
-                              tickLine={{ stroke: "#3a4452" }}
-                              tickFormatter={(v) => String(v)}
-                            />
-                            <YAxis
-                              tick={{ fill: "#9fb2c9", fontSize: 12 }}
-                              axisLine={{ stroke: "#3a4452" }}
-                              tickLine={{ stroke: "#3a4452" }}
-                              domain={playerTopxRatingAxis.domain}
-                              ticks={playerTopxRatingAxis.ticks}
-                              interval={0}
-                              minTickGap={0}
-                              tickFormatter={(v) => Number(v).toFixed(2)}
-                            />
-                            <Tooltip
-                              content={({ active, payload, label }) => {
-                                if (!active || !payload || payload.length === 0) return null;
-                                const rows = payload.filter(
-                                  (p) => p && p.value != null && p.dataKey !== "rank" && p.name !== "rank"
-                                );
-                                if (rows.length === 0) return null;
-                                return (
-                                  <div
-                                    style={{
-                                      background: "#14181f",
-                                      border: "1px solid #3a4452",
-                                      borderRadius: 10,
-                                      padding: "9px 13px",
-                                      color: "#e9edf3",
-                                      fontSize: 13,
-                                      lineHeight: 1.55,
-                                    }}
-                                  >
-                                    <div style={{ fontWeight: 700, marginBottom: 4 }}>Rank {label}</div>
-                                    {rows.map((p, i) => {
-                                      const maps = p.name === "Actual (observed)" ? p.payload?.maps : null;
-                                      return (
-                                        <div key={i} style={{ display: "flex", alignItems: "center", gap: 7 }}>
-                                          <span
-                                            style={{
-                                              width: 8,
-                                              height: 8,
-                                              borderRadius: "50%",
-                                              background: p.color || p.stroke || "#9fb2c9",
-                                              flex: "none",
-                                            }}
-                                          />
-                                          <span style={{ color: "#9fb2c9" }}>{p.name}:</span>
-                                          <span style={{ fontWeight: 600 }}>
-                                            {Number(p.value).toFixed(3)}
-                                            {maps ? ` (${Math.round(maps)} maps)` : ""}
-                                          </span>
-                                        </div>
-                                      );
-                                    })}
-                                  </div>
-                                );
-                              }}
-                            />
-                            <Legend wrapperStyle={{ color: "#9fb2c9" }} />
-                            <Line
-                              type="linear"
-                              dataKey="predictedRating"
-                              name="Predicted (avg curve)"
-                              stroke="#8aa0c6"
-                              strokeWidth={1.8}
-                              strokeDasharray="5 4"
-                              dot={false}
-                              connectNulls
-                              isAnimationActive={false}
-                            />
-                            {Math.abs(playerTopxShift) >= 0.005 && (
-                              <Line
-                                type="linear"
-                                dataKey="shiftedRating"
-                                name={`Predicted + shift (${playerTopxShift >= 0 ? "+" : ""}${playerTopxShift.toFixed(3)})`}
-                                stroke="#a78bfa"
-                                strokeWidth={1.8}
-                                strokeDasharray="2 4"
-                                dot={false}
-                                connectNulls
-                                isAnimationActive={false}
-                              />
-                            )}
-                            <Line
-                              type="linear"
-                              dataKey="finalRating"
-                              name="Weighted (used)"
-                              stroke="#22d3ee"
-                              strokeWidth={2.4}
-                              dot={{ r: 3, fill: "#22d3ee", strokeWidth: 0 }}
-                              connectNulls={false}
-                              isAnimationActive={false}
-                            />
-                            <Scatter
-                              data={playerTopxActualPoints}
-                              dataKey="rating"
-                              name="Actual (observed)"
-                              fill="#f97316"
-                              isAnimationActive={false}
-                            />
-                          </ComposedChart>
-                        </ResponsiveContainer>
+                        <TopXCurveChart topx={playerTopx} height={260} />
                       </div>
-                      <table className="topx-bucket-table">
-                        <thead>
-                          <tr>
-                            <th>Bucket</th>
-                            <th>Predicted</th>
-                            <th title="Predicted curve after this player's vs-ranked shift — the baseline the weighted value blends from">
-                              + Shift ({playerTopxShift >= 0 ? "+" : ""}
-                              {playerTopxShift.toFixed(3)})
-                            </th>
-                            <th>Actual</th>
-                            <th>Weighted</th>
-                            <th>Sample Weight</th>
-                            <th>Maps</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {playerTopxBucketRows.map((row) => (
-                            <tr key={`topx-row-${row.tier}`} style={row.estimated ? { opacity: 0.6 } : undefined}>
-                              <td>
-                                {row.tierLabel}
-                                {row.estimated && <span className="muted"> (est.)</span>}
-                              </td>
-                              <td style={{ color: "#8aa0c6" }}>
-                                {Number.isFinite(row.priorRating) ? row.priorRating.toFixed(3) : "-"}
-                              </td>
-                              <td style={{ color: "#a78bfa" }}>
-                                {Number.isFinite(row.adjustedPriorRating) ? row.adjustedPriorRating.toFixed(3) : "-"}
-                              </td>
-                              <td style={{ color: "#f0a763" }}>
-                                {!row.estimated && row.maps > 0 && Number.isFinite(row.rawBucketRating)
-                                  ? row.rawBucketRating.toFixed(3)
-                                  : "—"}
-                              </td>
-                              <td style={{ color: "#22d3ee", fontWeight: 600 }}>
-                                {Number.isFinite(row.bucketRating) ? row.bucketRating.toFixed(3) : "-"}
-                              </td>
-                              <td>{Number.isFinite(row.shrinkageWeight) ? `${Math.round(row.shrinkageWeight * 100)}%` : "-"}</td>
-                              <td>{Math.round(Number(row.maps || 0))}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
+                      <TopXCurveTable topx={playerTopx} />
                     </>
                   )}
                 </div>
@@ -11664,6 +11425,287 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Top-X curve: the player card's "Top X" tab and the Rating Lab draw the same
+// chart and table from these, so the two can never drift apart. `curve` is the
+// /players/{id}/rating-curve payload (the lab preview has the same shape).
+const TOPX_SERIES = { predicted: "#8aa0c6", shifted: "#a78bfa", actual: "#f0a763", actualDot: "#f97316", weighted: "#22d3ee" };
+
+const deriveTopXCurve = (curve) => {
+  const bucketRows = (Array.isArray(curve?.bucket_rows) ? curve.bucket_rows : [])
+    .map((row) => ({
+      tier: Number(row?.tier),
+      tierLabel: String(row?.tier_label || `Top ${Number(row?.tier)}`),
+      rankMidpoint: Number(row?.rank_midpoint),
+      bucketRating: Number.isFinite(Number(row?.bucket_rating)) ? Number(row.bucket_rating) : null,
+      bucketDelta: Number.isFinite(Number(row?.bucket_delta)) ? Number(row.bucket_delta) : null,
+      rawBucketDelta: Number.isFinite(Number(row?.raw_bucket_delta)) ? Number(row.raw_bucket_delta) : null,
+      rawBucketRating: Number.isFinite(Number(row?.raw_bucket_rating)) ? Number(row.raw_bucket_rating) : null,
+      priorRating: Number.isFinite(Number(row?.prior_rating)) ? Number(row.prior_rating) : null,
+      adjustedPriorRating: Number.isFinite(Number(row?.adjusted_prior_rating)) ? Number(row.adjusted_prior_rating) : null,
+      shrinkageWeight: Number.isFinite(Number(row?.shrinkage_weight)) ? Number(row.shrinkage_weight) : null,
+      maps: Number(row?.maps || 0),
+      estimated: Boolean(row?.estimated),
+    }))
+    .filter((row) => Number.isFinite(row.tier) && row.tier > 0 && row.tier < 100)
+    .sort((a, b) => a.tier - b.tier);
+  const shiftRaw = Number(curve?.personal_offset);
+  const shift = Number.isFinite(shiftRaw) ? shiftRaw : 0;
+  const graphRows = Array.isArray(curve?.graph_rows) ? curve.graph_rows : [];
+  const rows =
+    graphRows.length === 0
+      ? bucketRows
+          .map((row) => ({
+            rank: row.tier,
+            rankLabel: String(row.tier),
+            finalRating: row.bucketRating,
+            predictedRating: row.priorRating,
+            shiftedRating: row.adjustedPriorRating,
+          }))
+          .filter((row) => Number.isFinite(row.rank) && row.rank > 0 && row.finalRating !== null)
+      : graphRows
+          .map((row) => {
+            const predicted = Number.isFinite(Number(row?.predicted_rating)) ? Number(row.predicted_rating) : null;
+            return {
+              rank: Number(row?.rank),
+              rankLabel: String(row?.rank_label || row?.rank || ""),
+              finalRating: Number.isFinite(Number(row?.final_rating)) ? Number(row.final_rating) : null,
+              predictedRating: predicted,
+              shiftedRating: predicted === null ? null : predicted + shift,
+            };
+          })
+          .filter((row) => Number.isFinite(row.rank) && row.rank > 0 && row.finalRating !== null)
+          .sort((a, b) => a.rank - b.rank);
+  const actualPoints = bucketRows
+    .filter((r) => !r.estimated && r.maps > 0 && Number.isFinite(r.rawBucketRating))
+    .map((r) => ({ rank: r.tier, rating: r.rawBucketRating, maps: r.maps, tierLabel: r.tierLabel }));
+  const axis = buildNiceStepAxis(
+    [
+      ...rows.map((row) => row.finalRating),
+      ...rows.map((row) => row.predictedRating),
+      ...rows.map((row) => row.shiftedRating),
+      ...actualPoints.map((p) => p.rating),
+    ].filter((v) => Number.isFinite(v)),
+    0.05
+  );
+  return { bucketRows, shift, rows, actualPoints, axis };
+};
+
+// "Overall rating | Sample maps | Weight base | vs-ranked shift" line.
+const TopXCurveSummary = ({ curve, fallbackRating = 0 }) => (
+  <p className="muted">
+    Overall rating: {Number(curve?.base_rating || fallbackRating || 0).toFixed(3)} | Sample maps:{" "}
+    {Math.round(Number(curve?.sample_maps || 0))} | Weight base: {Math.round(Number(curve?.total_maps_proxy || 0))}
+    {Number.isFinite(Number(curve?.personal_offset)) && Math.abs(Number(curve.personal_offset)) >= 0.005 ? (
+      <>
+        {" "}| vs-ranked shift:{" "}
+        <span style={{ color: Number(curve.personal_offset) < 0 ? "#f0a763" : "#34d399" }}>
+          {Number(curve.personal_offset) >= 0 ? "+" : ""}
+          {Number(curve.personal_offset).toFixed(3)}
+        </span>
+      </>
+    ) : null}
+  </p>
+);
+
+const TopXCurveChart = ({ topx, height = 260 }) => (
+  <ResponsiveContainer width="100%" height={height}>
+    <ComposedChart data={topx.rows} margin={{ top: 12, right: 18, left: 6, bottom: 12 }}>
+      <CartesianGrid stroke="#232a34" strokeDasharray="3 3" />
+      <XAxis
+        type="number"
+        dataKey="rank"
+        domain={[1, 50]}
+        ticks={[1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50]}
+        interval={0}
+        minTickGap={0}
+        tick={{ fill: "#9fb2c9", fontSize: 12 }}
+        axisLine={{ stroke: "#3a4452" }}
+        tickLine={{ stroke: "#3a4452" }}
+        tickFormatter={(v) => String(v)}
+      />
+      <YAxis
+        tick={{ fill: "#9fb2c9", fontSize: 12 }}
+        axisLine={{ stroke: "#3a4452" }}
+        tickLine={{ stroke: "#3a4452" }}
+        domain={topx.axis.domain}
+        ticks={topx.axis.ticks}
+        interval={0}
+        minTickGap={0}
+        tickFormatter={(v) => Number(v).toFixed(2)}
+      />
+      <Tooltip
+        content={({ active, payload, label }) => {
+          if (!active || !payload || payload.length === 0) return null;
+          const rows = payload.filter((p) => p && p.value != null && p.dataKey !== "rank" && p.name !== "rank");
+          if (rows.length === 0) return null;
+          return (
+            <div
+              style={{
+                background: "#14181f",
+                border: "1px solid #3a4452",
+                borderRadius: 10,
+                padding: "9px 13px",
+                color: "#e9edf3",
+                fontSize: 13,
+                lineHeight: 1.55,
+              }}
+            >
+              <div style={{ fontWeight: 700, marginBottom: 4 }}>Rank {label}</div>
+              {rows.map((p, i) => {
+                const maps = p.name === "Actual (observed)" ? p.payload?.maps : null;
+                return (
+                  <div key={i} style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                    <span
+                      style={{
+                        width: 8,
+                        height: 8,
+                        borderRadius: "50%",
+                        background: p.color || p.stroke || "#9fb2c9",
+                        flex: "none",
+                      }}
+                    />
+                    <span style={{ color: "#9fb2c9" }}>{p.name}:</span>
+                    <span style={{ fontWeight: 600 }}>
+                      {Number(p.value).toFixed(3)}
+                      {maps ? ` (${Math.round(maps)} maps)` : ""}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          );
+        }}
+      />
+      <Legend wrapperStyle={{ color: "#9fb2c9" }} />
+      <Line
+        type="linear"
+        dataKey="predictedRating"
+        name="Predicted (avg curve)"
+        stroke={TOPX_SERIES.predicted}
+        strokeWidth={1.8}
+        strokeDasharray="5 4"
+        dot={false}
+        connectNulls
+        isAnimationActive={false}
+      />
+      {Math.abs(topx.shift) >= 0.005 && (
+        <Line
+          type="linear"
+          dataKey="shiftedRating"
+          name={`Predicted + shift (${topx.shift >= 0 ? "+" : ""}${topx.shift.toFixed(3)})`}
+          stroke={TOPX_SERIES.shifted}
+          strokeWidth={1.8}
+          strokeDasharray="2 4"
+          dot={false}
+          connectNulls
+          isAnimationActive={false}
+        />
+      )}
+      <Line
+        type="linear"
+        dataKey="finalRating"
+        name="Weighted (used)"
+        stroke={TOPX_SERIES.weighted}
+        strokeWidth={2.4}
+        dot={{ r: 3, fill: TOPX_SERIES.weighted, strokeWidth: 0 }}
+        connectNulls={false}
+        isAnimationActive={false}
+      />
+      <Scatter data={topx.actualPoints} dataKey="rating" name="Actual (observed)" fill={TOPX_SERIES.actualDot} isAnimationActive={false} />
+    </ComposedChart>
+  </ResponsiveContainer>
+);
+
+// The bucket table; `explain` adds the column-by-column explanation under it.
+const TopXCurveTable = ({ topx, explain = false }) => (
+  <>
+    <table className="topx-bucket-table">
+      <thead>
+        <tr>
+          <th>Bucket</th>
+          <th>Predicted</th>
+          <th title="Predicted curve after this player's vs-ranked shift — the baseline the weighted value blends from">
+            + Shift ({topx.shift >= 0 ? "+" : ""}
+            {topx.shift.toFixed(3)})
+          </th>
+          <th>Actual</th>
+          <th>Weighted</th>
+          <th>Sample Weight</th>
+          <th>Maps</th>
+        </tr>
+      </thead>
+      <tbody>
+        {topx.bucketRows.map((row) => (
+          <tr key={`topx-row-${row.tier}`} style={row.estimated ? { opacity: 0.6 } : undefined}>
+            <td>
+              {row.tierLabel}
+              {row.estimated && <span className="muted"> (est.)</span>}
+            </td>
+            <td style={{ color: TOPX_SERIES.predicted }}>{Number.isFinite(row.priorRating) ? row.priorRating.toFixed(3) : "-"}</td>
+            <td style={{ color: TOPX_SERIES.shifted }}>
+              {Number.isFinite(row.adjustedPriorRating) ? row.adjustedPriorRating.toFixed(3) : "-"}
+            </td>
+            <td style={{ color: TOPX_SERIES.actual }}>
+              {!row.estimated && row.maps > 0 && Number.isFinite(row.rawBucketRating) ? row.rawBucketRating.toFixed(3) : "—"}
+            </td>
+            <td style={{ color: TOPX_SERIES.weighted, fontWeight: 600 }}>
+              {Number.isFinite(row.bucketRating) ? row.bucketRating.toFixed(3) : "-"}
+            </td>
+            <td>{Number.isFinite(row.shrinkageWeight) ? `${Math.round(row.shrinkageWeight * 100)}%` : "-"}</td>
+            <td>{Math.round(Number(row.maps || 0))}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+    {explain && (
+      <div className="topx-explain">
+        <span className="topx-explain-term">
+          <i style={{ background: TOPX_SERIES.predicted }} />
+          Predicted
+        </span>
+        <span>
+          The average-player curve applied to this overall rating. A typical player's rating against Top-N opponents is
+          their overall × (1 + the average deviation for that tier), fitted from every player with real per-tier data.
+          A player with no Top-X data gets exactly this.
+        </span>
+        <span className="topx-explain-term">
+          <i style={{ background: TOPX_SERIES.shifted }} />
+          + Shift
+        </span>
+        <span>
+          Predicted moved by the player's own offset: the maps-weighted amount their real tiers sit above or below the
+          average curve, trusted in proportion to their ranked maps (half trust at 25). Every tier is judged against
+          this, so a 3-map tier is measured against the player's demonstrated ranked level rather than the population's.
+        </span>
+        <span className="topx-explain-term">
+          <i style={{ background: TOPX_SERIES.actualDot }} />
+          Actual
+        </span>
+        <span>The rating HLTV reports against that tier, as imported. Blank where the player has no maps in the tier.</span>
+        <span className="topx-explain-term">
+          <i style={{ background: TOPX_SERIES.weighted }} />
+          Weighted
+        </span>
+        <span>
+          What the match engine uses. Actual pulled toward + Shift by the sample weight. With no maps it is + Shift
+          itself, and the row is marked est.
+        </span>
+        <span className="topx-explain-term">Sample weight</span>
+        <span>How much Actual counts: maps ÷ (maps + 20). About 7 maps is 25%, 20 maps is 50%, 60 maps is 75%.</span>
+        <span className="topx-explain-term">Maps</span>
+        <span>Maps the player has played against opponents ranked in that tier.</span>
+        <span className="topx-explain-note">
+          The inputs are HLTV's cumulative "vs Top-N" figures; the table splits them into bands (6-10 is Top 10 minus
+          Top 5), so a band's maps and rating differ from the input above it. The chart joins the bands at ranks 1, 5,
+          10, 20, 30 and 50 (rank 1 takes the Top 5 value); between them the engine reads straight off the line. Sample
+          maps is the total across the bands.
+        </span>
+      </div>
+    )}
+  </>
+);
+
 const RATING_LAB_TIERS = [
   { tier: 5, label: "Top 5" },
   { tier: 10, label: "Top 10" },
@@ -11673,24 +11715,27 @@ const RATING_LAB_TIERS = [
 ];
 const TIER_COLORS = { 5: "#f97316", 10: "#eab308", 20: "#22d3ee", 30: "#a78bfa", 50: "#34d399" };
 
-const RATING_LAB_EXAMPLE = {
-  rating: "1.10",
-  rating_top5: "1.02",
-  maps_top5: "40",
+const RATING_LAB_BLANK = {
+  rating: "",
+  rating_top5: "",
+  maps_top5: "",
   rating_top10: "",
   maps_top10: "",
-  rating_top20: "1.08",
-  maps_top20: "25",
+  rating_top20: "",
+  maps_top20: "",
   rating_top30: "",
   maps_top30: "",
-  rating_top50: "1.14",
-  maps_top50: "60",
+  rating_top50: "",
+  maps_top50: "",
 };
 
 function RatingLabTab({ players }) {
-  const [stats, setStats] = useState(RATING_LAB_EXAMPLE);
-  const [preview, setPreview] = useState(null);
-  const [previewError, setPreviewError] = useState("");
+  const [stats, setStats] = useState(RATING_LAB_BLANK);
+  // The curve being shown: a real player's own /rating-curve while their
+  // numbers are untouched (exactly what their card shows), otherwise the
+  // preview of whatever is typed in.
+  const [curve, setCurve] = useState(null);
+  const [curveError, setCurveError] = useState("");
   const [avg, setAvg] = useState(null);
   const [avgLoading, setAvgLoading] = useState(false);
   const [avgError, setAvgError] = useState("");
@@ -11705,25 +11750,48 @@ function RatingLabTab({ players }) {
     setStats((prev) => ({ ...prev, [key]: val }));
     setEdited(true);
   };
-  const resetExample = () => {
-    setStats(RATING_LAB_EXAMPLE);
+  const clearAll = () => {
+    setStats(RATING_LAB_BLANK);
     setLoaded(null);
     setEdited(false);
     setLoadError("");
   };
 
-  // Live preview: run the exact rating-curve system on the hand-entered stats.
+  const ratingOk = Number.isFinite(Number(stats.rating)) && Number(stats.rating) > 0;
   useEffect(() => {
     let cancel = false;
+    if (loaded && !edited) {
+      (async () => {
+        try {
+          setCurveError("");
+          const data = await api.get(`/players/${loaded.id}/rating-curve`, 30000);
+          if (!cancel) setCurve(data);
+        } catch (e) {
+          if (!cancel) {
+            setCurve(null);
+            setCurveError(e?.message || "Could not load the curve.");
+          }
+        }
+      })();
+      return () => {
+        cancel = true;
+      };
+    }
+    if (!ratingOk) {
+      setCurve(null);
+      setCurveError("");
+      return undefined;
+    }
+    // Live preview: run the exact rating-curve system on the typed-in stats.
     const t = setTimeout(async () => {
       try {
-        setPreviewError("");
+        setCurveError("");
         const data = await api.post("/players/rating-curve/preview", stats, 30000);
-        if (!cancel) setPreview(data);
+        if (!cancel) setCurve(data);
       } catch (e) {
         if (!cancel) {
-          setPreview(null);
-          setPreviewError(e?.message || "Preview failed.");
+          setCurve(null);
+          setCurveError(e?.message || "Preview failed.");
         }
       }
     }, 300);
@@ -11731,7 +11799,7 @@ function RatingLabTab({ players }) {
       cancel = true;
       clearTimeout(t);
     };
-  }, [stats]);
+  }, [stats, loaded, edited, ratingOk]);
 
   const loadAverage = async () => {
     setAvgLoading(true);
@@ -11796,18 +11864,9 @@ function RatingLabTab({ players }) {
     if (opt) loadFromPlayer(opt);
   };
 
-  const predictedRows = useMemo(() => {
-    const rows = Array.isArray(preview?.predicted_curve) ? preview.predicted_curve : [];
-    return rows.map((r) => ({ rank: Number(r.rank), rating: r.rating == null ? null : Number(r.rating) }));
-  }, [preview]);
-  const anchorRows = useMemo(() => {
-    const rows = Array.isArray(preview?.graph_rows) ? preview.graph_rows : [];
-    return rows.map((r) => ({ rank: Number(r.rank), rating: Number(r.bucket_rating) }));
-  }, [preview]);
-  const predictedAxis = useMemo(
-    () => buildNiceStepAxis([...predictedRows.map((r) => r.rating), ...anchorRows.map((r) => r.rating)].filter((v) => Number.isFinite(v)), 0.02),
-    [predictedRows, anchorRows]
-  );
+  const topx = useMemo(() => deriveTopXCurve(curve), [curve]);
+  const hasCurve = Boolean(curve) && topx.bucketRows.length > 0;
+  const noTierData = hasCurve && topx.bucketRows.every((r) => r.estimated);
 
   // Average population view: scatter every per-tier delta, one series per tier.
   const scatterByTier = useMemo(() => {
@@ -11827,17 +11886,15 @@ function RatingLabTab({ players }) {
     return rows.map((r) => ({ rank: Number(r.rank), pct: Number(r.pct) * 100 })).sort((a, b) => a.rank - b.rank);
   }, [avg]);
 
-  const signed = (v) => `${Number(v) >= 0 ? "+" : ""}${Number(v).toFixed(3)}`;
-
   return (
     <Section title="Rating Lab — Top-X Curve Diagnostics">
       <div className="stack lab">
         <div className="card sub">
-          <h3>Example Player</h3>
+          <h3>Inspect a player</h3>
           <p className="muted">
-            Enter an overall rating and any cumulative "rating vs Top-N" values (with maps played) to see exactly the
-            rank-adjusted curve the match engine would use. Leave the tier fields blank to see the average-curve
-            fallback the system applies when a player has no Top-X data.
+            Search a player to see the Top-X curve their card shows and the match engine uses, or type an overall
+            rating and any "rating vs Top-N" values (with maps played) to test a hypothetical. Tiers left blank fall
+            back to the average curve.
           </p>
           <div className="lab-toolbar">
             <div className="lab-player">
@@ -11856,13 +11913,20 @@ function RatingLabTab({ players }) {
                 <>
                   Showing <strong>{loaded.name}</strong>
                   {loaded.team ? ` (${loaded.team})` : ""}
-                  {edited ? ", edited by hand" : ""}.{" "}
-                  <button type="button" className="lab-link" onClick={resetExample}>
-                    Back to the example
+                  {edited ? ", edited by hand" : ", as on their card"}.{" "}
+                  <button type="button" className="lab-link" onClick={clearAll}>
+                    Clear
+                  </button>
+                </>
+              ) : ratingOk ? (
+                <>
+                  Hypothetical player.{" "}
+                  <button type="button" className="lab-link" onClick={clearAll}>
+                    Clear
                   </button>
                 </>
               ) : (
-                "Hand-entered example. Search a player to load their stored numbers."
+                "Nothing loaded. Search a player, or type an overall rating to start a hypothetical."
               )}
               {loadError && <span className="lab-status-error"> {loadError}</span>}
             </div>
@@ -11893,99 +11957,40 @@ function RatingLabTab({ players }) {
                 </Fragment>
               ))}
               <p className="lab-note">
-                {previewError
-                  ? previewError
-                  : preview
-                    ? preview.used_average_fallback
-                      ? "No per-tier data: the average degradation curve is applied on top of the overall rating."
-                      : "Rank-adjusted from the entered Top-X buckets, with sample shrinkage toward the overall rating."
-                    : "Computing the preview..."}
+                {curveError
+                  ? curveError
+                  : !loaded && !ratingOk
+                    ? "Blank tiers use the average curve; a tier only pulls the curve toward its own rating once it has maps behind it."
+                    : hasCurve
+                      ? noTierData
+                        ? "No per-tier data: the average curve is applied on top of the overall rating."
+                        : "Each tier blends its own rating with the shifted average curve by sample weight. The table explains every column."
+                      : "Computing the curve..."}
               </p>
             </div>
 
-            <div className="value-chart-wrap lab-chart">
-              {preview ? (
-                <ResponsiveContainer width="100%" height={340}>
-                  <ComposedChart data={predictedRows} margin={{ top: 8, right: 18, left: 6, bottom: 26 }}>
-                    <CartesianGrid stroke="#232a34" strokeDasharray="3 3" />
-                    <XAxis
-                      type="number"
-                      dataKey="rank"
-                      domain={[1, 50]}
-                      ticks={[1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50]}
-                      interval={0}
-                      tick={{ fill: "#9fb2c9", fontSize: 12 }}
-                      axisLine={{ stroke: "#3a4452" }}
-                      tickLine={{ stroke: "#3a4452" }}
-                      label={{ value: "Opponent HLTV rank", position: "insideBottom", offset: -16, fill: "#7f97bd", fontSize: 11 }}
-                    />
-                    <YAxis
-                      tick={{ fill: "#9fb2c9", fontSize: 12 }}
-                      axisLine={{ stroke: "#3a4452" }}
-                      tickLine={{ stroke: "#3a4452" }}
-                      domain={predictedAxis.domain}
-                      ticks={predictedAxis.ticks}
-                      tickFormatter={(v) => Number(v).toFixed(2)}
-                      width={44}
-                    />
-                    <Tooltip
-                      contentStyle={{ background: "#14181f", border: "1px solid #3a4452", borderRadius: 10, color: "#e9edf3" }}
-                      formatter={(value, name) => [value == null ? "—" : Number(value).toFixed(3), name]}
-                      labelFormatter={(v) => `Rank ${v}`}
-                    />
-                    <Legend verticalAlign="top" align="right" height={26} iconSize={10} wrapperStyle={{ color: "#9fb2c9", fontSize: 12 }} />
-                    <Line
-                      type="linear"
-                      data={predictedRows}
-                      dataKey="rating"
-                      name="Predicted rating"
-                      stroke="#22d3ee"
-                      strokeWidth={2.2}
-                      dot={false}
-                      connectNulls={false}
-                      isAnimationActive={false}
-                    />
-                    <Scatter data={anchorRows} dataKey="rating" name="Tier anchors" fill="#f97316" isAnimationActive={false} />
-                  </ComposedChart>
-                </ResponsiveContainer>
+            <div className="lab-curve">
+              {hasCurve ? (
+                <>
+                  <TopXCurveSummary curve={curve} />
+                  <div className="value-chart-wrap topx-chart">
+                    <TopXCurveChart topx={topx} height={300} />
+                  </div>
+                </>
               ) : (
-                <div className="lab-chart-empty">{previewError || "Computing the preview..."}</div>
+                <div className="value-chart-wrap lab-chart">
+                  <div className="lab-chart-empty">
+                    {curveError || (ratingOk || loaded ? "Computing the curve..." : "Search a player or type an overall rating to draw the curve.")}
+                  </div>
+                </div>
               )}
             </div>
           </div>
 
-          {preview && (
-            <table className="lab-table">
-              <thead>
-                <tr>
-                  <th>Bucket</th>
-                  <th>Raw rating</th>
-                  <th>Adjusted rating</th>
-                  <th>Raw delta</th>
-                  <th>Shrunk delta</th>
-                  <th>Sample weight</th>
-                  <th>Maps</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(preview.bucket_rows || [])
-                  .filter((r) => Number(r.tier) > 0 && Number(r.tier) < 100)
-                  .map((r) => (
-                    <tr key={`br-${r.tier}`} className={r.estimated ? "est" : undefined}>
-                      <td className="lab-tier-name" style={{ color: TIER_COLORS[Number(r.tier)] }}>
-                        {r.tier_label}
-                        {r.estimated && <span className="lab-est">est.</span>}
-                      </td>
-                      <td>{Number(r.raw_bucket_rating).toFixed(3)}</td>
-                      <td>{Number(r.bucket_rating).toFixed(3)}</td>
-                      <td>{signed(r.raw_bucket_delta)}</td>
-                      <td>{signed(r.bucket_delta)}</td>
-                      <td>{Math.round(Number(r.shrinkage_weight) * 100)}%</td>
-                      <td>{Math.round(Number(r.maps || 0))}</td>
-                    </tr>
-                  ))}
-              </tbody>
-            </table>
+          {hasCurve && (
+            <div className="lab-table-wrap">
+              <TopXCurveTable topx={topx} explain />
+            </div>
           )}
         </div>
 
