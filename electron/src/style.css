@@ -4056,6 +4056,7 @@ button:disabled {
   font-weight: 700;
   font-size: 18px;
   letter-spacing: 0.01em;
+  color: #e9edf3;
 }
 .lab-tiers input {
   text-align: center;
@@ -4066,10 +4067,10 @@ button:disabled {
 .lab-note {
   grid-column: 1 / -1;
   margin: 8px 0 0;
-  color: #8fa3bf;
   font-size: 12.5px;
   line-height: 1.5;
 }
+.lab-note-error { color: #fca5a5; }
 
 .value-chart-wrap.lab-chart { height: auto; min-height: 340px; }
 .lab-chart-empty {

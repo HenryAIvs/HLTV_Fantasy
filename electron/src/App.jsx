@@ -11875,7 +11875,6 @@ function RatingLabTab({ players }) {
 
   const topx = useMemo(() => deriveTopXCurve(curve), [curve]);
   const hasCurve = Boolean(curve) && topx.bucketRows.length > 0;
-  const noTierData = hasCurve && topx.bucketRows.every((r) => r.estimated);
 
   // Average population view: scatter every per-tier delta, one series per tier.
   const scatterByTier = useMemo(() => {
@@ -11921,9 +11920,7 @@ function RatingLabTab({ players }) {
               <span className="lab-tier-head">Maps</span>
               {RATING_LAB_TIERS.map(({ tier, label }) => (
                 <Fragment key={`in-${tier}`}>
-                  <span className="lab-tier-name" style={{ color: TIER_COLORS[tier] }}>
-                    {label}
-                  </span>
+                  <span className="lab-tier-name">{label}</span>
                   <input
                     value={stats[`rating_top${tier}`]}
                     onChange={(e) => setStat(`rating_top${tier}`, e.target.value)}
@@ -11938,17 +11935,7 @@ function RatingLabTab({ players }) {
                   />
                 </Fragment>
               ))}
-              <p className="lab-note">
-                {loadError || curveError
-                  ? loadError || curveError
-                  : !loaded && !ratingOk
-                    ? "Blank tiers use the average curve; a tier only pulls the curve toward its own rating once it has maps behind it."
-                    : hasCurve
-                      ? noTierData
-                        ? "No per-tier data: the average curve is applied on top of the overall rating."
-                        : "Each tier blends its own rating with the shifted average curve by sample weight. The table explains every column."
-                      : "Computing the curve..."}
-              </p>
+              {(loadError || curveError) && <p className="lab-note lab-note-error">{loadError || curveError}</p>}
             </div>
 
             <div className="lab-curve">
