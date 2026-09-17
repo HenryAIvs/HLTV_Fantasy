@@ -1647,6 +1647,32 @@ def delete_dev_flag(key: str):
     return {"status": "ok", "removed": dev_flags.clear_flag(key)}
 
 
+@router.get("/users")
+def list_accounts() -> dict:
+    """Every signed-in account with activity (operator only)."""
+    from backend.data import auth_db
+
+    users = auth_db.list_users()
+    now = time.time()
+    return {
+        "users": users,
+        "total": len(users),
+        "online_now": sum(1 for u in users if (u.get("last_seen_at") or 0) > now - 10 * 60),
+        "active_7d": sum(1 for u in users if (u.get("last_seen_at") or u.get("last_login_at") or 0) > now - 7 * 86400),
+        "admins": sum(1 for u in users if u.get("is_admin")),
+    }
+
+
+@router.post("/users/{user_id}/admin")
+def set_account_admin(user_id: int, payload: dict | None = None) -> dict:
+    from backend.data import auth_db
+
+    is_admin = bool((payload or {}).get("is_admin"))
+    if not auth_db.set_admin(int(user_id), is_admin):
+        raise HTTPException(status_code=404, detail="No such user")
+    return {"status": "ok", "user": auth_db.public_user(auth_db.get_user(int(user_id)))}
+
+
 @router.post("/restart")
 def restart_backend():
     """Exit the process shortly after responding; the watchdog relaunches it

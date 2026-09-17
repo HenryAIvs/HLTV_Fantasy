@@ -281,8 +281,17 @@ const APP_INFO = (typeof window !== "undefined" && window.api?.appInfo) || null;
 // electron/main.js). Operator-only tabs and every control that scrapes HLTV
 // or rewrites the stored runs are hidden; the backend refuses them anyway
 // (backend/services/public_access.py). `?public` on the dev URL previews it.
-const PUBLIC_BUILD =
+// PUBLIC_BUILD_STATIC never changes: this is the installed app (sign-in,
+// updater, server probe). PUBLIC_BUILD is the *view*: true for ordinary users
+// of the installed app, false in the operator checkout and false again once
+// an admin account signs in, which unlocks every operator tab and control
+// (the backend treats an admin session as the operator too).
+const PUBLIC_BUILD_STATIC =
   Boolean(APP_INFO?.publicBuild) || (typeof window !== "undefined" && new URLSearchParams(window.location.search).has("public"));
+let PUBLIC_BUILD = PUBLIC_BUILD_STATIC;
+const setAdminView = (isAdmin) => {
+  PUBLIC_BUILD = PUBLIC_BUILD_STATIC && !isAdmin;
+};
 const APP_VERSION = APP_INFO?.version || "dev";
 const ALL_TABS = [
   { key: "view", label: "Database" },
@@ -290,8 +299,10 @@ const ALL_TABS = [
   { key: "tournament", label: "Tournament" },
   { key: "devlab", label: "Dev Lab" },
   { key: "scheduling", label: "Scheduling" },
+  { key: "users", label: "Users" },
 ];
-const tabs = PUBLIC_BUILD ? ALL_TABS.filter((t) => ["view", "events", "tournament"].includes(t.key)) : ALL_TABS;
+const PUBLIC_TAB_KEYS = ["view", "events", "tournament"];
+const visibleTabs = () => (PUBLIC_BUILD ? ALL_TABS.filter((t) => PUBLIC_TAB_KEYS.includes(t.key)) : ALL_TABS);
 const NOT_PUBLISHED = "Valuations for this event have not been published yet.";
 
 // Update prompt in the title bar (public build): electron-updater downloads in
@@ -389,7 +400,7 @@ const rememberViewEvent = (id) => {
 };
 const EVENT_SCOPED_PATH = /^\/(playoff|groups|simulate|best-team)(\/|$)/;
 const withViewEvent = (path) => {
-  if (!PUBLIC_BUILD || !VIEW_EVENT_ID || !EVENT_SCOPED_PATH.test(path)) return path;
+  if (!PUBLIC_BUILD_STATIC || !VIEW_EVENT_ID || !EVENT_SCOPED_PATH.test(path)) return path;
   return `${path}${path.includes("?") ? "&" : "?"}event_id=${VIEW_EVENT_ID}`;
 };
 
@@ -438,9 +449,9 @@ const compareVersions = (a, b) => {
 // message instead of empty pages and failed requests.
 const SERVER_PROBE_MS = 30000;
 function useServerStatus() {
-  const [state, setState] = useState({ status: PUBLIC_BUILD ? "checking" : "ok", config: null, error: null, checkedAt: null, failures: 0 });
+  const [state, setState] = useState({ status: PUBLIC_BUILD_STATIC ? "checking" : "ok", config: null, error: null, checkedAt: null, failures: 0 });
   const probe = useCallback(async () => {
-    if (!PUBLIC_BUILD) return;
+    if (!PUBLIC_BUILD_STATIC) return;
     try {
       const cfg = await api.get("/public/config", 10000);
       const min = cfg?.min_client_version;
@@ -457,7 +468,7 @@ function useServerStatus() {
     }
   }, []);
   useEffect(() => {
-    if (!PUBLIC_BUILD) return undefined;
+    if (!PUBLIC_BUILD_STATIC) return undefined;
     probe();
     const timer = setInterval(probe, SERVER_PROBE_MS);
     return () => clearInterval(timer);
@@ -491,14 +502,14 @@ const AUTH_POLL_MS = 2000;
 const AUTH_TIMEOUT_MS = 5 * 60 * 1000;
 
 function useAuth(serverOk, required) {
-  const [state, setState] = useState({ status: PUBLIC_BUILD ? "checking" : "signed_in", user: null, error: null });
+  const [state, setState] = useState({ status: PUBLIC_BUILD_STATIC ? "checking" : "signed_in", user: null, error: null });
   const pollRef = useRef(null);
   const stopPolling = () => {
     if (pollRef.current) clearInterval(pollRef.current);
     pollRef.current = null;
   };
   useEffect(() => {
-    if (!PUBLIC_BUILD || !serverOk) return undefined;
+    if (!PUBLIC_BUILD_STATIC || !serverOk) return undefined;
     if (!required) {
       // The server is not asking for sign-in (no Google client configured yet).
       setState({ status: "signed_in", user: null, error: null });
@@ -512,6 +523,7 @@ function useAuth(serverOk, required) {
       }
       try {
         const me = await api.get("/auth/me", 15000);
+        setAdminView(Boolean(me?.user?.is_admin));
         if (!cancelled) setState({ status: "signed_in", user: me?.user || null, error: null });
       } catch (e) {
         if (cancelled) return;
@@ -544,6 +556,7 @@ function useAuth(serverOk, required) {
         if (res?.status === "ok" && res.token) {
           stopPolling();
           await window.api?.auth?.set?.(res.token);
+          setAdminView(Boolean(res.user?.is_admin));
           setState({ status: "signed_in", user: res.user || null, error: null });
         } else if (res?.status === "unknown") {
           stopPolling();
@@ -565,6 +578,7 @@ function useAuth(serverOk, required) {
       /* the token is dropped locally regardless */
     }
     await window.api?.auth?.clear?.();
+    setAdminView(false);
     setState({ status: "signed_out", user: null, error: null });
   };
   return { ...state, signIn, cancelSignIn, signOut };
@@ -597,6 +611,109 @@ function SignInGate({ auth, configured }) {
         )}
         {auth.error && <p className="muted server-gate-meta">{auth.error}</p>}
       </div>
+    </div>
+  );
+}
+
+// ---- Users (operator / admin): every account, activity, admin toggle ------
+const fmtWhen = (ts) => {
+  if (!ts) return "-";
+  const d = new Date(ts * 1000);
+  const mins = (Date.now() - d.getTime()) / 60000;
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${Math.round(mins)} min ago`;
+  if (mins < 48 * 60) return `${Math.round(mins / 60)} h ago`;
+  return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+};
+
+function UsersTab({ notify, me }) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState("");
+  const [busyId, setBusyId] = useState(null);
+  const load = async () => {
+    setError("");
+    try {
+      setData(await api.get("/admin/users", 30000));
+    } catch (e) {
+      setError(e?.message || "Could not load users.");
+    }
+  };
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 60000);
+    return () => clearInterval(t);
+  }, []);
+  const toggleAdmin = async (u) => {
+    if (me && Number(me.id) === Number(u.id) && u.is_admin) {
+      notify("You can't remove your own admin access.");
+      return;
+    }
+    setBusyId(u.id);
+    try {
+      await api.post(`/admin/users/${u.id}/admin`, { is_admin: !u.is_admin });
+      await load();
+    } catch (e) {
+      notify(e?.message || "Could not update the account.");
+    } finally {
+      setBusyId(null);
+    }
+  };
+  const users = data?.users || [];
+  return (
+    <div className="stack">
+      <Section title="Users">
+        {error && <p className="muted">{error}</p>}
+        {data && (
+          <div className="pills" style={{ flexWrap: "wrap", marginBottom: 12 }}>
+            <div className="pill">{data.total} accounts</div>
+            <div className="pill">{data.online_now} online now</div>
+            <div className="pill">{data.active_7d} active in 7 days</div>
+            <div className="pill">{data.admins} admins</div>
+          </div>
+        )}
+        {data && users.length === 0 && <p className="muted">Nobody has signed in yet.</p>}
+        {users.length > 0 && (
+          <table>
+            <thead>
+              <tr>
+                <th>User</th>
+                <th>Email</th>
+                <th>Last seen</th>
+                <th>First sign-in</th>
+                <th>Sessions</th>
+                <th>Role</th>
+              </tr>
+            </thead>
+            <tbody>
+              {users.map((u) => {
+                const online = (u.last_seen_at || 0) * 1000 > Date.now() - 10 * 60000;
+                return (
+                  <tr key={u.id}>
+                    <td>
+                      <span className="user-cell">
+                        {u.picture ? <img src={u.picture} alt="" referrerPolicy="no-referrer" /> : <span className="user-avatar-fallback">{String(u.name || u.email || "?").slice(0, 1).toUpperCase()}</span>}
+                        <span>{u.name || "-"}</span>
+                        {online && <span className="online-dot" title="Online now" />}
+                      </span>
+                    </td>
+                    <td>{u.email || "-"}</td>
+                    <td title={u.last_seen_at ? new Date(u.last_seen_at * 1000).toLocaleString() : ""}>{fmtWhen(u.last_seen_at || u.last_login_at)}</td>
+                    <td>{u.created_at ? new Date(u.created_at * 1000).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" }) : "-"}</td>
+                    <td>
+                      {u.active_sessions} active / {u.total_sessions}
+                    </td>
+                    <td>
+                      <button className={u.is_admin ? "primary" : "secondary"} onClick={() => toggleAdmin(u)} disabled={busyId === u.id}>
+                        {u.is_admin ? "Admin" : "Make admin"}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </Section>
     </div>
   );
 }
@@ -14886,13 +15003,13 @@ export default function App() {
   // already failed; fetch again as soon as the gate lifts.
   const serverWasOk = useRef(server.status === "ok");
   useEffect(() => {
-    if (server.status === "ok" && !serverWasOk.current && (!PUBLIC_BUILD || auth.status === "signed_in")) load();
+    if (server.status === "ok" && !serverWasOk.current && (!PUBLIC_BUILD_STATIC || auth.status === "signed_in")) load();
     serverWasOk.current = server.status === "ok";
   }, [server.status]);
   // Public build: the data endpoints need a session, so load after sign-in.
   const authWasIn = useRef(false);
   useEffect(() => {
-    if (!PUBLIC_BUILD) return;
+    if (!PUBLIC_BUILD_STATIC) return;
     if (auth.status === "signed_in" && !authWasIn.current) load();
     authWasIn.current = auth.status === "signed_in";
   }, [auth.status]);
@@ -14912,7 +15029,7 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (!PUBLIC_BUILD) load();
+    if (!PUBLIC_BUILD_STATIC) load();
   }, []);
 
   const teamLookup = useMemo(() => {
@@ -15038,6 +15155,7 @@ export default function App() {
       />
     ),
     scheduling: <SchedulingTab notify={notify} players={players} refresh={load} mapStats={mapStatsJob} teams={teams} />,
+    users: <UsersTab notify={notify} me={auth.user} />,
   };
 
   return (
@@ -15047,27 +15165,28 @@ export default function App() {
         <span className="titlebar-brand">
           CS Fantasy <em>Toolkit</em>
         </span>
-        {PUBLIC_BUILD && <span className="titlebar-version">v{APP_VERSION}</span>}
+        {PUBLIC_BUILD_STATIC && <span className="titlebar-version">v{APP_VERSION}</span>}
         <UpdateBanner />
-        {PUBLIC_BUILD && auth.status === "signed_in" && auth.user && (
+        {PUBLIC_BUILD_STATIC && auth.status === "signed_in" && auth.user && (
           <span className="titlebar-user">
             {auth.user.picture && <img src={auth.user.picture} alt="" referrerPolicy="no-referrer" />}
             <span className="titlebar-user-name">{auth.user.name || auth.user.email}</span>
+            {auth.user.is_admin && <span className="titlebar-admin">Admin</span>}
             <button type="button" className="titlebar-signout" onClick={auth.signOut}>
               Sign out
             </button>
           </span>
         )}
       </div>
-      {PUBLIC_BUILD && server.status !== "ok" ? (
+      {PUBLIC_BUILD_STATIC && server.status !== "ok" ? (
         <ServerGate {...server} />
-      ) : PUBLIC_BUILD && auth.status !== "signed_in" ? (
+      ) : PUBLIC_BUILD_STATIC && auth.status !== "signed_in" ? (
         <SignInGate auth={auth} configured={server.config?.auth ? Boolean(server.config.auth.configured) : null} />
       ) : (
         <div className="layout">
-          {PUBLIC_BUILD && server.config?.message && <div className="server-notice">{server.config.message}</div>}
+          {PUBLIC_BUILD_STATIC && server.config?.message && <div className="server-notice">{server.config.message}</div>}
           <nav className="tab-bar">
-            {tabs.map((t) => (
+            {visibleTabs().map((t) => (
               <TabButton key={t.key} active={t.key === active} onClick={() => setActive(t.key)}>
                 {t.label}
               </TabButton>

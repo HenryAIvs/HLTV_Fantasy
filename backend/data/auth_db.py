@@ -55,9 +55,22 @@ def ensure_auth_schema() -> None:
             );
             """
         )
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+        if "is_admin" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
         conn.commit()
     finally:
         conn.close()
+
+
+# token hash -> (user_id, is_admin, checked_at); the middleware asks on every
+# public request, so the answer is cached briefly and dropped on any change.
+_SESSION_CACHE: Dict[str, tuple] = {}
+_SESSION_CACHE_TTL = 60.0
+
+
+def _cache_clear() -> None:
+    _SESSION_CACHE.clear()
 
 
 def _hash(token: str) -> str:
@@ -99,7 +112,74 @@ def public_user(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """The fields the app may see."""
     if not row:
         return None
-    return {"id": int(row["id"]), "email": row.get("email"), "name": row.get("name"), "picture": row.get("picture")}
+    return {
+        "id": int(row["id"]),
+        "email": row.get("email"),
+        "name": row.get("name"),
+        "picture": row.get("picture"),
+        "is_admin": bool(row.get("is_admin")),
+    }
+
+
+def set_admin(user_id: int, is_admin: bool) -> bool:
+    conn = connect()
+    try:
+        cur = conn.execute("UPDATE users SET is_admin = ? WHERE id = ?", (1 if is_admin else 0, int(user_id)))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+        _cache_clear()
+
+
+def set_admin_by_email(email: str, is_admin: bool) -> bool:
+    conn = connect()
+    try:
+        cur = conn.execute("UPDATE users SET is_admin = ? WHERE lower(email) = lower(?)", (1 if is_admin else 0, str(email)))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+        _cache_clear()
+
+
+def session_info(token: Optional[str]) -> Optional[tuple]:
+    """(user_id, is_admin) for a live session token, else None. Cached."""
+    if not token or len(token) < 20 or len(token) > 200:
+        return None
+    h = _hash(token)
+    now = time.time()
+    hit = _SESSION_CACHE.get(h)
+    if hit and now - hit[2] < _SESSION_CACHE_TTL:
+        return (hit[0], hit[1])
+    user_id = user_id_for_token(token)
+    if not user_id:
+        _SESSION_CACHE.pop(h, None)
+        return None
+    row = get_user(user_id)
+    info = (int(user_id), bool(row and row.get("is_admin")))
+    _SESSION_CACHE[h] = (info[0], info[1], now)
+    return info
+
+
+def list_users() -> list:
+    """Every account with sign-in and activity aggregates (operator view)."""
+    conn = connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT u.id, u.email, u.name, u.picture, u.is_admin, u.created_at, u.last_login_at,
+                   (SELECT MAX(s.last_seen_at) FROM sessions s WHERE s.user_id = u.id AND s.revoked = 0) AS last_seen_at,
+                   (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id AND s.revoked = 0 AND s.expires_at > ?) AS active_sessions,
+                   (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id) AS total_sessions
+            FROM users u
+            ORDER BY COALESCE(last_seen_at, u.last_login_at) DESC
+            """,
+            (time.time(),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 # ---- sessions ----------------------------------------------------------------
@@ -150,6 +230,7 @@ def revoke_session(token: Optional[str]) -> bool:
         return cur.rowcount > 0
     finally:
         conn.close()
+        _SESSION_CACHE.pop(_hash(token), None)
 
 
 # ---- sign-in handshake -------------------------------------------------------

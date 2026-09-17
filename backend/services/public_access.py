@@ -153,6 +153,15 @@ def is_operator(request) -> bool:
     token = request.headers.get("x-admin-token")
     if token and secrets.compare_digest(token, admin_token()):
         return True
+    # A signed-in admin account is the operator wherever it connects from.
+    header = request.headers.get("authorization") or ""
+    if header.lower().startswith("bearer "):
+        from backend.data import auth_db
+
+        info = auth_db.session_info(header[7:].strip())
+        if info and info[1]:
+            request.state.user_id = info[0]
+            return True
     if request.headers.get("x-public-client"):
         return False
     if any(request.headers.get(h) for h in _PROXY_HEADERS):

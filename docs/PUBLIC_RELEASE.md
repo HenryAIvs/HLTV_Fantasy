@@ -227,6 +227,14 @@ Setup (Google Cloud Console, once):
    No restart needed; `/public/config` then reports `auth.required: true`
    and the app shows its sign-in screen.
 
+Admins: an account with `is_admin` set is treated as the operator wherever
+it signs in from: the installed app shows every operator tab (Events actions,
+Dev Lab, Scheduling, Users) and the API accepts operator routes from its
+session, with no rate limits. Grant or revoke on the Users tab (an admin
+cannot demote themselves there) or with
+`POST /admin/users/{id}/admin {"is_admin": true}`. The Users tab lists every
+account with last seen, first sign-in and active sessions.
+
 Flow: the app opens the browser at `/auth/google/start` with a random state
 and a challenge, the server does the Google exchange and verifies the ID
 token, the app collects its session with `/auth/poll` (one-shot, verifier

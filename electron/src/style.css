@@ -3987,3 +3987,10 @@ button:disabled {
 .titlebar-signout { background: transparent; border: 1px solid #2c3441; color: #8fa3bf; padding: 2px 8px; font-size: 11px; cursor: pointer; }
 .titlebar-signout:hover { color: #f2f5f9; border-color: #6d7d95; }
 .titlebar-update + .titlebar-user { margin-left: 12px; }
+
+/* Users tab + admin badge */
+.titlebar-admin { padding: 1px 6px; border: 1px solid #ff6b1a; color: #ff8a47; font-family: var(--display); font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; }
+.user-cell { display: inline-flex; align-items: center; gap: 8px; }
+.user-cell img, .user-avatar-fallback { width: 24px; height: 24px; border-radius: 50%; }
+.user-avatar-fallback { display: inline-grid; place-items: center; background: #2c3441; color: #c6d0dc; font-size: 12px; font-weight: 700; }
+.online-dot { width: 8px; height: 8px; border-radius: 50%; background: #3ddc84; box-shadow: 0 0 0 2px #12161c; }
