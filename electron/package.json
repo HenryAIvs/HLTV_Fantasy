@@ -1,7 +1,7 @@
 {
   "name": "cs-fantasy",
   "productName": "CS Fantasy Toolkit",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "Counter-Strike fantasy valuations, brackets and roster optimisation.",
   "author": "HenryAIvs",
   "license": "UNLICENSED",

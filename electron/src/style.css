@@ -3994,3 +3994,9 @@ button:disabled {
 .user-cell img, .user-avatar-fallback { width: 24px; height: 24px; border-radius: 50%; }
 .user-avatar-fallback { display: inline-grid; place-items: center; background: #2c3441; color: #c6d0dc; font-size: 12px; font-weight: 700; }
 .online-dot { width: 8px; height: 8px; border-radius: 50%; background: #3ddc84; box-shadow: 0 0 0 2px #12161c; }
+
+/* In-app update prompt (replaces the native message box) */
+.update-modal-backdrop { z-index: 300; }
+.update-modal { width: min(520px, 92vw); background: #12161c; border: 1px solid #2c3441; border-top: 3px solid #ff6b1a; padding: 24px 28px 22px; }
+.update-modal h1 { margin: 0 0 10px; font-family: var(--display); font-size: 26px; line-height: 1.05; text-transform: uppercase; letter-spacing: 0.02em; color: #f2f5f9; }
+.update-modal p { margin: 0 0 6px; color: #c6d0dc; font-size: 15px; line-height: 1.5; }

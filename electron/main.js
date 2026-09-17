@@ -195,28 +195,6 @@ const sendUpdateStatus = (status) => {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("update-status", status);
 };
 
-// The title-bar banner is easy to miss; when the download is ready ask once
-// with a native dialog. "Later" leaves the banner in place, and the update
-// still installs on the next quit.
-let askedToRestart = false;
-const offerRestart = async (version) => {
-  if (askedToRestart || !mainWindow || mainWindow.isDestroyed()) return;
-  askedToRestart = true;
-  const { response } = await dialog.showMessageBox(mainWindow, {
-    type: "info",
-    title: "Update ready",
-    message: `CS Fantasy Toolkit ${version ? `v${version} ` : ""}has been downloaded.`,
-    detail: "Restart now to install it, or keep working and it installs when you next close the app.",
-    buttons: ["Restart now", "Later"],
-    defaultId: 0,
-    cancelId: 1,
-    noLink: true,
-  });
-  ulog("info", "restart dialog answered", response === 0 ? "restart now" : "later");
-  // Silent install (no setup wizard), then relaunch the updated app.
-  if (response === 0 && autoUpdater) autoUpdater.quitAndInstall(true, true);
-};
-
 // electron-updater against the GitHub release feed (package.json "publish").
 // Downloads in the background; the renderer shows a "restart to update"
 // prompt once the new version is ready.
@@ -230,10 +208,8 @@ const setupUpdater = () => {
   autoUpdater.on("update-available", (info) => sendUpdateStatus({ status: "available", version: info?.version }));
   autoUpdater.on("update-not-available", () => sendUpdateStatus({ status: "none" }));
   autoUpdater.on("download-progress", (p) => sendUpdateStatus({ status: "downloading", percent: Math.round(p?.percent || 0) }));
-  autoUpdater.on("update-downloaded", (info) => {
-    sendUpdateStatus({ status: "downloaded", version: info?.version });
-    offerRestart(info?.version);
-  });
+  // The renderer shows an in-app prompt (UpdateModal) on "downloaded".
+  autoUpdater.on("update-downloaded", (info) => sendUpdateStatus({ status: "downloaded", version: info?.version }));
   autoUpdater.on("error", (err) => sendUpdateStatus({ status: "error", message: String(err?.message || err) }));
   // Check shortly after launch, then every 30 minutes, and whenever the window
   // regains focus (at most once every 10 minutes) so a release published while
@@ -305,23 +281,28 @@ app.whenReady().then(async () => {
     }
   };
   ipcMain.on("auth-token-get", (event) => {
-    event.returnValue = readToken();
+    const token = readToken();
+    ulog("info", "session token read", { present: Boolean(token), length: token ? token.length : 0, encryption: safeStorage.isEncryptionAvailable() });
+    event.returnValue = token;
   });
   ipcMain.handle("auth-token-set", (_event, token) => {
     const text = String(token || "");
     if (!text) return { status: "ok" };
     const data = safeStorage.isEncryptionAvailable() ? safeStorage.encryptString(text) : Buffer.from(text, "utf8");
     fs.writeFileSync(tokenFile(), data);
+    ulog("info", "session token saved", { bytes: data.length });
     return { status: "ok" };
   });
-  ipcMain.handle("auth-token-clear", () => {
+  ipcMain.handle("auth-token-clear", (_event, reason) => {
     try {
       fs.unlinkSync(tokenFile());
     } catch {
       /* nothing stored */
     }
+    ulog("info", "session token cleared", { reason: String(reason || "") });
     return { status: "ok" };
   });
+  ipcMain.on("renderer-log", (_event, info) => ulog("info", "renderer", info));
   ipcMain.on("app-info", (event) => {
     event.returnValue = {
       publicBuild,

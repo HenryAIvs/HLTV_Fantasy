@@ -83,15 +83,16 @@ contextBridge.exposeInMainWorld("api", {
   installUpdate: () => ipcRenderer.invoke("install-update"),
   // Renderer-side errors go to the app log (updater.log in the data folder).
   reportError: (info) => ipcRenderer.send("renderer-error", info),
+  log: (info) => ipcRenderer.send("renderer-log", info),
   auth: {
     get: () => AUTH_TOKEN,
     set: (token) => {
       AUTH_TOKEN = String(token || "") || null;
       return ipcRenderer.invoke("auth-token-set", AUTH_TOKEN);
     },
-    clear: () => {
+    clear: (reason) => {
       AUTH_TOKEN = null;
-      return ipcRenderer.invoke("auth-token-clear");
+      return ipcRenderer.invoke("auth-token-clear", reason || "");
     },
   },
   checkForUpdates: () => ipcRenderer.invoke("check-updates"),

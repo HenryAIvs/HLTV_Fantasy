@@ -307,12 +307,55 @@ const NOT_PUBLISHED = "Valuations for this event have not been published yet.";
 
 // Update prompt in the title bar (public build): electron-updater downloads in
 // the background and the user restarts when it is ready.
-function UpdateBanner() {
-  const [status, setStatus] = useState(null);
+// One subscription to the updater's status, shared by the title-bar banner
+// and the in-app prompt.
+const updateStatusListeners = new Set();
+let latestUpdateStatus = null;
+if (typeof window !== "undefined" && window.api?.onUpdateStatus) {
+  window.api.onUpdateStatus((s) => {
+    latestUpdateStatus = s;
+    updateStatusListeners.forEach((fn) => fn(s));
+  });
+  // Lets a preview or a test drive the prompt without a real release.
+  window.__setUpdateStatus = (s) => {
+    latestUpdateStatus = s;
+    updateStatusListeners.forEach((fn) => fn(s));
+  };
+}
+const useUpdateStatus = () => {
+  const [status, setStatus] = useState(latestUpdateStatus);
   useEffect(() => {
-    if (!window.api?.onUpdateStatus) return;
-    window.api.onUpdateStatus((s) => setStatus(s));
+    updateStatusListeners.add(setStatus);
+    return () => updateStatusListeners.delete(setStatus);
   }, []);
+  return status;
+};
+
+// Shown once when an update has been downloaded; "Later" leaves the title-bar
+// button, and the update still installs when the app is next closed.
+function UpdateModal() {
+  const status = useUpdateStatus();
+  const [dismissedVersion, setDismissedVersion] = useState(null);
+  if (!status || status.status !== "downloaded" || dismissedVersion === (status.version || "?")) return null;
+  return (
+    <div className="modal-backdrop update-modal-backdrop">
+      <div className="update-modal">
+        <p className="server-gate-kicker">Update ready</p>
+        <h1>Version {status.version || ""} is ready to install</h1>
+        <p>Restart now and it installs in a few seconds, or keep working and it installs when you next close the app.</p>
+        <div className="server-gate-actions">
+          <button className="primary" onClick={() => window.api?.installUpdate?.()}>
+            Restart now
+          </button>
+          <button onClick={() => setDismissedVersion(status.version || "?")}>Later</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function UpdateBanner() {
+  const status = useUpdateStatus();
   if (!status) return null;
   if (status.status === "downloaded") {
     return (
@@ -503,6 +546,8 @@ const AUTH_TIMEOUT_MS = 5 * 60 * 1000;
 
 function useAuth(serverOk, required) {
   const [state, setState] = useState({ status: PUBLIC_BUILD_STATIC ? "checking" : "signed_in", user: null, error: null });
+  // Bumped by "Check again" on the sign-in screen: re-runs the stored-session check.
+  const [checkNonce, setCheckNonce] = useState(0);
   const pollRef = useRef(null);
   const stopPolling = () => {
     if (pollRef.current) clearInterval(pollRef.current);
@@ -518,24 +563,42 @@ function useAuth(serverOk, required) {
     let cancelled = false;
     (async () => {
       if (!window.api?.auth?.get?.()) {
+        window.api?.log?.({ auth: "no stored session; showing sign-in" });
         setState({ status: "signed_out", user: null, error: null });
         return;
       }
-      try {
-        const me = await api.get("/auth/me", 15000);
-        setAdminView(Boolean(me?.user?.is_admin));
-        if (!cancelled) setState({ status: "signed_in", user: me?.user || null, error: null });
-      } catch (e) {
-        if (cancelled) return;
-        // A rejected token is gone for good; anything else is a network blip.
-        if (/sign in|401/i.test(String(e?.message || ""))) window.api?.auth?.clear?.();
-        setState({ status: "signed_out", user: null, error: null });
+      // Confirm the stored session. A 401 means the server no longer knows
+      // it (signed out elsewhere, expired): drop it. Anything else is the
+      // server or the connection having a moment: retry a few times before
+      // asking the user to sign in again, and keep the token regardless.
+      let lastMessage = "";
+      for (let attempt = 1; attempt <= 4 && !cancelled; attempt++) {
+        try {
+          const me = await api.get("/auth/me", 15000);
+          setAdminView(Boolean(me?.user?.is_admin));
+          window.api?.log?.({ auth: "stored session accepted", attempt, admin: Boolean(me?.user?.is_admin) });
+          if (!cancelled) setState({ status: "signed_in", user: me?.user || null, error: null });
+          return;
+        } catch (e) {
+          lastMessage = String(e?.message || e);
+          if (/sign in|\b401\b/i.test(lastMessage)) {
+            window.api?.log?.({ auth: "stored session rejected (401); clearing", attempt });
+            window.api?.auth?.clear?.("rejected by server");
+            if (!cancelled) setState({ status: "signed_out", user: null, error: null });
+            return;
+          }
+          window.api?.log?.({ auth: "session check failed; will retry", attempt, message: lastMessage });
+          await new Promise((r) => setTimeout(r, 3000 * attempt));
+        }
       }
+      if (cancelled) return;
+      window.api?.log?.({ auth: "session check gave up; token kept", message: lastMessage });
+      setState({ status: "signed_out", user: null, error: `Couldn't confirm your sign-in (${lastMessage}). Your session is still saved.`, retryable: true });
     })();
     return () => {
       cancelled = true;
     };
-  }, [serverOk, required]);
+  }, [serverOk, required, checkNonce]);
   useEffect(() => () => stopPolling(), []);
   const signIn = async () => {
     stopPolling();
@@ -571,17 +634,21 @@ function useAuth(serverOk, required) {
     stopPolling();
     setState({ status: "signed_out", user: null, error: null });
   };
+  const recheck = () => {
+    setState((prev) => ({ ...prev, status: "checking", error: null }));
+    setCheckNonce((n) => n + 1);
+  };
   const signOut = async () => {
     try {
       await api.post("/auth/signout", {}, 10000);
     } catch {
       /* the token is dropped locally regardless */
     }
-    await window.api?.auth?.clear?.();
+    await window.api?.auth?.clear?.("signed out");
     setAdminView(false);
     setState({ status: "signed_out", user: null, error: null });
   };
-  return { ...state, signIn, cancelSignIn, signOut };
+  return { ...state, signIn, cancelSignIn, signOut, recheck };
 }
 
 function SignInGate({ auth, configured }) {
@@ -604,7 +671,12 @@ function SignInGate({ auth, configured }) {
           </>
         ) : (
           <div className="server-gate-actions">
-            <button className="primary" onClick={auth.signIn} disabled={configured === false || auth.status === "checking"}>
+            {auth.retryable && (
+              <button className="primary" onClick={auth.recheck}>
+                Check again
+              </button>
+            )}
+            <button className={auth.retryable ? "" : "primary"} onClick={auth.signIn} disabled={configured === false || auth.status === "checking"}>
               {auth.status === "checking" ? "Checking..." : "Continue with Google"}
             </button>
           </div>
@@ -15361,6 +15433,7 @@ export default function App() {
           </span>
         )}
       </div>
+      {PUBLIC_BUILD_STATIC && <UpdateModal />}
       {PUBLIC_BUILD_STATIC && server.status !== "ok" ? (
         <ServerGate {...server} />
       ) : PUBLIC_BUILD_STATIC && auth.status !== "signed_in" ? (
