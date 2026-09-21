@@ -11974,7 +11974,7 @@ function RatingLabTab({ players }) {
 
         <div className="card sub pool">
           <div className="pool-head">
-            <h3>Average Player Top-X (whole pool)</h3>
+            <h3>Average Player Top-X</h3>
             <div className="pool-head-right">
               {avg && (
                 <div className="pool-stats">
@@ -11988,9 +11988,6 @@ function RatingLabTab({ players }) {
                   </div>
                 </div>
               )}
-              <button className="secondary" onClick={loadAverage} disabled={avgLoading}>
-                {avgLoading ? "Loading..." : "Refresh"}
-              </button>
             </div>
           </div>
           {avgError && <p className="error">{avgError}</p>}
