@@ -470,91 +470,6 @@ tr:hover { background: #10141a; }
   outline-offset: 3px;
 }
 
-.model-slice-card {
-  border: 1px solid #2c3441;
-  border-radius: 12px;
-  background: #10141a;
-  padding: 14px;
-}
-
-.model-slice-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-
-.model-slice-head h3 {
-  margin: 0 0 4px;
-}
-
-.model-slice-track {
-  position: relative;
-  height: 112px;
-  border: 1px solid #2c3441;
-  border-radius: 6px;
-  overflow: hidden;
-  background:
-    repeating-linear-gradient(90deg, rgba(148, 163, 184, 0.12) 0 1px, transparent 1px 10%),
-    linear-gradient(180deg, #12161d 0%, #12161d 100%);
-}
-
-.model-slice-zero,
-.model-slice-end {
-  position: absolute;
-  top: 8px;
-  z-index: 2;
-  color: #8fa3bf;
-  font-size: 12px;
-}
-
-.model-slice-zero { left: 10px; }
-.model-slice-end { right: 10px; }
-
-.model-slice-segment {
-  position: absolute;
-  min-width: 58px;
-  height: 26px;
-  border-radius: 4px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: #e9edf3;
-  font-size: 12px;
-  font-weight: 700;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.model-slice-segment.test {
-  top: 58px;
-  background: #ff6b1a;
-  border: 1px solid #ff8a47;
-}
-
-.model-slice-segment.train {
-  top: 84px;
-  background: #0e7490;
-  border: 1px solid #22d3ee;
-}
-
-.model-slice-segment.db {
-  top: 32px;
-  background: #334155;
-  border: 1px solid #64748b;
-}
-
-.model-slice-meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px 16px;
-  margin-top: 10px;
-  color: #8fa3bf;
-  font-size: 13px;
-}
-
 .warning-text {
   color: #fbbf24;
 }
@@ -4196,14 +4111,17 @@ button:disabled {
   margin-bottom: 14px;
 }
 .mm-go { margin-bottom: 1px; }
-.mm-run-note {
-  flex: 1 1 260px;
-  color: #8fa3bf;
-  font-size: 12.5px;
-  line-height: 1.5;
-  padding-bottom: 6px;
+.mm-progress {
+  flex: 1 1 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-bottom: 2px;
 }
-.mm-data-note { color: #8fa3bf; font-size: 12.5px; }
+.mm-progress .mm-bar-fill { transition: width 0.25s ease; }
+.mm-progress-label { color: #8fa3bf; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.mm-run-row { align-items: center; }
+.mm-data-note { color: #8fa3bf; font-size: 12.5px; margin: 0 0 12px; }
 .mm-jobs { display: flex; flex-direction: column; gap: 10px; }
 .mm-job {
   display: grid;

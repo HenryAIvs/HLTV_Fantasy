@@ -4155,24 +4155,55 @@ def _map_model_input_summary(
     }
 
 
+# Progress of the one lab run at a time, so the page can draw a real bar.
+_MAP_MODEL_LAB_PROGRESS: Dict[str, Any] = {"running": False, "fraction": 0.0, "label": "", "started_at": None}
+_MAP_MODEL_LAB_PROGRESS_LOCK = threading.Lock()
+
+
+def _lab_progress(fraction: float, label: str, running: bool = True) -> None:
+    with _MAP_MODEL_LAB_PROGRESS_LOCK:
+        if running and not _MAP_MODEL_LAB_PROGRESS.get("running"):
+            _MAP_MODEL_LAB_PROGRESS["started_at"] = time.time()
+        _MAP_MODEL_LAB_PROGRESS.update(
+            {"running": bool(running), "fraction": float(max(0.0, min(1.0, fraction))), "label": str(label)}
+        )
+
+
+@router.get("/hltv-results/map-model-lab/progress")
+def get_map_model_lab_progress():
+    with _MAP_MODEL_LAB_PROGRESS_LOCK:
+        return dict(_MAP_MODEL_LAB_PROGRESS)
+
+
 @router.get("/hltv-results/map-model-lab")
 def get_map_model_lab():
+    try:
+        return _run_map_model_lab()
+    finally:
+        _lab_progress(1.0, "Done", running=False)
+
+
+def _run_map_model_lab():
     """One chronological split, fixed by usable maps: walking from the newest
     match backwards, the test slice is the smallest set of whole matches that
     holds at least _MAP_MODEL_TEST_MAPS usable maps, and the training slice
     is every match before it. Whole matches, so series-level metrics see
     complete series. (A random split lets the fit learn a period from its
     own neighbours and reports a few points too high.)"""
+    _lab_progress(0.02, "Loading matches")
     db_matches = int(count_hltv_results())
     all_rows = list_hltv_results(limit=db_matches, offset=0) if db_matches > 0 else []
+    _lab_progress(0.08, "Loading historical map-stat windows")
     historical_map_stats_by_window, historical_cache_summary = _build_historical_team_map_stats_by_window(
         all_rows,
         fetch_missing=False,
     )
     # Elo replays the full stored timeline; each match only sees earlier results.
+    _lab_progress(0.22, "Replaying Elo over the match timeline")
     prematch_elo_by_match = _build_prematch_elo_by_match(all_rows)
     # Candidates: every ranked map with its data flags; kept: complete data
     # only (both teams' historical map stats for that map, and the veto).
+    _lab_progress(0.34, "Building map samples")
     all_candidates = _iter_ranked_map_samples(
         all_rows, historical_map_stats_by_window=historical_map_stats_by_window, prematch_elo_by_match=prematch_elo_by_match
     )
@@ -4208,8 +4239,11 @@ def get_map_model_lab():
     train_limit = len(train_rows)
     # Win probabilities come from models trained directly on the map result;
     # the round-share models are kept for scoreline prediction only.
+    _lab_progress(0.5, "Fitting the map-data win model")
     models_with_map_data = _fit_map_model_set(train_samples, include_map_stats=True, target="map_win")
+    _lab_progress(0.6, "Fitting the rank-only win model")
     models_rank_only = _fit_map_model_set(train_samples, include_map_stats=False, target="map_win")
+    _lab_progress(0.68, "Fitting the scoreline models")
     score_models_with = _fit_map_model_set(train_samples, include_map_stats=True)
     score_models_rank = _fit_map_model_set(train_samples, include_map_stats=False)
     if not test_samples:
@@ -4218,6 +4252,7 @@ def get_map_model_lab():
             detail="No evaluation maps have historical six-month map stats for both teams. Fetch missing historical map stats, or fix team identity mappings.",
         )
 
+    _lab_progress(0.84, "Evaluating on the holdout")
     test_series_contexts = _iter_series_contexts(
         test_rows,
         historical_map_stats_by_window=historical_map_stats_by_window,

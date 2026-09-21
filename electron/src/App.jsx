@@ -11342,7 +11342,7 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
                     )}
                     {task === "map_model" && (
                       <div className="muted" style={{ fontSize: 12 }}>
-                        Whatever the map model is missing (the three jobs on the Model Lab page), for up to{" "}
+                        Whatever the map model is missing (the three jobs under Model Data below), for up to{" "}
                         <input
                           type="number"
                           min={1}
@@ -11389,6 +11389,8 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
           )}
         </div>
       </Section>
+
+      <ModelDataPanel />
 
       <TopxImportPanel players={players} notify={notify} refresh={refresh} />
 
@@ -12374,17 +12376,11 @@ function BackfillRow({ name, detail, done, total, missing, unit, extra, job, ver
   );
 }
 
-// The lab's fixed split (mirrors _MAP_MODEL_TEST_MAPS on the backend, which
-// the response also reports): the holdout is the newest matches holding the
-// latest 1,000 usable maps; training is every match before them.
-const MODEL_LAB_TEST_MAPS = 1000;
-
-function ModelLabTab() {
-  const [dbMatchCount, setDbMatchCount] = useState(0);
-  // The three backfills the map model depends on. Each is a pausable
-  // server-side job driven through useBackfillJob; the scheduler's nightly
-  // "map_model" task drives these very same jobs, so progress shows here
-  // whichever side started them.
+// The three backfills the map model depends on, as a Scheduling-tab panel.
+// Each is a pausable server-side job driven through useBackfillJob; the
+// scheduler's nightly "map_model" task drives these very same jobs, so
+// progress shows here whichever side started them.
+function ModelDataPanel() {
   const [histCoverage, setHistCoverage] = useState(null);
   const histJob = useBackfillJob("/events/hltv-results/historical-map-stats", "historical map stats");
   const loadHistCoverage = async () => {
@@ -12429,6 +12425,50 @@ function ModelLabTab() {
     loadMapSbCoverage();
     mapSbJob.hydrate();
   }, []);
+
+  return (
+    <Section title="Model Data">
+      <p className="muted mm-data-note">
+        What the map model needs and how much of it is stored. The nightly "Map model data" task fetches whatever is
+        missing; any job can also be run from here.
+      </p>
+      <div className="mm-jobs">
+        <BackfillRow
+          name="Historical map stats"
+          detail="Six-month map stats for both teams as of each match date. Maps without them are left out of the model."
+          done={histCoverage?.cached_windows}
+          total={histCoverage?.required_windows}
+          missing={histCoverage?.missing_windows}
+          unit="team windows"
+          extra={Number(histCoverage?.unmapped_team_keys || 0) > 0 ? `${histCoverage.unmapped_team_keys} team names not in the team DB` : ""}
+          job={histJob}
+        />
+        <BackfillRow
+          name="Match vetoes"
+          detail="Who picked each map, plus missing per-map scores and player stats. Feeds the picked-map feature and veto-simulated series."
+          done={vetoCoverage?.with_veto}
+          total={vetoCoverage?.total_matches}
+          missing={vetoCoverage?.missing_veto}
+          unit="matches"
+          job={vetoJob}
+        />
+        <BackfillRow
+          name="Per-map scoreboards"
+          detail="Player scoreboards for every map (the map tabs in the match view), mostly re-parsed from archived pages without scraping."
+          done={mapSbCoverage?.with_map_scoreboards}
+          total={mapSbCoverage?.total_matches}
+          missing={mapSbCoverage?.missing_map_scoreboards}
+          unit="matches"
+          job={mapSbJob}
+          verb="Scan"
+          activeLabel="Scanning"
+        />
+      </div>
+    </Section>
+  );
+}
+
+function ModelLabTab() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
@@ -12459,44 +12499,6 @@ function ModelLabTab() {
       map_elo_gap: "Map Elo gap",
       picked_by_a: "Picked by team",
     }[feature] || feature);
-  useEffect(() => {
-    let live = true;
-    api
-      .get("/events/hltv-results?limit=1&offset=0")
-      .then((data) => {
-        if (!live) return;
-        setDbMatchCount(Number(data?.total || data?.count || 0));
-      })
-      .catch(() => {
-        if (live) setDbMatchCount(0);
-      });
-    return () => {
-      live = false;
-    };
-  }, []);
-
-  const timeline = useMemo(() => {
-    const dbTotal = Math.max(0, Number(result?.db_matches || dbMatchCount || 0));
-    // How many matches the holdout spans is only known once a run has counted
-    // usable maps; before that the track shows the database alone.
-    const testLen = Math.min(dbTotal, Number(result?.split?.test_matches || 0));
-    const trainLen = result ? Math.max(0, dbTotal - testLen) : 0;
-    const total = Math.max(dbTotal, 1);
-    const segmentStyle = (start, length) => ({
-      left: `${(start / total) * 100}%`,
-      width: `${length > 0 ? Math.max(1.5, (length / total) * 100) : 0}%`,
-    });
-    return {
-      dbTotal,
-      testStart: 0,
-      testEnd: testLen,
-      trainStart: testLen,
-      trainEnd: testLen + trainLen,
-      dbStyle: segmentStyle(0, dbTotal),
-      testStyle: segmentStyle(0, testLen),
-      trainStyle: segmentStyle(testLen, trainLen),
-    };
-  }, [dbMatchCount, result, result?.db_matches, result?.split?.test_matches]);
 
   const rankEffectLevelBands = useMemo(
     () => (result?.rank_effect_curve?.level_bands || []).filter((band) => Array.isArray(band.rows) && band.rows.length > 0),
@@ -12517,14 +12519,24 @@ function ModelLabTab() {
     );
   };
 
+  // Phase and fraction reported by the backend while a run is in flight.
+  const [progress, setProgress] = useState(null);
   const run = async () => {
     setBusy(true);
     setError("");
     setResult(null);
     setSelectedBreakdownRow(null);
+    setProgress({ fraction: 0, label: "Starting..." });
+    const poll = setInterval(async () => {
+      try {
+        const p = await api.get("/events/hltv-results/map-model-lab/progress", 5000);
+        if (p && p.running) setProgress({ fraction: Number(p.fraction || 0), label: String(p.label || "") });
+      } catch {
+        // keep the last value
+      }
+    }, 400);
     try {
-      // The split is fixed server-side (newest matches test, the rest train).
-      // Building samples over every stored match takes a while; allow it.
+      // The split is fixed server-side (latest usable maps test, the rest train).
       const data = await api.get("/events/hltv-results/map-model-lab", 600000);
       if (data?.detail) {
         setError(String(data.detail));
@@ -12534,7 +12546,9 @@ function ModelLabTab() {
     } catch (e) {
       setError(e?.message || "Failed to run model lab.");
     } finally {
+      clearInterval(poll);
       setBusy(false);
+      setProgress(null);
     }
   };
 
@@ -12550,79 +12564,17 @@ function ModelLabTab() {
             <button className="primary mm-go" onClick={run} disabled={busy}>
               {busy ? "Running..." : "Train & evaluate"}
             </button>
-            <span className="mm-run-note">
-              Tests on the latest {fmtInt(result?.split?.test_maps_target || MODEL_LAB_TEST_MAPS)} usable maps (the newest matches
-              with complete data) and trains on every match before them. The split is fixed so runs are comparable.
-            </span>
-          </div>
-          <div className="model-slice-track" aria-label="Training and testing slices across stored matches">
-            <div className="model-slice-zero">Newest</div>
-            <div className="model-slice-end">Older</div>
-            <div className="model-slice-segment db" style={timeline.dbStyle}>
-              DB {timeline.dbTotal.toLocaleString()}
-            </div>
-            {timeline.testEnd > timeline.testStart && (
-              <div className="model-slice-segment test" style={timeline.testStyle}>
-                Test
-              </div>
-            )}
-            {timeline.trainEnd > timeline.trainStart && (
-              <div className="model-slice-segment train" style={timeline.trainStyle}>
-                Train
-              </div>
-            )}
-          </div>
-          <div className="model-slice-meta">
-            <span>DB matches {timeline.dbTotal.toLocaleString()}</span>
-            {result ? (
-              <>
-                <span>
-                  Test: newest {timeline.testEnd.toLocaleString()} matches, {fmtInt(result.split?.test_maps)} usable maps
+            {busy && (
+              <div className="mm-progress" aria-label="Training progress">
+                <div className="mm-bar">
+                  <div className="mm-bar-fill" style={{ width: `${Math.round((progress?.fraction || 0) * 100)}%` }} />
+                </div>
+                <span className="mm-progress-label">
+                  {progress?.label || "Starting..."}
+                  {progress?.fraction ? ` · ${Math.round(progress.fraction * 100)}%` : ""}
                 </span>
-                <span>Train: the {(timeline.trainEnd - timeline.trainStart).toLocaleString()} before them</span>
-              </>
-            ) : (
-              <span>Run to see how many matches the latest {fmtInt(MODEL_LAB_TEST_MAPS)} usable maps span</span>
+              </div>
             )}
-          </div>
-        </div>
-
-        <div className="card sub">
-          <div className="pool-head">
-            <h3>Model data</h3>
-            <span className="mm-data-note">Missing data is fetched every night by the scheduler; any job can also be run from here.</span>
-          </div>
-          <div className="mm-jobs">
-            <BackfillRow
-              name="Historical map stats"
-              detail="Six-month map stats for both teams as of each match date. Maps without them are left out of the model."
-              done={histCoverage?.cached_windows}
-              total={histCoverage?.required_windows}
-              missing={histCoverage?.missing_windows}
-              unit="team windows"
-              extra={Number(histCoverage?.unmapped_team_keys || 0) > 0 ? `${histCoverage.unmapped_team_keys} team names not in the team DB` : ""}
-              job={histJob}
-            />
-            <BackfillRow
-              name="Match vetoes"
-              detail="Who picked each map, plus missing per-map scores and player stats. Feeds the picked-map feature and veto-simulated series."
-              done={vetoCoverage?.with_veto}
-              total={vetoCoverage?.total_matches}
-              missing={vetoCoverage?.missing_veto}
-              unit="matches"
-              job={vetoJob}
-            />
-            <BackfillRow
-              name="Per-map scoreboards"
-              detail="Player scoreboards for every map (the map tabs in the match view), mostly re-parsed from archived pages without scraping."
-              done={mapSbCoverage?.with_map_scoreboards}
-              total={mapSbCoverage?.total_matches}
-              missing={mapSbCoverage?.missing_map_scoreboards}
-              unit="matches"
-              job={mapSbJob}
-              verb="Scan"
-              activeLabel="Scanning"
-            />
           </div>
         </div>
         {error && <p className="error">{error}</p>}
