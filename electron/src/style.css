@@ -4193,3 +4193,9 @@ button:disabled {
 .players-controls .field { margin-bottom: 10px; }
 .players-controls .search-field { flex: 1 1 320px; max-width: 420px; }
 .players-controls .field:not(.search-field) { width: 220px; }
+
+/* Model Lab calibration chart */
+.value-chart-wrap.mm-cal-chart { position: relative; }
+.pool-legend i.bar-a { width: 12px; height: 10px; background: #ff6b1a; }
+.pool-legend i.bar-b { width: 12px; height: 10px; background: #3a4452; }
+.mm-warn { color: #f0a763; }

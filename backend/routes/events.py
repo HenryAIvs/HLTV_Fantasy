@@ -4003,6 +4003,62 @@ def _veto_sim_series_metrics(
     }
 
 
+def _calibration_report(pairs: List[tuple[float, float]]) -> Dict[str, Any]:
+    """How honest the probabilities are. `pairs` are (p_team1, y_team1).
+
+    bins: favourite-framed, 5-point buckets from 50% to 100%: when the model
+    made a side the favourite with that probability, how often did it win?
+    ece: the count-weighted mean gap between stated and observed rates.
+    reliability / resolution / uncertainty: the Brier decomposition over
+    ten equal-width team-1 buckets (brier ~= reliability - resolution +
+    uncertainty); low reliability = well calibrated, high resolution =
+    confident where it should be."""
+    clean = [(float(p), float(y)) for p, y in pairs if y in (0.0, 1.0)]
+    n_all = len(clean)
+    if n_all == 0:
+        return {"n": 0, "ece": None, "reliability": None, "resolution": None, "uncertainty": None, "bins": []}
+    # favourite framing
+    fav = [(max(p, 1.0 - p), 1.0 if (p >= 0.5) == (y == 1.0) else 0.0) for p, y in clean]
+    bins = []
+    ece = 0.0
+    for k in range(10):
+        lo = 0.5 + 0.05 * k
+        hi = lo + 0.05
+        members = [(p, w) for p, w in fav if (lo <= p < hi) or (k == 9 and p >= hi)]
+        n = len(members)
+        if n:
+            mean_p = sum(p for p, _ in members) / n
+            observed = sum(w for _, w in members) / n
+            ece += (n / n_all) * abs(mean_p - observed)
+        else:
+            mean_p = None
+            observed = None
+        bins.append({"lo": lo, "hi": hi, "label": f"{int(round(lo * 100))}-{int(round(hi * 100))}%", "n": n, "predicted": mean_p, "observed": observed})
+    # Brier decomposition, team-1 framing, ten equal-width buckets
+    base = sum(y for _, y in clean) / n_all
+    reliability = 0.0
+    resolution = 0.0
+    for k in range(10):
+        lo = 0.1 * k
+        hi = lo + 0.1
+        members = [(p, y) for p, y in clean if (lo <= p < hi) or (k == 9 and p >= hi)]
+        n = len(members)
+        if not n:
+            continue
+        mean_p = sum(p for p, _ in members) / n
+        observed = sum(y for _, y in members) / n
+        reliability += n * (mean_p - observed) ** 2
+        resolution += n * (observed - base) ** 2
+    return {
+        "n": n_all,
+        "ece": ece,
+        "reliability": reliability / n_all,
+        "resolution": resolution / n_all,
+        "uncertainty": base * (1.0 - base),
+        "bins": bins,
+    }
+
+
 def _evaluate_map_model_set(
     models: Dict[str, Dict[str, Any]],
     test_samples: List[Dict[str, Any]],
@@ -4018,6 +4074,8 @@ def _evaluate_map_model_set(
     abs_round_share_error = 0.0
     winner_correct = 0
     brier_sum = 0.0
+    map_pairs: List[tuple[float, float]] = []
+    series_pairs: List[tuple[float, float]] = []
     by_map: Dict[str, Dict[str, Any]] = {}
     series_groups: Dict[str, Dict[str, Any]] = {}
     for sample in test_samples:
@@ -4040,6 +4098,7 @@ def _evaluate_map_model_set(
         abs_round_share_error += round_share_error
         winner_correct += 1 if pred_outcome == actual_outcome else 0
         brier_sum += (p_map - actual_map_target) ** 2
+        map_pairs.append((float(p_map), float(actual_map_target)))
         series_url = str(sample.get("match_url") or "")
         if series_url:
             group = series_groups.setdefault(
@@ -4095,6 +4154,7 @@ def _evaluate_map_model_set(
         series_n += 1
         series_correct += 1 if predicted_winner == actual else 0
         series_brier_sum += (p_series - actual) ** 2
+        series_pairs.append((float(p_series), float(actual)))
 
     n = max(1, len(test_samples))
     map_metrics = []
@@ -4122,6 +4182,8 @@ def _evaluate_map_model_set(
             "n_series": series_n,
             "series_winner_accuracy": (series_correct / series_n) if series_n else None,
             "series_brier": (series_brier_sum / series_n) if series_n else None,
+            "calibration": _calibration_report(map_pairs),
+            "series_calibration": _calibration_report(series_pairs),
             "veto_sim": _veto_sim_series_metrics(models, series_contexts) if series_contexts else None,
         },
         "maps": map_metrics,

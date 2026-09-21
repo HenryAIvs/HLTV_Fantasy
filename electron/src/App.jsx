@@ -12688,25 +12688,30 @@ function ModelLabTab() {
                 </div>
               </div>
               <div className="topx-tile">
-                <div className="topx-tile-label">Map winner</div>
-                <div className="topx-tile-value">{pct(wm.winner_accuracy, 1)}</div>
-                <div className="topx-tile-maps">rank only {pct(ro.winner_accuracy, 1)}</div>
-              </div>
-              <div className="topx-tile">
                 <div className="topx-tile-label">Map Brier</div>
                 <div className="topx-tile-value">{num(wm.brier, 3)}</div>
-                <div className="topx-tile-maps">rank only {num(ro.brier, 3)}</div>
+                <div className="topx-tile-maps">rank only {num(ro.brier, 3)} · coin flip 0.250</div>
+              </div>
+              <div className="topx-tile">
+                <div className="topx-tile-label">Calibration error</div>
+                <div className="topx-tile-value">{wm.calibration?.ece != null ? pct(wm.calibration.ece, 1) : "—"}</div>
+                <div className="topx-tile-maps">
+                  rank only {ro.calibration?.ece != null ? pct(ro.calibration.ece, 1) : "—"} · gap between stated and observed
+                </div>
               </div>
             </div>
             <div className="card sub">
               <h3>Model comparison</h3>
               {(() => {
                 const rows = [
-                  { label: "Map winner", a: wm.winner_accuracy, b: ro.winner_accuracy, fmt: (v) => pct(v, 1), higherBetter: true },
                   { label: "Map Brier", a: wm.brier, b: ro.brier, fmt: (v) => Number(v).toFixed(3), higherBetter: false },
+                  { label: "Map calibration error", a: wm.calibration?.ece, b: ro.calibration?.ece, fmt: (v) => pct(v, 1), higherBetter: false },
+                  { label: "Map resolution", a: wm.calibration?.resolution, b: ro.calibration?.resolution, fmt: (v) => Number(v).toFixed(4), higherBetter: true },
+                  { label: "Map winner", a: wm.winner_accuracy, b: ro.winner_accuracy, fmt: (v) => pct(v, 1), higherBetter: true },
                   { label: "Score MAE", a: wm.score_mae, b: ro.score_mae, fmt: (v) => Number(v).toFixed(2), higherBetter: false },
                   { label: `Series winner (n ${Number(wm.n_series || 0).toLocaleString()})`, a: wm.series_winner_accuracy, b: ro.series_winner_accuracy, fmt: (v) => pct(v, 1), higherBetter: true },
                   { label: "Series Brier", a: wm.series_brier, b: ro.series_brier, fmt: (v) => Number(v).toFixed(3), higherBetter: false },
+                  { label: "Series calibration error", a: wm.series_calibration?.ece, b: ro.series_calibration?.ece, fmt: (v) => pct(v, 1), higherBetter: false },
                   { label: `Veto-sim winner (n ${Number(wm.veto_sim?.n || 0).toLocaleString()})`, a: wm.veto_sim?.winner_accuracy, b: ro.veto_sim?.winner_accuracy, fmt: (v) => pct(v, 1), higherBetter: true },
                   { label: "Veto-sim Brier", a: wm.veto_sim?.brier, b: ro.veto_sim?.brier, fmt: (v) => Number(v).toFixed(3), higherBetter: false },
                   { label: "Veto maps matched", a: wm.veto_sim?.map_match_rate, b: ro.veto_sim?.map_match_rate, fmt: (v) => pct(v, 1), higherBetter: true },
@@ -12746,6 +12751,115 @@ function ModelLabTab() {
                 . Test maps kept {fmtInt(result.input_summary?.test?.maps)} of {fmtInt(result.input_summary?.test?.candidate_maps)}.
               </p>
             </div>
+            {(wm.calibration?.bins || []).length > 0 && (
+              <div className="card sub">
+                <h3>Calibration</h3>
+                <div className="value-chart-wrap topx-chart mm-cal-chart">
+                  <div className="pool-legend">
+                    <span>
+                      <i className="bar-a" /> With map data
+                    </span>
+                    <span>
+                      <i className="bar-b" /> Rank only
+                    </span>
+                    <span>
+                      <i className="line" /> Perfect
+                    </span>
+                  </div>
+                  <ResponsiveContainer width="100%" height={300}>
+                    <ComposedChart
+                      data={(wm.calibration.bins || [])
+                        .map((b, i) => ({
+                          label: b.label,
+                          perfect: (b.lo + b.hi) / 2,
+                          a: b.n >= 10 ? b.observed : null,
+                          aN: b.n,
+                          aPred: b.predicted,
+                          b: (ro.calibration?.bins?.[i]?.n ?? 0) >= 10 ? ro.calibration?.bins?.[i]?.observed ?? null : null,
+                          bN: ro.calibration?.bins?.[i]?.n ?? 0,
+                          bPred: ro.calibration?.bins?.[i]?.predicted ?? null,
+                        }))
+                        // buckets with fewer than 10 maps stay in the table but would draw misleading bars
+                        .filter((d) => d.aN >= 10 || d.bN >= 10)}
+                      margin={{ top: 26, right: 18, left: 6, bottom: 22 }}
+                    >
+                      <CartesianGrid stroke="#232a34" strokeDasharray="3 3" />
+                      <XAxis
+                        dataKey="label"
+                        tick={{ fill: "#9fb2c9", fontSize: 11 }}
+                        axisLine={{ stroke: "#3a4452" }}
+                        tickLine={{ stroke: "#3a4452" }}
+                        label={{ value: "Probability given to the favourite  ·  bars: how often it won", position: "insideBottom", offset: -14, fill: "#7f97bd", fontSize: 11 }}
+                      />
+                      <YAxis
+                        domain={[0.4, 1]}
+                        ticks={[0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]}
+                        tick={{ fill: "#9fb2c9", fontSize: 11 }}
+                        axisLine={{ stroke: "#3a4452" }}
+                        tickLine={{ stroke: "#3a4452" }}
+                        tickFormatter={(v) => `${Math.round(Number(v) * 100)}%`}
+                        width={44}
+                      />
+                      <Tooltip
+                        cursor={{ fill: "rgba(255, 107, 26, 0.06)" }}
+                        content={({ active, payload, label }) => {
+                          if (!active || !payload || payload.length === 0) return null;
+                          const d = payload[0]?.payload || {};
+                          const line = (name, obs, n, pred) =>
+                            obs == null ? `${name}: fewer than 10 maps` : `${name}: won ${pct(obs, 1)} of ${Number(n).toLocaleString()} (stated ${pct(pred, 1)})`;
+                          return (
+                            <div className="pool-tooltip">
+                              <div className="pool-tooltip-title">Favourite at {label}</div>
+                              <div>{line("With map data", d.a, d.aN, d.aPred)}</div>
+                              <div>{line("Rank only", d.b, d.bN, d.bPred)}</div>
+                            </div>
+                          );
+                        }}
+                      />
+                      <Bar dataKey="a" name="With map data" fill="#ff6b1a" isAnimationActive={false} />
+                      <Bar dataKey="b" name="Rank only" fill="#3a4452" isAnimationActive={false} />
+                      <Line
+                        type="linear"
+                        dataKey="perfect"
+                        name="Perfect"
+                        stroke="#f2f5f9"
+                        strokeWidth={1.5}
+                        strokeDasharray="5 4"
+                        dot={false}
+                        isAnimationActive={false}
+                      />
+                    </ComposedChart>
+                  </ResponsiveContainer>
+                </div>
+                <table className="mm-table mm-compare">
+                  <thead>
+                    <tr>
+                      <th>Favourite at</th>
+                      <th>Maps</th>
+                      <th>Stated</th>
+                      <th>Won</th>
+                      <th>Gap</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(wm.calibration.bins || [])
+                      .filter((b) => b.n > 0)
+                      .map((b) => (
+                        <tr key={b.label}>
+                          <td>{b.label}</td>
+                          <td>{Number(b.n).toLocaleString()}</td>
+                          <td>{pct(b.predicted, 1)}</td>
+                          <td>{pct(b.observed, 1)}</td>
+                          <td className={Math.abs(Number(b.observed) - Number(b.predicted)) > 0.05 ? "mm-warn" : ""}>
+                            {Number(b.observed) - Number(b.predicted) >= 0 ? "+" : ""}
+                            {((Number(b.observed) - Number(b.predicted)) * 100).toFixed(1)}
+                          </td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
             {rankEffectLevelBands.length > 0 && (
               <div className="card sub">
                 <h3>Rank Gap Effect</h3>
