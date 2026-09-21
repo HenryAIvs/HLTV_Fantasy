@@ -12374,9 +12374,11 @@ function BackfillRow({ name, detail, done, total, missing, unit, extra, job, ver
   );
 }
 
+// The lab's fixed split (mirrors _MAP_MODEL_TEST_MATCHES on the backend, which
+// the response also reports): test on the newest matches, train on the rest.
+const MODEL_LAB_TEST_MATCHES = 1000;
+
 function ModelLabTab() {
-  const [trainLimit, setTrainLimit] = useState("0");
-  const [testLimit, setTestLimit] = useState("0");
   const [dbMatchCount, setDbMatchCount] = useState(0);
   // The three backfills the map model depends on. Each is a pausable
   // server-side job driven through useBackfillJob; the scheduler's nightly
@@ -12456,11 +12458,6 @@ function ModelLabTab() {
       map_elo_gap: "Map Elo gap",
       picked_by_a: "Picked by team",
     }[feature] || feature);
-  const toPositiveInt = (value, fallback = 0) => {
-    const parsed = Number.parseInt(String(value ?? ""), 10);
-    return Number.isFinite(parsed) ? Math.max(0, parsed) : fallback;
-  };
-
   useEffect(() => {
     let live = true;
     api
@@ -12477,46 +12474,26 @@ function ModelLabTab() {
     };
   }, []);
 
-  const effectiveSlice = (startValue, limitValue) => {
-    const rawStart = toPositiveInt(startValue, 0);
-    const rawLimit = toPositiveInt(limitValue, 0);
-    const dbTotal = Math.max(0, Number(result?.db_matches || dbMatchCount || 0));
-    if (dbTotal <= 0) {
-      return { start: rawStart, length: rawLimit, end: rawStart + rawLimit };
-    }
-    const start = Math.min(rawStart, dbTotal);
-    const length = Math.min(rawLimit, Math.max(0, dbTotal - start));
-    return { start, length, end: start + length };
-  };
-
-  const sliceRangeLabel = (start, end) => {
-    if (end <= start) return "none";
-    return `${start.toLocaleString()}-${(end - 1).toLocaleString()}`;
-  };
-
   const timeline = useMemo(() => {
     const dbTotal = Math.max(0, Number(result?.db_matches || dbMatchCount || 0));
-    const test = effectiveSlice(0, testLimit);
-    const train = effectiveSlice(test.length, trainLimit);
-    const total = Math.max(dbTotal, train.end, test.end, 1);
-    const overlap = Math.max(0, Math.min(train.end, test.end) - Math.max(train.start, test.start));
+    const testLen = Math.min(dbTotal, Number(result?.split?.test_matches || MODEL_LAB_TEST_MATCHES));
+    const trainLen = Math.max(0, dbTotal - testLen);
+    const total = Math.max(dbTotal, 1);
     const segmentStyle = (start, length) => ({
       left: `${(start / total) * 100}%`,
       width: `${length > 0 ? Math.max(1.5, (length / total) * 100) : 0}%`,
     });
     return {
-      total,
-      overlap,
       dbTotal,
-      trainStart: train.start,
-      trainEnd: train.end,
-      testStart: test.start,
-      testEnd: test.end,
+      testStart: 0,
+      testEnd: testLen,
+      trainStart: testLen,
+      trainEnd: testLen + trainLen,
       dbStyle: segmentStyle(0, dbTotal),
-      trainStyle: segmentStyle(train.start, train.length),
-      testStyle: segmentStyle(test.start, test.length),
+      testStyle: segmentStyle(0, testLen),
+      trainStyle: segmentStyle(testLen, trainLen),
     };
-  }, [trainLimit, testLimit, dbMatchCount, result?.db_matches]);
+  }, [dbMatchCount, result?.db_matches, result?.split?.test_matches]);
 
   const rankEffectLevelBands = useMemo(
     () => (result?.rank_effect_curve?.level_bands || []).filter((band) => Array.isArray(band.rows) && band.rows.length > 0),
@@ -12543,14 +12520,9 @@ function ModelLabTab() {
     setResult(null);
     setSelectedBreakdownRow(null);
     try {
-      const params = new URLSearchParams({
-        train_limit: String(toPositiveInt(trainLimit, 0)),
-        test_limit: String(toPositiveInt(testLimit, 0)),
-        fetch_missing_map_stats: "false",
-      });
-      // Training scales with dataset size (~40s at 1,600 matches); give it far
-      // more than the 30s default before declaring the backend unresponsive.
-      const data = await api.get(`/events/hltv-results/map-model-lab?${params.toString()}`, 600000);
+      // The split is fixed server-side (newest matches test, the rest train).
+      // Building samples over every stored match takes a while; allow it.
+      const data = await api.get("/events/hltv-results/map-model-lab", 600000);
       if (data?.detail) {
         setError(String(data.detail));
         return;
@@ -12572,12 +12544,13 @@ function ModelLabTab() {
       <div className="stack lab">
         <div className="card sub">
           <div className="mm-run-row">
-            <Input label="Train limit" value={trainLimit} onChange={setTrainLimit} className="mm-num" placeholder="0 = all" />
-            <Input label="Test limit" value={testLimit} onChange={setTestLimit} className="mm-num" placeholder="0 = none" />
             <button className="primary mm-go" onClick={run} disabled={busy}>
               {busy ? "Running..." : "Train & evaluate"}
             </button>
-            <span className="mm-run-note">Tests on the newest matches and trains on the ones before them.</span>
+            <span className="mm-run-note">
+              Tests on the newest {fmtInt(timeline.testEnd)} matches (about the last month) and trains on the{" "}
+              {fmtInt(timeline.trainEnd - timeline.trainStart)} before them. The split is fixed so runs are comparable.
+            </span>
           </div>
           <div className="model-slice-track" aria-label="Training and testing slices across stored matches">
             <div className="model-slice-zero">Newest</div>
@@ -12598,9 +12571,8 @@ function ModelLabTab() {
           </div>
           <div className="model-slice-meta">
             <span>DB matches {timeline.dbTotal.toLocaleString()}</span>
-            <span>Test rows {sliceRangeLabel(timeline.testStart, timeline.testEnd)}</span>
-            <span>Train rows {sliceRangeLabel(timeline.trainStart, timeline.trainEnd)}</span>
-            {timeline.overlap > 0 && <span className="warning-text">Overlap: {timeline.overlap.toLocaleString()} matches</span>}
+            <span>Test: newest {timeline.testEnd.toLocaleString()}</span>
+            <span>Train: the {(timeline.trainEnd - timeline.trainStart).toLocaleString()} before them</span>
           </div>
         </div>
 

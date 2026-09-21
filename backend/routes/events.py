@@ -82,6 +82,11 @@ def _sigmoid(z: float) -> float:
 # maps each against fourteen inputs overfit; coefficients flipped sign between
 # maps and the held-out score fell below the rank-only baseline).
 _MAP_MODEL_L2 = 1e-2
+# The lab's one split: test on the newest N matches (about the last month at
+# 2026 volumes: ~2,200 maps, ~1,100 kept once their map-stat windows are
+# stored, which pins winner accuracy to about +/-1.4 points), train on every
+# older match. Chosen 2026-09-21; not user-adjustable.
+_MAP_MODEL_TEST_MATCHES = 1000
 
 ROUND_SHARE_FEATURES: Tuple[Tuple[str, str], ...] = (
     ("hltv_gap", "hltv_gap"),
@@ -244,43 +249,72 @@ def _fit_round_share_logistic_2d(samples: List[Dict[str, float]], include_map_st
     feature_defs = ROUND_SHARE_FEATURES if include_map_stats else ROUND_SHARE_FEATURES[:6]
     ys = [float(s["round_share"]) for s in samples]
     ws = [max(1.0, float(s.get("weight") or 1.0)) for s in samples]
-    total_w = max(1.0, sum(ws))
-    raw_features: Dict[str, List[float]] = {
-        name: [float(sample.get(sample_key) or 0.0) for sample in samples]
-        for name, sample_key in feature_defs
-    }
-    means: Dict[str, float] = {}
-    stds: Dict[str, float] = {}
-    z_features: Dict[str, List[float]] = {}
-    for name, values in raw_features.items():
-        mean = sum(x * w for x, w in zip(values, ws)) / total_w
-        var = sum(w * (x - mean) ** 2 for x, w in zip(values, ws)) / total_w
-        std = math.sqrt(var) if var > 1e-12 else 1.0
-        means[name] = mean
-        stds[name] = std
-        z_features[name] = [(x - mean) / std for x in values]
-
-    a = 0.0
-    coefs: Dict[str, float] = {name: 0.0 for name, _sample_key in feature_defs}
     l2 = float(_MAP_MODEL_L2)
     lr = 0.03
-    for _ in range(3500):
-        ga = 0.0
-        gradients: Dict[str, float] = {name: 0.0 for name, _sample_key in feature_defs}
-        for idx, (y, w) in enumerate(zip(ys, ws)):
-            z = a
-            for name, _sample_key in feature_defs:
-                z += coefs[name] * z_features[name][idx]
-            p = _sigmoid(z)
+    iterations = 3500
+    names = [name for name, _sample_key in feature_defs]
+    try:
+        import numpy as np
+    except Exception:  # pragma: no cover - numpy is in requirements.txt
+        np = None
+    if np is not None:
+        # Same weighted z-scoring and full-batch gradient descent as the loop
+        # below, vectorised: training on every stored match takes seconds.
+        X = np.array([[float(sample.get(sample_key) or 0.0) for _name, sample_key in feature_defs] for sample in samples], dtype=float)
+        y = np.array(ys, dtype=float)
+        w = np.array(ws, dtype=float)
+        total_w = max(1.0, float(w.sum()))
+        mean = (X * w[:, None]).sum(axis=0) / total_w
+        var = (w[:, None] * (X - mean) ** 2).sum(axis=0) / total_w
+        std = np.where(var > 1e-12, np.sqrt(np.maximum(var, 0.0)), 1.0)
+        Z = (X - mean) / std
+        a = 0.0
+        b = np.zeros(len(names), dtype=float)
+        for _ in range(iterations):
+            p = 1.0 / (1.0 + np.exp(-np.clip(a + Z @ b, -60.0, 60.0)))
             e = (p - y) * w
-            ga += e
-            for name, _sample_key in feature_defs:
-                gradients[name] += e * z_features[name][idx]
-        ga = ga / total_w + l2 * a
-        a -= lr * ga
-        for name, _sample_key in feature_defs:
-            gradients[name] = gradients[name] / total_w + l2 * coefs[name]
-            coefs[name] -= lr * gradients[name]
+            ga = float(e.sum()) / total_w + l2 * a
+            gb = (Z * e[:, None]).sum(axis=0) / total_w + l2 * b
+            a -= lr * ga
+            b -= lr * gb
+        coefs = {name: float(b[i]) for i, name in enumerate(names)}
+        means = {name: float(mean[i]) for i, name in enumerate(names)}
+        stds = {name: float(std[i]) for i, name in enumerate(names)}
+    else:
+        total_w = max(1.0, sum(ws))
+        raw_features: Dict[str, List[float]] = {
+            name: [float(sample.get(sample_key) or 0.0) for sample in samples]
+            for name, sample_key in feature_defs
+        }
+        means = {}
+        stds = {}
+        z_features: Dict[str, List[float]] = {}
+        for name, values in raw_features.items():
+            mean_v = sum(x * wt for x, wt in zip(values, ws)) / total_w
+            var_v = sum(wt * (x - mean_v) ** 2 for x, wt in zip(values, ws)) / total_w
+            std_v = math.sqrt(var_v) if var_v > 1e-12 else 1.0
+            means[name] = mean_v
+            stds[name] = std_v
+            z_features[name] = [(x - mean_v) / std_v for x in values]
+        a = 0.0
+        coefs = {name: 0.0 for name in names}
+        for _ in range(iterations):
+            ga = 0.0
+            gradients = {name: 0.0 for name in names}
+            for idx, (yv, wt) in enumerate(zip(ys, ws)):
+                z = a
+                for name in names:
+                    z += coefs[name] * z_features[name][idx]
+                p = _sigmoid(z)
+                e = (p - yv) * wt
+                ga += e
+                for name in names:
+                    gradients[name] += e * z_features[name][idx]
+            ga = ga / total_w + l2 * a
+            a -= lr * ga
+            for name in names:
+                gradients[name] = gradients[name] / total_w + l2 * coefs[name]
+                coefs[name] -= lr * gradients[name]
 
     model = {
         "a": a,
@@ -4112,32 +4146,24 @@ def _map_model_input_summary(
 
 
 @router.get("/hltv-results/map-model-lab")
-def get_map_model_lab(
-    train_limit: int = 3000,
-    train_offset: int = 500,
-    test_limit: int = 500,
-    test_offset: int = 0,
-    fetch_missing_map_stats: bool = False,
-):
-    """Chronological split only: the test slice is the newest matches, the
-    training slice the ones before them, so the score measures forecasting
-    (a random split lets the fit learn a period from its own neighbours and
-    reports a few points too high)."""
+def get_map_model_lab():
+    """One chronological split, fixed: the test slice is the newest
+    _MAP_MODEL_TEST_MATCHES matches, the training slice every match before
+    them, so the score measures forecasting on roughly the last month. (A
+    random split lets the fit learn a period from its own neighbours and
+    reports a few points too high; a smaller test slice is too noisy, a
+    larger one reaches back into a different meta and starves training of
+    the most relevant matches.)"""
     db_matches = int(count_hltv_results())
-    train_limit = max(0, min(100000, int(train_limit)))
-    test_limit = max(0, min(100000, int(test_limit)))
-    train_offset = max(0, int(train_offset or 0))
-    test_offset = max(0, int(test_offset or 0))
-    if db_matches > 0:
-        test_offset = 0
-        train_offset = min(test_limit, db_matches)
-        train_limit = min(train_limit, max(0, db_matches - train_offset))
-        test_limit = min(test_limit, max(0, db_matches - test_offset))
-    train_rows = list_hltv_results(limit=train_limit, offset=train_offset)
-    test_rows = list_hltv_results(limit=test_limit, offset=test_offset)
+    test_offset = 0
+    test_limit = min(int(_MAP_MODEL_TEST_MATCHES), db_matches)
+    train_offset = test_limit
+    train_limit = max(0, db_matches - train_offset)
+    train_rows = list_hltv_results(limit=train_limit, offset=train_offset) if train_limit > 0 else []
+    test_rows = list_hltv_results(limit=test_limit, offset=test_offset) if test_limit > 0 else []
     historical_map_stats_by_window, historical_cache_summary = _build_historical_team_map_stats_by_window(
         [*train_rows, *test_rows],
-        fetch_missing=bool(fetch_missing_map_stats),
+        fetch_missing=False,
     )
     # Elo replays the full stored timeline; each match only sees earlier results.
     elo_rows = list_hltv_results(limit=db_matches, offset=0)
@@ -4195,7 +4221,7 @@ def get_map_model_lab(
         "status": "ok",
         "method": "Trains two logistic formulas per feature set on the same historical slice: win probabilities come from a model trained directly on map results, and scorelines from a round-share model over the same features. The rank-only baseline uses HLTV/VRS rank gaps, matchup rank level, and gap-by-level interactions. The map-data model adds directional Team A minus Team B deltas: six-month map-stat gaps (win/pick/ban/played share), pre-match overall and per-map Elo gaps replayed from the stored match timeline with margin-of-victory weighting, and who picked the map in the veto (when veto data is stored). Both are evaluated on the same covered holdout slice.",
         "db_matches": db_matches,
-        "split": {"mode": "ordered"},
+        "split": {"mode": "ordered", "test_matches": len(test_rows), "train_matches": len(train_rows)},
         "map_pool": MAP_POOL,
         "train": {
             "limit": train_limit,
