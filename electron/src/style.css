@@ -4182,3 +4182,14 @@ button:disabled {
   .mm-job-actions { justify-self: start; }
   .mm-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+
+/* Database > Players: search + scope side by side */
+.players-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px 16px;
+}
+.players-controls .field { margin-bottom: 10px; }
+.players-controls .search-field { flex: 1 1 320px; max-width: 420px; }
+.players-controls .field:not(.search-field) { width: 220px; }

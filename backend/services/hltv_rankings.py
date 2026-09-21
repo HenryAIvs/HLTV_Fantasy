@@ -163,6 +163,68 @@ def _build_vrs_ranking_url_undated() -> str:
     return "https://www.hltv.org/valve-ranking/teams"
 
 
+def _build_hltv_team_url(team_id: int, slug: str) -> str:
+    return f"https://www.hltv.org/team/{int(team_id)}/{slugify_hltv_team_name(slug) or 'team'}"
+
+
+_TEAM_LINEUP_ANCHOR_RE = re.compile(
+    r'<a[^>]*href="/player/(?P<player_id>\d+)/(?P<slug>[^"/?#]+)"[^>]*class="col-custom"[^>]*>(?P<inner>.*?)</a>',
+    re.S,
+)
+
+
+def _extract_team_lineup(html: str) -> List[Dict[str, object]]:
+    """The team page's current five-player lineup from its `bodyshot-team`
+    block: one /player/{id}/{slug} anchor per starter (title = nickname), with
+    an optional role pill (IGL / AWPer). Coaches and former players live in
+    other blocks and are not included."""
+    start = html.find('class="bodyshot-team')
+    if start < 0:
+        return []
+    block = html[start : start + 20000]
+    end = block.find('class="bodyshot-team-bg"', 10)
+    if end > 0:
+        block = block[:end]
+    out: List[Dict[str, object]] = []
+    seen: set[int] = set()
+    for m in _TEAM_LINEUP_ANCHOR_RE.finditer(block):
+        player_id = int(m.group("player_id"))
+        if player_id in seen:
+            continue
+        seen.add(player_id)
+        anchor = m.group(0)
+        title = re.search(r'title="([^"]*)"', anchor)
+        name = _strip_html(title.group(1)) if title else ""
+        if not name:
+            bold = re.search(r'class="text-ellipsis bold">([^<]*)<', m.group("inner"))
+            name = _strip_html(bold.group(1)) if bold else m.group("slug")
+        role = ""
+        if "role-pill--igl" in m.group("inner"):
+            role = "igl"
+        elif "role-pill--awp" in m.group("inner"):
+            role = "awp"
+        out.append({"player_id": player_id, "name": name.strip(), "slug": m.group("slug"), "role": role})
+        if len(out) >= 5:
+            break
+    return out
+
+
+def get_hltv_team_lineup(hltv_team_id: int, team_name: str) -> Dict[str, object]:
+    """Fetch a team's HLTV page and return its current lineup."""
+    url = _build_hltv_team_url(int(hltv_team_id), team_name or "team")
+    html = _fetch_html_with_uc_driver(url, wait_text=None)
+    lineup = _extract_team_lineup(html)
+    logger.info("HLTV team lineup parsed: team_id=%s players=%d url=%s", hltv_team_id, len(lineup), url)
+    if not lineup:
+        if _is_cloudflare_challenge_html(html):
+            raise HLTVRankingError(
+                "HLTV team page is behind a Cloudflare/interstitial challenge. "
+                "Open once in visible browser mode and complete challenge, then retry."
+            )
+        raise RankingPageParseError("Could not find the lineup on the HLTV team page.")
+    return {"team_id": int(hltv_team_id), "team_name": team_name or "", "url": url, "lineup": lineup}
+
+
 def _build_results_url(offset: int = 0) -> str:
     offset = max(0, int(offset))
     if offset <= 0:

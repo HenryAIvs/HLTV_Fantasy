@@ -9257,6 +9257,9 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
   const [dbTab, setDbTab] = useState("players");
   const [playerSearch, setPlayerSearch] = useState("");
   const [playerSort, setPlayerSort] = useState("name_asc");
+  // "event": players with a fantasy price (they were in an event); "all" adds
+  // the roster players the nightly team-data task creates from HLTV team pages.
+  const [playerScope, setPlayerScope] = useState("event");
   const [teamSearch, setTeamSearch] = useState("");
   const [teamSort, setTeamSort] = useState("name_asc");
   const [selectedPlayer, setSelectedPlayer] = useState(null);
@@ -9735,6 +9738,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
   const filteredSortedPlayers = useMemo(() => {
     const q = playerSearch.trim().toLowerCase();
     const list = players.filter((p) => {
+      if (playerScope === "event" && !(Number(p.price) > 0)) return false;
       if (!q) return true;
       const teamsText = (playerTeamLookup[p.player_id] || []).join(", ").toLowerCase();
       return (
@@ -9763,7 +9767,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     });
 
     return list;
-  }, [players, playerSearch, playerSort, playerTeamLookup]);
+  }, [playerScope, players, playerSearch, playerSort, playerTeamLookup]);
   const filteredSortedTeams = useMemo(() => {
     const q = teamSearch.trim().toLowerCase();
     const list = teams.filter((t) => {
@@ -9835,8 +9839,17 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
           <p className="error">{error}</p>
         ) : (
           <div className="players-panel">
-            <div className="grid two">
+            <div className="players-controls">
               <Input label="Search Players" value={playerSearch} onChange={setPlayerSearch} placeholder="Name or team" className="search-field" />
+              <Select
+                label="Show"
+                value={playerScope}
+                onChange={setPlayerScope}
+                options={[
+                  { value: "event", label: `Event players (${players.filter((p) => Number(p.price) > 0).length})` },
+                  { value: "all", label: `All players (${players.length})` },
+                ]}
+              />
             </div>
             <div className="players-table-wrap">
             <table className="players-table">
@@ -11123,11 +11136,13 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
   const [runTime, setRunTime] = useState("00:00");
   const [lookbackDays, setLookbackDays] = useState(3);
   const [mapModelMinutes, setMapModelMinutes] = useState(120);
+  const [teamDataTopN, setTeamDataTopN] = useState(200);
   const pollRef = useRef(null);
 
   const TASK_LABELS = {
     events: "New fantasy events",
     rankings: "Team rankings (HLTV + VRS)",
+    team_data: "Team rosters and map stats (top-ranked teams)",
     matches: "New matches played",
     ratings: "Player Top-X ratings",
     map_model: "Map model data (vetoes, scoreboards, historical map stats)",
@@ -11159,6 +11174,7 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
         setRunTime(String(data.config.run_time || "00:00"));
         setLookbackDays(Number(data.config.matches_lookback_days || 3));
         setMapModelMinutes(Number(data.config.map_model_minutes || 120));
+        setTeamDataTopN(Number(data.config.team_data_top_n || 200));
       }
     } catch (e) {
       setMessage(e?.message || "Backend not reachable.");
@@ -11307,7 +11323,7 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
             </tr>
           </thead>
           <tbody>
-            {["events", "rankings", "matches", "ratings", "map_model"].map((task) => {
+            {["events", "rankings", "team_data", "matches", "ratings", "map_model"].map((task) => {
               const flagKey = `do_${task}`;
               return (
                 <tr key={task}>
@@ -11340,9 +11356,25 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
                         All players in the database, using the active timeframe window.
                       </div>
                     )}
+                    {task === "team_data" && (
+                      <div className="muted" style={{ fontSize: 12 }}>
+                        Current lineups and six-month map stats for the top{" "}
+                        <input
+                          type="number"
+                          min={10}
+                          max={500}
+                          value={teamDataTopN}
+                          onChange={(e) => setTeamDataTopN(Number(e.target.value))}
+                          onBlur={() => patchConfig({ team_data_top_n: teamDataTopN })}
+                          disabled={saveBusy}
+                          style={{ width: 60 }}
+                        />{" "}
+                        ranked teams; new roster players get their Top-X ratings the same night.
+                      </div>
+                    )}
                     {task === "map_model" && (
                       <div className="muted" style={{ fontSize: 12 }}>
-                        Whatever the map model is missing (the three jobs under Model Data below), for up to{" "}
+                        Whatever the map model is missing (the three jobs under Data Coverage below), for up to{" "}
                         <input
                           type="number"
                           min={1}
@@ -11390,7 +11422,7 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
         </div>
       </Section>
 
-      <ModelDataPanel />
+      <ModelDataPanel topN={teamDataTopN} />
 
       <TopxImportPanel players={players} notify={notify} refresh={refresh} />
 
@@ -12380,7 +12412,22 @@ function BackfillRow({ name, detail, done, total, missing, unit, extra, job, ver
 // Each is a pausable server-side job driven through useBackfillJob; the
 // scheduler's nightly "map_model" task drives these very same jobs, so
 // progress shows here whichever side started them.
-function ModelDataPanel() {
+function ModelDataPanel({ topN = 200 }) {
+  const [rosterCoverage, setRosterCoverage] = useState(null);
+  const rosterJob = useBackfillJob("/teams/rosters", "team rosters");
+  const loadRosterCoverage = async () => {
+    try {
+      const cov = await api.get(`/teams/rosters/coverage?top_n=${Number(topN) || 0}`);
+      if (cov && cov.status === "ok") setRosterCoverage(cov);
+    } catch {
+      // Coverage is informational.
+    }
+  };
+  rosterJob.onSettledRef.current = loadRosterCoverage;
+  useEffect(() => {
+    loadRosterCoverage();
+    rosterJob.hydrate();
+  }, [topN]);
   const [histCoverage, setHistCoverage] = useState(null);
   const histJob = useBackfillJob("/events/hltv-results/historical-map-stats", "historical map stats");
   const loadHistCoverage = async () => {
@@ -12427,12 +12474,21 @@ function ModelDataPanel() {
   }, []);
 
   return (
-    <Section title="Model Data">
+    <Section title="Data Coverage">
       <p className="muted mm-data-note">
-        What the map model needs and how much of it is stored. The nightly "Map model data" task fetches whatever is
-        missing; any job can also be run from here.
+        What the models need and how much of it is stored. The nightly tasks fetch whatever is missing; any job can
+        also be run from here.
       </p>
       <div className="mm-jobs">
+        <BackfillRow
+          name="Team rosters"
+          detail={`Current five-player lineups from the HLTV team pages of the top ${Number(topN) || 200} ranked teams; players are created by HLTV id.`}
+          done={rosterCoverage?.with_roster}
+          total={rosterCoverage?.teams_in_scope}
+          missing={rosterCoverage?.missing_roster}
+          unit="teams"
+          job={rosterJob}
+        />
         <BackfillRow
           name="Historical map stats"
           detail="Six-month map stats for both teams as of each match date. Maps without them are left out of the model."

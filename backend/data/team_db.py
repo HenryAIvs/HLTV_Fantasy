@@ -109,6 +109,25 @@ def add_or_update_team(
     conn.close()
 
 
+def update_team_roster(team_id: int, player_ids: List[int]) -> None:
+    """Store a team's current lineup in its five roster slots (missing slots
+    become 0). Only the slots change; ranks and stats are left alone."""
+    ids = [int(p) for p in list(player_ids)[:5] if p] + [0] * 5
+    conn = connect()
+    try:
+        conn.execute(
+            """
+            UPDATE teams
+            SET player1_id = ?, player2_id = ?, player3_id = ?, player4_id = ?, player5_id = ?
+            WHERE team_id = ?
+            """,
+            (ids[0], ids[1], ids[2], ids[3], ids[4], int(team_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def update_team_map_stats(
     team_id: int,
     *,

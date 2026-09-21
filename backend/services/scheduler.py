@@ -139,6 +139,7 @@ class DataScheduler:
             ("topx batch", lambda: players._get_latest_topx_batch_job(include_completed=False),
              players.resume_fetch_top_ratings_batch_job),
             ("rankings refresh", teams._get_latest_rankings_job, teams.resume_rankings_refresh_job),
+            ("team rosters", teams._get_latest_roster_job, teams.resume_roster_import_job),
             ("map-stats import", lambda: teams._get_latest_map_stats_job(include_completed=False),
              teams.resume_map_stats_import_job),
         ]
@@ -249,6 +250,11 @@ class DataScheduler:
             tasks.append("events")
         if cfg.get("do_rankings"):
             tasks.append("rankings")
+        # Rosters + team map stats for the top-N teams; after rankings so the
+        # scope uses tonight's ranks, before ratings so new roster players
+        # get their Top-X numbers the same night.
+        if cfg.get("do_team_data"):
+            tasks.append("team_data")
         if cfg.get("do_matches"):
             tasks.append("matches")
         if cfg.get("do_ratings"):
@@ -420,6 +426,8 @@ class DataScheduler:
                 msg = self._task_ratings()
             elif task == "map_model":
                 msg = self._task_map_model(cfg)
+            elif task == "team_data":
+                msg = self._task_team_data(cfg)
             else:
                 raise ValueError(f"Unknown task '{task}'")
             schedule_db.finish_run(run_id, "success", msg)
@@ -498,6 +506,83 @@ class DataScheduler:
         result = players._run_top_ratings_batch(items, 1, progress_callback=_progress, months=months) or {}
         return f"{len(ids)} players, {months}mo: {_short(result)}"
 
+    def _drive_job(self, name, unit, total_hint, latest_fn, start_fn, resume_fn, pause_fn, deadline,
+                   processed_key="processed_items", total_key="total_items"):
+        """Run one pausable job family to completion (or to the deadline):
+        resume a paused/failed latest job, else start one; poll it, mirror
+        progress into the scheduler state; at the deadline ask it to pause
+        and wait for it to settle. Returns (note, failed)."""
+        active = {"queued", "running", "pausing", "canceling"}
+        latest = latest_fn() or {}
+        status = str(latest.get("status") or "")
+        if status in active:
+            job_id = str(latest.get("job_id") or "")
+        elif status in {"paused", "failed"} and latest.get("job_id"):
+            job_id = str(latest["job_id"])
+            resume_fn(job_id)
+        else:
+            job_id = str((start_fn() or {}).get("job_id") or "")
+        if not job_id:
+            return f"{name}: could not start a job", True
+        self._set_state(processed=0, total=int(total_hint or 0), message=f"{name.capitalize()}: starting ({total_hint} {unit})")
+        cut_short = False
+        while True:
+            time.sleep(2)
+            job = latest_fn() or {}
+            st = str(job.get("status") or "")
+            processed = int(job.get(processed_key) or 0)
+            total = int(job.get(total_key) or 0)
+            self._set_state(processed=processed, total=total,
+                            message=f"{name.capitalize()}: {processed}/{total} {unit}" + (" (pausing, time budget)" if cut_short else ""))
+            if st not in active:
+                break
+            if not cut_short and time.time() >= deadline:
+                pause_fn(job_id)
+                cut_short = True
+        final = latest_fn() or {}
+        st = str(final.get("status") or "")
+        ok = int(final.get("ok") or 0)
+        failed = int(final.get("failed") or 0)
+        tail = " (paused: time budget)" if cut_short else f" ({st})"
+        return f"{name}: {ok} done, {failed} failed{tail}", st == "failed"
+
+    def _task_team_data(self, cfg: Dict[str, Any]) -> str:
+        """Refresh the top-N ranked teams: current lineups from their HLTV team
+        pages (players created by HLTV id, roster slots filled), then their
+        six-month map stats through the existing map-stats import job."""
+        from backend.routes import teams
+
+        top_n = max(10, min(500, int(cfg.get("team_data_top_n") or 200)))
+        deadline = time.time() + 6 * 3600  # bounded by N teams, not by time
+        notes: List[str] = []
+        failed_any = False
+
+        cov = teams._roster_coverage(top_n)
+        note, failed = self._drive_job(
+            "team rosters", "teams", cov.get("teams_in_scope", 0),
+            teams._get_latest_roster_job, lambda: teams.start_roster_import_job({"top_n": top_n}),
+            teams.resume_roster_import_job, teams.pause_roster_import_job, deadline,
+        )
+        after = teams._roster_coverage(top_n)
+        notes.append(f"{note}, {after.get('with_roster', 0)}/{after.get('teams_in_scope', 0)} top-{top_n} teams have a lineup")
+        failed_any = failed_any or failed
+
+        scope_ids = [int(t["team_id"]) for t in teams._roster_scope_teams(top_n)]
+        note, failed = self._drive_job(
+            "team map stats", "teams", len(scope_ids),
+            lambda: teams._get_latest_map_stats_job(include_completed=False),
+            lambda: teams.start_map_stats_import_job({"team_ids": scope_ids}),
+            teams.resume_map_stats_import_job, teams.pause_map_stats_import_job, deadline,
+            processed_key="processed_teams", total_key="total_teams",
+        )
+        notes.append(note)
+        failed_any = failed_any or failed
+
+        message = "; ".join(notes)
+        if failed_any:
+            raise RuntimeError(message)
+        return message
+
     def _task_map_model(self, cfg: Dict[str, Any]) -> str:
         """Fetch what the map-data model is missing: match vetoes, per-map
         scoreboards, then historical map-stat windows (the quick ones first;
@@ -531,43 +616,10 @@ class DataScheduler:
             if time.time() >= deadline:
                 notes.append(f"{name}: {missing} {unit} missing, left for the next night (time budget)")
                 continue
-            latest = latest_fn() or {}
-            status = str(latest.get("status") or "")
-            if status in active:
-                job_id = str(latest.get("job_id") or "")
-            elif status in {"paused", "failed"} and latest.get("job_id"):
-                job_id = str(latest["job_id"])
-                resume_fn(job_id)
-            else:
-                job_id = str((start_fn() or {}).get("job_id") or "")
-            if not job_id:
-                notes.append(f"{name}: could not start a job")
-                failed_any = True
-                continue
-            self._set_state(processed=0, total=missing, message=f"Map model: {name} ({missing} {unit} missing)")
-            cut_short = False
-            while True:
-                time.sleep(2)
-                job = latest_fn() or {}
-                st = str(job.get("status") or "")
-                processed = int(job.get("processed_items") or 0)
-                total = int(job.get("total_items") or 0)
-                self._set_state(processed=processed, total=total,
-                                message=f"Map model: {name} {processed}/{total}" + (" (pausing, time budget)" if cut_short else ""))
-                if st not in active:
-                    break
-                if not cut_short and time.time() >= deadline:
-                    pause_fn(job_id)
-                    cut_short = True
-            final = latest_fn() or {}
-            st = str(final.get("status") or "")
-            ok = int(final.get("ok") or 0)
-            failed = int(final.get("failed") or 0)
-            left = int((coverage_fn() or {}).get(missing_key) or 0)
-            if st == "failed":
-                failed_any = True
-            tail = " (paused: time budget)" if cut_short else f" ({st})"
-            notes.append(f"{name}: {ok} fetched, {failed} failed, {left} {unit} left{tail}")
+            note, failed = self._drive_job(name, unit, missing, latest_fn, start_fn, resume_fn, pause_fn, deadline)
+            after = int((coverage_fn() or {}).get(missing_key) or 0)
+            notes.append(f"{note}, {after} {unit} left")
+            failed_any = failed_any or failed
         # Keep the lab's cached evaluation current: re-run it (about 15 s)
         # when tonight changed the data it trains on.
         try:

@@ -8,7 +8,9 @@ import time
 from fastapi import APIRouter, HTTPException
 
 from backend.routes.players import _INTERRUPTION_BOILERPLATE
+from backend.data.player_db import add_or_update_player
 from backend.services.hltv_rankings import (
+    get_hltv_team_lineup,
     HLTVRankingError,
     RankingPageParseError,
     TeamNotRankedError,
@@ -19,6 +21,7 @@ from backend.services.hltv_rankings import (
     get_team_vrs_rank_and_points_on_date,
 )
 from backend.data.team_db import (
+    update_team_roster,
     connect as connect_team_db,
     get_all_teams,
     get_team_by_id,
@@ -1350,3 +1353,383 @@ def upsert_team(payload: dict):
 def remove_team(team_id: int):
     delete_team(team_id)
     return {"status": "ok"}
+
+
+# --- Team rosters as a pausable/resumable background job -----------------------
+# One HLTV team page per team: the current five-player lineup goes into the
+# team's roster slots and each player is upserted by HLTV id (name only, so
+# fantasy prices/roles of event players are never touched). Scope: the top N
+# ranked teams that have an HLTV id. Same job shape as the other backfills so
+# the scheduler and the Scheduling tab drive it the same way.
+ROSTER_JOBS: dict[str, dict] = {}
+ROSTER_WORKERS: dict[str, threading.Thread] = {}
+ROSTER_JOBS_LOCK = threading.Lock()
+_ROSTER_SCHEMA_READY = False
+DEFAULT_ROSTER_TOP_N = 200
+
+
+def ensure_roster_job_schema() -> None:
+    global _ROSTER_SCHEMA_READY
+    if _ROSTER_SCHEMA_READY:
+        return
+    conn = connect_team_db()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS roster_import_jobs (
+                job_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                error TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                progress REAL NOT NULL DEFAULT 0,
+                processed_items INTEGER NOT NULL DEFAULT 0,
+                total_items INTEGER NOT NULL DEFAULT 0,
+                ok INTEGER NOT NULL DEFAULT 0,
+                failed INTEGER NOT NULL DEFAULT 0,
+                current_item TEXT NOT NULL DEFAULT '',
+                pause_requested INTEGER NOT NULL DEFAULT 0,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                top_n INTEGER NOT NULL DEFAULT 200,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                started_at REAL,
+                finished_at REAL
+            );
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_roster_jobs_updated ON roster_import_jobs(updated_at DESC)")
+        conn.commit()
+    finally:
+        conn.close()
+    _ROSTER_SCHEMA_READY = True
+
+
+def _roster_job_from_row(row: sqlite3.Row) -> dict:
+    out = dict(row)
+    out["pause_requested"] = bool(out.get("pause_requested"))
+    out["cancel_requested"] = bool(out.get("cancel_requested"))
+    return out
+
+
+def _save_roster_job(job: dict) -> None:
+    ensure_roster_job_schema()
+    job["updated_at"] = time.time()
+    conn = connect_team_db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO roster_import_jobs (
+                job_id, status, error, last_error, progress, processed_items, total_items,
+                ok, failed, current_item, pause_requested, cancel_requested, top_n,
+                created_at, updated_at, started_at, finished_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                status = excluded.status, error = excluded.error, last_error = excluded.last_error,
+                progress = excluded.progress, processed_items = excluded.processed_items,
+                total_items = excluded.total_items, ok = excluded.ok, failed = excluded.failed,
+                current_item = excluded.current_item, pause_requested = excluded.pause_requested,
+                cancel_requested = excluded.cancel_requested, top_n = excluded.top_n,
+                updated_at = excluded.updated_at, started_at = excluded.started_at,
+                finished_at = excluded.finished_at
+            """,
+            (
+                str(job["job_id"]), str(job.get("status") or "queued"), str(job.get("error") or ""),
+                str(job.get("last_error") or ""), float(job.get("progress") or 0.0),
+                int(job.get("processed_items") or 0), int(job.get("total_items") or 0),
+                int(job.get("ok") or 0), int(job.get("failed") or 0), str(job.get("current_item") or ""),
+                1 if job.get("pause_requested") else 0, 1 if job.get("cancel_requested") else 0,
+                int(job.get("top_n") or DEFAULT_ROSTER_TOP_N),
+                float(job.get("created_at") or time.time()), float(job["updated_at"]),
+                job.get("started_at"), job.get("finished_at"),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _get_stored_roster_job(job_id: str) -> dict | None:
+    ensure_roster_job_schema()
+    conn = connect_team_db()
+    try:
+        row = conn.execute("SELECT * FROM roster_import_jobs WHERE job_id = ?", (job_id,)).fetchone()
+        return _roster_job_from_row(row) if row else None
+    finally:
+        conn.close()
+
+
+def _publish_roster_job(job: dict) -> None:
+    with ROSTER_JOBS_LOCK:
+        ROSTER_JOBS[str(job["job_id"])] = dict(job)
+    _save_roster_job(job)
+
+
+def _roster_worker_is_active(job_id: str) -> bool:
+    with ROSTER_JOBS_LOCK:
+        worker = ROSTER_WORKERS.get(job_id)
+        return bool(worker and worker.is_alive())
+
+
+def _roster_job_response(job: dict) -> dict:
+    return {
+        "job_id": str(job["job_id"]),
+        "status": job.get("status", "queued"),
+        "error": job.get("error", ""),
+        "last_error": job.get("last_error", ""),
+        "progress": job.get("progress", 0.0),
+        "processed_items": job.get("processed_items", 0),
+        "total_items": job.get("total_items", 0),
+        "ok": job.get("ok", 0),
+        "failed": job.get("failed", 0),
+        "current_item": job.get("current_item", ""),
+        "pause_requested": bool(job.get("pause_requested")),
+        "cancel_requested": bool(job.get("cancel_requested")),
+        "top_n": int(job.get("top_n") or DEFAULT_ROSTER_TOP_N),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+    }
+
+
+def _get_roster_job_for_response(job_id: str) -> dict:
+    with ROSTER_JOBS_LOCK:
+        cached = ROSTER_JOBS.get(job_id)
+        job = dict(cached) if cached else None
+    if not job:
+        job = _get_stored_roster_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job_id not found")
+    if job.get("status") in {"queued", "running", "pausing", "canceling"} and not _roster_worker_is_active(job_id):
+        job["status"] = "canceled" if job.get("cancel_requested") else "paused"
+        job["last_error"] = job.get("last_error") or "Job was interrupted before completion. Resume to continue."
+        job["error"] = ""
+        job["pause_requested"] = False
+        job["cancel_requested"] = False
+        _publish_roster_job(job)
+    return job
+
+
+def _get_latest_roster_job() -> dict | None:
+    ensure_roster_job_schema()
+    conn = connect_team_db()
+    try:
+        row = conn.execute("SELECT job_id FROM roster_import_jobs ORDER BY updated_at DESC LIMIT 1").fetchone()
+    finally:
+        conn.close()
+    return _get_roster_job_for_response(str(row["job_id"])) if row else None
+
+
+def _roster_scope_teams(top_n: int) -> list[dict]:
+    """The top-N ranked teams that have an HLTV id, best rank first."""
+    teams = []
+    for t in get_all_teams():
+        rank = int(t.get("hltv_rank") or 0)
+        if rank <= 0 or rank > int(top_n) or not t.get("hltv_team_id"):
+            continue
+        teams.append(t)
+    teams.sort(key=lambda t: int(t.get("hltv_rank") or 0))
+    return teams
+
+
+def _team_has_roster(t: dict) -> bool:
+    return all(int(t.get(f"player{i}_id") or 0) > 0 for i in range(1, 6))
+
+
+def _roster_coverage(top_n: int) -> dict:
+    scope = _roster_scope_teams(top_n)
+    with_roster = sum(1 for t in scope if _team_has_roster(t))
+    return {
+        "top_n": int(top_n),
+        "teams_in_scope": len(scope),
+        "with_roster": with_roster,
+        "missing_roster": len(scope) - with_roster,
+    }
+
+
+def _run_roster_job(job_id: str) -> None:
+    job = _get_stored_roster_job(job_id)
+    if not job:
+        return
+
+    def stop_requested() -> str:
+        with ROSTER_JOBS_LOCK:
+            live = ROSTER_JOBS.get(job_id) or {}
+        if live.get("cancel_requested"):
+            return "canceled"
+        if live.get("pause_requested"):
+            return "paused"
+        return ""
+
+    job["status"] = "running"
+    job["pause_requested"] = False
+    job["cancel_requested"] = False
+    job["error"] = ""
+    if job.get("last_error") in _INTERRUPTION_BOILERPLATE:
+        job["last_error"] = ""
+    job["started_at"] = job.get("started_at") or time.time()
+    job["finished_at"] = None
+    job["current_item"] = "Listing teams"
+    _publish_roster_job(job)
+    try:
+        # Every (re)start re-lists the scope so a resumed job carries on with
+        # whatever is still unrefreshed tonight: teams whose roster was stored
+        # earlier in this same job are recognised by the processed counter.
+        teams = _roster_scope_teams(int(job.get("top_n") or DEFAULT_ROSTER_TOP_N))
+        total = len(teams)
+        processed = int(job.get("processed_items") or 0)
+        ok = int(job.get("ok") or 0)
+        failed = int(job.get("failed") or 0)
+        job["total_items"] = total
+        job["progress"] = (processed / total) if total else 1.0
+        _publish_roster_job(job)
+        for team in teams[processed:]:
+            stopped = stop_requested()
+            if stopped:
+                job["status"] = stopped
+                job["pause_requested"] = False
+                job["cancel_requested"] = False
+                job["last_error"] = "Canceled" if stopped == "canceled" else "Paused"
+                job["finished_at"] = time.time()
+                _publish_roster_job(job)
+                return
+            name = str(team.get("name") or "")
+            job["current_item"] = f"{name} (#{team.get('hltv_rank')})"
+            try:
+                info = get_hltv_team_lineup(int(team["hltv_team_id"]), name)
+                lineup = list(info.get("lineup") or [])
+                for p in lineup:
+                    add_or_update_player(player_id=int(p["player_id"]), name=str(p.get("name") or "") or None)
+                update_team_roster(int(team["team_id"]), [int(p["player_id"]) for p in lineup])
+                ok += 1
+            except Exception as exc:  # noqa: BLE001 - record and move on
+                failed += 1
+                job["last_error"] = f"{name}: {exc}"
+            processed += 1
+            job["processed_items"] = processed
+            job["ok"] = ok
+            job["failed"] = failed
+            job["progress"] = processed / float(total) if total else 1.0
+            with ROSTER_JOBS_LOCK:
+                live = ROSTER_JOBS.get(job_id) or {}
+            job["pause_requested"] = bool(live.get("pause_requested"))
+            job["cancel_requested"] = bool(live.get("cancel_requested"))
+            job["status"] = "canceling" if job["cancel_requested"] else "pausing" if job["pause_requested"] else "running"
+            _publish_roster_job(job)
+        job["status"] = "completed"
+        job["current_item"] = ""
+        job["finished_at"] = time.time()
+        job["progress"] = 1.0
+        _publish_roster_job(job)
+    except Exception as exc:  # noqa: BLE001
+        job["status"] = "failed"
+        job["error"] = str(exc)
+        job["last_error"] = str(exc)
+        job["finished_at"] = time.time()
+        _publish_roster_job(job)
+
+
+def _start_roster_worker(job_id: str) -> None:
+    with ROSTER_JOBS_LOCK:
+        worker = ROSTER_WORKERS.get(job_id)
+        if worker and worker.is_alive():
+            return
+        worker = threading.Thread(target=_run_roster_job, args=(job_id,), daemon=True)
+        ROSTER_WORKERS[job_id] = worker
+        worker.start()
+
+
+def _configured_roster_top_n() -> int:
+    """The Scheduling tab's top-N setting; the manual start and the coverage
+    panel use it so everything agrees on the scope."""
+    try:
+        from backend.data import schedule_db
+
+        return max(10, min(500, int(schedule_db.get_schedule_config().get("team_data_top_n") or DEFAULT_ROSTER_TOP_N)))
+    except Exception:  # noqa: BLE001
+        return DEFAULT_ROSTER_TOP_N
+
+
+@router.get("/rosters/coverage")
+def get_roster_coverage(top_n: int = 0):
+    n = max(1, min(500, int(top_n))) if int(top_n or 0) > 0 else _configured_roster_top_n()
+    return {"status": "ok", **_roster_coverage(n)}
+
+
+@router.post("/rosters/start")
+def start_roster_import_job(payload: dict | None = None):
+    body = payload or {}
+    top_n = max(1, min(500, int(body.get("top_n") or 0))) if int(body.get("top_n") or 0) > 0 else _configured_roster_top_n()
+    latest = _get_latest_roster_job()
+    if latest and latest.get("status") in {"queued", "running", "pausing", "canceling"}:
+        return {"job_id": latest["job_id"], "status": latest.get("status"), "reused": True}
+    now = time.time()
+    job_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    job = {
+        "job_id": job_id, "status": "queued", "error": "", "last_error": "", "progress": 0.0,
+        "processed_items": 0, "total_items": 0, "ok": 0, "failed": 0, "current_item": "",
+        "pause_requested": False, "cancel_requested": False, "top_n": top_n,
+        "created_at": now, "updated_at": now, "started_at": None, "finished_at": None,
+    }
+    _publish_roster_job(job)
+    _start_roster_worker(job_id)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@router.get("/rosters/latest")
+def get_latest_roster_import_job():
+    job = _get_latest_roster_job()
+    if not job:
+        return {"exists": False}
+    return {"exists": True, **_roster_job_response(job)}
+
+
+@router.get("/rosters/job/{job_id}")
+def get_roster_import_job(job_id: str):
+    return _roster_job_response(_get_roster_job_for_response(job_id))
+
+
+@router.post("/rosters/job/{job_id}/pause")
+def pause_roster_import_job(job_id: str):
+    job = _get_roster_job_for_response(job_id)
+    if job.get("status") in {"completed", "canceled", "failed", "paused"}:
+        return _roster_job_response(job)
+    job["pause_requested"] = True
+    job["status"] = "pausing" if _roster_worker_is_active(job_id) else "paused"
+    _publish_roster_job(job)
+    return _roster_job_response(job)
+
+
+@router.post("/rosters/job/{job_id}/cancel")
+def cancel_roster_import_job(job_id: str):
+    job = _get_roster_job_for_response(job_id)
+    if job.get("status") in {"completed", "canceled", "failed"}:
+        return _roster_job_response(job)
+    job["cancel_requested"] = True
+    job["pause_requested"] = False
+    job["status"] = "canceling" if _roster_worker_is_active(job_id) else "canceled"
+    if job["status"] == "canceled":
+        job["cancel_requested"] = False
+        job["last_error"] = "Canceled"
+        job["finished_at"] = time.time()
+    _publish_roster_job(job)
+    return _roster_job_response(job)
+
+
+@router.post("/rosters/job/{job_id}/resume")
+def resume_roster_import_job(job_id: str):
+    job = _get_roster_job_for_response(job_id)
+    if job.get("status") in {"completed", "canceled"}:
+        return _roster_job_response(job)
+    if job.get("status") == "running" and _roster_worker_is_active(job_id):
+        return _roster_job_response(job)
+    job["status"] = "queued"
+    job["pause_requested"] = False
+    job["cancel_requested"] = False
+    job["error"] = ""
+    if job.get("last_error") in _INTERRUPTION_BOILERPLATE:
+        job["last_error"] = ""
+    job["finished_at"] = None
+    _publish_roster_job(job)
+    _start_roster_worker(job_id)
+    return _roster_job_response(job)
