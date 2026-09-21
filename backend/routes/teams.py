@@ -1600,7 +1600,11 @@ def _run_roster_job(job_id: str) -> None:
                 lineup = list(info.get("lineup") or [])
                 for p in lineup:
                     add_or_update_player(player_id=int(p["player_id"]), name=str(p.get("name") or "") or None)
+                # No confirmed lineup on HLTV: clear the stale slots; the team
+                # then shows as "missing" in coverage, which is the truth.
                 update_team_roster(int(team["team_id"]), [int(p["player_id"]) for p in lineup])
+                if info.get("no_lineup"):
+                    job["last_error"] = f"{name}: no current lineup listed on HLTV"
                 ok += 1
             except Exception as exc:  # noqa: BLE001 - record and move on
                 failed += 1

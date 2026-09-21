@@ -221,6 +221,10 @@ def get_hltv_team_lineup(hltv_team_id: int, team_name: str) -> Dict[str, object]
                 "HLTV team page is behind a Cloudflare/interstitial challenge. "
                 "Open once in visible browser mode and complete challenge, then retry."
             )
+        # A team with no confirmed lineup shows five "?" silhouettes in the
+        # grid: a real answer ("no current lineup"), not a parse failure.
+        if 'class="bodyshot-team' in html and "player_silhouette" in html:
+            return {"team_id": int(hltv_team_id), "team_name": team_name or "", "url": url, "lineup": [], "no_lineup": True}
         raise RankingPageParseError("Could not find the lineup on the HLTV team page.")
     return {"team_id": int(hltv_team_id), "team_name": team_name or "", "url": url, "lineup": lineup}
 
