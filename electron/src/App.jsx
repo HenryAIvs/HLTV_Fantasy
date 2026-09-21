@@ -11122,6 +11122,7 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
   // Local edit state so typing a time doesn't fire a save per keystroke.
   const [runTime, setRunTime] = useState("00:00");
   const [lookbackDays, setLookbackDays] = useState(3);
+  const [mapModelMinutes, setMapModelMinutes] = useState(120);
   const pollRef = useRef(null);
 
   const TASK_LABELS = {
@@ -11129,6 +11130,7 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
     rankings: "Team rankings (HLTV + VRS)",
     matches: "New matches played",
     ratings: "Player Top-X ratings",
+    map_model: "Map model data (vetoes, scoreboards, historical map stats)",
     valuations: "Event valuations (groups + playoff)",
     hltv_session: "HLTV login check",
   };
@@ -11156,6 +11158,7 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
       if (data?.config) {
         setRunTime(String(data.config.run_time || "00:00"));
         setLookbackDays(Number(data.config.matches_lookback_days || 3));
+        setMapModelMinutes(Number(data.config.map_model_minutes || 120));
       }
     } catch (e) {
       setMessage(e?.message || "Backend not reachable.");
@@ -11304,7 +11307,7 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
             </tr>
           </thead>
           <tbody>
-            {["events", "rankings", "matches", "ratings"].map((task) => {
+            {["events", "rankings", "matches", "ratings", "map_model"].map((task) => {
               const flagKey = `do_${task}`;
               return (
                 <tr key={task}>
@@ -11335,6 +11338,22 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
                     {task === "ratings" && (
                       <div className="muted" style={{ fontSize: 12 }}>
                         All players in the database, using the active timeframe window.
+                      </div>
+                    )}
+                    {task === "map_model" && (
+                      <div className="muted" style={{ fontSize: 12 }}>
+                        Whatever the map model is missing (the three jobs on the Model Lab page), for up to{" "}
+                        <input
+                          type="number"
+                          min={1}
+                          max={720}
+                          value={mapModelMinutes}
+                          onChange={(e) => setMapModelMinutes(Number(e.target.value))}
+                          onBlur={() => patchConfig({ map_model_minutes: mapModelMinutes })}
+                          disabled={saveBusy}
+                          style={{ width: 60 }}
+                        />{" "}
+                        minutes a night; anything left continues the next night.
                       </div>
                     )}
                   </td>
@@ -12282,23 +12301,90 @@ function useBackfillJob(basePath, jobLabel) {
   };
 }
 
+// One row of the Model Lab's data panel: what the job covers, how much is
+// stored, and the job's controls/progress (job = useBackfillJob(...)).
+function BackfillRow({ name, detail, done, total, missing, unit, extra, job, verb = "Fetch", activeLabel = "Fetching" }) {
+  const loaded = total != null;
+  const d = Number(done || 0);
+  const t = Number(total || 0);
+  const m = Number(missing || 0);
+  const pctDone = t > 0 ? Math.min(100, (d / t) * 100) : 0;
+  const active = job.active;
+  const showProgress = job.status !== "idle" && job.status !== "completed";
+  return (
+    <div className={`mm-job${active ? " active" : ""}`}>
+      <div className="mm-job-info">
+        <div className="mm-job-name">{name}</div>
+        <div className="mm-job-detail">{detail}</div>
+      </div>
+      <div className="mm-job-cov">
+        <div className="mm-job-cov-head">
+          <span className="mm-job-cov-value">{loaded && t > 0 ? `${pctDone.toFixed(1)}%` : "—"}</span>
+          <span className="mm-job-cov-text">
+            {!loaded
+              ? "Checking coverage..."
+              : `${d.toLocaleString()} of ${t.toLocaleString()} ${unit}${t > 0 ? (m > 0 ? ` · ${m.toLocaleString()} missing` : " · complete") : ""}${extra ? ` · ${extra}` : ""}`}
+          </span>
+        </div>
+        <div className="mm-bar">
+          <div className="mm-bar-fill" style={{ width: `${pctDone}%` }} />
+        </div>
+        {showProgress && (
+          <div className="mm-job-progress">
+            <span>
+              {active ? activeLabel : job.status} {job.processed.toLocaleString()} / {job.total.toLocaleString()} · ok {job.ok} · failed{" "}
+              {job.failed}
+              {active && job.total > job.processed ? ` · ETA ${formatBatchEta(job.etaSeconds)}` : ""}
+            </span>
+            {job.current && <span className="mm-job-current">{job.current}</span>}
+            {job.lastError && <span className="mm-job-error">{job.lastError}</span>}
+          </div>
+        )}
+        {job.status === "completed" && (
+          <div className="mm-job-progress">
+            <span>
+              Done: {job.ok} {verb === "Scan" ? "scanned" : "fetched"}, {job.failed} failed.
+            </span>
+          </div>
+        )}
+      </div>
+      <div className="mm-job-actions">
+        {!active && !job.resumable && (
+          <button className="secondary" onClick={job.start} disabled={t > 0 && m <= 0}>
+            {verb} missing
+          </button>
+        )}
+        {active && job.jobId && (
+          <button className="secondary" onClick={job.pause} disabled={["pausing", "canceling"].includes(job.status)}>
+            {job.status === "pausing" ? "Pausing..." : "Pause"}
+          </button>
+        )}
+        {job.resumable && job.jobId && (
+          <button className="secondary" onClick={job.resume}>
+            Resume
+          </button>
+        )}
+        {(active || job.resumable) && job.jobId && (
+          <button className="danger" onClick={job.cancel} disabled={job.status === "canceling"}>
+            {job.status === "canceling" ? "Canceling..." : "Cancel"}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function ModelLabTab() {
   const [trainLimit, setTrainLimit] = useState("0");
   const [testLimit, setTestLimit] = useState("0");
   const [randomSplit, setRandomSplit] = useState(false);
   const [dbMatchCount, setDbMatchCount] = useState(0);
+  // The three backfills the map model depends on. Each is a pausable
+  // server-side job driven through useBackfillJob; the scheduler's nightly
+  // "map_model" task drives these very same jobs, so progress shows here
+  // whichever side started them.
   const [histCoverage, setHistCoverage] = useState(null);
-  const [histJobStatus, setHistJobStatus] = useState("idle");
-  const [histJobId, setHistJobId] = useState("");
-  const [histJobProcessed, setHistJobProcessed] = useState(0);
-  const [histJobTotal, setHistJobTotal] = useState(0);
-  const [histJobOk, setHistJobOk] = useState(0);
-  const [histJobFailed, setHistJobFailed] = useState(0);
-  const [histJobCurrent, setHistJobCurrent] = useState("");
-  const [histJobLastError, setHistJobLastError] = useState("");
-  const [histJobEtaSeconds, setHistJobEtaSeconds] = useState(null);
-  const histJobPollingRef = useRef(false);
-
+  const histJob = useBackfillJob("/events/hltv-results/historical-map-stats", "historical map stats");
   const loadHistCoverage = async () => {
     try {
       const cov = await api.get("/events/hltv-results/historical-map-stats/coverage");
@@ -12307,6 +12393,7 @@ function ModelLabTab() {
       // Coverage is informational; the lab still works without it.
     }
   };
+  histJob.onSettledRef.current = loadHistCoverage;
 
   const [vetoCoverage, setVetoCoverage] = useState(null);
   const vetoJob = useBackfillJob("/events/hltv-results/veto-backfill", "veto backfill");
@@ -12332,149 +12419,14 @@ function ModelLabTab() {
   };
   mapSbJob.onSettledRef.current = loadMapSbCoverage;
 
-  const applyHistJobStatus = (status, jobIdOverride = "") => {
-    const jobId = String(jobIdOverride || status?.job_id || "");
-    const nextStatus = String(status?.status || "queued");
-    const lastError = String(status?.last_error || status?.error || "");
-    const processed = Number(status?.processed_items || 0);
-    const total = Number(status?.total_items || 0);
-    setHistJobStatus(nextStatus);
-    setHistJobId(jobId);
-    setHistJobProcessed(processed);
-    setHistJobTotal(total);
-    setHistJobOk(Number(status?.ok || 0));
-    setHistJobFailed(Number(status?.failed || 0));
-    setHistJobCurrent(String(status?.current_item || ""));
-    setHistJobLastError(lastError);
-    const startedAtMs = getBatchStartedAtMs(status);
-    if (processed > 0 && total > processed && ["queued", "running", "pausing", "canceling"].includes(nextStatus)) {
-      const elapsedSeconds = Math.max(1, (Date.now() - startedAtMs) / 1000);
-      const rate = processed / elapsedSeconds;
-      setHistJobEtaSeconds(rate > 0 ? (total - processed) / rate : null);
-    } else {
-      setHistJobEtaSeconds(null);
-    }
-    return { jobId, nextStatus, lastError };
-  };
-
-  const pollHistJob = async (jobId) => {
-    if (!jobId || histJobPollingRef.current) return;
-    histJobPollingRef.current = true;
-    try {
-      let done = false;
-      let pollFailures = 0;
-      while (!done) {
-        let status;
-        try {
-          status = await api.get(`/events/hltv-results/historical-map-stats/job/${jobId}`, 60000);
-          pollFailures = 0;
-        } catch (pollError) {
-          // The job keeps running server-side; only give up after repeated failures.
-          pollFailures += 1;
-          if (pollFailures >= 5) throw pollError;
-          await new Promise((resolve) => setTimeout(resolve, 3000));
-          continue;
-        }
-        const applied = applyHistJobStatus(status, jobId);
-        if (["completed", "failed", "paused", "canceled"].includes(applied.nextStatus)) {
-          await loadHistCoverage();
-          done = true;
-          break;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-      }
-    } catch (e) {
-      setHistJobStatus("failed");
-      setHistJobLastError(String(e?.message || "Failed to poll historical map stats job."));
-    } finally {
-      histJobPollingRef.current = false;
-    }
-  };
-
-  const startHistJob = async () => {
-    setHistJobStatus("queued");
-    setHistJobProcessed(0);
-    setHistJobTotal(0);
-    setHistJobOk(0);
-    setHistJobFailed(0);
-    setHistJobLastError("");
-    setHistJobCurrent("");
-    try {
-      const start = await api.post("/events/hltv-results/historical-map-stats/start", {});
-      const jobId = String(start?.job_id || "");
-      if (!jobId) throw new Error("Failed to start historical map stats job.");
-      setHistJobId(jobId);
-      await pollHistJob(jobId);
-    } catch (e) {
-      setHistJobStatus("failed");
-      setHistJobLastError(String(e?.message || "Failed to start historical map stats job."));
-    }
-  };
-
-  const pauseHistJob = async () => {
-    if (!histJobId) return;
-    setHistJobStatus("pausing");
-    try {
-      const status = await api.post(`/events/hltv-results/historical-map-stats/job/${histJobId}/pause`, {});
-      const applied = applyHistJobStatus(status, histJobId);
-      if (["pausing", "running", "queued"].includes(applied.nextStatus)) pollHistJob(histJobId);
-    } catch (e) {
-      setHistJobLastError(String(e?.message || "Failed to pause historical map stats job."));
-    }
-  };
-
-  const cancelHistJob = async () => {
-    if (!histJobId) return;
-    setHistJobStatus("canceling");
-    try {
-      const status = await api.post(`/events/hltv-results/historical-map-stats/job/${histJobId}/cancel`, {});
-      const applied = applyHistJobStatus(status, histJobId);
-      if (["canceling", "running", "queued", "pausing"].includes(applied.nextStatus)) pollHistJob(histJobId);
-    } catch (e) {
-      setHistJobLastError(String(e?.message || "Failed to cancel historical map stats job."));
-    }
-  };
-
-  const resumeHistJob = async () => {
-    if (!histJobId) return;
-    try {
-      const status = await api.post(`/events/hltv-results/historical-map-stats/job/${histJobId}/resume`, {});
-      const applied = applyHistJobStatus(status, histJobId);
-      if (["queued", "running", "pausing"].includes(applied.nextStatus)) pollHistJob(histJobId);
-    } catch (e) {
-      setHistJobLastError(String(e?.message || "Failed to resume historical map stats job."));
-    }
-  };
-
   useEffect(() => {
-    let cancelled = false;
     loadHistCoverage();
-    const hydrateHistJob = async () => {
-      try {
-        const latest = await api.get("/events/hltv-results/historical-map-stats/latest");
-        if (cancelled || !latest?.exists) return;
-        if (["completed", "canceled"].includes(String(latest?.status || ""))) return;
-        const applied = applyHistJobStatus(latest);
-        if (["queued", "running", "pausing", "canceling"].includes(applied.nextStatus)) {
-          pollHistJob(applied.jobId);
-        }
-      } catch {
-        // Optional panel; ignore startup failures.
-      }
-    };
-    hydrateHistJob();
+    histJob.hydrate();
     loadVetoCoverage();
     vetoJob.hydrate();
     loadMapSbCoverage();
     mapSbJob.hydrate();
-    return () => {
-      cancelled = true;
-    };
   }, []);
-
-  const histJobActive = ["queued", "running", "pausing", "canceling"].includes(histJobStatus);
-  const histJobResumable = ["paused", "failed"].includes(histJobStatus);
-  const histJobPct = histJobTotal > 0 ? Math.min(100, Math.max(0, (histJobProcessed / histJobTotal) * 100)) : 0;
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
@@ -12610,188 +12562,29 @@ function ModelLabTab() {
     }
   };
 
+  const wm = result?.metrics || {};
+  const ro = result?.rank_only_metrics || {};
+  const fmtInt = (v) => Number(v || 0).toLocaleString();
+
   return (
     <Section title="Map Model Lab">
-      <div className="stack">
-        <div className="grid two">
-          <Input label="Train Limit" value={trainLimit} onChange={setTrainLimit} />
-          <Input label="Test Limit" value={testLimit} onChange={setTestLimit} />
-        </div>
-        <div className="actions" style={{ marginTop: 0 }}>
-          <label className="checkbox-inline">
-            <input type="checkbox" checked={randomSplit} onChange={(e) => setRandomSplit(e.target.checked)} disabled={busy} />
-            <span>Random train/test split</span>
-          </label>
-          <button className="primary" onClick={run} disabled={busy}>
-            {busy ? "Running..." : "Train & Evaluate"}
-          </button>
-        </div>
+      <div className="stack lab">
         <div className="card sub">
-          <h3>Historical Map Stats</h3>
-          <p className="muted">
-            The map-data model only uses maps where both teams have pre-match six-month map stats stored in the
-            database. This job scrapes and permanently stores each missing team/date window; it is safe to pause,
-            cancel, and resume across sessions, and already-stored windows are always skipped.
-          </p>
-          {histCoverage && (
-            <p className="muted">
-              Coverage: {Number(histCoverage.cached_windows || 0).toLocaleString()} of{" "}
-              {Number(histCoverage.required_windows || 0).toLocaleString()} team-windows stored |{" "}
-              {Number(histCoverage.missing_windows || 0).toLocaleString()} missing
-              {Number(histCoverage.unmapped_team_keys || 0) > 0
-                ? ` | ${histCoverage.unmapped_team_keys} team names not in the team DB`
-                : ""}
-            </p>
-          )}
-          <div className="actions" style={{ marginTop: 0 }}>
-            <button className="secondary" onClick={startHistJob} disabled={histJobActive}>
-              {histJobActive ? `Fetching ${histJobProcessed}/${histJobTotal}` : "Fetch Missing Historical Stats"}
+          <div className="mm-run-row">
+            <Input label="Train limit" value={trainLimit} onChange={setTrainLimit} className="mm-num" placeholder="0 = all" />
+            <Input label="Test limit" value={testLimit} onChange={setTestLimit} className="mm-num" placeholder="0 = none" />
+            <label className="checkbox-inline mm-check">
+              <input type="checkbox" checked={randomSplit} onChange={(e) => setRandomSplit(e.target.checked)} disabled={busy} />
+              <span>Random split</span>
+            </label>
+            <button className="primary mm-go" onClick={run} disabled={busy}>
+              {busy ? "Running..." : "Train & evaluate"}
             </button>
-            {histJobActive && histJobId && (
-              <button className="secondary" onClick={pauseHistJob} disabled={["pausing", "canceling"].includes(histJobStatus)}>
-                {histJobStatus === "pausing" ? "Pausing..." : "Pause"}
-              </button>
-            )}
-            {histJobResumable && histJobId && (
-              <button className="secondary" onClick={resumeHistJob}>
-                Resume
-              </button>
-            )}
-            {(histJobActive || histJobResumable) && histJobId && (
-              <button className="danger" onClick={cancelHistJob} disabled={histJobStatus === "canceling"}>
-                {histJobStatus === "canceling" ? "Canceling..." : "Cancel"}
-              </button>
-            )}
-          </div>
-          {histJobStatus !== "idle" && histJobStatus !== "completed" && (
-            <>
-              <p className="muted">
-                Progress: {histJobProcessed.toLocaleString()} / {histJobTotal.toLocaleString()} | ok {histJobOk} | failed{" "}
-                {histJobFailed}
-                {histJobActive && histJobTotal > histJobProcessed ? ` | ETA: ${formatBatchEta(histJobEtaSeconds)}` : ""}
-              </p>
-              <div className="progress">
-                <div className="progress-bar determinate" style={{ width: `${histJobPct}%` }} />
-              </div>
-              {histJobCurrent && <p className="muted">Current: {histJobCurrent}</p>}
-              {histJobLastError && <p className="muted">Last error: {histJobLastError}</p>}
-            </>
-          )}
-          {histJobStatus === "completed" && (
-            <p className="muted">Backfill complete: {histJobOk} fetched, {histJobFailed} failed.</p>
-          )}
-        </div>
-        <div className="card sub">
-          <h3>Match Veto Backfill</h3>
-          <p className="muted">
-            Fetches each stored match page to fill in the map veto (who picked each map) plus any missing per-map
-            scores and player stats. The picked-map feature and veto-simulated series predictions need this data.
-            Safe to pause, cancel, and resume across sessions; matches already checked are always skipped.
-          </p>
-          {vetoCoverage && (
-            <p className="muted">
-              Coverage: {Number(vetoCoverage.with_veto || 0).toLocaleString()} of{" "}
-              {Number(vetoCoverage.total_matches || 0).toLocaleString()} matches have veto data |{" "}
-              {Number(vetoCoverage.missing_veto || 0).toLocaleString()} missing
-            </p>
-          )}
-          <div className="actions" style={{ marginTop: 0 }}>
-            <button className="secondary" onClick={vetoJob.start} disabled={vetoJob.active}>
-              {vetoJob.active ? `Fetching ${vetoJob.processed}/${vetoJob.total}` : "Fetch Missing Vetoes"}
-            </button>
-            {vetoJob.active && vetoJob.jobId && (
-              <button className="secondary" onClick={vetoJob.pause} disabled={["pausing", "canceling"].includes(vetoJob.status)}>
-                {vetoJob.status === "pausing" ? "Pausing..." : "Pause"}
-              </button>
-            )}
-            {vetoJob.resumable && vetoJob.jobId && (
-              <button className="secondary" onClick={vetoJob.resume}>
-                Resume
-              </button>
-            )}
-            {(vetoJob.active || vetoJob.resumable) && vetoJob.jobId && (
-              <button className="danger" onClick={vetoJob.cancel} disabled={vetoJob.status === "canceling"}>
-                {vetoJob.status === "canceling" ? "Canceling..." : "Cancel"}
-              </button>
-            )}
-          </div>
-          {vetoJob.status !== "idle" && vetoJob.status !== "completed" && (
-            <>
-              <p className="muted">
-                Progress: {vetoJob.processed.toLocaleString()} / {vetoJob.total.toLocaleString()} | ok {vetoJob.ok} |{" "}
-                failed {vetoJob.failed}
-                {vetoJob.active && vetoJob.total > vetoJob.processed ? ` | ETA: ${formatBatchEta(vetoJob.etaSeconds)}` : ""}
-              </p>
-              <div className="progress">
-                <div className="progress-bar determinate" style={{ width: `${vetoJob.pctDone}%` }} />
-              </div>
-              {vetoJob.current && <p className="muted">Current: {vetoJob.current}</p>}
-              {vetoJob.lastError && <p className="muted">Last error: {vetoJob.lastError}</p>}
-            </>
-          )}
-          {vetoJob.status === "completed" && (
-            <p className="muted">Backfill complete: {vetoJob.ok} fetched, {vetoJob.failed} failed.</p>
-          )}
-        </div>
-        <div className="card sub">
-          <h3>Per-Map Scoreboard Backfill</h3>
-          <p className="muted">
-            Fills each stored match's per-map player scoreboards (the map tabs in the match view). Most matches
-            are re-parsed from the archived page copy with no scraping; only matches with no archived page are
-            fetched live. Safe to pause, cancel, and resume; already-scanned matches are always skipped.
-          </p>
-          {mapSbCoverage && (
-            <p className="muted">
-              Coverage: {Number(mapSbCoverage.with_map_scoreboards || 0).toLocaleString()} of{" "}
-              {Number(mapSbCoverage.total_matches || 0).toLocaleString()} matches scanned |{" "}
-              {Number(mapSbCoverage.missing_map_scoreboards || 0).toLocaleString()} missing
-            </p>
-          )}
-          <div className="actions" style={{ marginTop: 0 }}>
-            <button className="secondary" onClick={mapSbJob.start} disabled={mapSbJob.active}>
-              {mapSbJob.active ? `Scanning ${mapSbJob.processed}/${mapSbJob.total}` : "Fetch Map Scoreboards"}
-            </button>
-            {mapSbJob.active && mapSbJob.jobId && (
-              <button className="secondary" onClick={mapSbJob.pause} disabled={["pausing", "canceling"].includes(mapSbJob.status)}>
-                {mapSbJob.status === "pausing" ? "Pausing..." : "Pause"}
-              </button>
-            )}
-            {mapSbJob.resumable && mapSbJob.jobId && (
-              <button className="secondary" onClick={mapSbJob.resume}>
-                Resume
-              </button>
-            )}
-            {(mapSbJob.active || mapSbJob.resumable) && mapSbJob.jobId && (
-              <button className="danger" onClick={mapSbJob.cancel} disabled={mapSbJob.status === "canceling"}>
-                {mapSbJob.status === "canceling" ? "Canceling..." : "Cancel"}
-              </button>
-            )}
-          </div>
-          {mapSbJob.status !== "idle" && mapSbJob.status !== "completed" && (
-            <>
-              <p className="muted">
-                Progress: {mapSbJob.processed.toLocaleString()} / {mapSbJob.total.toLocaleString()} | ok {mapSbJob.ok} |{" "}
-                failed {mapSbJob.failed}
-                {mapSbJob.active && mapSbJob.total > mapSbJob.processed ? ` | ETA: ${formatBatchEta(mapSbJob.etaSeconds)}` : ""}
-              </p>
-              <div className="progress">
-                <div className="progress-bar determinate" style={{ width: `${mapSbJob.pctDone}%` }} />
-              </div>
-              {mapSbJob.current && <p className="muted">Current: {mapSbJob.current}</p>}
-              {mapSbJob.lastError && <p className="muted">Last error: {mapSbJob.lastError}</p>}
-            </>
-          )}
-          {mapSbJob.status === "completed" && (
-            <p className="muted">Backfill complete: {mapSbJob.ok} scanned, {mapSbJob.failed} failed.</p>
-          )}
-        </div>
-        <div className="model-slice-card">
-          <div className="model-slice-head">
-            <div>
-              <h3>Stored Match Timeline</h3>
-              <p className="muted">Left is newest. Ordered mode tests on newest matches and trains on the next older matches.</p>
-            </div>
-            <span className="pill">DB only</span>
+            <span className="mm-run-note">
+              {randomSplit
+                ? "Random split samples train and test rows from the whole database."
+                : "Tests on the newest matches and trains on the next older ones."}
+            </span>
           </div>
           <div className="model-slice-track" aria-label="Training and testing slices across stored matches">
             <div className="model-slice-zero">Newest</div>
@@ -12799,12 +12592,16 @@ function ModelLabTab() {
             <div className="model-slice-segment db" style={timeline.dbStyle}>
               DB {timeline.dbTotal.toLocaleString()}
             </div>
-            <div className="model-slice-segment test" style={timeline.testStyle}>
-              Test
-            </div>
-            <div className="model-slice-segment train" style={timeline.trainStyle}>
-              Train
-            </div>
+            {timeline.testEnd > timeline.testStart && (
+              <div className="model-slice-segment test" style={timeline.testStyle}>
+                Test
+              </div>
+            )}
+            {timeline.trainEnd > timeline.trainStart && (
+              <div className="model-slice-segment train" style={timeline.trainStyle}>
+                Train
+              </div>
+            )}
           </div>
           <div className="model-slice-meta">
             <span>DB matches {timeline.dbTotal.toLocaleString()}</span>
@@ -12814,70 +12611,118 @@ function ModelLabTab() {
             {timeline.overlap > 0 && <span className="warning-text">Overlap: {timeline.overlap.toLocaleString()} matches</span>}
           </div>
         </div>
+
+        <div className="card sub">
+          <div className="pool-head">
+            <h3>Model data</h3>
+            <span className="mm-data-note">Missing data is fetched every night by the scheduler; any job can also be run from here.</span>
+          </div>
+          <div className="mm-jobs">
+            <BackfillRow
+              name="Historical map stats"
+              detail="Six-month map stats for both teams as of each match date. Maps without them are left out of the model."
+              done={histCoverage?.cached_windows}
+              total={histCoverage?.required_windows}
+              missing={histCoverage?.missing_windows}
+              unit="team windows"
+              extra={Number(histCoverage?.unmapped_team_keys || 0) > 0 ? `${histCoverage.unmapped_team_keys} team names not in the team DB` : ""}
+              job={histJob}
+            />
+            <BackfillRow
+              name="Match vetoes"
+              detail="Who picked each map, plus missing per-map scores and player stats. Feeds the picked-map feature and veto-simulated series."
+              done={vetoCoverage?.with_veto}
+              total={vetoCoverage?.total_matches}
+              missing={vetoCoverage?.missing_veto}
+              unit="matches"
+              job={vetoJob}
+            />
+            <BackfillRow
+              name="Per-map scoreboards"
+              detail="Player scoreboards for every map (the map tabs in the match view), mostly re-parsed from archived pages without scraping."
+              done={mapSbCoverage?.with_map_scoreboards}
+              total={mapSbCoverage?.total_matches}
+              missing={mapSbCoverage?.missing_map_scoreboards}
+              unit="matches"
+              job={mapSbJob}
+              verb="Scan"
+              activeLabel="Scanning"
+            />
+          </div>
+        </div>
         {error && <p className="error">{error}</p>}
         {result && (
           <div className="stack">
-            <div className="grid four">
-              <div className="card sub">
-                <h3>Train</h3>
-                <p className="muted">Matches {Number(result.train?.matches_loaded || 0).toLocaleString()}</p>
-                <p className="muted">Maps {Number(result.train?.map_samples || 0).toLocaleString()}</p>
-                <p className="muted">{result.split?.random ? "Random sample" : "Older holdout-safe rows"}</p>
+            <div className="mm-tiles">
+              <div className="topx-tile">
+                <div className="topx-tile-label">Train matches</div>
+                <div className="topx-tile-value">{fmtInt(result.train?.matches_loaded)}</div>
+                <div className="topx-tile-maps">
+                  {fmtInt(result.train?.map_samples)} maps · {result.split?.random ? "random sample" : "older rows"}
+                </div>
               </div>
-              <div className="card sub">
-                <h3>Test</h3>
-                <p className="muted">Matches {Number(result.test?.matches_loaded || 0).toLocaleString()}</p>
-                <p className="muted">Maps {Number(result.test?.map_samples || 0).toLocaleString()}</p>
-                <p className="muted">
-                  {result.split?.random ? `Random seed ${Number(result.split?.random_seed || 0).toLocaleString()}` : "Newest rows"}
-                </p>
+              <div className="topx-tile">
+                <div className="topx-tile-label">Test matches</div>
+                <div className="topx-tile-value">{fmtInt(result.test?.matches_loaded)}</div>
+                <div className="topx-tile-maps">
+                  {fmtInt(result.test?.map_samples)} maps ·{" "}
+                  {result.split?.random ? `seed ${fmtInt(result.split?.random_seed)}` : "newest rows"}
+                </div>
               </div>
-              <div className="card sub">
-                <h3>Model Comparison</h3>
-                {(() => {
-                  const wm = result.metrics || {};
-                  const ro = result.rank_only_metrics || {};
-                  const rows = [
-                    { label: "Map winner", a: wm.winner_accuracy, b: ro.winner_accuracy, fmt: (v) => pct(v, 1), higherBetter: true },
-                    { label: "Map Brier", a: wm.brier, b: ro.brier, fmt: (v) => Number(v).toFixed(3), higherBetter: false },
-                    { label: "Score MAE", a: wm.score_mae, b: ro.score_mae, fmt: (v) => Number(v).toFixed(2), higherBetter: false },
-                    { label: `Series winner (n ${Number(wm.n_series || 0).toLocaleString()})`, a: wm.series_winner_accuracy, b: ro.series_winner_accuracy, fmt: (v) => pct(v, 1), higherBetter: true },
-                    { label: "Series Brier", a: wm.series_brier, b: ro.series_brier, fmt: (v) => Number(v).toFixed(3), higherBetter: false },
-                    { label: `Veto-sim winner (n ${Number(wm.veto_sim?.n || 0).toLocaleString()})`, a: wm.veto_sim?.winner_accuracy, b: ro.veto_sim?.winner_accuracy, fmt: (v) => pct(v, 1), higherBetter: true },
-                    { label: "Veto-sim Brier", a: wm.veto_sim?.brier, b: ro.veto_sim?.brier, fmt: (v) => Number(v).toFixed(3), higherBetter: false },
-                    { label: "Veto maps matched", a: wm.veto_sim?.map_match_rate, b: ro.veto_sim?.map_match_rate, fmt: (v) => pct(v, 1), higherBetter: true },
-                  ].filter((row) => row.a != null && row.b != null);
-                  return (
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>Metric</th>
-                          <th>With Map Data</th>
-                          <th>Rank Only</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {rows.map((row) => {
-                          const aWins = row.higherBetter ? Number(row.a) > Number(row.b) : Number(row.a) < Number(row.b);
-                          const bWins = row.higherBetter ? Number(row.b) > Number(row.a) : Number(row.b) < Number(row.a);
-                          return (
-                            <tr key={row.label}>
-                              <td>{row.label}</td>
-                              <td>{aWins ? <strong>{row.fmt(row.a)}</strong> : row.fmt(row.a)}</td>
-                              <td>{bWins ? <strong>{row.fmt(row.b)}</strong> : row.fmt(row.b)}</td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  );
-                })()}
-                <p className="muted">
-                  Bold = better. Historical maps kept {pct(result.input_summary?.train?.map_stats_coverage, 1)} (
-                  {Number(result.input_summary?.train?.maps || 0).toLocaleString()} /{" "}
-                  {Number(result.input_summary?.train?.candidate_maps || 0).toLocaleString()})
-                </p>
+              <div className="topx-tile">
+                <div className="topx-tile-label">Map winner</div>
+                <div className="topx-tile-value">{pct(wm.winner_accuracy, 1)}</div>
+                <div className="topx-tile-maps">rank only {pct(ro.winner_accuracy, 1)}</div>
               </div>
+              <div className="topx-tile">
+                <div className="topx-tile-label">Map Brier</div>
+                <div className="topx-tile-value">{num(wm.brier, 3)}</div>
+                <div className="topx-tile-maps">rank only {num(ro.brier, 3)}</div>
+              </div>
+            </div>
+            <div className="card sub">
+              <h3>Model comparison</h3>
+              {(() => {
+                const rows = [
+                  { label: "Map winner", a: wm.winner_accuracy, b: ro.winner_accuracy, fmt: (v) => pct(v, 1), higherBetter: true },
+                  { label: "Map Brier", a: wm.brier, b: ro.brier, fmt: (v) => Number(v).toFixed(3), higherBetter: false },
+                  { label: "Score MAE", a: wm.score_mae, b: ro.score_mae, fmt: (v) => Number(v).toFixed(2), higherBetter: false },
+                  { label: `Series winner (n ${Number(wm.n_series || 0).toLocaleString()})`, a: wm.series_winner_accuracy, b: ro.series_winner_accuracy, fmt: (v) => pct(v, 1), higherBetter: true },
+                  { label: "Series Brier", a: wm.series_brier, b: ro.series_brier, fmt: (v) => Number(v).toFixed(3), higherBetter: false },
+                  { label: `Veto-sim winner (n ${Number(wm.veto_sim?.n || 0).toLocaleString()})`, a: wm.veto_sim?.winner_accuracy, b: ro.veto_sim?.winner_accuracy, fmt: (v) => pct(v, 1), higherBetter: true },
+                  { label: "Veto-sim Brier", a: wm.veto_sim?.brier, b: ro.veto_sim?.brier, fmt: (v) => Number(v).toFixed(3), higherBetter: false },
+                  { label: "Veto maps matched", a: wm.veto_sim?.map_match_rate, b: ro.veto_sim?.map_match_rate, fmt: (v) => pct(v, 1), higherBetter: true },
+                ].filter((row) => row.a != null && row.b != null);
+                return (
+                  <table className="mm-table mm-compare">
+                    <thead>
+                      <tr>
+                        <th>Metric</th>
+                        <th>With map data</th>
+                        <th>Rank only</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {rows.map((row) => {
+                        const aWins = row.higherBetter ? Number(row.a) > Number(row.b) : Number(row.a) < Number(row.b);
+                        const bWins = row.higherBetter ? Number(row.b) > Number(row.a) : Number(row.b) < Number(row.a);
+                        return (
+                          <tr key={row.label}>
+                            <td>{row.label}</td>
+                            <td className={aWins ? "mm-win" : ""}>{row.fmt(row.a)}</td>
+                            <td className={bWins ? "mm-win" : ""}>{row.fmt(row.b)}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                );
+              })()}
+              <p className="muted">
+                Orange = better. Historical maps kept {pct(result.input_summary?.train?.map_stats_coverage, 1)} (
+                {Number(result.input_summary?.train?.maps || 0).toLocaleString()} /{" "}
+                {Number(result.input_summary?.train?.candidate_maps || 0).toLocaleString()})
+              </p>
             </div>
             {rankEffectLevelBands.length > 0 && (
               <div className="card sub">
@@ -12891,26 +12736,30 @@ function ModelLabTab() {
                         <span>{Number(band.n || 0).toLocaleString()} maps</span>
                       </div>
                       <ResponsiveContainer width="100%" height={220}>
-                        <ComposedChart data={band.rows} margin={{ top: 8, right: 12, left: 0, bottom: 12 }}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="#233458" />
+                        <ComposedChart data={band.rows} margin={{ top: 4, right: 12, left: 0, bottom: 16 }}>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#232a34" />
                           <XAxis
                             dataKey="gap"
                             type="number"
-                            tick={{ fill: "#9eb6dd", fontSize: 11 }}
-                            label={{ value: "Rank gap", position: "insideBottom", offset: -4, fill: "#9eb6dd" }}
+                            tick={{ fill: "#9fb2c9", fontSize: 11 }}
+                            axisLine={{ stroke: "#3a4452" }}
+                            tickLine={{ stroke: "#3a4452" }}
+                            label={{ value: "Rank gap", position: "insideBottom", offset: -10, fill: "#7f97bd", fontSize: 11 }}
                           />
                           <YAxis
                             domain={[0, 1]}
-                            tick={{ fill: "#9eb6dd", fontSize: 11 }}
+                            tick={{ fill: "#9fb2c9", fontSize: 11 }}
+                            axisLine={{ stroke: "#3a4452" }}
+                            tickLine={{ stroke: "#3a4452" }}
                             tickFormatter={(v) => `${(Number(v) * 100).toFixed(0)}%`}
                           />
                           <Tooltip content={<RankEffectTooltip />} />
-                          <Legend />
+                          <Legend itemSorter={null} verticalAlign="top" align="right" height={24} iconSize={10} wrapperStyle={{ color: "#9fb2c9", fontSize: 12 }} />
                           <Line
                             type="monotone"
                             dataKey="predicted_winrate"
                             name="Predicted"
-                            stroke="#38bdf8"
+                            stroke="#22d3ee"
                             strokeWidth={2}
                             dot={{ r: 3 }}
                             connectNulls={false}
@@ -12919,7 +12768,7 @@ function ModelLabTab() {
                             type="monotone"
                             dataKey="actual_winrate"
                             name="Actual"
-                            stroke="#fbbf24"
+                            stroke="#ff6b1a"
                             strokeWidth={2}
                             dot={{ r: 3 }}
                             connectNulls={false}
@@ -12931,7 +12780,7 @@ function ModelLabTab() {
                 </div>
               </div>
             )}
-            <table>
+            <table className="mm-table">
               <thead>
                 <tr>
                   <th>Map</th>
@@ -12955,7 +12804,7 @@ function ModelLabTab() {
                 ))}
               </tbody>
             </table>
-            <table>
+            <table className="mm-table">
               <thead>
                 <tr>
                   <th>Date</th>
@@ -12971,7 +12820,7 @@ function ModelLabTab() {
               </thead>
               <tbody>
                 {(result.rows || []).map((row, idx) => (
-                  <tr key={`${row.match_url || idx}-${row.map}`} onClick={() => setSelectedBreakdownRow(row)}>
+                  <tr key={`${row.match_url || idx}-${row.map}`} className="row-link" onClick={() => setSelectedBreakdownRow(row)}>
                     <td>{formatDMY(row.match_date)}</td>
                     <td>{row.team1} vs {row.team2}</td>
                     <td>{row.map}</td>
@@ -13032,16 +12881,21 @@ function ModelLabTab() {
                   <h3>Scoreline Probabilities</h3>
                   <ResponsiveContainer width="100%" height={300}>
                     <BarChart data={selectedBreakdownRow.score_distribution || []}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#233458" />
-                      <XAxis dataKey="score" tick={{ fill: "#9eb6dd", fontSize: 11 }} interval={0} angle={-45} textAnchor="end" height={70} />
-                      <YAxis tick={{ fill: "#9eb6dd", fontSize: 12 }} tickFormatter={(v) => `${(Number(v) * 100).toFixed(0)}%`} />
-                      <Tooltip formatter={(value) => pct(value, 2)} labelStyle={{ color: "#0f172a" }} />
-                      <Bar dataKey="probability" fill="#38bdf8" />
+                      <CartesianGrid strokeDasharray="3 3" stroke="#232a34" />
+                      <XAxis dataKey="score" tick={{ fill: "#9fb2c9", fontSize: 11 }} interval={0} angle={-45} textAnchor="end" height={70} />
+                      <YAxis tick={{ fill: "#9fb2c9", fontSize: 12 }} tickFormatter={(v) => `${(Number(v) * 100).toFixed(0)}%`} />
+                      <Tooltip
+                        formatter={(value) => pct(value, 2)}
+                        contentStyle={{ background: "#14181f", border: "1px solid #3a4452", color: "#e9edf3" }}
+                        labelStyle={{ color: "#e9edf3" }}
+                        cursor={{ fill: "rgba(255, 107, 26, 0.08)" }}
+                      />
+                      <Bar dataKey="probability" fill="#ff6b1a" />
                     </BarChart>
                   </ResponsiveContainer>
                 </div>
 
-                <table>
+                <table className="mm-table">
                   <thead>
                     <tr>
                       <th>Factor</th>

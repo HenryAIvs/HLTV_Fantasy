@@ -153,9 +153,16 @@ class DataScheduler:
                 job = getter() or {}
                 if not isinstance(job, dict) or job.get("exists") is False:
                     continue
-                if str(job.get("status") or "") == "paused" and not job.get("pause_requested"):
-                    resume(str(job.get("job_id")))
-                    logger.info("Auto-resumed interrupted %s job %s", name, job.get("job_id"))
+                if str(job.get("status") or "") != "paused" or job.get("pause_requested"):
+                    continue
+                # A pause the worker honoured on request (the user's Pause button
+                # or the map_model task's time budget) is recorded as last_error
+                # "Paused"; an interruption (backend died mid-run) carries the
+                # "interrupted before completion" text. Only the latter resumes.
+                if str(job.get("last_error") or "").strip() == "Paused":
+                    continue
+                resume(str(job.get("job_id")))
+                logger.info("Auto-resumed interrupted %s job %s", name, job.get("job_id"))
             except Exception:
                 logger.info("Could not auto-resume %s job", name, exc_info=True)
 
@@ -246,6 +253,10 @@ class DataScheduler:
             tasks.append("matches")
         if cfg.get("do_ratings"):
             tasks.append("ratings")
+        # After the results import, so tonight's new matches get their
+        # vetoes, scoreboards and map-stat windows too.
+        if cfg.get("do_map_model"):
+            tasks.append("map_model")
         return tasks
 
     def run_now(self, task: str = "all") -> Dict[str, Any]:
@@ -407,6 +418,8 @@ class DataScheduler:
                 msg = self._task_matches(cfg)
             elif task == "ratings":
                 msg = self._task_ratings()
+            elif task == "map_model":
+                msg = self._task_map_model(cfg)
             else:
                 raise ValueError(f"Unknown task '{task}'")
             schedule_db.finish_run(run_id, "success", msg)
@@ -484,6 +497,81 @@ class DataScheduler:
 
         result = players._run_top_ratings_batch(items, 1, progress_callback=_progress, months=months) or {}
         return f"{len(ids)} players, {months}mo: {_short(result)}"
+
+    def _task_map_model(self, cfg: Dict[str, Any]) -> str:
+        """Fetch what the map-data model is missing: match vetoes, per-map
+        scoreboards, then historical map-stat windows (the quick ones first;
+        the windows are the long tail and take whatever time is left). Drives
+        the same pausable jobs the Model Lab runs by hand (so the lab shows
+        the progress and can pause them), within map_model_minutes per night;
+        a job cut short is paused and resumed by the next night's task."""
+        from backend.routes import events
+
+        budget = max(60.0, float(cfg.get("map_model_minutes") or 120) * 60.0)
+        deadline = time.time() + budget
+        active = {"queued", "running", "pausing", "canceling"}
+        families = [
+            ("vetoes", "matches", events.get_veto_backfill_coverage, "missing_veto",
+             events._get_latest_veto_job, events.start_veto_backfill_job,
+             events.resume_veto_backfill_job, events.pause_veto_backfill_job),
+            ("map scoreboards", "matches", events.get_map_scoreboards_coverage, "missing_map_scoreboards",
+             events._get_latest_map_sb_job, events.start_map_scoreboards_job,
+             events.resume_map_scoreboards_job, events.pause_map_scoreboards_job),
+            ("historical map stats", "windows", events.get_historical_map_stats_coverage, "missing_windows",
+             events._get_latest_historical_job, events.start_historical_map_stats_job,
+             events.resume_historical_map_stats_job, events.pause_historical_map_stats_job),
+        ]
+        notes: List[str] = []
+        failed_any = False
+        for name, unit, coverage_fn, missing_key, latest_fn, start_fn, resume_fn, pause_fn in families:
+            missing = int((coverage_fn() or {}).get(missing_key) or 0)
+            if missing <= 0:
+                notes.append(f"{name}: complete")
+                continue
+            if time.time() >= deadline:
+                notes.append(f"{name}: {missing} {unit} missing, left for the next night (time budget)")
+                continue
+            latest = latest_fn() or {}
+            status = str(latest.get("status") or "")
+            if status in active:
+                job_id = str(latest.get("job_id") or "")
+            elif status in {"paused", "failed"} and latest.get("job_id"):
+                job_id = str(latest["job_id"])
+                resume_fn(job_id)
+            else:
+                job_id = str((start_fn() or {}).get("job_id") or "")
+            if not job_id:
+                notes.append(f"{name}: could not start a job")
+                failed_any = True
+                continue
+            self._set_state(processed=0, total=missing, message=f"Map model: {name} ({missing} {unit} missing)")
+            cut_short = False
+            while True:
+                time.sleep(2)
+                job = latest_fn() or {}
+                st = str(job.get("status") or "")
+                processed = int(job.get("processed_items") or 0)
+                total = int(job.get("total_items") or 0)
+                self._set_state(processed=processed, total=total,
+                                message=f"Map model: {name} {processed}/{total}" + (" (pausing, time budget)" if cut_short else ""))
+                if st not in active:
+                    break
+                if not cut_short and time.time() >= deadline:
+                    pause_fn(job_id)
+                    cut_short = True
+            final = latest_fn() or {}
+            st = str(final.get("status") or "")
+            ok = int(final.get("ok") or 0)
+            failed = int(final.get("failed") or 0)
+            left = int((coverage_fn() or {}).get(missing_key) or 0)
+            if st == "failed":
+                failed_any = True
+            tail = " (paused: time budget)" if cut_short else f" ({st})"
+            notes.append(f"{name}: {ok} fetched, {failed} failed, {left} {unit} left{tail}")
+        message = "; ".join(notes)
+        if failed_any:
+            raise RuntimeError(message)
+        return message
 
     # ---- status --------------------------------------------------------------
     def _set_state(self, **kwargs: Any) -> None:
