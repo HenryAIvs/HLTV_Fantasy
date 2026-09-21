@@ -12374,9 +12374,10 @@ function BackfillRow({ name, detail, done, total, missing, unit, extra, job, ver
   );
 }
 
-// The lab's fixed split (mirrors _MAP_MODEL_TEST_MATCHES on the backend, which
-// the response also reports): test on the newest matches, train on the rest.
-const MODEL_LAB_TEST_MATCHES = 1000;
+// The lab's fixed split (mirrors _MAP_MODEL_TEST_MAPS on the backend, which
+// the response also reports): the holdout is the newest matches holding the
+// latest 1,000 usable maps; training is every match before them.
+const MODEL_LAB_TEST_MAPS = 1000;
 
 function ModelLabTab() {
   const [dbMatchCount, setDbMatchCount] = useState(0);
@@ -12476,8 +12477,10 @@ function ModelLabTab() {
 
   const timeline = useMemo(() => {
     const dbTotal = Math.max(0, Number(result?.db_matches || dbMatchCount || 0));
-    const testLen = Math.min(dbTotal, Number(result?.split?.test_matches || MODEL_LAB_TEST_MATCHES));
-    const trainLen = Math.max(0, dbTotal - testLen);
+    // How many matches the holdout spans is only known once a run has counted
+    // usable maps; before that the track shows the database alone.
+    const testLen = Math.min(dbTotal, Number(result?.split?.test_matches || 0));
+    const trainLen = result ? Math.max(0, dbTotal - testLen) : 0;
     const total = Math.max(dbTotal, 1);
     const segmentStyle = (start, length) => ({
       left: `${(start / total) * 100}%`,
@@ -12493,7 +12496,7 @@ function ModelLabTab() {
       testStyle: segmentStyle(0, testLen),
       trainStyle: segmentStyle(testLen, trainLen),
     };
-  }, [dbMatchCount, result?.db_matches, result?.split?.test_matches]);
+  }, [dbMatchCount, result, result?.db_matches, result?.split?.test_matches]);
 
   const rankEffectLevelBands = useMemo(
     () => (result?.rank_effect_curve?.level_bands || []).filter((band) => Array.isArray(band.rows) && band.rows.length > 0),
@@ -12548,8 +12551,8 @@ function ModelLabTab() {
               {busy ? "Running..." : "Train & evaluate"}
             </button>
             <span className="mm-run-note">
-              Tests on the newest {fmtInt(timeline.testEnd)} matches (about the last month) and trains on the{" "}
-              {fmtInt(timeline.trainEnd - timeline.trainStart)} before them. The split is fixed so runs are comparable.
+              Tests on the latest {fmtInt(result?.split?.test_maps_target || MODEL_LAB_TEST_MAPS)} usable maps (the newest matches
+              with complete data) and trains on every match before them. The split is fixed so runs are comparable.
             </span>
           </div>
           <div className="model-slice-track" aria-label="Training and testing slices across stored matches">
@@ -12571,8 +12574,16 @@ function ModelLabTab() {
           </div>
           <div className="model-slice-meta">
             <span>DB matches {timeline.dbTotal.toLocaleString()}</span>
-            <span>Test: newest {timeline.testEnd.toLocaleString()}</span>
-            <span>Train: the {(timeline.trainEnd - timeline.trainStart).toLocaleString()} before them</span>
+            {result ? (
+              <>
+                <span>
+                  Test: newest {timeline.testEnd.toLocaleString()} matches, {fmtInt(result.split?.test_maps)} usable maps
+                </span>
+                <span>Train: the {(timeline.trainEnd - timeline.trainStart).toLocaleString()} before them</span>
+              </>
+            ) : (
+              <span>Run to see how many matches the latest {fmtInt(MODEL_LAB_TEST_MAPS)} usable maps span</span>
+            )}
           </div>
         </div>
 
@@ -12629,7 +12640,7 @@ function ModelLabTab() {
                 <div className="topx-tile-label">Test matches</div>
                 <div className="topx-tile-value">{fmtInt(result.test?.matches_loaded)}</div>
                 <div className="topx-tile-maps">
-                  {fmtInt(result.test?.map_samples)} maps · newest rows
+                  {fmtInt(result.test?.map_samples)} maps · latest usable
                 </div>
               </div>
               <div className="topx-tile">

@@ -82,11 +82,21 @@ def _sigmoid(z: float) -> float:
 # maps each against fourteen inputs overfit; coefficients flipped sign between
 # maps and the held-out score fell below the rank-only baseline).
 _MAP_MODEL_L2 = 1e-2
-# The lab's one split: test on the newest N matches (about the last month at
-# 2026 volumes: ~2,200 maps, ~1,100 kept once their map-stat windows are
-# stored, which pins winner accuracy to about +/-1.4 points), train on every
-# older match. Chosen 2026-09-21; not user-adjustable.
-_MAP_MODEL_TEST_MATCHES = 1000
+# The lab's one split: the holdout is the latest N USABLE maps (both teams'
+# historical map stats for the map, and the veto), taken as whole matches
+# from the newest backwards; training is every match before them. Counting
+# usable maps keeps the holdout the same size whether or not the newest
+# matches' data has been fetched yet; 1,000 maps pins winner accuracy to
+# about +/-1.5 points. Chosen 2026-09-21; not user-adjustable.
+_MAP_MODEL_TEST_MAPS = 1000
+
+
+def _lab_match_key(obj: Dict[str, Any]) -> str:
+    """Stable per-match key shared by result rows and their map samples."""
+    url = str(obj.get("match_url") or "").strip()
+    if url:
+        return url
+    return f"{obj.get('team1')}|{obj.get('team2')}|{obj.get('match_date')}"
 
 ROUND_SHARE_FEATURES: Tuple[Tuple[str, str], ...] = (
     ("hltv_gap", "hltv_gap"),
@@ -4147,49 +4157,55 @@ def _map_model_input_summary(
 
 @router.get("/hltv-results/map-model-lab")
 def get_map_model_lab():
-    """One chronological split, fixed: the test slice is the newest
-    _MAP_MODEL_TEST_MATCHES matches, the training slice every match before
-    them, so the score measures forecasting on roughly the last month. (A
-    random split lets the fit learn a period from its own neighbours and
-    reports a few points too high; a smaller test slice is too noisy, a
-    larger one reaches back into a different meta and starves training of
-    the most relevant matches.)"""
+    """One chronological split, fixed by usable maps: walking from the newest
+    match backwards, the test slice is the smallest set of whole matches that
+    holds at least _MAP_MODEL_TEST_MAPS usable maps, and the training slice
+    is every match before it. Whole matches, so series-level metrics see
+    complete series. (A random split lets the fit learn a period from its
+    own neighbours and reports a few points too high.)"""
     db_matches = int(count_hltv_results())
-    test_offset = 0
-    test_limit = min(int(_MAP_MODEL_TEST_MATCHES), db_matches)
-    train_offset = test_limit
-    train_limit = max(0, db_matches - train_offset)
-    train_rows = list_hltv_results(limit=train_limit, offset=train_offset) if train_limit > 0 else []
-    test_rows = list_hltv_results(limit=test_limit, offset=test_offset) if test_limit > 0 else []
+    all_rows = list_hltv_results(limit=db_matches, offset=0) if db_matches > 0 else []
     historical_map_stats_by_window, historical_cache_summary = _build_historical_team_map_stats_by_window(
-        [*train_rows, *test_rows],
+        all_rows,
         fetch_missing=False,
     )
     # Elo replays the full stored timeline; each match only sees earlier results.
-    elo_rows = list_hltv_results(limit=db_matches, offset=0)
-    prematch_elo_by_match = _build_prematch_elo_by_match(elo_rows)
+    prematch_elo_by_match = _build_prematch_elo_by_match(all_rows)
     # Candidates: every ranked map with its data flags; kept: complete data
     # only (both teams' historical map stats for that map, and the veto).
-    train_candidate_samples = _iter_ranked_map_samples(
-        train_rows, historical_map_stats_by_window=historical_map_stats_by_window, prematch_elo_by_match=prematch_elo_by_match
+    all_candidates = _iter_ranked_map_samples(
+        all_rows, historical_map_stats_by_window=historical_map_stats_by_window, prematch_elo_by_match=prematch_elo_by_match
     )
-    test_candidate_samples = _iter_ranked_map_samples(
-        test_rows, historical_map_stats_by_window=historical_map_stats_by_window, prematch_elo_by_match=prematch_elo_by_match
-    )
-    train_samples = _iter_ranked_map_samples(
-        train_rows,
+    all_kept = _iter_ranked_map_samples(
+        all_rows,
         historical_map_stats_by_window=historical_map_stats_by_window,
         require_map_stats=True,
         require_veto=True,
         prematch_elo_by_match=prematch_elo_by_match,
     )
-    test_samples = _iter_ranked_map_samples(
-        test_rows,
-        historical_map_stats_by_window=historical_map_stats_by_window,
-        require_map_stats=True,
-        require_veto=True,
-        prematch_elo_by_match=prematch_elo_by_match,
-    )
+    kept_per_match: Dict[str, int] = {}
+    for sample in all_kept:
+        key = _lab_match_key(sample)
+        kept_per_match[key] = kept_per_match.get(key, 0) + 1
+    # Newest first: whole matches until the holdout holds enough usable maps.
+    n_test_rows = 0
+    test_kept = 0
+    for row in all_rows:
+        if test_kept >= int(_MAP_MODEL_TEST_MAPS):
+            break
+        n_test_rows += 1
+        test_kept += kept_per_match.get(_lab_match_key(row), 0)
+    test_rows = all_rows[:n_test_rows]
+    train_rows = all_rows[n_test_rows:]
+    test_keys = {_lab_match_key(r) for r in test_rows}
+    test_candidate_samples = [s for s in all_candidates if _lab_match_key(s) in test_keys]
+    train_candidate_samples = [s for s in all_candidates if _lab_match_key(s) not in test_keys]
+    test_samples = [s for s in all_kept if _lab_match_key(s) in test_keys]
+    train_samples = [s for s in all_kept if _lab_match_key(s) not in test_keys]
+    test_offset = 0
+    test_limit = len(test_rows)
+    train_offset = len(test_rows)
+    train_limit = len(train_rows)
     # Win probabilities come from models trained directly on the map result;
     # the round-share models are kept for scoreline prediction only.
     models_with_map_data = _fit_map_model_set(train_samples, include_map_stats=True, target="map_win")
@@ -4221,7 +4237,13 @@ def get_map_model_lab():
         "status": "ok",
         "method": "Trains two logistic formulas per feature set on the same historical slice: win probabilities come from a model trained directly on map results, and scorelines from a round-share model over the same features. The rank-only baseline uses HLTV/VRS rank gaps, matchup rank level, and gap-by-level interactions. The map-data model adds directional Team A minus Team B deltas: six-month map-stat gaps (win/pick/ban/played share), pre-match overall and per-map Elo gaps replayed from the stored match timeline with margin-of-victory weighting, and who picked the map in the veto (when veto data is stored). Both are evaluated on the same covered holdout slice.",
         "db_matches": db_matches,
-        "split": {"mode": "ordered", "test_matches": len(test_rows), "train_matches": len(train_rows)},
+        "split": {
+            "mode": "ordered",
+            "test_maps_target": int(_MAP_MODEL_TEST_MAPS),
+            "test_maps": len(test_samples),
+            "test_matches": len(test_rows),
+            "train_matches": len(train_rows),
+        },
         "map_pool": MAP_POOL,
         "train": {
             "limit": train_limit,
