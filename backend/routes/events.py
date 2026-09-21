@@ -77,6 +77,12 @@ def _sigmoid(z: float) -> float:
 
 # First 6 entries are the rank-only baseline (see _fit_round_share_logistic_2d's
 # [:6] slice); map-informed features must be appended after them.
+# Ridge strength for the map-model fit. Chosen 2026-09-21 on a held-out slice:
+# 1e-2 with one pooled model beat 1e-4 and beat per-map models (a few hundred
+# maps each against fourteen inputs overfit; coefficients flipped sign between
+# maps and the held-out score fell below the rank-only baseline).
+_MAP_MODEL_L2 = 1e-2
+
 ROUND_SHARE_FEATURES: Tuple[Tuple[str, str], ...] = (
     ("hltv_gap", "hltv_gap"),
     ("hltv_level", "hltv_level"),
@@ -256,7 +262,7 @@ def _fit_round_share_logistic_2d(samples: List[Dict[str, float]], include_map_st
 
     a = 0.0
     coefs: Dict[str, float] = {name: 0.0 for name, _sample_key in feature_defs}
-    l2 = 1e-4
+    l2 = float(_MAP_MODEL_L2)
     lr = 0.03
     for _ in range(3500):
         ga = 0.0
@@ -3479,7 +3485,9 @@ def _fit_map_model_set(
     include_map_stats: bool = True,
     target: str = "round_share",
 ) -> Dict[str, Dict[str, Any]]:
-    """Fit global + per-map logistic models over the shared feature set.
+    """Fit one pooled logistic model over the shared feature set and serve it
+    for every map (per-map fits overfit and scored worse held-out; see
+    _MAP_MODEL_L2).
 
     target="round_share" fits round share weighted by rounds (scoreline model);
     target="map_win" fits the binary map result with unit weight (probability
@@ -3544,18 +3552,7 @@ def _fit_map_model_set(
     }
     models: Dict[str, Dict[str, Any]] = {"__global__": global_model}
     for map_name, rows in by_map.items():
-        if len(rows) >= 20:
-            try:
-                models[map_name] = {
-                    **_fit_round_share_logistic_2d(rows, include_map_stats=include_map_stats),
-                    "scope": "map",
-                    "target": str(target),
-                    "samples": len(rows),
-                }
-                continue
-            except Exception:
-                pass
-        models[map_name] = {**global_model, "scope": "global_fallback", "samples": len(rows)}
+        models[map_name] = {**global_model, "samples": len(rows)}
     return models
 
 
@@ -4120,45 +4117,30 @@ def get_map_model_lab(
     train_offset: int = 500,
     test_limit: int = 500,
     test_offset: int = 0,
-    random_split: bool = False,
-    random_seed: int | None = None,
     fetch_missing_map_stats: bool = False,
 ):
+    """Chronological split only: the test slice is the newest matches, the
+    training slice the ones before them, so the score measures forecasting
+    (a random split lets the fit learn a period from its own neighbours and
+    reports a few points too high)."""
     db_matches = int(count_hltv_results())
     train_limit = max(0, min(100000, int(train_limit)))
     test_limit = max(0, min(100000, int(test_limit)))
     train_offset = max(0, int(train_offset or 0))
     test_offset = max(0, int(test_offset or 0))
-    seed_used = int(random_seed if random_seed is not None else random.randrange(1, 2_147_483_647))
-    if random_split and db_matches > 0:
-        total_needed = min(db_matches, train_limit + test_limit)
-        all_rows = list_hltv_results(limit=db_matches, offset=0)
-        rng = random.Random(seed_used)
-        rng.shuffle(all_rows)
-        test_count = min(test_limit, total_needed)
-        train_count = min(train_limit, max(0, total_needed - test_count))
-        test_rows = all_rows[:test_count]
-        train_rows = all_rows[test_count : test_count + train_count]
-        train_offset = 0
+    if db_matches > 0:
         test_offset = 0
-        train_limit = len(train_rows)
-        test_limit = len(test_rows)
-    else:
-        random_split = False
-        seed_used = 0
-        if db_matches > 0:
-            test_offset = 0
-            train_offset = min(test_limit, db_matches)
-            train_limit = min(train_limit, max(0, db_matches - train_offset))
-            test_limit = min(test_limit, max(0, db_matches - test_offset))
-        train_rows = list_hltv_results(limit=train_limit, offset=train_offset)
-        test_rows = list_hltv_results(limit=test_limit, offset=test_offset)
+        train_offset = min(test_limit, db_matches)
+        train_limit = min(train_limit, max(0, db_matches - train_offset))
+        test_limit = min(test_limit, max(0, db_matches - test_offset))
+    train_rows = list_hltv_results(limit=train_limit, offset=train_offset)
+    test_rows = list_hltv_results(limit=test_limit, offset=test_offset)
     historical_map_stats_by_window, historical_cache_summary = _build_historical_team_map_stats_by_window(
         [*train_rows, *test_rows],
         fetch_missing=bool(fetch_missing_map_stats),
     )
     # Elo replays the full stored timeline; each match only sees earlier results.
-    elo_rows = all_rows if random_split else list_hltv_results(limit=db_matches, offset=0)
+    elo_rows = list_hltv_results(limit=db_matches, offset=0)
     prematch_elo_by_match = _build_prematch_elo_by_match(elo_rows)
     # Candidates: every ranked map with its data flags; kept: complete data
     # only (both teams' historical map stats for that map, and the veto).
@@ -4213,11 +4195,7 @@ def get_map_model_lab(
         "status": "ok",
         "method": "Trains two logistic formulas per feature set on the same historical slice: win probabilities come from a model trained directly on map results, and scorelines from a round-share model over the same features. The rank-only baseline uses HLTV/VRS rank gaps, matchup rank level, and gap-by-level interactions. The map-data model adds directional Team A minus Team B deltas: six-month map-stat gaps (win/pick/ban/played share), pre-match overall and per-map Elo gaps replayed from the stored match timeline with margin-of-victory weighting, and who picked the map in the veto (when veto data is stored). Both are evaluated on the same covered holdout slice.",
         "db_matches": db_matches,
-        "split": {
-            "mode": "random" if random_split else "ordered",
-            "random": bool(random_split),
-            "random_seed": seed_used if random_split else None,
-        },
+        "split": {"mode": "ordered"},
         "map_pool": MAP_POOL,
         "train": {
             "limit": train_limit,

@@ -12377,7 +12377,6 @@ function BackfillRow({ name, detail, done, total, missing, unit, extra, job, ver
 function ModelLabTab() {
   const [trainLimit, setTrainLimit] = useState("0");
   const [testLimit, setTestLimit] = useState("0");
-  const [randomSplit, setRandomSplit] = useState(false);
   const [dbMatchCount, setDbMatchCount] = useState(0);
   // The three backfills the map model depends on. Each is a pausable
   // server-side job driven through useBackfillJob; the scheduler's nightly
@@ -12453,6 +12452,9 @@ function ModelLabTab() {
       ban_gap: "Ban gap",
       played_pct_gap: "Played share gap",
       map_stats_available: "Map stats available",
+      elo_gap: "Elo gap",
+      map_elo_gap: "Map Elo gap",
+      picked_by_a: "Picked by team",
     }[feature] || feature);
   const toPositiveInt = (value, fallback = 0) => {
     const parsed = Number.parseInt(String(value ?? ""), 10);
@@ -12544,7 +12546,6 @@ function ModelLabTab() {
       const params = new URLSearchParams({
         train_limit: String(toPositiveInt(trainLimit, 0)),
         test_limit: String(toPositiveInt(testLimit, 0)),
-        random_split: randomSplit ? "true" : "false",
         fetch_missing_map_stats: "false",
       });
       // Training scales with dataset size (~40s at 1,600 matches); give it far
@@ -12573,18 +12574,10 @@ function ModelLabTab() {
           <div className="mm-run-row">
             <Input label="Train limit" value={trainLimit} onChange={setTrainLimit} className="mm-num" placeholder="0 = all" />
             <Input label="Test limit" value={testLimit} onChange={setTestLimit} className="mm-num" placeholder="0 = none" />
-            <label className="checkbox-inline mm-check">
-              <input type="checkbox" checked={randomSplit} onChange={(e) => setRandomSplit(e.target.checked)} disabled={busy} />
-              <span>Random split</span>
-            </label>
             <button className="primary mm-go" onClick={run} disabled={busy}>
               {busy ? "Running..." : "Train & evaluate"}
             </button>
-            <span className="mm-run-note">
-              {randomSplit
-                ? "Random split samples train and test rows from the whole database."
-                : "Tests on the newest matches and trains on the next older ones."}
-            </span>
+            <span className="mm-run-note">Tests on the newest matches and trains on the ones before them.</span>
           </div>
           <div className="model-slice-track" aria-label="Training and testing slices across stored matches">
             <div className="model-slice-zero">Newest</div>
@@ -12607,7 +12600,6 @@ function ModelLabTab() {
             <span>DB matches {timeline.dbTotal.toLocaleString()}</span>
             <span>Test rows {sliceRangeLabel(timeline.testStart, timeline.testEnd)}</span>
             <span>Train rows {sliceRangeLabel(timeline.trainStart, timeline.trainEnd)}</span>
-            {randomSplit && <span className="warning-text">Random split ignores timeline order</span>}
             {timeline.overlap > 0 && <span className="warning-text">Overlap: {timeline.overlap.toLocaleString()} matches</span>}
           </div>
         </div>
@@ -12658,15 +12650,14 @@ function ModelLabTab() {
                 <div className="topx-tile-label">Train matches</div>
                 <div className="topx-tile-value">{fmtInt(result.train?.matches_loaded)}</div>
                 <div className="topx-tile-maps">
-                  {fmtInt(result.train?.map_samples)} maps · {result.split?.random ? "random sample" : "older rows"}
+                  {fmtInt(result.train?.map_samples)} maps · older rows
                 </div>
               </div>
               <div className="topx-tile">
                 <div className="topx-tile-label">Test matches</div>
                 <div className="topx-tile-value">{fmtInt(result.test?.matches_loaded)}</div>
                 <div className="topx-tile-maps">
-                  {fmtInt(result.test?.map_samples)} maps ·{" "}
-                  {result.split?.random ? `seed ${fmtInt(result.split?.random_seed)}` : "newest rows"}
+                  {fmtInt(result.test?.map_samples)} maps · newest rows
                 </div>
               </div>
               <div className="topx-tile">
@@ -12791,7 +12782,6 @@ function ModelLabTab() {
                   <th>Test Maps</th>
                   <th>Score MAE</th>
                   <th>Winner</th>
-                  <th>Model</th>
                   <th>Train Samples</th>
                 </tr>
               </thead>
@@ -12802,7 +12792,6 @@ function ModelLabTab() {
                     <td>{Number(row.n || 0).toLocaleString()}</td>
                     <td>{Number(row.score_mae || 0).toFixed(2)}</td>
                     <td>{pct(row.winner_accuracy, 1)}</td>
-                    <td>{row.model_scope}</td>
                     <td>{Number(row.training_samples || 0).toLocaleString()}</td>
                   </tr>
                 ))}
@@ -12877,7 +12866,6 @@ function ModelLabTab() {
                   <div className="card sub">
                     <h3>Map Win</h3>
                     <p className="muted">{pct(selectedBreakdownRow.team1_map_win_probability, 2)}</p>
-                    <p className="muted">Model {selectedBreakdownRow.model_scope || "-"}</p>
                   </div>
                 </div>
 
