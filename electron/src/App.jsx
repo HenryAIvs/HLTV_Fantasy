@@ -12719,9 +12719,13 @@ function ModelLabTab() {
                 );
               })()}
               <p className="muted">
-                Orange = better. Historical maps kept {pct(result.input_summary?.train?.map_stats_coverage, 1)} (
-                {Number(result.input_summary?.train?.maps || 0).toLocaleString()} /{" "}
-                {Number(result.input_summary?.train?.candidate_maps || 0).toLocaleString()})
+                Orange = better. Training maps kept {fmtInt(result.input_summary?.train?.maps)} of{" "}
+                {fmtInt(result.input_summary?.train?.candidate_maps)}: {fmtInt(result.input_summary?.train?.excluded_missing_map_stats)}{" "}
+                dropped for no historical map stats, {fmtInt(result.input_summary?.train?.excluded_missing_veto)} for no veto
+                {Number(result.input_summary?.train?.vrs_substituted || 0) > 0
+                  ? `; HLTV rank used in place of VRS on ${fmtInt(result.input_summary?.train?.vrs_substituted)}`
+                  : ""}
+                . Test maps kept {fmtInt(result.input_summary?.test?.maps)} of {fmtInt(result.input_summary?.test?.candidate_maps)}.
               </p>
             </div>
             {rankEffectLevelBands.length > 0 && (

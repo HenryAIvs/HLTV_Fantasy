@@ -3362,8 +3362,14 @@ def _iter_ranked_map_samples(
     *,
     historical_map_stats_by_window: Dict[tuple[str, str, str], Dict[str, Dict[str, float]]] | None = None,
     require_map_stats: bool = False,
+    require_veto: bool = False,
     prematch_elo_by_match: Dict[str, Dict[str, Any]] | None = None,
 ) -> List[Dict[str, Any]]:
+    """One sample per played map. require_map_stats drops maps where either
+    team lacks pre-match six-month stats for that map; require_veto drops
+    every map of a match with no stored veto (so "picked by" is never a
+    silent zero). Each sample also carries veto_available / vrs_substituted
+    so a summary can say what was defaulted."""
     samples: List[Dict[str, Any]] = []
     for r in rows:
         t1 = str(r.get("team1") or "").strip()
@@ -3377,7 +3383,8 @@ def _iter_ranked_map_samples(
             continue
         # Valve's ranking barely exists before 2024; substitute the HLTV rank so
         # CS2-era matches from late 2023 stay usable as training data.
-        if v1 is None or v2 is None:
+        vrs_substituted = v1 is None or v2 is None
+        if vrs_substituted:
             v1, v2 = h1, h2
         k1 = _norm_team_name(t1)
         k2 = _norm_team_name(t2)
@@ -3390,6 +3397,9 @@ def _iter_ranked_map_samples(
             team1_stats = (team_map_stats_by_key or {}).get(k1)
             team2_stats = (team_map_stats_by_key or {}).get(k2)
         pickers = _map_pickers_from_veto(r.get("veto_json"), t1, t2)
+        veto_available = bool(pickers)
+        if require_veto and not veto_available:
+            continue
         elo_entry = (prematch_elo_by_match or {}).get(str(r.get("match_url") or "").strip())
         series_score1 = _to_float_or_none(r.get("score1"))
         series_score2 = _to_float_or_none(r.get("score2"))
@@ -3455,6 +3465,8 @@ def _iter_ranked_map_samples(
                     "elo_gap": elo_gap,
                     "map_elo_gap": map_elo_gap,
                     "picked_by_a": float(pickers.get(map_name, 0.0)),
+                    "veto_available": 1.0 if veto_available else 0.0,
+                    "vrs_substituted": 1.0 if vrs_substituted else 0.0,
                     "series_score1": int(series_score1) if series_score1 is not None else None,
                     "series_score2": int(series_score2) if series_score2 is not None else None,
                 }
@@ -4075,17 +4087,30 @@ def _evaluate_map_model_set(
     }
 
 
-def _map_model_input_summary(samples: List[Dict[str, Any]], *, candidate_maps: int | None = None) -> Dict[str, Any]:
+def _map_model_input_summary(
+    samples: List[Dict[str, Any]], *, candidates: List[Dict[str, Any]] | None = None
+) -> Dict[str, Any]:
+    """What the lab kept, what it dropped and why. `candidates` are the same
+    rows' maps built with no requirements (flags intact), `samples` the kept
+    ones."""
     total = len(samples)
-    with_stats = sum(1 for sample in samples if float(sample.get("map_stats_available") or 0.0) > 0.0)
-    candidates = int(candidate_maps if candidate_maps is not None else total)
+    cands = list(candidates) if candidates is not None else list(samples)
+    n_cand = len(cands)
+    has_stats = lambda s: float(s.get("map_stats_available") or 0.0) > 0.0  # noqa: E731
+    has_veto = lambda s: float(s.get("veto_available") or 0.0) > 0.0  # noqa: E731
+    no_stats = sum(1 for c in cands if not has_stats(c))
+    no_veto = sum(1 for c in cands if has_stats(c) and not has_veto(c))
+    with_stats = sum(1 for s in samples if has_stats(s))
+    vrs_sub = sum(1 for s in samples if float(s.get("vrs_substituted") or 0.0) > 0.0)
     return {
         "maps": total,
-        "candidate_maps": candidates,
+        "candidate_maps": n_cand,
         "with_map_stats": with_stats,
-        "excluded_missing_map_stats": max(0, candidates - total),
+        "excluded_missing_map_stats": no_stats,
+        "excluded_missing_veto": no_veto,
+        "vrs_substituted": vrs_sub,
         "missing_map_stats": max(0, total - with_stats),
-        "map_stats_coverage": (total / candidates) if candidates else 0.0,
+        "map_stats_coverage": (total / n_cand) if n_cand else 0.0,
     }
 
 
@@ -4135,18 +4160,26 @@ def get_map_model_lab(
     # Elo replays the full stored timeline; each match only sees earlier results.
     elo_rows = all_rows if random_split else list_hltv_results(limit=db_matches, offset=0)
     prematch_elo_by_match = _build_prematch_elo_by_match(elo_rows)
-    train_candidate_samples = _iter_ranked_map_samples(train_rows, prematch_elo_by_match=prematch_elo_by_match)
-    test_candidate_samples = _iter_ranked_map_samples(test_rows, prematch_elo_by_match=prematch_elo_by_match)
+    # Candidates: every ranked map with its data flags; kept: complete data
+    # only (both teams' historical map stats for that map, and the veto).
+    train_candidate_samples = _iter_ranked_map_samples(
+        train_rows, historical_map_stats_by_window=historical_map_stats_by_window, prematch_elo_by_match=prematch_elo_by_match
+    )
+    test_candidate_samples = _iter_ranked_map_samples(
+        test_rows, historical_map_stats_by_window=historical_map_stats_by_window, prematch_elo_by_match=prematch_elo_by_match
+    )
     train_samples = _iter_ranked_map_samples(
         train_rows,
         historical_map_stats_by_window=historical_map_stats_by_window,
         require_map_stats=True,
+        require_veto=True,
         prematch_elo_by_match=prematch_elo_by_match,
     )
     test_samples = _iter_ranked_map_samples(
         test_rows,
         historical_map_stats_by_window=historical_map_stats_by_window,
         require_map_stats=True,
+        require_veto=True,
         prematch_elo_by_match=prematch_elo_by_match,
     )
     # Win probabilities come from models trained directly on the map result;
@@ -4209,8 +4242,8 @@ def get_map_model_lab(
             "rank_only": rank_only["metrics"],
         },
         "input_summary": {
-            "train": _map_model_input_summary(train_samples, candidate_maps=len(train_candidate_samples)),
-            "test": _map_model_input_summary(test_samples, candidate_maps=len(test_candidate_samples)),
+            "train": _map_model_input_summary(train_samples, candidates=train_candidate_samples),
+            "test": _map_model_input_summary(test_samples, candidates=test_candidate_samples),
             "map_feature_shape": "directional_deltas",
             "historical_map_stats": historical_cache_summary,
         },
