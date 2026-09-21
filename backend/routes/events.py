@@ -23,6 +23,7 @@ from backend.services.hltv_rankings import (
     HLTVRankingError,
 )
 from backend.data.db import connect as event_db_connect
+from backend.data.singleton_state import SingletonState
 from backend.data.event_db import (
     get_historical_team_map_stats_keys,
     clear_hltv_results,
@@ -4175,10 +4176,67 @@ def get_map_model_lab_progress():
         return dict(_MAP_MODEL_LAB_PROGRESS)
 
 
+# The last train-and-evaluate result, kept so the page opens with it and the
+# nightly task can refresh it. The signature says what the run saw; comparing
+# it with the live counts tells whether the data has changed since.
+_MAP_MODEL_LAB_STATE = SingletonState("map_model_lab_result")
+_MAP_MODEL_LAB_STATE_READY = False
+
+
+def _lab_state() -> SingletonState:
+    global _MAP_MODEL_LAB_STATE_READY
+    if not _MAP_MODEL_LAB_STATE_READY:
+        _MAP_MODEL_LAB_STATE.ensure_table()
+        _MAP_MODEL_LAB_STATE_READY = True
+    return _MAP_MODEL_LAB_STATE
+
+
+def _lab_data_signature() -> Dict[str, int]:
+    """Cheap counts of what the lab trains on: stored matches, matches with a
+    veto, historical map-stat windows."""
+    conn = event_db_connect()
+    try:
+        matches = conn.execute("SELECT COUNT(*) AS c FROM hltv_results").fetchone()["c"]
+        vetoes = conn.execute(
+            "SELECT COUNT(*) AS c FROM hltv_results WHERE veto_json IS NOT NULL AND veto_json != '' AND veto_json != '[]'"
+        ).fetchone()["c"]
+        windows = conn.execute("SELECT COUNT(*) AS c FROM historical_team_map_stats").fetchone()["c"]
+    finally:
+        conn.close()
+    return {"matches": int(matches or 0), "vetoes": int(vetoes or 0), "windows": int(windows or 0)}
+
+
+@router.get("/hltv-results/map-model-lab/latest")
+def get_map_model_lab_latest():
+    """The cached last result, with whether the data changed since it ran."""
+    saved = _lab_state().load()
+    if not saved or not saved.get("result"):
+        return {"exists": False}
+    payload = saved.get("payload") or {}
+    then = payload.get("signature") or {}
+    now = _lab_data_signature()
+    changes = {k: int(now.get(k, 0)) - int(then.get(k, 0)) for k in now if int(now.get(k, 0)) != int(then.get(k, 0))}
+    return {
+        "exists": True,
+        "computed_at": float(payload.get("computed_at") or saved.get("updated_at") or 0.0),
+        "stale": bool(changes),
+        "changes": changes,
+        "result": saved.get("result"),
+    }
+
+
 @router.get("/hltv-results/map-model-lab")
 def get_map_model_lab():
     try:
-        return _run_map_model_lab()
+        signature = _lab_data_signature()
+        result = _run_map_model_lab()
+        computed_at = time.time()
+        result["cache"] = {"computed_at": computed_at, "signature": signature}
+        try:
+            _lab_state().save({"computed_at": computed_at, "signature": signature}, result)
+        except Exception:  # noqa: BLE001 - a cache miss must not fail the run
+            logger.exception("Could not cache the map model lab result")
+        return result
     finally:
         _lab_progress(1.0, "Done", running=False)
 

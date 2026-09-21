@@ -12521,6 +12521,33 @@ function ModelLabTab() {
 
   // Phase and fraction reported by the backend while a run is in flight.
   const [progress, setProgress] = useState(null);
+  // The cached last run: when it ran and whether the data changed since.
+  const [cache, setCache] = useState(null);
+  useEffect(() => {
+    let live = true;
+    api
+      .get("/events/hltv-results/map-model-lab/latest", 60000)
+      .then((latest) => {
+        if (!live || !latest?.exists) return;
+        setResult(latest.result || null);
+        setCache({ computed_at: Number(latest.computed_at || 0), stale: Boolean(latest.stale), changes: latest.changes || {} });
+      })
+      .catch(() => {
+        // No cache is fine; the page just starts empty.
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+  const describeChanges = (changes) => {
+    const parts = [];
+    const label = { matches: "matches", vetoes: "vetoes", windows: "map-stat windows" };
+    Object.entries(changes || {}).forEach(([k, v]) => {
+      const n = Number(v || 0);
+      if (n !== 0) parts.push(`${n > 0 ? "+" : ""}${n.toLocaleString()} ${label[k] || k}`);
+    });
+    return parts.join(", ");
+  };
   const run = async () => {
     setBusy(true);
     setError("");
@@ -12543,6 +12570,7 @@ function ModelLabTab() {
         return;
       }
       setResult(data);
+      setCache({ computed_at: Number(data?.cache?.computed_at || Date.now() / 1000), stale: false, changes: {} });
     } catch (e) {
       setError(e?.message || "Failed to run model lab.");
     } finally {
@@ -12564,6 +12592,14 @@ function ModelLabTab() {
             <button className="primary mm-go" onClick={run} disabled={busy}>
               {busy ? "Running..." : "Train & evaluate"}
             </button>
+            {!busy && cache && (
+              <span className={`mm-run-note${cache.stale ? " stale" : ""}`}>
+                Last run {new Date(cache.computed_at * 1000).toLocaleString()}
+                {cache.stale
+                  ? ` · data changed since (${describeChanges(cache.changes)}). Run again for current numbers.`
+                  : " · data unchanged since, results are current."}
+              </span>
+            )}
             {busy && (
               <div className="mm-progress" aria-label="Training progress">
                 <div className="mm-bar">

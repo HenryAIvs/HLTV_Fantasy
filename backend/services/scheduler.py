@@ -568,6 +568,24 @@ class DataScheduler:
                 failed_any = True
             tail = " (paused: time budget)" if cut_short else f" ({st})"
             notes.append(f"{name}: {ok} fetched, {failed} failed, {left} {unit} left{tail}")
+        # Keep the lab's cached evaluation current: re-run it (about 15 s)
+        # when tonight changed the data it trains on.
+        try:
+            latest = events.get_map_model_lab_latest()
+            if not latest.get("exists") or latest.get("stale"):
+                self._set_state(processed=0, total=0, message="Map model: re-evaluating the lab model")
+                res = events.get_map_model_lab()
+                m = res.get("metrics") or {}
+                r = res.get("rank_only_metrics") or {}
+                notes.append(
+                    f"lab re-evaluated: map data {float(m.get('winner_accuracy') or 0) * 100:.1f}% "
+                    f"vs rank-only {float(r.get('winner_accuracy') or 0) * 100:.1f}% winners "
+                    f"on {int((res.get('split') or {}).get('test_maps') or 0)} maps"
+                )
+            else:
+                notes.append("lab evaluation already current")
+        except Exception as exc:  # noqa: BLE001 - the fetches above still count
+            notes.append(f"lab re-evaluation failed: {exc}")
         message = "; ".join(notes)
         if failed_any:
             raise RuntimeError(message)
