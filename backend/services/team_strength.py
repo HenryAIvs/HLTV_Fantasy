@@ -1,14 +1,17 @@
 # team_strength.py
+#
+# P(team A beats team B) for the simulators, from the map model trained on
+# the stored HLTV results (backend.routes.events): a per-map logistic model
+# over ranks, six-month map stats, the veto pick and the per-player rating,
+# averaged over the active map pool and pushed through the best-of formula
+# for the match type. The model is trained on every usable stored map at
+# startup and refreshed by the nightly map-model task.
 
-import math
-import json
-import os
-from functools import lru_cache
-from typing import Tuple
+import threading
+import time
+from typing import Any, Dict, Tuple
 
-from backend.data.db import ROOT_DIR, connect as _connect
-
-PARAMS_PATH = str(ROOT_DIR / "winrate_params.json")
+from backend.data.db import connect as _connect
 
 
 # Ranks pinned by a valuation running on a frozen input snapshot (an event
@@ -35,104 +38,95 @@ class rank_overrides:
         return False
 
 
-def _get_hltv_rank(team_id: int) -> int:
-    rank = _RANK_OVERRIDE.get(int(team_id))
-    if rank:
-        return max(1, int(rank))
-    return _get_hltv_rank_db(team_id)
+_WINS_NEEDED = {"bo1": 1, "bo3": 2, "bo5": 3}
+_UNRANKED = 100  # a team with no HLTV rank is treated as a weak one
+_PROFILE_TTL_SECONDS = 300.0  # rankings and map stats change nightly
+_profile_cache: Dict[int, Tuple[float, Dict[str, Any]]] = {}
+_prob_cache: Dict[tuple, float] = {}
+_cache_lock = threading.Lock()
 
 
-@lru_cache(maxsize=2048)
-def _get_hltv_rank_db(team_id: int) -> int:
-    """
-    Fetch hltv_rank for a given team_id from the teams table.
-    If missing or invalid, fall back to a large rank (weaker team).
-    """
+def _events():
+    # Imported lazily: backend.routes.events reaches this module through the
+    # match engine, so a module-level import would be circular.
+    from backend.routes import events
+
+    return events
+
+
+def _team_profile(team_id: int) -> Dict[str, Any]:
+    """Name key, ranks and current six-month map stats for a team."""
+    now = time.monotonic()
+    with _cache_lock:
+        hit = _profile_cache.get(int(team_id))
+        if hit and now - hit[0] < _PROFILE_TTL_SECONDS:
+            return hit[1]
+    events = _events()
     conn = _connect()
     try:
         row = conn.execute(
-            "SELECT hltv_rank FROM teams WHERE team_id = ?",
-            (team_id,),
+            "SELECT name, hltv_rank, vrs_rank, map_stats_json FROM teams WHERE team_id = ?",
+            (int(team_id),),
         ).fetchone()
     finally:
         conn.close()
 
-    if row is None:
-        return 100  # unknown team, treat as weak
+    def _rank(value: Any) -> int | None:
+        try:
+            rank = int(value)
+        except Exception:
+            return None
+        return rank if rank > 0 else None
 
-    try:
-        rank = int(row["hltv_rank"])
-        if rank <= 0:
-            raise ValueError
-        return rank
-    except Exception:
-        return 100
-
-
-def _logistic(x: float) -> float:
-    return 1.0 / (1.0 + math.exp(-x))
-
-
-# Fitted logistic parameters from Team odd.xlsx
-_A_OFFSET = -0.04246783059403746
-_B_SLOPE  =  0.4270428576181436
-
-_PARAM_CACHE_MTIME = None
-_PARAM_CACHE_VALS: Tuple[float, float] | None = None
+    profile = {
+        "key": events._norm_team_name(str(row["name"] or "")) if row is not None else "",
+        "hltv_rank": (_rank(row["hltv_rank"]) if row is not None else None) or _UNRANKED,
+        "vrs_rank": _rank(row["vrs_rank"]) if row is not None else None,
+        "map_stats": events._parse_team_map_stats(row["map_stats_json"]) if row is not None else {},
+    }
+    with _cache_lock:
+        _profile_cache[int(team_id)] = (now, profile)
+    return profile
 
 
-def _load_params_from_file() -> Tuple[float, float]:
-    global _PARAM_CACHE_MTIME, _PARAM_CACHE_VALS
-    try:
-        mtime = os.path.getmtime(PARAMS_PATH)
-    except OSError:
-        return _A_OFFSET, _B_SLOPE
-
-    if _PARAM_CACHE_VALS is not None and _PARAM_CACHE_MTIME == mtime:
-        return _PARAM_CACHE_VALS
-
-    try:
-        with open(PARAMS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        a = float(data.get("a_offset", _A_OFFSET))
-        b = float(data.get("b_slope", _B_SLOPE))
-        _PARAM_CACHE_MTIME = mtime
-        _PARAM_CACHE_VALS = (a, b)
-        return a, b
-    except Exception:
-        return _A_OFFSET, _B_SLOPE
+def get_hltv_rank(team_id: int) -> int:
+    """The team's HLTV rank: a pinned override if a snapshot valuation set
+    one, else the teams table (unranked counts as weak)."""
+    rank = _RANK_OVERRIDE.get(int(team_id))
+    if rank:
+        return max(1, int(rank))
+    return int(_team_profile(team_id)["hltv_rank"])
 
 
-def _get_params() -> Tuple[float, float]:
-    """
-    Return (a_offset, b_slope), allowing overrides via winrate_params.json.
-    """
-    return _load_params_from_file()
+def clear_caches() -> None:
+    """Drop the per-team profiles and cached probabilities (after a retrain)."""
+    with _cache_lock:
+        _profile_cache.clear()
+        _prob_cache.clear()
 
 
 def get_team_winrate(teamA_id: int, teamB_id: int, match_type: str = "bo3") -> float:
-    """
-    Return P(A beats B) using HLTV global ranks and the calibrated logistic model.
-
-      - Look up HLTV ranks for both teams from DB.
-      - Convert ranks to strength via s = -ln(rank).
-      - Compute d = sA - sB = ln(rankB / rankA).
-      - P(A wins) = sigmoid(A_OFFSET + B_SLOPE * d).
-
-    match_type is accepted for signature compatibility, but this model
-    does not currently vary by BO1/BO3; any such effects are handled
-    elsewhere in scoring.
-    """
-
-    rankA = _get_hltv_rank(teamA_id)
-    rankB = _get_hltv_rank(teamB_id)
-
-    # strength difference: d = ln(rankB/rankA)
-    ra = max(1, rankA)
-    rb = max(1, rankB)
-    d = math.log(rb / ra)
-
-    a_offset, b_slope = _get_params()
-    z = a_offset + b_slope * d
-    pA = _logistic(z)
-    return pA
+    """P(A beats B) in a series of the given type from the trained map model."""
+    events = _events()
+    production = events.get_production_map_model()
+    if not production:
+        events.ensure_production_map_model()
+        production = events.get_production_map_model()
+    if not production:
+        raise RuntimeError("No win model is trained yet: import HLTV results first.")
+    rank_a = get_hltv_rank(teamA_id)
+    rank_b = get_hltv_rank(teamB_id)
+    wins_needed = _WINS_NEEDED.get(str(match_type or "bo3").lower(), 2)
+    key = (int(teamA_id), int(teamB_id), rank_a, rank_b, wins_needed, production.get("trained_at"))
+    with _cache_lock:
+        cached = _prob_cache.get(key)
+    if cached is not None:
+        return cached
+    a = {**_team_profile(teamA_id), "hltv_rank": rank_a}
+    b = {**_team_profile(teamB_id), "hltv_rank": rank_b}
+    p = events.production_series_probability(production, a, b, wins_needed)
+    with _cache_lock:
+        if len(_prob_cache) > 200000:
+            _prob_cache.clear()
+        _prob_cache[key] = p
+    return p

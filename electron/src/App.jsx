@@ -12541,19 +12541,17 @@ function ModelLabTab() {
   const featureLabel = (feature) =>
     ({
       hltv_gap: "HLTV rank gap",
-      hltv_level: "HLTV matchup level",
       hltv_gap_level: "HLTV gap x level",
       vrs_gap: "VRS rank gap",
-      vrs_level: "VRS matchup level",
       vrs_gap_level: "VRS gap x level",
+      log_rank_gap: "Log rank gap",
+      log_rank_gap_level: "Log rank gap x level",
       map_win_gap: "Map win gap",
       pick_gap: "Pick gap",
       ban_gap: "Ban gap",
       played_pct_gap: "Played share gap",
-      map_stats_available: "Map stats available",
-      elo_gap: "Elo gap",
-      map_elo_gap: "Map Elo gap",
       picked_by_a: "Picked by team",
+      player_rating_gap: "Player rating gap",
     }[feature] || feature);
 
   const rankEffectLevelBands = useMemo(
@@ -12579,8 +12577,29 @@ function ModelLabTab() {
   const [progress, setProgress] = useState(null);
   // The cached last run: when it ran and whether the data changed since.
   const [cache, setCache] = useState(null);
+  // The model the simulators use (trained on everything, refreshed nightly).
+  const [appModel, setAppModel] = useState(null);
+  const [retraining, setRetraining] = useState(false);
+  const loadAppModel = useCallback(() => {
+    api
+      .get("/events/hltv-results/map-model/production", 60000)
+      .then((info) => setAppModel(info || null))
+      .catch(() => setAppModel(null));
+  }, []);
+  const retrainAppModel = useCallback(async () => {
+    setRetraining(true);
+    try {
+      await api.post("/events/hltv-results/map-model/production/train", {}, 600000);
+    } catch (err) {
+      setError(String(err?.message || err));
+    } finally {
+      setRetraining(false);
+      loadAppModel();
+    }
+  }, [loadAppModel]);
   useEffect(() => {
     let live = true;
+    loadAppModel();
     api
       .get("/events/hltv-results/map-model-lab/latest", 60000)
       .then((latest) => {
@@ -12654,6 +12673,18 @@ function ModelLabTab() {
                 {cache.stale
                   ? ` · data changed since (${describeChanges(cache.changes)}). Run again for current numbers.`
                   : " · data unchanged since, results are current."}
+              </span>
+            )}
+            {!busy && (
+              <span className={`mm-run-note${appModel?.stale ? " stale" : ""}`}>
+                {appModel?.exists
+                  ? `App uses the model trained ${new Date(appModel.trained_at * 1000).toLocaleString()} on ${Number(appModel.maps || 0).toLocaleString()} maps` +
+                    (appModel.stale ? " · data changed since." : ".")
+                  : "No app model trained yet."}
+                {" "}
+                <button type="button" className="mm-link" onClick={retrainAppModel} disabled={retraining}>
+                  {retraining ? "Retraining..." : "Retrain"}
+                </button>
               </span>
             )}
             {busy && (

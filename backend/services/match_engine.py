@@ -19,7 +19,7 @@ from backend.swiss_stage.fantasy_scoring import (
     compute_win_points,
 )
 from backend.swiss_stage.swiss_models import TeamState
-from backend.services.team_strength import _get_hltv_rank, get_team_winrate
+from backend.services.team_strength import get_hltv_rank, get_team_winrate
 
 
 BOOSTER_NAMES = {
@@ -70,7 +70,8 @@ def calculate_win_probability(
 ) -> float:
     """
     Calculate P(team A beats team B) using the provided winrate model.
-    Defaults to the HLTV-rank-based model in team_strength.get_team_winrate.
+    Defaults to team_strength.get_team_winrate, the trained map model for
+    the match type.
     """
     model = winrate_model or get_team_winrate
     return model(team_a_id, team_b_id, match_type)
@@ -120,7 +121,7 @@ def apply_fantasy_points_for_team(
     if team_rank_by_id is not None and opponent_team_id in team_rank_by_id:
         opponent_rank = int(team_rank_by_id[opponent_team_id])
     else:
-        opponent_rank = _get_hltv_rank(opponent_team_id)
+        opponent_rank = get_hltv_rank(opponent_team_id)
 
     for player in team.players.values():
         if player_rows_by_id is not None:

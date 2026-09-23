@@ -101,163 +101,46 @@ def _lab_match_key(obj: Dict[str, Any]) -> str:
 
 ROUND_SHARE_FEATURES: Tuple[Tuple[str, str], ...] = (
     ("hltv_gap", "hltv_gap"),
-    ("hltv_level", "hltv_level"),
     ("hltv_gap_level", "hltv_gap_level"),
     ("vrs_gap", "vrs_gap"),
-    ("vrs_level", "vrs_level"),
     ("vrs_gap_level", "vrs_gap_level"),
+    ("log_rank_gap", "log_rank_gap"),
+    ("log_rank_gap_level", "log_rank_gap_level"),
     ("map_win_gap", "map_win_gap"),
     ("pick_gap", "pick_gap"),
     ("ban_gap", "ban_gap"),
     ("played_pct_gap", "played_pct_gap"),
-    ("map_stats_available", "map_stats_available"),
-    ("elo_gap", "elo_gap"),
-    ("map_elo_gap", "map_elo_gap"),
     ("picked_by_a", "picked_by_a"),
+    ("player_rating_gap", "player_rating_gap"),
 )
+# Every feature is a signed team1-minus-team2 difference, so a map seen from
+# team2's side is the same row negated (_fit_map_model_set). Level-only
+# inputs (average rank, "map stats available") were dropped on 2026-09-23:
+# under that mirroring they cannot carry weight, and walk-forward confirmed
+# the fit is identical without them. The team Elo went the same day: with the
+# per-player rating present its weight was ~0 and the score did not move.
+# The first six entries derive from ranks alone (the "rank only" model).
+_RANK_ONLY_FEATURE_COUNT = 6
+# Bumped when the feature set changes so cached fits report stale.
+_MAP_MODEL_FEATURE_VERSION = 6
 
 
-def _fit_logistic_1d(xs: List[float], ys: List[int]) -> Dict[str, float]:
-    if len(xs) < 10 or len(xs) != len(ys):
-        raise ValueError("Not enough data points to fit model.")
-
-    mean_x = sum(xs) / len(xs)
-    var_x = sum((x - mean_x) ** 2 for x in xs) / max(1, len(xs) - 1)
-    std_x = math.sqrt(var_x) if var_x > 1e-12 else 1.0
-    zs = [(x - mean_x) / std_x for x in xs]
-
-    a = 0.0
-    b = 0.0
-    l2 = 1e-4
-    lr = 0.03
-    n = float(len(zs))
-    for _ in range(2500):
-        ga = 0.0
-        gb = 0.0
-        for z, y in zip(zs, ys):
-            p = _sigmoid(a + b * z)
-            e = p - float(y)
-            ga += e
-            gb += e * z
-        ga = ga / n + l2 * a
-        gb = gb / n + l2 * b
-        a -= lr * ga
-        b -= lr * gb
-
-    return {"a": a, "b": b, "mean_x": mean_x, "std_x": std_x}
-
-
-def _predict_logistic_1d(model: Dict[str, float], x: float) -> float:
-    z = (x - float(model["mean_x"])) / float(model["std_x"] if model["std_x"] != 0 else 1.0)
-    return _sigmoid(float(model["a"]) + float(model["b"]) * z)
-
-
-def _fit_logistic_2d(x1s: List[float], x2s: List[float], ys: List[int]) -> Dict[str, float]:
-    if len(x1s) < 20 or len(x1s) != len(x2s) or len(x1s) != len(ys):
-        raise ValueError("Not enough data points to fit 2-feature model.")
-
-    n = float(len(x1s))
-    m1 = sum(x1s) / len(x1s)
-    m2 = sum(x2s) / len(x2s)
-    v1 = sum((x - m1) ** 2 for x in x1s) / max(1, len(x1s) - 1)
-    v2 = sum((x - m2) ** 2 for x in x2s) / max(1, len(x2s) - 1)
-    s1 = math.sqrt(v1) if v1 > 1e-12 else 1.0
-    s2 = math.sqrt(v2) if v2 > 1e-12 else 1.0
-    z1s = [(x - m1) / s1 for x in x1s]
-    z2s = [(x - m2) / s2 for x in x2s]
-
-    a = 0.0
-    b1 = 0.0
-    b2 = 0.0
-    l2 = 1e-4
-    lr = 0.02
-    for _ in range(3000):
-        ga = 0.0
-        gb1 = 0.0
-        gb2 = 0.0
-        for z1, z2, y in zip(z1s, z2s, ys):
-            p = _sigmoid(a + b1 * z1 + b2 * z2)
-            e = p - float(y)
-            ga += e
-            gb1 += e * z1
-            gb2 += e * z2
-        ga = ga / n + l2 * a
-        gb1 = gb1 / n + l2 * b1
-        gb2 = gb2 / n + l2 * b2
-        a -= lr * ga
-        b1 -= lr * gb1
-        b2 -= lr * gb2
-
-    return {
-        "a": a,
-        "b_hltv": b1,
-        "b_vrs": b2,
-        "mean_hltv": m1,
-        "std_hltv": s1,
-        "mean_vrs": m2,
-        "std_vrs": s2,
-    }
-
-
-def _predict_logistic_2d(
-    model: Dict[str, float],
-    x1: float,
-    x2: float,
-    x3: float | None = None,
-    x4: float | None = None,
-    map_win_a: float = 0.0,
-    map_win_b: float = 0.0,
-    pick_a: float = 0.0,
-    pick_b: float = 0.0,
-    ban_a: float = 0.0,
-    ban_b: float = 0.0,
-    played_pct_a: float = 0.0,
-    played_pct_b: float = 0.0,
-) -> float:
-    if "b_hltv_gap" in model or "b_map_win_gap" in model or "b_pick_gap" in model or "b_ban_gap" in model:
-        hltv_a = float(x1)
-        hltv_b = float(x2)
-        vrs_a = float(x3 if x3 is not None else 0.0)
-        vrs_b = float(x4 if x4 is not None else 0.0)
-        values = {
-            "hltv_gap": hltv_b - hltv_a,
-            "hltv_level": (hltv_a + hltv_b) / 2.0,
-            "hltv_gap_level": (hltv_b - hltv_a) * ((hltv_a + hltv_b) / 2.0),
-            "vrs_gap": vrs_b - vrs_a,
-            "vrs_level": (vrs_a + vrs_b) / 2.0,
-            "vrs_gap_level": (vrs_b - vrs_a) * ((vrs_a + vrs_b) / 2.0),
-            "map_win_gap": float(map_win_a) - float(map_win_b),
-            "pick_gap": float(pick_a) - float(pick_b),
-            "ban_gap": float(ban_a) - float(ban_b),
-            "played_pct_gap": float(played_pct_a) - float(played_pct_b),
-            "map_stats_available": 1.0
-            if any(
-                abs(float(v)) > 1e-12
-                for v in (map_win_a, map_win_b, pick_a, pick_b, ban_a, ban_b, played_pct_a, played_pct_b)
-            )
-            else 0.0,
-            # Callers of this legacy path have no Elo/veto context; zero is the
-            # neutral value under standardization.
-            "elo_gap": 0.0,
-            "map_elo_gap": 0.0,
-            "picked_by_a": 0.0,
-        }
-        z = float(model["a"])
-        for name, _sample_key in ROUND_SHARE_FEATURES:
-            mean = float(model.get(f"mean_{name}", 0.0))
-            std = float(model.get(f"std_{name}", 1.0)) or 1.0
-            z += float(model.get(f"b_{name}", 0.0)) * ((values[name] - mean) / std)
-        return _sigmoid(z)
-
-    z1 = (x1 - float(model["mean_hltv"])) / float(model["std_hltv"] if model["std_hltv"] != 0 else 1.0)
-    z2 = (x2 - float(model["mean_vrs"])) / float(model["std_vrs"] if model["std_vrs"] != 0 else 1.0)
-    return _sigmoid(float(model["a"]) + float(model["b_hltv"]) * z1 + float(model["b_vrs"]) * z2)
+def _log_rank_features(rank_a: float, rank_b: float) -> Dict[str, float]:
+    """ln-rank gap and gap x level. Rank differences are not linear in
+    strength: 1 vs 5 is a far bigger gap than 41 vs 45, and the linear gap
+    features alone left the model timid about the top of the table (rank 1
+    teams won 71% of out-of-sample maps against a 64% prediction). These
+    removed that bias (ranks 1-5 off by +3.4 pts -> 0.0) in the 2026-09-23
+    walk-forward factor test."""
+    la = math.log(max(1.0, float(rank_a)))
+    lb = math.log(max(1.0, float(rank_b)))
+    return {"log_rank_gap": lb - la, "log_rank_gap_level": (lb - la) * (la + lb) / 2.0}
 
 
 def _fit_round_share_logistic_2d(samples: List[Dict[str, float]], include_map_stats: bool = True) -> Dict[str, float]:
     if len(samples) < 20:
         raise ValueError("Not enough round-share samples.")
-    feature_defs = ROUND_SHARE_FEATURES if include_map_stats else ROUND_SHARE_FEATURES[:6]
+    feature_defs = ROUND_SHARE_FEATURES if include_map_stats else ROUND_SHARE_FEATURES[:_RANK_ONLY_FEATURE_COUNT]
     ys = [float(s["round_share"]) for s in samples]
     ws = [max(1.0, float(s.get("weight") or 1.0)) for s in samples]
     l2 = float(_MAP_MODEL_L2)
@@ -1594,190 +1477,6 @@ def _enrich_hltv_results_historical_points(
         "dates_hltv_live": dates_hltv_live,
         "dates_vrs_cache": dates_vrs_cache,
         "dates_vrs_live": dates_vrs_live,
-    }
-
-
-@router.get("/hltv-results/winrate-model-current-points")
-def get_winrate_model_current_points(limit: int = 1000, fallback_current: int = 1):
-    """
-    Fit winrate models from stored HLTV results using CURRENT team points:
-      - HLTV points model
-      - VRS points model
-    """
-    lim_in = int(limit)
-    if lim_in <= 0:
-        lim = max(1, count_hltv_results())
-    else:
-        lim = max(50, min(lim_in, 100000))
-    rows = list_hltv_results(limit=lim, offset=0)
-    if not rows:
-        raise HTTPException(status_code=400, detail="No stored HLTV results. Import results first.")
-
-    use_current_fallback = int(fallback_current) != 0
-    hltv_points_by_team, vrs_points_by_team = _build_current_points_maps()
-
-    fit_hltv_x: List[float] = []
-    fit_hltv_y: List[int] = []
-    fit_vrs_x: List[float] = []
-    fit_vrs_y: List[int] = []
-    fit_combo_hx: List[float] = []
-    fit_combo_vx: List[float] = []
-    fit_combo_y: List[int] = []
-    match_rows: List[Dict[str, Any]] = []
-    hist_hltv_count = 0
-    hist_vrs_count = 0
-    hist_both_count = 0
-    fallback_hltv_count = 0
-    fallback_vrs_count = 0
-
-    for i, r in enumerate(rows):
-        t1 = str(r.get("team1") or "").strip()
-        t2 = str(r.get("team2") or "").strip()
-        winner = str(r.get("winner") or "").strip()
-        if not t1 or not t2:
-            continue
-        if winner not in (t1, t2):
-            continue
-        y = 1 if winner == t1 else 0
-
-        k1 = _norm_team_name(t1)
-        k2 = _norm_team_name(t2)
-        hp1 = r.get("hltv_points_1")
-        hp2 = r.get("hltv_points_2")
-        vp1 = r.get("vrs_points_1")
-        vp2 = r.get("vrs_points_2")
-        had_hist_hltv = (hp1 is not None and hp2 is not None)
-        had_hist_vrs = (vp1 is not None and vp2 is not None)
-        if had_hist_hltv:
-            hist_hltv_count += 1
-        if had_hist_vrs:
-            hist_vrs_count += 1
-        if had_hist_hltv and had_hist_vrs:
-            hist_both_count += 1
-
-        if use_current_fallback:
-            if hp1 is None:
-                hp1 = hltv_points_by_team.get(k1)
-            if hp2 is None:
-                hp2 = hltv_points_by_team.get(k2)
-            if vp1 is None:
-                vp1 = vrs_points_by_team.get(k1)
-            if vp2 is None:
-                vp2 = vrs_points_by_team.get(k2)
-        if (not had_hist_hltv) and (hp1 is not None and hp2 is not None):
-            fallback_hltv_count += 1
-        if (not had_hist_vrs) and (vp1 is not None and vp2 is not None):
-            fallback_vrs_count += 1
-
-        hx = None
-        vx = None
-        if hp1 is not None and hp2 is not None:
-            hx = float(hp1 - hp2)
-            fit_hltv_x.append(hx)
-            fit_hltv_y.append(y)
-        if vp1 is not None and vp2 is not None:
-            vx = float(vp1 - vp2)
-            fit_vrs_x.append(vx)
-            fit_vrs_y.append(y)
-        if hx is not None and vx is not None:
-            fit_combo_hx.append(hx)
-            fit_combo_vx.append(vx)
-            fit_combo_y.append(y)
-
-        match_rows.append(
-            {
-                "idx": i + 1,
-                "team1": t1,
-                "team2": t2,
-                "winner": winner,
-                "actual_team1_win": y,
-                "match_date": r.get("match_date"),
-                "hltv_points_1": hp1,
-                "hltv_points_2": hp2,
-                "vrs_points_1": vp1,
-                "vrs_points_2": vp2,
-                "hltv_effective_date": r.get("hltv_effective_date"),
-                "vrs_effective_date": r.get("vrs_effective_date"),
-                "hltv_points_source": ("historical" if had_hist_hltv else ("current_fallback" if (hp1 is not None and hp2 is not None) else "missing")),
-                "vrs_points_source": ("historical" if had_hist_vrs else ("current_fallback" if (vp1 is not None and vp2 is not None) else "missing")),
-                "hltv_x": hx,
-                "vrs_x": vx,
-                "event": r.get("event"),
-                "match_url": r.get("match_url"),
-            }
-        )
-
-    if len(fit_hltv_x) < 20 and len(fit_vrs_x) < 20:
-        raise HTTPException(status_code=400, detail="Not enough matched teams with current points to fit models.")
-
-    hltv_model = _fit_logistic_1d(fit_hltv_x, fit_hltv_y) if len(fit_hltv_x) >= 20 else None
-    vrs_model = _fit_logistic_1d(fit_vrs_x, fit_vrs_y) if len(fit_vrs_x) >= 20 else None
-    combo_model = _fit_logistic_2d(fit_combo_hx, fit_combo_vx, fit_combo_y) if len(fit_combo_hx) >= 20 else None
-
-    hltv_brier_sum = 0.0
-    hltv_n = 0
-    vrs_brier_sum = 0.0
-    vrs_n = 0
-    combo_brier_sum = 0.0
-    combo_n = 0
-    for row in match_rows:
-        if hltv_model and row["hltv_x"] is not None:
-            p = _predict_logistic_1d(hltv_model, float(row["hltv_x"]))
-            row["pred_hltv_team1_win"] = p
-            hltv_brier_sum += (p - float(row["actual_team1_win"])) ** 2
-            hltv_n += 1
-        else:
-            row["pred_hltv_team1_win"] = None
-
-        if vrs_model and row["vrs_x"] is not None:
-            p = _predict_logistic_1d(vrs_model, float(row["vrs_x"]))
-            row["pred_vrs_team1_win"] = p
-            vrs_brier_sum += (p - float(row["actual_team1_win"])) ** 2
-            vrs_n += 1
-        else:
-            row["pred_vrs_team1_win"] = None
-
-        if combo_model and row["hltv_x"] is not None and row["vrs_x"] is not None:
-            p = _predict_logistic_2d(combo_model, float(row["hltv_x"]), float(row["vrs_x"]))
-            row["pred_combo_team1_win"] = p
-            combo_brier_sum += (p - float(row["actual_team1_win"])) ** 2
-            combo_n += 1
-        else:
-            row["pred_combo_team1_win"] = None
-
-    return {
-        "status": "ok",
-        "matches_considered": len(match_rows),
-        "coverage": {
-            "matches": len(match_rows),
-            "historical_hltv": hist_hltv_count,
-            "historical_vrs": hist_vrs_count,
-            "historical_both": hist_both_count,
-            "fallback_hltv": fallback_hltv_count,
-            "fallback_vrs": fallback_vrs_count,
-            "missing_hltv_after_fallback": max(0, len(match_rows) - (hist_hltv_count + fallback_hltv_count)),
-            "missing_vrs_after_fallback": max(0, len(match_rows) - (hist_vrs_count + fallback_vrs_count)),
-            "fallback_enabled": bool(use_current_fallback),
-        },
-        "hltv_model": {
-            "available": bool(hltv_model),
-            "samples": len(fit_hltv_x),
-            "params": hltv_model,
-            "brier": (hltv_brier_sum / hltv_n) if hltv_n > 0 else None,
-        },
-        "vrs_model": {
-            "available": bool(vrs_model),
-            "samples": len(fit_vrs_x),
-            "params": vrs_model,
-            "brier": (vrs_brier_sum / vrs_n) if vrs_n > 0 else None,
-        },
-        "combo_model": {
-            "available": bool(combo_model),
-            "samples": len(fit_combo_hx),
-            "params": combo_model,
-            "brier": (combo_brier_sum / combo_n) if combo_n > 0 else None,
-        },
-        "rows": match_rows,
     }
 
 
@@ -3313,30 +3012,117 @@ def _series_probability_from_map_probability(p_map: float, best_of: int) -> floa
     return min(0.999, max(0.001, total))
 
 
-_ELO_START = 1500.0
-_ELO_K_MAP = 32.0
-_ELO_K_OVERALL = 20.0
+_RATING_START = 1500.0
+# Player ratings are Glicko-style: a mean and a deviation per player. The
+# deviation starts at _PLAYER_SIGMA0, shrinks with every map down to
+# _PLAYER_SIGMA_MIN, and sets the update size, so a new player moves fast and
+# a veteran barely moves. No inflation for inactivity: walk-forward on
+# 2026-09-23 every no-growth setting beat a fixed-K Elo (K 20, itself the best
+# of a sweep) by 1.0-1.5 series-Brier points x1000, while idle growth of 15
+# or 30 per root-day lost 0.6-1.3. Start 250-350 and a floor near 40 were
+# within noise of each other; 300/40 sits in the middle.
+_PLAYER_SIGMA0 = 300.0
+_PLAYER_SIGMA_MIN = 40.0
+_GLICKO_Q = math.log(10.0) / 400.0
 
 
-def _build_prematch_elo_by_match(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """Pre-match overall and per-map Elo for each stored match, keyed by match_url.
+def _scoreboard_team_ratings(row: Dict[str, Any], key1: str, key2: str) -> Dict[str, tuple[float, float]]:
+    """{canonical map: (team1 mean player rating, team2 mean player rating)}
+    from the stored per-map scoreboard; a side needs at least four rated
+    players or the map is left out."""
+    out: Dict[str, tuple[float, float]] = {}
+    for canon, (side1, side2) in _scoreboard_lineups(row, key1, key2).items():
+        r1 = [r for _pid, r in side1 if r is not None]
+        r2 = [r for _pid, r in side2 if r is not None]
+        if len(r1) >= 4 and len(r2) >= 4:
+            out[canon] = (sum(r1) / len(r1), sum(r2) / len(r2))
+    return out
+
+
+def _scoreboard_lineups(row: Dict[str, Any], key1: str, key2: str) -> Dict[str, tuple[List[tuple[str, float | None]], List[tuple[str, float | None]]]]:
+    """{canonical map: ([(player id, rating)] team1, [...] team2)} from the
+    stored per-map scoreboard, at most five a side, in scoreboard order."""
+    raw = row.get("map_player_stats_json")
+    if not raw:
+        return {}
+    try:
+        per_map = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return {}
+    if not isinstance(per_map, dict):
+        return {}
+    out: Dict[str, tuple[List[tuple[str, float | None]], List[tuple[str, float | None]]]] = {}
+    for map_name, players in per_map.items():
+        canon = _canonical_map_name(map_name)
+        if not canon:
+            continue
+        sides: Dict[str, List[tuple[str, float | None]]] = {key1: [], key2: []}
+        for p in players or []:
+            if not isinstance(p, dict):
+                continue
+            team_key = _norm_team_name(str(p.get("team") or ""))
+            if team_key not in sides:
+                continue
+            pid = p.get("player_id")
+            pid_key = str(pid) if pid not in (None, "") else "name:" + str(p.get("player") or "")
+            sides[team_key].append((pid_key, _to_float_or_none(p.get("rating"))))
+        if sides[key1] and sides[key2]:
+            out[canon] = (sides[key1][:5], sides[key2][:5])
+    return out
+
+
+def _build_prematch_player_ratings(
+    rows: List[Dict[str, Any]],
+    current: Dict[str, Any] | None = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Pre-match player-rating summary for each stored match, keyed by match_url.
 
     Matches are replayed chronologically, so every entry reflects only earlier
-    results (no label leakage). A team's first appearance on a map inherits its
-    overall Elo as the prior, which keeps cold-start gaps sane. Rating updates
-    scale with the round margin, so a 13-1 moves ratings more than a 13-11.
+    results (no label leakage). Each snapshot carries "players": {map: (team1
+    mean, team2 mean)} for the five who played that map, and
+    "players_fallback" = the same for each side's most recent five (what a
+    pre-match prediction has).
+
+    Every player carries a Glicko-style mean and deviation (see
+    _PLAYER_SIGMA0); a side's strength is the mean of its five and its
+    variance the mean of their variances over five; each of the five takes
+    the Glicko step against the opposing side. The result fed in is the team
+    mean player-rating gap on the map, 0.5 + clamp(gap, -0.5..0.5): a win with
+    a 0.1 rating edge counts 0.6, a stomp 1.0, and winning while outplayed on
+    the scoreboard earns almost nothing (maps without a stored scoreboard use
+    the plain win/loss). A player first seen starts at the current level of
+    the team they join. Credit follows players across roster moves.
+
+    Measured walk-forward on 2026-09-23 against the previous round-margin team
+    Elo: series Brier 0.2184 -> 0.2150. With this rating present the team Elo
+    carried no weight, so it was removed.
+
+    When `current` is given it is filled with the state after the last match:
+    {"players_by_team": {team key: mean rating of its last five},
+     "last_five": {team key: [player ids]}} for live predictions.
     """
-    overall: Dict[str, float] = {}
-    per_map: Dict[tuple, float] = {}
+    player: Dict[str, float] = {}
+    player_var: Dict[str, float] = {}
+    last_five: Dict[str, List[str]] = {}
     out: Dict[str, Dict[str, Any]] = {}
+    sigma0_sq = _PLAYER_SIGMA0 ** 2
 
-    def _expected(e_a: float, e_b: float) -> float:
-        return 1.0 / (1.0 + 10.0 ** ((e_b - e_a) / 400.0))
+    def _side(pids: List[str]) -> tuple[float, float, float] | None:
+        """(mean rating, variance of the side mean, prior for unseen players)."""
+        if not pids:
+            return None
+        known = [player[p] for p in pids if p in player]
+        prior = (sum(known) / len(known)) if known else _RATING_START
+        mean = sum(player.get(p, prior) for p in pids) / float(len(pids))
+        var = sum(player_var.get(p, sigma0_sq) for p in pids) / float(len(pids) ** 2)
+        return mean, var, prior
 
-    def _margin_factor(s1: int, s2: int) -> float:
-        # ~0.57 for a 2-round overtime win, 1.0 around a 6-round margin,
-        # ~1.32 for a 13-1; log damping keeps blowouts from dominating.
-        return math.log1p(abs(int(s1) - int(s2))) / math.log1p(6)
+    def _side_mean(pids: List[str]) -> float | None:
+        side = _side(pids)
+        return side[0] if side else None
+
+    def _g(var: float) -> float:
+        return 1.0 / math.sqrt(1.0 + 3.0 * _GLICKO_Q * _GLICKO_Q * var / (math.pi ** 2))
 
     ordered = sorted(rows, key=lambda r: (str(r.get("match_date") or ""), str(r.get("match_id") or r.get("match_url") or "")))
     for r in ordered:
@@ -3345,14 +3131,18 @@ def _build_prematch_elo_by_match(rows: List[Dict[str, Any]]) -> Dict[str, Dict[s
         k2 = _norm_team_name(str(r.get("team2") or ""))
         if not url or not k1 or not k2:
             continue
-        o1 = overall.get(k1, _ELO_START)
-        o2 = overall.get(k2, _ELO_START)
-        snapshot: Dict[str, Any] = {"overall": (o1, o2), "maps": {}}
-        played = []
+        snapshot: Dict[str, Any] = {"players": {}, "players_fallback": None}
+        lineups = _scoreboard_lineups(r, k1, k2)
+        team_ratings = _scoreboard_team_ratings(r, k1, k2)
+        fb1 = _side_mean(last_five.get(k1, []))
+        fb2 = _side_mean(last_five.get(k2, []))
+        if fb1 is not None and fb2 is not None:
+            snapshot["players_fallback"] = (fb1, fb2)
+        player_updates = []
         for m in _parse_stored_maps(r.get("maps_json")):
             map_name = _canonical_map_name(m.get("map"))
             # Off-pool maps still update ratings: a Vertigo win is evidence of
-            # strength, and the per-map rating is ready if the map returns.
+            # strength, and the ratings are ready if the map returns.
             if not map_name:
                 continue
             try:
@@ -3362,22 +3152,51 @@ def _build_prematch_elo_by_match(rows: List[Dict[str, Any]]) -> Dict[str, Dict[s
                 continue
             if s1 == s2:
                 continue
-            e1 = per_map.get((k1, map_name), o1)
-            e2 = per_map.get((k2, map_name), o2)
-            snapshot["maps"][map_name] = (e1, e2)
-            played.append((map_name, e1, e2, 1.0 if s1 > s2 else 0.0, _margin_factor(s1, s2)))
+            ratings = team_ratings.get(map_name)
+            if ratings is not None:
+                result = 0.5 + max(-0.5, min(0.5, float(ratings[0]) - float(ratings[1])))
+            else:
+                result = 1.0 if s1 > s2 else 0.0
+            lineup = lineups.get(map_name)
+            if lineup and len(lineup[0]) == 5 and len(lineup[1]) == 5:
+                pids1 = [pid for pid, _r in lineup[0]]
+                pids2 = [pid for pid, _r in lineup[1]]
+                side1 = _side(pids1)
+                side2 = _side(pids2)
+                if side1 is not None and side2 is not None:
+                    snapshot["players"][map_name] = (side1[0], side2[0])
+                    player_updates.append((pids1, pids2, side1, side2, result))
         out[url] = snapshot
         # Update ratings only after the whole match is snapshotted.
-        for map_name, e1, e2, result, margin in played:
-            exp_map = _expected(e1, e2)
-            per_map[(k1, map_name)] = e1 + _ELO_K_MAP * margin * (result - exp_map)
-            per_map[(k2, map_name)] = e2 + _ELO_K_MAP * margin * ((1.0 - result) - (1.0 - exp_map))
-            c1 = overall.get(k1, _ELO_START)
-            c2 = overall.get(k2, _ELO_START)
-            exp_overall = _expected(c1, c2)
-            overall[k1] = c1 + _ELO_K_OVERALL * margin * (result - exp_overall)
-            overall[k2] = c2 + _ELO_K_OVERALL * margin * ((1.0 - result) - (1.0 - exp_overall))
+        for pids1, pids2, side1, side2, result in player_updates:
+            for pids, own, opp, res in ((pids1, side1, side2, result), (pids2, side2, side1, 1.0 - result)):
+                g_opp = _g(opp[1])
+                exp_side = 1.0 / (1.0 + 10.0 ** (-g_opp * (own[0] - opp[0]) / 400.0))
+                d_sq = 1.0 / (_GLICKO_Q * _GLICKO_Q * g_opp * g_opp * exp_side * (1.0 - exp_side))
+                for pid in pids:
+                    old_var = player_var.get(pid, sigma0_sq)
+                    new_var = max(_PLAYER_SIGMA_MIN ** 2, 1.0 / (1.0 / old_var + 1.0 / d_sq))
+                    player[pid] = player.get(pid, own[2]) + _GLICKO_Q * new_var * g_opp * (res - exp_side)
+                    player_var[pid] = new_var
+            last_five[k1] = list(pids1)
+            last_five[k2] = list(pids2)
+    if current is not None:
+        current["players_by_team"] = {team: mean for team, pids in last_five.items() if (mean := _side_mean(pids)) is not None}
+        current["last_five"] = dict(last_five)
     return out
+
+
+def _player_rating_gap(entry: Dict[str, Any] | None, map_name: str | None = None) -> float:
+    """Team1 minus team2 mean player rating: the five who played that map when
+    the scoreboard is stored, else each side's most recent five, else 0."""
+    if not entry:
+        return 0.0
+    pair = (entry.get("players") or {}).get(map_name) if map_name else None
+    if not pair:
+        pair = entry.get("players_fallback")
+    if not pair:
+        return 0.0
+    return float(pair[0]) - float(pair[1])
 
 
 def _map_pickers_from_veto(veto_json: Any, team1: str, team2: str) -> Dict[str, float]:
@@ -3414,7 +3233,7 @@ def _iter_ranked_map_samples(
     historical_map_stats_by_window: Dict[tuple[str, str, str], Dict[str, Dict[str, float]]] | None = None,
     require_map_stats: bool = False,
     require_veto: bool = False,
-    prematch_elo_by_match: Dict[str, Dict[str, Any]] | None = None,
+    prematch_ratings_by_match: Dict[str, Dict[str, Any]] | None = None,
 ) -> List[Dict[str, Any]]:
     """One sample per played map. require_map_stats drops maps where either
     team lacks pre-match six-month stats for that map; require_veto drops
@@ -3451,7 +3270,7 @@ def _iter_ranked_map_samples(
         veto_available = bool(pickers)
         if require_veto and not veto_available:
             continue
-        elo_entry = (prematch_elo_by_match or {}).get(str(r.get("match_url") or "").strip())
+        ratings_entry = (prematch_ratings_by_match or {}).get(str(r.get("match_url") or "").strip())
         series_score1 = _to_float_or_none(r.get("score1"))
         series_score2 = _to_float_or_none(r.get("score2"))
         for m in maps:
@@ -3474,13 +3293,6 @@ def _iter_ranked_map_samples(
             )
             if require_map_stats and float(map_stat_features.get("map_stats_available") or 0.0) <= 0.0:
                 continue
-            elo_gap = 0.0
-            map_elo_gap = 0.0
-            if elo_entry:
-                overall = elo_entry.get("overall") or (0.0, 0.0)
-                elo_gap = float(overall[0]) - float(overall[1])
-                map_pair = (elo_entry.get("maps") or {}).get(map_name)
-                map_elo_gap = float(map_pair[0]) - float(map_pair[1]) if map_pair else elo_gap
             samples.append(
                 {
                     "match_url": r.get("match_url"),
@@ -3497,11 +3309,10 @@ def _iter_ranked_map_samples(
                     "vrs_a": float(v1),
                     "vrs_b": float(v2),
                     "hltv_gap": float(h2 - h1),
-                    "hltv_level": float((h1 + h2) / 2.0),
                     "hltv_gap_level": float((h2 - h1) * ((h1 + h2) / 2.0)),
                     "vrs_gap": float(v2 - v1),
-                    "vrs_level": float((v1 + v2) / 2.0),
                     "vrs_gap_level": float((v2 - v1) * ((v1 + v2) / 2.0)),
+                    **_log_rank_features(h1, h2),
                     "round_share": float(s1 / total_rounds),
                     "weight": float(total_rounds),
                     "hltv_rank_1": h1,
@@ -3513,9 +3324,8 @@ def _iter_ranked_map_samples(
                     "ban_gap": float(map_stat_features.get("ban_gap") or 0.0),
                     "played_pct_gap": float(map_stat_features.get("played_pct_gap") or 0.0),
                     "map_stats_available": float(map_stat_features.get("map_stats_available") or 0.0),
-                    "elo_gap": elo_gap,
-                    "map_elo_gap": map_elo_gap,
                     "picked_by_a": float(pickers.get(map_name, 0.0)),
+                    "player_rating_gap": _player_rating_gap(ratings_entry, map_name),
                     "veto_available": 1.0 if veto_available else 0.0,
                     "vrs_substituted": 1.0 if vrs_substituted else 0.0,
                     "series_score1": int(series_score1) if series_score1 is not None else None,
@@ -3549,42 +3359,12 @@ def _fit_map_model_set(
         else:
             target_value = float(sample["round_share"])
             target_weight = float(sample["weight"])
-        row_a = {
-            "hltv_gap": float(sample["hltv_gap"]),
-            "hltv_level": float(sample["hltv_level"]),
-            "hltv_gap_level": float(sample["hltv_gap_level"]),
-            "vrs_gap": float(sample["vrs_gap"]),
-            "vrs_level": float(sample["vrs_level"]),
-            "vrs_gap_level": float(sample["vrs_gap_level"]),
-            "map_win_gap": float(sample.get("map_win_gap") or 0.0),
-            "pick_gap": float(sample.get("pick_gap") or 0.0),
-            "ban_gap": float(sample.get("ban_gap") or 0.0),
-            "played_pct_gap": float(sample.get("played_pct_gap") or 0.0),
-            "map_stats_available": float(sample.get("map_stats_available") or 0.0),
-            "elo_gap": float(sample.get("elo_gap") or 0.0),
-            "map_elo_gap": float(sample.get("map_elo_gap") or 0.0),
-            "picked_by_a": float(sample.get("picked_by_a") or 0.0),
-            "round_share": target_value,
-            "weight": target_weight,
-        }
-        row_b = {
-            "hltv_gap": -float(sample["hltv_gap"]),
-            "hltv_level": float(sample["hltv_level"]),
-            "hltv_gap_level": -float(sample["hltv_gap_level"]),
-            "vrs_gap": -float(sample["vrs_gap"]),
-            "vrs_level": float(sample["vrs_level"]),
-            "vrs_gap_level": -float(sample["vrs_gap_level"]),
-            "map_win_gap": -float(sample.get("map_win_gap") or 0.0),
-            "pick_gap": -float(sample.get("pick_gap") or 0.0),
-            "ban_gap": -float(sample.get("ban_gap") or 0.0),
-            "played_pct_gap": -float(sample.get("played_pct_gap") or 0.0),
-            "map_stats_available": float(sample.get("map_stats_available") or 0.0),
-            "elo_gap": -float(sample.get("elo_gap") or 0.0),
-            "map_elo_gap": -float(sample.get("map_elo_gap") or 0.0),
-            "picked_by_a": -float(sample.get("picked_by_a") or 0.0),
-            "round_share": 1.0 - target_value,
-            "weight": target_weight,
-        }
+        row_a = {name: float(sample.get(key) or 0.0) for name, key in ROUND_SHARE_FEATURES}
+        row_b = {name: -value for name, value in row_a.items()}
+        row_a["round_share"] = target_value
+        row_b["round_share"] = 1.0 - target_value
+        row_a["weight"] = target_weight
+        row_b["weight"] = target_weight
         symmetric.extend([row_a, row_b])
         by_map.setdefault(str(sample["map"]), []).extend([row_a, row_b])
     if len(symmetric) < 20:
@@ -3777,7 +3557,7 @@ def _build_rank_effect_curve(model: Dict[str, Any], samples: List[Dict[str, Any]
 def _iter_series_contexts(
     rows: List[Dict[str, Any]],
     historical_map_stats_by_window: Dict[tuple[str, str, str], Dict[str, Dict[str, float]]] | None = None,
-    prematch_elo_by_match: Dict[str, Dict[str, Any]] | None = None,
+    prematch_ratings_by_match: Dict[str, Dict[str, Any]] | None = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Per-match pre-match feature bundles covering the WHOLE map pool.
 
@@ -3807,35 +3587,23 @@ def _iter_series_contexts(
         else:
             team1_stats = None
             team2_stats = None
-        elo_entry = (prematch_elo_by_match or {}).get(url)
-        elo_gap = 0.0
-        if elo_entry:
-            overall = elo_entry.get("overall") or (0.0, 0.0)
-            elo_gap = float(overall[0]) - float(overall[1])
+        ratings_entry = (prematch_ratings_by_match or {}).get(url)
         shared = {
             "hltv_gap": float(h2 - h1),
-            "hltv_level": float((h1 + h2) / 2.0),
             "hltv_gap_level": float((h2 - h1) * ((h1 + h2) / 2.0)),
             "vrs_gap": float(v2 - v1),
-            "vrs_level": float((v1 + v2) / 2.0),
             "vrs_gap_level": float((v2 - v1) * ((v1 + v2) / 2.0)),
-            "elo_gap": elo_gap,
+            **_log_rank_features(h1, h2),
+            "player_rating_gap": _player_rating_gap(ratings_entry),
         }
         per_map: Dict[str, Dict[str, float]] = {}
         for map_name in MAP_POOL:
             features = _map_stat_features(team1_stats, team2_stats, map_name)
-            map_elo_gap = elo_gap
-            if elo_entry:
-                map_pair = (elo_entry.get("maps") or {}).get(map_name)
-                if map_pair:
-                    map_elo_gap = float(map_pair[0]) - float(map_pair[1])
             per_map[map_name] = {
                 "map_win_gap": float(features.get("map_win_gap") or 0.0),
                 "pick_gap": float(features.get("pick_gap") or 0.0),
                 "ban_gap": float(features.get("ban_gap") or 0.0),
                 "played_pct_gap": float(features.get("played_pct_gap") or 0.0),
-                "map_stats_available": float(features.get("map_stats_available") or 0.0),
-                "map_elo_gap": map_elo_gap,
             }
         series_score1 = _to_float_or_none(r.get("score1"))
         series_score2 = _to_float_or_none(r.get("score2"))
@@ -3941,6 +3709,15 @@ def _series_win_probability(map_probs: List[float], wins_needed: int) -> float:
     return float(sum(prob for wins, prob in enumerate(dist) if wins >= wins_needed))
 
 
+def _series_wins_needed(score1: Any, score2: Any) -> int:
+    """Maps a side must win, from a stored series score. Bo1 rows keep the MAP
+    score (13-9, 22-19) as the series score, so anything above 5 is one map;
+    treating it as maps-to-win made a Bo1 a best-of-25 and turned the series
+    metrics into near-certainties (found 2026-09-23)."""
+    m = max(int(score1), int(score2))
+    return 1 if m > 5 else max(1, m)
+
+
 def _best_of_series_win_probability(p_map: float, wins_needed: int) -> float:
     """P(team wins a best-of-(2n-1) series) assuming per-map win probability p_map."""
     wins_needed = max(1, int(wins_needed))
@@ -3967,7 +3744,7 @@ def _veto_sim_series_metrics(
         s2 = ctx.get("series_score2")
         if s1 is None or s2 is None or int(s1) == int(s2):
             continue
-        wins_needed = max(int(s1), int(s2))
+        wins_needed = _series_wins_needed(s1, s2)
         shared = ctx.get("shared") or {}
         per_map = ctx.get("per_map") or {}
         neutral_p: Dict[str, float] = {}
@@ -4146,7 +3923,7 @@ def _evaluate_map_model_set(
         probs = group.get("probs") or []
         if s1 is None or s2 is None or int(s1) == int(s2) or not probs:
             continue
-        wins_needed = max(int(s1), int(s2))
+        wins_needed = _series_wins_needed(s1, s2)
         p_map_avg = sum(probs) / len(probs)
         p_series = _best_of_series_win_probability(p_map_avg, wins_needed)
         actual = 1.0 if int(s1) > int(s2) else 0.0
@@ -4265,7 +4042,12 @@ def _lab_data_signature() -> Dict[str, int]:
         windows = conn.execute("SELECT COUNT(*) AS c FROM historical_team_map_stats").fetchone()["c"]
     finally:
         conn.close()
-    return {"matches": int(matches or 0), "vetoes": int(vetoes or 0), "windows": int(windows or 0)}
+    return {
+        "matches": int(matches or 0),
+        "vetoes": int(vetoes or 0),
+        "windows": int(windows or 0),
+        "features": int(_MAP_MODEL_FEATURE_VERSION),
+    }
 
 
 @router.get("/hltv-results/map-model-lab/latest")
@@ -4318,21 +4100,21 @@ def _run_map_model_lab():
         all_rows,
         fetch_missing=False,
     )
-    # Elo replays the full stored timeline; each match only sees earlier results.
-    _lab_progress(0.22, "Replaying Elo over the match timeline")
-    prematch_elo_by_match = _build_prematch_elo_by_match(all_rows)
+    # The rating replay covers the full stored timeline; each match only sees earlier results.
+    _lab_progress(0.22, "Replaying player ratings over the match timeline")
+    prematch_ratings_by_match = _build_prematch_player_ratings(all_rows)
     # Candidates: every ranked map with its data flags; kept: complete data
     # only (both teams' historical map stats for that map, and the veto).
     _lab_progress(0.34, "Building map samples")
     all_candidates = _iter_ranked_map_samples(
-        all_rows, historical_map_stats_by_window=historical_map_stats_by_window, prematch_elo_by_match=prematch_elo_by_match
+        all_rows, historical_map_stats_by_window=historical_map_stats_by_window, prematch_ratings_by_match=prematch_ratings_by_match
     )
     all_kept = _iter_ranked_map_samples(
         all_rows,
         historical_map_stats_by_window=historical_map_stats_by_window,
         require_map_stats=True,
         require_veto=True,
-        prematch_elo_by_match=prematch_elo_by_match,
+        prematch_ratings_by_match=prematch_ratings_by_match,
     )
     kept_per_match: Dict[str, int] = {}
     for sample in all_kept:
@@ -4376,7 +4158,7 @@ def _run_map_model_lab():
     test_series_contexts = _iter_series_contexts(
         test_rows,
         historical_map_stats_by_window=historical_map_stats_by_window,
-        prematch_elo_by_match=prematch_elo_by_match,
+        prematch_ratings_by_match=prematch_ratings_by_match,
     )
     with_map_data = _evaluate_map_model_set(
         models_with_map_data,
@@ -5108,3 +4890,155 @@ def import_hltv_event(payload: Dict[str, Any]):
         "group_format": (autofill or {}).get("group_format"),
         "group_count": len((autofill or {}).get("groups") or []) if autofill else 0,
     }
+
+
+# ---- the model the app uses ---------------------------------------------------
+_MAP_MODEL_PRODUCTION_STATE = SingletonState("map_model_production")
+_MAP_MODEL_PRODUCTION_STATE_READY = False
+
+
+def _production_state() -> SingletonState:
+    global _MAP_MODEL_PRODUCTION_STATE_READY
+    if not _MAP_MODEL_PRODUCTION_STATE_READY:
+        _MAP_MODEL_PRODUCTION_STATE.ensure_table()
+        _MAP_MODEL_PRODUCTION_STATE_READY = True
+    return _MAP_MODEL_PRODUCTION_STATE
+_PRODUCTION_CACHE: Dict[str, Any] = {"checked_at": 0.0, "updated_at": None, "value": None}
+_PRODUCTION_LOCK = threading.Lock()
+
+
+def train_production_map_model() -> Dict[str, Any]:
+    """Fit the pooled map model on every usable stored map (the lab keeps a
+    holdout; the app should not) and snapshot the current player ratings per
+    team, then store both for the simulators (team_strength.get_team_winrate)."""
+    db_matches = int(count_hltv_results())
+    rows = list_hltv_results(limit=db_matches, offset=0) if db_matches > 0 else []
+    historical, _summary = _build_historical_team_map_stats_by_window(rows, fetch_missing=False)
+    current: Dict[str, Any] = {}
+    ratings = _build_prematch_player_ratings(rows, current=current)
+    samples = _iter_ranked_map_samples(
+        rows,
+        historical_map_stats_by_window=historical,
+        require_map_stats=True,
+        require_veto=True,
+        prematch_ratings_by_match=ratings,
+    )
+    if len(samples) < 200:
+        raise HTTPException(status_code=400, detail="Not enough usable maps to train the app model.")
+    model = _fit_map_model_set(samples, include_map_stats=True, target="map_win")["__global__"]
+    teams = {key: {"players": float(mean)} for key, mean in (current.get("players_by_team") or {}).items()}
+    trained_at = time.time()
+    signature = _lab_data_signature()
+    result = {
+        "model": model,
+        "teams": teams,
+        "trained_at": trained_at,
+        "maps": len(samples),
+        "matches": len({_lab_match_key(x) for x in samples}),
+        "teams_rated": len(teams),
+        "features": int(_MAP_MODEL_FEATURE_VERSION),
+        "signature": signature,
+    }
+    _production_state().save({"trained_at": trained_at, "signature": signature}, result)
+    with _PRODUCTION_LOCK:
+        _PRODUCTION_CACHE.update({"checked_at": 0.0, "updated_at": None, "value": None})
+    from backend.services import team_strength  # lazy: it imports this module lazily too
+
+    team_strength.clear_caches()
+    logger.info("App map model trained on %d maps (%d teams rated)", len(samples), len(teams))
+    return {k: v for k, v in result.items() if k not in ("model", "teams")}
+
+
+def get_production_map_model() -> Dict[str, Any] | None:
+    """The stored app model, re-read from the state row at most every 30 s."""
+    now = time.monotonic()
+    with _PRODUCTION_LOCK:
+        if _PRODUCTION_CACHE["value"] is not None and now - float(_PRODUCTION_CACHE["checked_at"]) < 30.0:
+            return _PRODUCTION_CACHE["value"]
+    saved = _production_state().load()
+    value = (saved or {}).get("result") or None
+    if value and not value.get("model"):
+        value = None
+    updated_at = (saved or {}).get("updated_at")
+    with _PRODUCTION_LOCK:
+        changed = updated_at != _PRODUCTION_CACHE["updated_at"]
+        _PRODUCTION_CACHE.update({"checked_at": now, "updated_at": updated_at, "value": value})
+    if changed:
+        from backend.services import team_strength
+
+        team_strength.clear_caches()
+    return value
+
+
+def ensure_production_map_model(force: bool = False) -> Dict[str, Any]:
+    """Train the app model when there is none, when the data it trains on
+    changed (matches, vetoes, map-stat windows, feature version), or on
+    request. Returns the summary plus whether it trained."""
+    saved = _production_state().load()
+    result = (saved or {}).get("result") or {}
+    then = ((saved or {}).get("payload") or {}).get("signature") or {}
+    now = _lab_data_signature()
+    stale = any(int(now.get(k, 0)) != int(then.get(k, 0)) for k in now)
+    if force or not result.get("model") or stale:
+        summary = train_production_map_model()
+        return {"trained": True, **summary}
+    return {"trained": False, **{k: v for k, v in result.items() if k not in ("model", "teams")}}
+
+
+def production_series_probability(production: Dict[str, Any], team_a: Dict[str, Any], team_b: Dict[str, Any], wins_needed: int) -> float:
+    """P(team A wins a best-of series) from the app model.
+
+    team_a / team_b: {"key": normalised name, "hltv_rank": int, "vrs_rank":
+    int | None, "map_stats": {map: {win_rate, pick_rate, ban_rate, played}}}.
+    The map probability is averaged over the active pool (no veto is known
+    pre-match; walk-forward this scored the same as a simulated veto) and
+    pushed through the best-of formula."""
+    model = production["model"]
+    rated = production.get("teams") or {}
+    h1 = float(max(1, int(team_a.get("hltv_rank") or 100)))
+    h2 = float(max(1, int(team_b.get("hltv_rank") or 100)))
+    v1 = float(team_a.get("vrs_rank") or h1)
+    v2 = float(team_b.get("vrs_rank") or h2)
+    pa = (rated.get(str(team_a.get("key") or "")) or {}).get("players")
+    pb = (rated.get(str(team_b.get("key") or "")) or {}).get("players")
+    shared = {
+        "hltv_gap": h2 - h1,
+        "hltv_gap_level": (h2 - h1) * ((h1 + h2) / 2.0),
+        "vrs_gap": v2 - v1,
+        "vrs_gap_level": (v2 - v1) * ((v1 + v2) / 2.0),
+        **_log_rank_features(h1, h2),
+        "picked_by_a": 0.0,
+        "player_rating_gap": (float(pa) - float(pb)) if (pa is not None and pb is not None) else 0.0,
+    }
+    stats_a = team_a.get("map_stats") or {}
+    stats_b = team_b.get("map_stats") or {}
+    probs = []
+    for map_name in MAP_POOL:
+        features = _map_stat_features(stats_a, stats_b, map_name)
+        values = {
+            **shared,
+            "map_win_gap": float(features.get("map_win_gap") or 0.0),
+            "pick_gap": float(features.get("pick_gap") or 0.0),
+            "ban_gap": float(features.get("ban_gap") or 0.0),
+            "played_pct_gap": float(features.get("played_pct_gap") or 0.0),
+        }
+        probs.append(_model_map_win_probability(model, values))
+    return _best_of_series_win_probability(sum(probs) / len(probs), wins_needed)
+
+
+@router.get("/hltv-results/map-model/production")
+def get_map_model_production():
+    """What the simulators use: when it was trained and on how much."""
+    production = get_production_map_model()
+    if not production:
+        return {"exists": False}
+    summary = {k: v for k, v in production.items() if k not in ("model", "teams")}
+    now = _lab_data_signature()
+    then = production.get("signature") or {}
+    summary["stale"] = any(int(now.get(k, 0)) != int(then.get(k, 0)) for k in now)
+    return {"exists": True, **summary}
+
+
+@router.post("/hltv-results/map-model/production/train")
+def train_map_model_production():
+    return {"trained": True, **train_production_map_model()}

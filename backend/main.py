@@ -82,6 +82,12 @@ async def _lifespan(app: FastAPI):
     import threading
 
     def _warm() -> None:
+        # The win-probability model the simulators use: train it when the data
+        # or the feature set changed since it was last stored (~25 s).
+        try:
+            events.ensure_production_map_model()
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning("Could not refresh the app map model", exc_info=True)
         events.warm_kind_cache()  # ~1 s; needed by the first Tournament open
         groups.warm_caches()  # ~10 s: outcome sample + the three default Top 5 queries
         try:

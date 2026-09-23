@@ -638,6 +638,16 @@ class DataScheduler:
                 notes.append("lab evaluation already current")
         except Exception as exc:  # noqa: BLE001 - the fetches above still count
             notes.append(f"lab re-evaluation failed: {exc}")
+        # The model the simulators use: retrain on everything when the data changed.
+        try:
+            self._set_state(processed=0, total=0, message="Map model: refreshing the app model")
+            info = events.ensure_production_map_model()
+            notes.append(
+                f"app model {'retrained' if info.get('trained') else 'already current'} "
+                f"({int(info.get('maps') or 0)} maps, {int(info.get('teams_rated') or 0)} teams rated)"
+            )
+        except Exception as exc:  # noqa: BLE001
+            notes.append(f"app model refresh failed: {exc}")
         message = "; ".join(notes)
         if failed_any:
             raise RuntimeError(message)
