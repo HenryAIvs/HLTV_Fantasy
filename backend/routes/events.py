@@ -119,8 +119,6 @@ ROUND_SHARE_FEATURES: Tuple[Tuple[str, str], ...] = (
 # under that mirroring they cannot carry weight, and walk-forward confirmed
 # the fit is identical without them. The team Elo went the same day: with the
 # per-player rating present its weight was ~0 and the score did not move.
-# The first six entries derive from ranks alone (the "rank only" model).
-_RANK_ONLY_FEATURE_COUNT = 6
 # Bumped when the feature set changes so cached fits report stale.
 _MAP_MODEL_FEATURE_VERSION = 6
 
@@ -137,10 +135,10 @@ def _log_rank_features(rank_a: float, rank_b: float) -> Dict[str, float]:
     return {"log_rank_gap": lb - la, "log_rank_gap_level": (lb - la) * (la + lb) / 2.0}
 
 
-def _fit_round_share_logistic_2d(samples: List[Dict[str, float]], include_map_stats: bool = True) -> Dict[str, float]:
+def _fit_round_share_logistic_2d(samples: List[Dict[str, float]]) -> Dict[str, float]:
     if len(samples) < 20:
         raise ValueError("Not enough round-share samples.")
-    feature_defs = ROUND_SHARE_FEATURES if include_map_stats else ROUND_SHARE_FEATURES[:_RANK_ONLY_FEATURE_COUNT]
+    feature_defs = ROUND_SHARE_FEATURES
     ys = [float(s["round_share"]) for s in samples]
     ws = [max(1.0, float(s.get("weight") or 1.0)) for s in samples]
     l2 = float(_MAP_MODEL_L2)
@@ -214,7 +212,6 @@ def _fit_round_share_logistic_2d(samples: List[Dict[str, float]], include_map_st
         "a": a,
         "samples": len(samples),
         "rounds": int(round(total_w)),
-        "feature_set": "with_map_data" if include_map_stats else "rank_only",
     }
     for name, _sample_key in feature_defs:
         model[f"b_{name}"] = coefs[name]
@@ -3337,7 +3334,6 @@ def _iter_ranked_map_samples(
 
 def _fit_map_model_set(
     samples: List[Dict[str, Any]],
-    include_map_stats: bool = True,
     target: str = "round_share",
 ) -> Dict[str, Dict[str, Any]]:
     """Fit one pooled logistic model over the shared feature set and serve it
@@ -3370,7 +3366,7 @@ def _fit_map_model_set(
     if len(symmetric) < 20:
         raise HTTPException(status_code=400, detail="Not enough training maps with stored scores and HLTV/VRS ranks.")
     global_model = {
-        **_fit_round_share_logistic_2d(symmetric, include_map_stats=include_map_stats),
+        **_fit_round_share_logistic_2d(symmetric),
         "scope": "global",
         "samples": len(symmetric),
         "target": str(target),
@@ -4141,13 +4137,10 @@ def _run_map_model_lab():
     train_limit = len(train_rows)
     # Win probabilities come from models trained directly on the map result;
     # the round-share models are kept for scoreline prediction only.
-    _lab_progress(0.5, "Fitting the map-data win model")
-    models_with_map_data = _fit_map_model_set(train_samples, include_map_stats=True, target="map_win")
-    _lab_progress(0.6, "Fitting the rank-only win model")
-    models_rank_only = _fit_map_model_set(train_samples, include_map_stats=False, target="map_win")
-    _lab_progress(0.68, "Fitting the scoreline models")
-    score_models_with = _fit_map_model_set(train_samples, include_map_stats=True)
-    score_models_rank = _fit_map_model_set(train_samples, include_map_stats=False)
+    _lab_progress(0.5, "Fitting the win model")
+    models = _fit_map_model_set(train_samples, target="map_win")
+    _lab_progress(0.68, "Fitting the scoreline model")
+    score_models = _fit_map_model_set(train_samples)
     if not test_samples:
         raise HTTPException(
             status_code=400,
@@ -4160,19 +4153,16 @@ def _run_map_model_lab():
         historical_map_stats_by_window=historical_map_stats_by_window,
         prematch_ratings_by_match=prematch_ratings_by_match,
     )
-    with_map_data = _evaluate_map_model_set(
-        models_with_map_data,
+    evaluation = _evaluate_map_model_set(
+        models,
         test_samples,
         include_rows=True,
         series_contexts=test_series_contexts,
-        score_models=score_models_with,
-    )
-    rank_only = _evaluate_map_model_set(
-        models_rank_only, test_samples, series_contexts=test_series_contexts, score_models=score_models_rank
+        score_models=score_models,
     )
     return {
         "status": "ok",
-        "method": "Trains two logistic formulas per feature set on the same historical slice: win probabilities come from a model trained directly on map results, and scorelines from a round-share model over the same features. The rank-only baseline uses HLTV/VRS rank gaps, matchup rank level, and gap-by-level interactions. The map-data model adds directional Team A minus Team B deltas: six-month map-stat gaps (win/pick/ban/played share), pre-match overall and per-map Elo gaps replayed from the stored match timeline with margin-of-victory weighting, and who picked the map in the veto (when veto data is stored). Both are evaluated on the same covered holdout slice.",
+        "method": "The same recipe as the app model, fitted on the older matches only and scored on the holdout. Win probabilities come from a logistic model trained on the map result over signed team-A-minus-team-B inputs: HLTV and VRS rank gaps (linear, log, and scaled by matchup level), six-month map-stat gaps (win, pick, ban, played share), who picked the map, and the per-player rating gap replayed from the stored timeline. Scorelines come from a round-share fit over the same inputs.",
         "db_matches": db_matches,
         "split": {
             "mode": "ordered",
@@ -4194,25 +4184,17 @@ def _run_map_model_lab():
             "matches_loaded": len(test_rows),
             "map_samples": len(test_samples),
         },
-        "formula": models_with_map_data["__global__"],
-        "rank_only_formula": models_rank_only["__global__"],
-        "rank_effect_curve": _build_rank_effect_curve(models_with_map_data["__global__"], train_samples),
-        "rank_only_effect_curve": _build_rank_effect_curve(models_rank_only["__global__"], train_samples),
-        "metrics": with_map_data["metrics"],
-        "rank_only_metrics": rank_only["metrics"],
-        "comparison": {
-            "with_map_data": with_map_data["metrics"],
-            "rank_only": rank_only["metrics"],
-        },
+        "formula": models["__global__"],
+        "rank_effect_curve": _build_rank_effect_curve(models["__global__"], train_samples),
+        "metrics": evaluation["metrics"],
         "input_summary": {
             "train": _map_model_input_summary(train_samples, candidates=train_candidate_samples),
             "test": _map_model_input_summary(test_samples, candidates=test_candidate_samples),
             "map_feature_shape": "directional_deltas",
             "historical_map_stats": historical_cache_summary,
         },
-        "maps": with_map_data["maps"],
-        "rank_only_maps": rank_only["maps"],
-        "rows": with_map_data["rows"],
+        "maps": evaluation["maps"],
+        "rows": evaluation["rows"],
     }
 
 
@@ -4925,7 +4907,7 @@ def train_production_map_model() -> Dict[str, Any]:
     )
     if len(samples) < 200:
         raise HTTPException(status_code=400, detail="Not enough usable maps to train the app model.")
-    model = _fit_map_model_set(samples, include_map_stats=True, target="map_win")["__global__"]
+    model = _fit_map_model_set(samples, target="map_win")["__global__"]
     teams = {key: {"players": float(mean)} for key, mean in (current.get("players_by_team") or {}).items()}
     trained_at = time.time()
     signature = _lab_data_signature()
@@ -5026,13 +5008,34 @@ def production_series_probability(production: Dict[str, Any], team_a: Dict[str, 
     return _best_of_series_win_probability(sum(probs) / len(probs), wins_needed)
 
 
+def _model_weights(model: Dict[str, Any]) -> Dict[str, Any]:
+    """The fitted intercept and, per input, its standardised weight (the
+    logit change per standard deviation of the input) with the training mean
+    and standard deviation that define that unit."""
+    rows = []
+    for name, _key in ROUND_SHARE_FEATURES:
+        if f"b_{name}" not in model:
+            continue
+        rows.append(
+            {
+                "feature": name,
+                "weight": float(model.get(f"b_{name}") or 0.0),
+                "mean": float(model.get(f"mean_{name}") or 0.0),
+                "std": float(model.get(f"std_{name}") or 1.0),
+            }
+        )
+    rows.sort(key=lambda r: -abs(r["weight"]))
+    return {"intercept": float(model.get("a") or 0.0), "features": rows}
+
+
 @router.get("/hltv-results/map-model/production")
 def get_map_model_production():
-    """What the simulators use: when it was trained and on how much."""
+    """What the simulators use: when it was trained, on how much, and its weights."""
     production = get_production_map_model()
     if not production:
         return {"exists": False}
     summary = {k: v for k, v in production.items() if k not in ("model", "teams")}
+    summary["weights"] = _model_weights(production["model"])
     now = _lab_data_signature()
     then = production.get("signature") or {}
     summary["stale"] = any(int(now.get(k, 0)) != int(then.get(k, 0)) for k in now)

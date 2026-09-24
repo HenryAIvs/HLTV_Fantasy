@@ -4122,8 +4122,16 @@ button:disabled {
 .mm-progress-label { color: #8fa3bf; font-size: 12.5px; font-variant-numeric: tabular-nums; }
 .mm-run-note { flex: 1 1 320px; color: #8fa3bf; font-size: 12.5px; line-height: 1.5; }
 .mm-run-note.stale { color: #f0a763; }
-.mm-link { background: none; border: 0; padding: 0; color: #ff6b1a; font: inherit; cursor: pointer; text-decoration: underline; }
-.mm-link:disabled { color: #8fa3bf; cursor: default; text-decoration: none; }
+.mm-app-head { flex: 1 1 320px; display: flex; flex-direction: column; gap: 2px; }
+.mm-app-head h3 { margin: 0; }
+.mm-app-head .mm-run-note { flex: 0 0 auto; }
+.mm-weights { margin-top: 12px; }
+.mm-weights td:nth-child(2) { font-variant-numeric: tabular-nums; width: 90px; }
+.mm-weights td:nth-child(3) { width: 45%; }
+.mm-weight-bar { height: 10px; background: #ff6b1a; clip-path: polygon(0 0, calc(100% - 4px) 0, 100% 100%, 0 100%); }
+.mm-weight-bar.neg { background: #7fb3ff; }
+.mm-pos { color: #ff6b1a; }
+.mm-neg { color: #7fb3ff; }
 .mm-run-row { align-items: center; }
 .mm-data-note { color: #8fa3bf; font-size: 12.5px; margin: 0 0 12px; }
 .mm-jobs { display: flex; flex-direction: column; gap: 10px; }

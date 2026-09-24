@@ -12656,7 +12656,6 @@ function ModelLabTab() {
   };
 
   const wm = result?.metrics || {};
-  const ro = result?.rank_only_metrics || {};
   const fmtInt = (v) => Number(v || 0).toLocaleString();
 
   return (
@@ -12664,8 +12663,55 @@ function ModelLabTab() {
       <div className="stack lab">
         <div className="card sub">
           <div className="mm-run-row">
+            <div className="mm-app-head">
+              <h3>App model</h3>
+              <span className={`mm-run-note${appModel?.stale ? " stale" : ""}`}>
+                {appModel?.exists
+                  ? `Trained ${new Date(appModel.trained_at * 1000).toLocaleString()} on ${fmtInt(appModel.maps)} maps from ${fmtInt(appModel.matches)} matches · ${fmtInt(appModel.teams_rated)} teams rated` +
+                    (appModel.stale ? " · data changed since." : ".")
+                  : "No app model trained yet."}
+              </span>
+            </div>
+            <button className="primary mm-go" onClick={retrainAppModel} disabled={retraining}>
+              {retraining ? "Retraining..." : "Retrain"}
+            </button>
+          </div>
+          {(appModel?.weights?.features || []).length > 0 && (
+            <table className="mm-table mm-weights">
+              <thead>
+                <tr>
+                  <th>Input</th>
+                  <th>Weight</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {(() => {
+                  const maxAbs = Math.max(...appModel.weights.features.map((row) => Math.abs(Number(row.weight) || 0)), 1e-9);
+                  return appModel.weights.features.map((row) => (
+                    <tr key={row.feature}>
+                      <td>{featureLabel(row.feature)}</td>
+                      <td className={row.weight >= 0 ? "mm-pos" : "mm-neg"}>
+                        {row.weight >= 0 ? "+" : ""}
+                        {num(row.weight, 3)}
+                      </td>
+                      <td>
+                        <div
+                          className={`mm-weight-bar${row.weight < 0 ? " neg" : ""}`}
+                          style={{ width: `${Math.max(2, Math.round((Math.abs(row.weight) / maxAbs) * 100))}%` }}
+                        />
+                      </td>
+                    </tr>
+                  ));
+                })()}
+              </tbody>
+            </table>
+          )}
+        </div>
+        <div className="card sub">
+          <div className="mm-run-row">
             <button className="primary mm-go" onClick={run} disabled={busy}>
-              {busy ? "Running..." : "Train & evaluate"}
+              {busy ? "Running..." : "Evaluate on holdout"}
             </button>
             {!busy && cache && (
               <span className={`mm-run-note${cache.stale ? " stale" : ""}`}>
@@ -12673,18 +12719,6 @@ function ModelLabTab() {
                 {cache.stale
                   ? ` · data changed since (${describeChanges(cache.changes)}). Run again for current numbers.`
                   : " · data unchanged since, results are current."}
-              </span>
-            )}
-            {!busy && (
-              <span className={`mm-run-note${appModel?.stale ? " stale" : ""}`}>
-                {appModel?.exists
-                  ? `App uses the model trained ${new Date(appModel.trained_at * 1000).toLocaleString()} on ${Number(appModel.maps || 0).toLocaleString()} maps` +
-                    (appModel.stale ? " · data changed since." : ".")
-                  : "No app model trained yet."}
-                {" "}
-                <button type="button" className="mm-link" onClick={retrainAppModel} disabled={retraining}>
-                  {retraining ? "Retraining..." : "Retrain"}
-                </button>
               </span>
             )}
             {busy && (
@@ -12721,59 +12755,45 @@ function ModelLabTab() {
               <div className="topx-tile">
                 <div className="topx-tile-label">Map Brier</div>
                 <div className="topx-tile-value">{num(wm.brier, 3)}</div>
-                <div className="topx-tile-maps">rank only {num(ro.brier, 3)} · coin flip 0.250</div>
+                <div className="topx-tile-maps">coin flip 0.250</div>
               </div>
               <div className="topx-tile">
                 <div className="topx-tile-label">Calibration error</div>
                 <div className="topx-tile-value">{wm.calibration?.ece != null ? pct(wm.calibration.ece, 1) : "—"}</div>
-                <div className="topx-tile-maps">
-                  rank only {ro.calibration?.ece != null ? pct(ro.calibration.ece, 1) : "—"} · gap between stated and observed
-                </div>
+                <div className="topx-tile-maps">gap between stated and observed</div>
               </div>
             </div>
             <div className="card sub">
-              <h3>Model comparison</h3>
+              <h3>Holdout metrics</h3>
               {(() => {
                 const rows = [
-                  { label: "Map Brier", a: wm.brier, b: ro.brier, fmt: (v) => Number(v).toFixed(3), higherBetter: false },
-                  { label: "Map calibration error", a: wm.calibration?.ece, b: ro.calibration?.ece, fmt: (v) => pct(v, 1), higherBetter: false },
-                  { label: "Map resolution", a: wm.calibration?.resolution, b: ro.calibration?.resolution, fmt: (v) => Number(v).toFixed(4), higherBetter: true },
-                  { label: "Map winner", a: wm.winner_accuracy, b: ro.winner_accuracy, fmt: (v) => pct(v, 1), higherBetter: true },
-                  { label: "Score MAE", a: wm.score_mae, b: ro.score_mae, fmt: (v) => Number(v).toFixed(2), higherBetter: false },
-                  { label: `Series winner (n ${Number(wm.n_series || 0).toLocaleString()})`, a: wm.series_winner_accuracy, b: ro.series_winner_accuracy, fmt: (v) => pct(v, 1), higherBetter: true },
-                  { label: "Series Brier", a: wm.series_brier, b: ro.series_brier, fmt: (v) => Number(v).toFixed(3), higherBetter: false },
-                  { label: "Series calibration error", a: wm.series_calibration?.ece, b: ro.series_calibration?.ece, fmt: (v) => pct(v, 1), higherBetter: false },
-                  { label: `Veto-sim winner (n ${Number(wm.veto_sim?.n || 0).toLocaleString()})`, a: wm.veto_sim?.winner_accuracy, b: ro.veto_sim?.winner_accuracy, fmt: (v) => pct(v, 1), higherBetter: true },
-                  { label: "Veto-sim Brier", a: wm.veto_sim?.brier, b: ro.veto_sim?.brier, fmt: (v) => Number(v).toFixed(3), higherBetter: false },
-                  { label: "Veto maps matched", a: wm.veto_sim?.map_match_rate, b: ro.veto_sim?.map_match_rate, fmt: (v) => pct(v, 1), higherBetter: true },
-                ].filter((row) => row.a != null && row.b != null);
+                  { label: "Map Brier", v: wm.brier, fmt: (v) => Number(v).toFixed(3) },
+                  { label: "Map calibration error", v: wm.calibration?.ece, fmt: (v) => pct(v, 1) },
+                  { label: "Map resolution", v: wm.calibration?.resolution, fmt: (v) => Number(v).toFixed(4) },
+                  { label: "Map winner", v: wm.winner_accuracy, fmt: (v) => pct(v, 1) },
+                  { label: "Score MAE", v: wm.score_mae, fmt: (v) => Number(v).toFixed(2) },
+                  { label: `Series winner (n ${fmtInt(wm.n_series)})`, v: wm.series_winner_accuracy, fmt: (v) => pct(v, 1) },
+                  { label: "Series Brier", v: wm.series_brier, fmt: (v) => Number(v).toFixed(3) },
+                  { label: "Series calibration error", v: wm.series_calibration?.ece, fmt: (v) => pct(v, 1) },
+                  { label: `Veto-sim winner (n ${fmtInt(wm.veto_sim?.n)})`, v: wm.veto_sim?.winner_accuracy, fmt: (v) => pct(v, 1) },
+                  { label: "Veto-sim Brier", v: wm.veto_sim?.brier, fmt: (v) => Number(v).toFixed(3) },
+                  { label: "Veto maps matched", v: wm.veto_sim?.map_match_rate, fmt: (v) => pct(v, 1) },
+                ].filter((row) => row.v != null);
                 return (
                   <table className="mm-table mm-compare">
-                    <thead>
-                      <tr>
-                        <th>Metric</th>
-                        <th>With map data</th>
-                        <th>Rank only</th>
-                      </tr>
-                    </thead>
                     <tbody>
-                      {rows.map((row) => {
-                        const aWins = row.higherBetter ? Number(row.a) > Number(row.b) : Number(row.a) < Number(row.b);
-                        const bWins = row.higherBetter ? Number(row.b) > Number(row.a) : Number(row.b) < Number(row.a);
-                        return (
-                          <tr key={row.label}>
-                            <td>{row.label}</td>
-                            <td className={aWins ? "mm-win" : ""}>{row.fmt(row.a)}</td>
-                            <td className={bWins ? "mm-win" : ""}>{row.fmt(row.b)}</td>
-                          </tr>
-                        );
-                      })}
+                      {rows.map((row) => (
+                        <tr key={row.label}>
+                          <td>{row.label}</td>
+                          <td>{row.fmt(row.v)}</td>
+                        </tr>
+                      ))}
                     </tbody>
                   </table>
                 );
               })()}
               <p className="muted">
-                Orange = better. Training maps kept {fmtInt(result.input_summary?.train?.maps)} of{" "}
+                Training maps kept {fmtInt(result.input_summary?.train?.maps)} of{" "}
                 {fmtInt(result.input_summary?.train?.candidate_maps)}: {fmtInt(result.input_summary?.train?.excluded_missing_map_stats)}{" "}
                 dropped for no historical map stats, {fmtInt(result.input_summary?.train?.excluded_missing_veto)} for no veto
                 {Number(result.input_summary?.train?.vrs_substituted || 0) > 0
@@ -12788,10 +12808,7 @@ function ModelLabTab() {
                 <div className="value-chart-wrap topx-chart mm-cal-chart">
                   <div className="pool-legend">
                     <span>
-                      <i className="bar-a" /> With map data
-                    </span>
-                    <span>
-                      <i className="bar-b" /> Rank only
+                      <i className="bar-a" /> Favourite won
                     </span>
                     <span>
                       <i className="line" /> Perfect
@@ -12800,18 +12817,15 @@ function ModelLabTab() {
                   <ResponsiveContainer width="100%" height={300}>
                     <ComposedChart
                       data={(wm.calibration.bins || [])
-                        .map((b, i) => ({
+                        .map((b) => ({
                           label: b.label,
                           perfect: (b.lo + b.hi) / 2,
                           a: b.n >= 10 ? b.observed : null,
                           aN: b.n,
                           aPred: b.predicted,
-                          b: (ro.calibration?.bins?.[i]?.n ?? 0) >= 10 ? ro.calibration?.bins?.[i]?.observed ?? null : null,
-                          bN: ro.calibration?.bins?.[i]?.n ?? 0,
-                          bPred: ro.calibration?.bins?.[i]?.predicted ?? null,
                         }))
                         // buckets with fewer than 10 maps stay in the table but would draw misleading bars
-                        .filter((d) => d.aN >= 10 || d.bN >= 10)}
+                        .filter((d) => d.aN >= 10)}
                       margin={{ top: 26, right: 18, left: 6, bottom: 22 }}
                     >
                       <CartesianGrid stroke="#232a34" strokeDasharray="3 3" />
@@ -12841,14 +12855,12 @@ function ModelLabTab() {
                           return (
                             <div className="pool-tooltip">
                               <div className="pool-tooltip-title">Favourite at {label}</div>
-                              <div>{line("With map data", d.a, d.aN, d.aPred)}</div>
-                              <div>{line("Rank only", d.b, d.bN, d.bPred)}</div>
+                              <div>{line("Favourite", d.a, d.aN, d.aPred)}</div>
                             </div>
                           );
                         }}
                       />
-                      <Bar dataKey="a" name="With map data" fill="#ff6b1a" isAnimationActive={false} />
-                      <Bar dataKey="b" name="Rank only" fill="#3a4452" isAnimationActive={false} />
+                      <Bar dataKey="a" name="Favourite won" fill="#ff6b1a" isAnimationActive={false} />
                       <Line
                         type="linear"
                         dataKey="perfect"
