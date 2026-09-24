@@ -620,24 +620,19 @@ class DataScheduler:
             after = int((coverage_fn() or {}).get(missing_key) or 0)
             notes.append(f"{note}, {after} {unit} left")
             failed_any = failed_any or failed
-        # Keep the lab's cached evaluation current: re-run it (about 15 s)
-        # when tonight changed the data it trains on.
+        # Keep the Model Lab's cached holdout evaluation current (about 20 s
+        # when tonight changed the data it uses).
         try:
-            latest = events.get_map_model_lab_latest()
-            if not latest.get("exists") or latest.get("stale"):
-                self._set_state(processed=0, total=0, message="Map model: re-evaluating the lab model")
-                res = events.get_map_model_lab()
-                m = res.get("metrics") or {}
-                r = res.get("rank_only_metrics") or {}
-                notes.append(
-                    f"lab re-evaluated: map data {float(m.get('winner_accuracy') or 0) * 100:.1f}% "
-                    f"vs rank-only {float(r.get('winner_accuracy') or 0) * 100:.1f}% winners "
-                    f"on {int((res.get('split') or {}).get('test_maps') or 0)} maps"
-                )
-            else:
-                notes.append("lab evaluation already current")
+            self._set_state(processed=0, total=0, message="Map model: refreshing the holdout evaluation")
+            info = events.ensure_map_model_evaluation()
+            m = info.get("metrics") or {}
+            notes.append(
+                f"holdout evaluation {'re-run' if info.get('evaluated') else 'already current'} "
+                f"(map Brier {float(m.get('brier') or 0):.3f}, series Brier {float(m.get('series_brier') or 0):.3f} "
+                f"on {int((info.get('split') or {}).get('test_maps') or 0)} maps)"
+            )
         except Exception as exc:  # noqa: BLE001 - the fetches above still count
-            notes.append(f"lab re-evaluation failed: {exc}")
+            notes.append(f"holdout evaluation failed: {exc}")
         # The model the simulators use: retrain on everything when the data changed.
         try:
             self._set_state(processed=0, total=0, message="Map model: refreshing the app model")

@@ -88,6 +88,11 @@ async def _lifespan(app: FastAPI):
             events.ensure_production_map_model()
         except Exception:  # noqa: BLE001
             logging.getLogger(__name__).warning("Could not refresh the app map model", exc_info=True)
+        # The Model Lab's holdout evaluation, same rule (~20 s when stale).
+        try:
+            events.ensure_map_model_evaluation()
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning("Could not refresh the map model evaluation", exc_info=True)
         events.warm_kind_cache()  # ~1 s; needed by the first Tournament open
         groups.warm_caches()  # ~10 s: outcome sample + the three default Top 5 queries
         try:

@@ -12525,8 +12525,6 @@ function ModelDataPanel({ topN = 200 }) {
 }
 
 function ModelLabTab() {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
   const [result, setResult] = useState(null);
   const [selectedBreakdownRow, setSelectedBreakdownRow] = useState(null);
 
@@ -12573,33 +12571,20 @@ function ModelLabTab() {
     );
   };
 
-  // Phase and fraction reported by the backend while a run is in flight.
-  const [progress, setProgress] = useState(null);
-  // The cached last run: when it ran and whether the data changed since.
+  // The cached last evaluation: when it ran and whether the data changed since.
   const [cache, setCache] = useState(null);
   // The model the simulators use (trained on everything, refreshed nightly).
   const [appModel, setAppModel] = useState(null);
-  const [retraining, setRetraining] = useState(false);
-  const loadAppModel = useCallback(() => {
-    api
-      .get("/events/hltv-results/map-model/production", 60000)
-      .then((info) => setAppModel(info || null))
-      .catch(() => setAppModel(null));
-  }, []);
-  const retrainAppModel = useCallback(async () => {
-    setRetraining(true);
-    try {
-      await api.post("/events/hltv-results/map-model/production/train", {}, 600000);
-    } catch (err) {
-      setError(String(err?.message || err));
-    } finally {
-      setRetraining(false);
-      loadAppModel();
-    }
-  }, [loadAppModel]);
   useEffect(() => {
     let live = true;
-    loadAppModel();
+    api
+      .get("/events/hltv-results/map-model/production", 60000)
+      .then((info) => {
+        if (live) setAppModel(info || null);
+      })
+      .catch(() => {
+        if (live) setAppModel(null);
+      });
     api
       .get("/events/hltv-results/map-model-lab/latest", 60000)
       .then((latest) => {
@@ -12619,42 +12604,10 @@ function ModelLabTab() {
     const label = { matches: "matches", vetoes: "vetoes", windows: "map-stat windows" };
     Object.entries(changes || {}).forEach(([k, v]) => {
       const n = Number(v || 0);
-      if (n !== 0) parts.push(`${n > 0 ? "+" : ""}${n.toLocaleString()} ${label[k] || k}`);
+      if (n !== 0 && label[k]) parts.push(`${n > 0 ? "+" : ""}${n.toLocaleString()} ${label[k]}`);
     });
     return parts.join(", ");
   };
-  const run = async () => {
-    setBusy(true);
-    setError("");
-    setResult(null);
-    setSelectedBreakdownRow(null);
-    setProgress({ fraction: 0, label: "Starting..." });
-    const poll = setInterval(async () => {
-      try {
-        const p = await api.get("/events/hltv-results/map-model-lab/progress", 5000);
-        if (p && p.running) setProgress({ fraction: Number(p.fraction || 0), label: String(p.label || "") });
-      } catch {
-        // keep the last value
-      }
-    }, 400);
-    try {
-      // The split is fixed server-side (latest usable maps test, the rest train).
-      const data = await api.get("/events/hltv-results/map-model-lab", 600000);
-      if (data?.detail) {
-        setError(String(data.detail));
-        return;
-      }
-      setResult(data);
-      setCache({ computed_at: Number(data?.cache?.computed_at || Date.now() / 1000), stale: false, changes: {} });
-    } catch (e) {
-      setError(e?.message || "Failed to run model lab.");
-    } finally {
-      clearInterval(poll);
-      setBusy(false);
-      setProgress(null);
-    }
-  };
-
   const wm = result?.metrics || {};
   const fmtInt = (v) => Number(v || 0).toLocaleString();
 
@@ -12662,19 +12615,14 @@ function ModelLabTab() {
     <Section title="Map Model Lab">
       <div className="stack lab">
         <div className="card sub">
-          <div className="mm-run-row">
-            <div className="mm-app-head">
-              <h3>App model</h3>
-              <span className={`mm-run-note${appModel?.stale ? " stale" : ""}`}>
-                {appModel?.exists
-                  ? `Trained ${new Date(appModel.trained_at * 1000).toLocaleString()} on ${fmtInt(appModel.maps)} maps from ${fmtInt(appModel.matches)} matches · ${fmtInt(appModel.teams_rated)} teams rated` +
-                    (appModel.stale ? " · data changed since." : ".")
-                  : "No app model trained yet."}
-              </span>
-            </div>
-            <button className="primary mm-go" onClick={retrainAppModel} disabled={retraining}>
-              {retraining ? "Retraining..." : "Retrain"}
-            </button>
+          <div className="mm-app-head">
+            <h3>App model</h3>
+            <span className={`mm-run-note${appModel?.stale ? " stale" : ""}`}>
+              {appModel?.exists
+                ? `Trained ${new Date(appModel.trained_at * 1000).toLocaleString()} on ${fmtInt(appModel.maps)} maps from ${fmtInt(appModel.matches)} matches · ${fmtInt(appModel.teams_rated)} teams rated` +
+                  (appModel.stale ? " · data changed since; refreshes after tonight's fetch." : ".")
+                : "No app model trained yet; it is built after the first results import."}
+            </span>
           </div>
           {(appModel?.weights?.features || []).length > 0 && (
             <table className="mm-table mm-weights">
@@ -12709,32 +12657,16 @@ function ModelLabTab() {
           )}
         </div>
         <div className="card sub">
-          <div className="mm-run-row">
-            <button className="primary mm-go" onClick={run} disabled={busy}>
-              {busy ? "Running..." : "Evaluate on holdout"}
-            </button>
-            {!busy && cache && (
-              <span className={`mm-run-note${cache.stale ? " stale" : ""}`}>
-                Last run {new Date(cache.computed_at * 1000).toLocaleString()}
-                {cache.stale
-                  ? ` · data changed since (${describeChanges(cache.changes)}). Run again for current numbers.`
-                  : " · data unchanged since, results are current."}
-              </span>
-            )}
-            {busy && (
-              <div className="mm-progress" aria-label="Training progress">
-                <div className="mm-bar">
-                  <div className="mm-bar-fill" style={{ width: `${Math.round((progress?.fraction || 0) * 100)}%` }} />
-                </div>
-                <span className="mm-progress-label">
-                  {progress?.label || "Starting..."}
-                  {progress?.fraction ? ` · ${Math.round(progress.fraction * 100)}%` : ""}
-                </span>
-              </div>
-            )}
+          <div className="mm-app-head">
+            <h3>Holdout evaluation</h3>
+            <span className={`mm-run-note${cache?.stale ? " stale" : ""}`}>
+              {cache
+                ? `Evaluated ${new Date(cache.computed_at * 1000).toLocaleString()} on the latest usable maps` +
+                  (cache.stale ? ` · data changed since (${describeChanges(cache.changes)}); refreshes after tonight's fetch.` : ".")
+                : "Not evaluated yet; runs after the first results import."}
+            </span>
           </div>
         </div>
-        {error && <p className="error">{error}</p>}
         {result && (
           <div className="stack">
             <div className="mm-tiles">

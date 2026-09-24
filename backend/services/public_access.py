@@ -71,8 +71,6 @@ PUBLIC_GET_DENY: List[str] = [
     r"/events/hltv-recent-results",  # live HLTV fetch
     r"/events/hltv-results/match-details",  # live HLTV fetch + DB write (use /stored)
     r"/teams/(hltv|vrs)-ranking/by-date",  # live HLTV fetch
-    r"/events/hltv-results/map-model-lab",  # model training (Dev Lab)
-    r"/events/hltv-results/map-model/production/train",  # retrain the app model
     r"/events/page-snapshots(/.*)?",
     r"/events/\d+/swiss-context",
     r".*/job/.*",  # operator job status

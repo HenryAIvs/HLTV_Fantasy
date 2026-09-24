@@ -3991,26 +3991,6 @@ def _map_model_input_summary(
     }
 
 
-# Progress of the one lab run at a time, so the page can draw a real bar.
-_MAP_MODEL_LAB_PROGRESS: Dict[str, Any] = {"running": False, "fraction": 0.0, "label": "", "started_at": None}
-_MAP_MODEL_LAB_PROGRESS_LOCK = threading.Lock()
-
-
-def _lab_progress(fraction: float, label: str, running: bool = True) -> None:
-    with _MAP_MODEL_LAB_PROGRESS_LOCK:
-        if running and not _MAP_MODEL_LAB_PROGRESS.get("running"):
-            _MAP_MODEL_LAB_PROGRESS["started_at"] = time.time()
-        _MAP_MODEL_LAB_PROGRESS.update(
-            {"running": bool(running), "fraction": float(max(0.0, min(1.0, fraction))), "label": str(label)}
-        )
-
-
-@router.get("/hltv-results/map-model-lab/progress")
-def get_map_model_lab_progress():
-    with _MAP_MODEL_LAB_PROGRESS_LOCK:
-        return dict(_MAP_MODEL_LAB_PROGRESS)
-
-
 # The last train-and-evaluate result, kept so the page opens with it and the
 # nightly task can refresh it. The signature says what the run saw; comparing
 # it with the live counts tells whether the data has changed since.
@@ -4065,20 +4045,26 @@ def get_map_model_lab_latest():
     }
 
 
-@router.get("/hltv-results/map-model-lab")
-def get_map_model_lab():
-    try:
-        signature = _lab_data_signature()
-        result = _run_map_model_lab()
-        computed_at = time.time()
-        result["cache"] = {"computed_at": computed_at, "signature": signature}
-        try:
-            _lab_state().save({"computed_at": computed_at, "signature": signature}, result)
-        except Exception:  # noqa: BLE001 - a cache miss must not fail the run
-            logger.exception("Could not cache the map model lab result")
-        return result
-    finally:
-        _lab_progress(1.0, "Done", running=False)
+def evaluate_map_model() -> Dict[str, Any]:
+    """Run the holdout evaluation and cache it for the page."""
+    signature = _lab_data_signature()
+    result = _run_map_model_lab()
+    computed_at = time.time()
+    result["cache"] = {"computed_at": computed_at, "signature": signature}
+    _lab_state().save({"computed_at": computed_at, "signature": signature}, result)
+    return result
+
+
+def ensure_map_model_evaluation() -> Dict[str, Any]:
+    """Re-run the holdout evaluation when there is none or the data it uses
+    changed (startup and the nightly map-model task). Returns the metrics and
+    whether it ran."""
+    latest = get_map_model_lab_latest()
+    if latest.get("exists") and not latest.get("stale"):
+        result = latest.get("result") or {}
+        return {"evaluated": False, "metrics": result.get("metrics") or {}, "split": result.get("split") or {}}
+    result = evaluate_map_model()
+    return {"evaluated": True, "metrics": result.get("metrics") or {}, "split": result.get("split") or {}}
 
 
 def _run_map_model_lab():
@@ -4088,20 +4074,16 @@ def _run_map_model_lab():
     is every match before it. Whole matches, so series-level metrics see
     complete series. (A random split lets the fit learn a period from its
     own neighbours and reports a few points too high.)"""
-    _lab_progress(0.02, "Loading matches")
     db_matches = int(count_hltv_results())
     all_rows = list_hltv_results(limit=db_matches, offset=0) if db_matches > 0 else []
-    _lab_progress(0.08, "Loading historical map-stat windows")
     historical_map_stats_by_window, historical_cache_summary = _build_historical_team_map_stats_by_window(
         all_rows,
         fetch_missing=False,
     )
     # The rating replay covers the full stored timeline; each match only sees earlier results.
-    _lab_progress(0.22, "Replaying player ratings over the match timeline")
     prematch_ratings_by_match = _build_prematch_player_ratings(all_rows)
     # Candidates: every ranked map with its data flags; kept: complete data
     # only (both teams' historical map stats for that map, and the veto).
-    _lab_progress(0.34, "Building map samples")
     all_candidates = _iter_ranked_map_samples(
         all_rows, historical_map_stats_by_window=historical_map_stats_by_window, prematch_ratings_by_match=prematch_ratings_by_match
     )
@@ -4137,9 +4119,7 @@ def _run_map_model_lab():
     train_limit = len(train_rows)
     # Win probabilities come from models trained directly on the map result;
     # the round-share models are kept for scoreline prediction only.
-    _lab_progress(0.5, "Fitting the win model")
     models = _fit_map_model_set(train_samples, target="map_win")
-    _lab_progress(0.68, "Fitting the scoreline model")
     score_models = _fit_map_model_set(train_samples)
     if not test_samples:
         raise HTTPException(
@@ -4147,7 +4127,6 @@ def _run_map_model_lab():
             detail="No evaluation maps have historical six-month map stats for both teams. Fetch missing historical map stats, or fix team identity mappings.",
         )
 
-    _lab_progress(0.84, "Evaluating on the holdout")
     test_series_contexts = _iter_series_contexts(
         test_rows,
         historical_map_stats_by_window=historical_map_stats_by_window,
@@ -5040,8 +5019,3 @@ def get_map_model_production():
     then = production.get("signature") or {}
     summary["stale"] = any(int(now.get(k, 0)) != int(then.get(k, 0)) for k in now)
     return {"exists": True, **summary}
-
-
-@router.post("/hltv-results/map-model/production/train")
-def train_map_model_production():
-    return {"trained": True, **train_production_map_model()}
