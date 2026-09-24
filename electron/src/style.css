@@ -4163,8 +4163,15 @@ button:disabled {
 .mm-job-current { color: #8fa3bf; }
 .mm-job-error { color: #fca5a5; }
 .mm-job-actions { display: flex; gap: 8px; justify-self: end; }
-.mm-tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
-.mm-tiles .topx-tile-value { font-variant-numeric: tabular-nums; }
+.mm-metric-groups { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
+.mm-metric-group { background: #171c24; border: 1px solid #2c3441; border-left: 3px solid #ff6b1a; padding: 12px 14px; }
+.mm-metric-group .topx-tile-value { font-variant-numeric: tabular-nums; }
+.mm-metric-rows { margin-top: 10px; border-top: 1px solid #242b35; }
+.mm-metric-rows > div { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-bottom: 1px solid #242b35; font-size: 13.5px; }
+.mm-metric-rows > div span:first-child { color: #c3cddb; }
+.mm-metric-rows > div span:last-child { font-variant-numeric: tabular-nums; color: #f2f5f9; }
+.mm-kept { margin: 12px 0 0; font-size: 12.5px; }
+@media (max-width: 900px) { .mm-metric-groups { grid-template-columns: 1fr; } }
 .mm-table th, .mm-table td { padding: 7px 12px; font-variant-numeric: tabular-nums; }
 .mm-compare { max-width: 640px; }
 .mm-win { color: #ff8a47; font-weight: 700; }

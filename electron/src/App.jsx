@@ -12655,79 +12655,83 @@ function ModelLabTab() {
             <h3>Holdout evaluation</h3>
             <span className={`mm-run-note${cache?.stale ? " stale" : ""}`}>
               {cache
-                ? `Evaluated ${new Date(cache.computed_at * 1000).toLocaleString()} on the latest usable maps` +
+                ? `Evaluated ${new Date(cache.computed_at * 1000).toLocaleString()}` +
                   (cache.stale ? ` · data changed since (${describeChanges(cache.changes)}); refreshes after tonight's fetch.` : ".")
                 : "Not evaluated yet; runs after the first results import."}
+              {result
+                ? ` Fitted on the older ${fmtInt(result.train?.matches_loaded)} matches (${fmtInt(result.train?.map_samples)} maps), scored on the newest ${fmtInt(result.test?.matches_loaded)} matches (${fmtInt(result.test?.map_samples)} maps) it never saw.`
+                : ""}
             </span>
           </div>
+          {result && (
+            <>
+              <div className="mm-metric-groups">
+                {[
+                  {
+                    key: "map",
+                    title: "Per map",
+                    n: `${fmtInt(wm.n_maps)} maps`,
+                    brier: wm.brier,
+                    rows: [
+                      ["Calibration error", wm.calibration?.ece != null ? pct(wm.calibration.ece, 1) : "-"],
+                      ["Winner picked", pct(wm.winner_accuracy, 1)],
+                      ["Scoreline miss", wm.score_mae != null ? `${Number(wm.score_mae).toFixed(1)} rounds` : "-"],
+                    ],
+                  },
+                  {
+                    key: "series",
+                    title: "Per series",
+                    n: `${fmtInt(wm.n_series)} series`,
+                    brier: wm.series_brier,
+                    rows: [
+                      ["Calibration error", wm.series_calibration?.ece != null ? pct(wm.series_calibration.ece, 1) : "-"],
+                      ["Winner picked", pct(wm.series_winner_accuracy, 1)],
+                    ],
+                  },
+                  {
+                    key: "prematch",
+                    title: "Pre-match, veto simulated",
+                    n: `${fmtInt(wm.veto_sim?.n)} series`,
+                    brier: wm.veto_sim?.brier,
+                    rows: [
+                      ["Winner picked", pct(wm.veto_sim?.winner_accuracy, 1)],
+                      ["Veto maps matched", pct(wm.veto_sim?.map_match_rate, 1)],
+                    ],
+                  },
+                ]
+                  .filter((g) => g.brier != null)
+                  .map((g) => (
+                    <div key={g.key} className="mm-metric-group">
+                      <div className="topx-tile-label">
+                        {g.title} · {g.n}
+                      </div>
+                      <div className="topx-tile-value">{num(g.brier, 3)}</div>
+                      <div className="topx-tile-maps">Brier · coin flip 0.250</div>
+                      <div className="mm-metric-rows">
+                        {g.rows.map(([label, value]) => (
+                          <div key={label}>
+                            <span>{label}</span>
+                            <span>{value}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+              </div>
+              <p className="muted mm-kept">
+                Training kept {fmtInt(result.input_summary?.train?.maps)} of {fmtInt(result.input_summary?.train?.candidate_maps)} maps:{" "}
+                {fmtInt(result.input_summary?.train?.excluded_missing_map_stats)} lacked historical map stats,{" "}
+                {fmtInt(result.input_summary?.train?.excluded_missing_veto)} a veto
+                {Number(result.input_summary?.train?.vrs_substituted || 0) > 0
+                  ? `, and ${fmtInt(result.input_summary?.train?.vrs_substituted)} used the HLTV rank in place of a missing VRS rank`
+                  : ""}
+                . Test kept {fmtInt(result.input_summary?.test?.maps)} of {fmtInt(result.input_summary?.test?.candidate_maps)}.
+              </p>
+            </>
+          )}
         </div>
         {result && (
           <div className="stack">
-            <div className="mm-tiles">
-              <div className="topx-tile">
-                <div className="topx-tile-label">Train matches</div>
-                <div className="topx-tile-value">{fmtInt(result.train?.matches_loaded)}</div>
-                <div className="topx-tile-maps">
-                  {fmtInt(result.train?.map_samples)} maps · older rows
-                </div>
-              </div>
-              <div className="topx-tile">
-                <div className="topx-tile-label">Test matches</div>
-                <div className="topx-tile-value">{fmtInt(result.test?.matches_loaded)}</div>
-                <div className="topx-tile-maps">
-                  {fmtInt(result.test?.map_samples)} maps · latest usable
-                </div>
-              </div>
-              <div className="topx-tile">
-                <div className="topx-tile-label">Map Brier</div>
-                <div className="topx-tile-value">{num(wm.brier, 3)}</div>
-                <div className="topx-tile-maps">coin flip 0.250</div>
-              </div>
-              <div className="topx-tile">
-                <div className="topx-tile-label">Calibration error</div>
-                <div className="topx-tile-value">{wm.calibration?.ece != null ? pct(wm.calibration.ece, 1) : "—"}</div>
-                <div className="topx-tile-maps">gap between stated and observed</div>
-              </div>
-            </div>
-            <div className="card sub">
-              <h3>Holdout metrics</h3>
-              {(() => {
-                const rows = [
-                  { label: "Map Brier", v: wm.brier, fmt: (v) => Number(v).toFixed(3) },
-                  { label: "Map calibration error", v: wm.calibration?.ece, fmt: (v) => pct(v, 1) },
-                  { label: "Map resolution", v: wm.calibration?.resolution, fmt: (v) => Number(v).toFixed(4) },
-                  { label: "Map winner", v: wm.winner_accuracy, fmt: (v) => pct(v, 1) },
-                  { label: "Score MAE", v: wm.score_mae, fmt: (v) => Number(v).toFixed(2) },
-                  { label: `Series winner (n ${fmtInt(wm.n_series)})`, v: wm.series_winner_accuracy, fmt: (v) => pct(v, 1) },
-                  { label: "Series Brier", v: wm.series_brier, fmt: (v) => Number(v).toFixed(3) },
-                  { label: "Series calibration error", v: wm.series_calibration?.ece, fmt: (v) => pct(v, 1) },
-                  { label: `Veto-sim winner (n ${fmtInt(wm.veto_sim?.n)})`, v: wm.veto_sim?.winner_accuracy, fmt: (v) => pct(v, 1) },
-                  { label: "Veto-sim Brier", v: wm.veto_sim?.brier, fmt: (v) => Number(v).toFixed(3) },
-                  { label: "Veto maps matched", v: wm.veto_sim?.map_match_rate, fmt: (v) => pct(v, 1) },
-                ].filter((row) => row.v != null);
-                return (
-                  <table className="mm-table mm-compare">
-                    <tbody>
-                      {rows.map((row) => (
-                        <tr key={row.label}>
-                          <td>{row.label}</td>
-                          <td>{row.fmt(row.v)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                );
-              })()}
-              <p className="muted">
-                Training maps kept {fmtInt(result.input_summary?.train?.maps)} of{" "}
-                {fmtInt(result.input_summary?.train?.candidate_maps)}: {fmtInt(result.input_summary?.train?.excluded_missing_map_stats)}{" "}
-                dropped for no historical map stats, {fmtInt(result.input_summary?.train?.excluded_missing_veto)} for no veto
-                {Number(result.input_summary?.train?.vrs_substituted || 0) > 0
-                  ? `; HLTV rank used in place of VRS on ${fmtInt(result.input_summary?.train?.vrs_substituted)}`
-                  : ""}
-                . Test maps kept {fmtInt(result.input_summary?.test?.maps)} of {fmtInt(result.input_summary?.test?.candidate_maps)}.
-              </p>
-            </div>
             {(wm.calibration?.bins || []).length > 0 && (
               <div className="card sub">
                 <h3>Calibration</h3>
