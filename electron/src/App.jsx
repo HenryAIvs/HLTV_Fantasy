@@ -10196,7 +10196,7 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                     <h4 className="team-detail-heading">Map Stats</h4>
                     {teamMapStatsRows.length > 0 && (
                       <p className="muted">
-                        Last 3 months: {teamMapStatsTotalPlayed.toLocaleString()} maps played
+                        Last 6 months: {teamMapStatsTotalPlayed.toLocaleString()} maps played
                         {Number(teamVetoProfile?.matches || 0) > 0
                           ? ` · pick/ban from ${teamVetoProfile.matches} stored vetoes`
                           : ""}

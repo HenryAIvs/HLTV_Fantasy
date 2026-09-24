@@ -1057,7 +1057,11 @@ def get_hltv_team_map_stats_for_range(
 
 
 def get_hltv_team_map_stats(team_id: int, team_name: str | None = None) -> Dict[str, object]:
-    start_date, end_date = _last_3_months_range()
+    """The team's current map stats over the last six months: the same window
+    the win model trains on (backend.routes.events._historical_map_stats_window),
+    so live features mean what the fitted weights expect."""
+    end_d = date.today()
+    start_date, end_date = (end_d - relativedelta(months=6)).isoformat(), end_d.isoformat()
     return get_hltv_team_map_stats_for_range(team_id, team_name, start_date=start_date, end_date=end_date)
 
 
