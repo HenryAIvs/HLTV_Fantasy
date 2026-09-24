@@ -4141,7 +4141,6 @@ def _run_map_model_lab():
     )
     return {
         "status": "ok",
-        "method": "The same recipe as the app model, fitted on the older matches only and scored on the holdout. Win probabilities come from a logistic model trained on the map result over signed team-A-minus-team-B inputs: HLTV and VRS rank gaps (linear, log, and scaled by matchup level), six-month map-stat gaps (win, pick, ban, played share), who picked the map, and the per-player rating gap replayed from the stored timeline. Scorelines come from a round-share fit over the same inputs.",
         "db_matches": db_matches,
         "split": {
             "mode": "ordered",

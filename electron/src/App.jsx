@@ -12571,8 +12571,6 @@ function ModelLabTab() {
     );
   };
 
-  // The cached last evaluation: when it ran and whether the data changed since.
-  const [cache, setCache] = useState(null);
   // The model the simulators use (trained on everything, refreshed nightly).
   const [appModel, setAppModel] = useState(null);
   useEffect(() => {
@@ -12590,7 +12588,6 @@ function ModelLabTab() {
       .then((latest) => {
         if (!live || !latest?.exists) return;
         setResult(latest.result || null);
-        setCache({ computed_at: Number(latest.computed_at || 0), stale: Boolean(latest.stale), changes: latest.changes || {} });
       })
       .catch(() => {
         // No cache is fine; the page just starts empty.
@@ -12599,15 +12596,6 @@ function ModelLabTab() {
       live = false;
     };
   }, []);
-  const describeChanges = (changes) => {
-    const parts = [];
-    const label = { matches: "matches", vetoes: "vetoes", windows: "map-stat windows" };
-    Object.entries(changes || {}).forEach(([k, v]) => {
-      const n = Number(v || 0);
-      if (n !== 0 && label[k]) parts.push(`${n > 0 ? "+" : ""}${n.toLocaleString()} ${label[k]}`);
-    });
-    return parts.join(", ");
-  };
   const wm = result?.metrics || {};
   const fmtInt = (v) => Number(v || 0).toLocaleString();
 
@@ -12653,15 +12641,6 @@ function ModelLabTab() {
         <div className="card sub">
           <div className="mm-app-head">
             <h3>Holdout evaluation</h3>
-            <span className={`mm-run-note${cache?.stale ? " stale" : ""}`}>
-              {cache
-                ? `Evaluated ${new Date(cache.computed_at * 1000).toLocaleString()}` +
-                  (cache.stale ? ` · data changed since (${describeChanges(cache.changes)}); refreshes after tonight's fetch.` : ".")
-                : "Not evaluated yet; runs after the first results import."}
-              {result
-                ? ` Fitted on the older ${fmtInt(result.train?.matches_loaded)} matches (${fmtInt(result.train?.map_samples)} maps), scored on the newest ${fmtInt(result.test?.matches_loaded)} matches (${fmtInt(result.test?.map_samples)} maps) it never saw.`
-                : ""}
-            </span>
           </div>
           {result && (
             <>
@@ -12706,7 +12685,7 @@ function ModelLabTab() {
                         {g.title} · {g.n}
                       </div>
                       <div className="topx-tile-value">{num(g.brier, 3)}</div>
-                      <div className="topx-tile-maps">Brier · coin flip 0.250</div>
+                      <div className="topx-tile-maps">Brier</div>
                       <div className="mm-metric-rows">
                         {g.rows.map(([label, value]) => (
                           <div key={label}>
@@ -12718,15 +12697,6 @@ function ModelLabTab() {
                     </div>
                   ))}
               </div>
-              <p className="muted mm-kept">
-                Training kept {fmtInt(result.input_summary?.train?.maps)} of {fmtInt(result.input_summary?.train?.candidate_maps)} maps:{" "}
-                {fmtInt(result.input_summary?.train?.excluded_missing_map_stats)} lacked historical map stats,{" "}
-                {fmtInt(result.input_summary?.train?.excluded_missing_veto)} a veto
-                {Number(result.input_summary?.train?.vrs_substituted || 0) > 0
-                  ? `, and ${fmtInt(result.input_summary?.train?.vrs_substituted)} used the HLTV rank in place of a missing VRS rank`
-                  : ""}
-                . Test kept {fmtInt(result.input_summary?.test?.maps)} of {fmtInt(result.input_summary?.test?.candidate_maps)}.
-              </p>
             </>
           )}
         </div>
@@ -12836,7 +12806,6 @@ function ModelLabTab() {
             {rankEffectLevelBands.length > 0 && (
               <div className="card sub">
                 <h3>Rank Gap Effect</h3>
-                <p className="muted">{result.rank_effect_curve.description}</p>
                 <div className="rank-level-chart-grid">
                   {rankEffectLevelBands.map((band) => (
                     <div key={band.key} className="rank-level-chart">
@@ -12944,9 +12913,6 @@ function ModelLabTab() {
                 ))}
               </tbody>
             </table>
-            <div className="card sub">
-              <p className="muted">{result.method}</p>
-            </div>
           </div>
         )}
         {selectedBreakdownRow && (

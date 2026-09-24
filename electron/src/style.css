@@ -4170,7 +4170,6 @@ button:disabled {
 .mm-metric-rows > div { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-bottom: 1px solid #242b35; font-size: 13.5px; }
 .mm-metric-rows > div span:first-child { color: #c3cddb; }
 .mm-metric-rows > div span:last-child { font-variant-numeric: tabular-nums; color: #f2f5f9; }
-.mm-kept { margin: 12px 0 0; font-size: 12.5px; }
 @media (max-width: 900px) { .mm-metric-groups { grid-template-columns: 1fr; } }
 .mm-table th, .mm-table td { padding: 7px 12px; font-variant-numeric: tabular-nums; }
 .mm-compare { max-width: 640px; }
