@@ -12695,102 +12695,111 @@ function ModelLabTab() {
             {(wm.calibration?.bins || []).length > 0 && (
               <div className="card sub">
                 <h3>Calibration</h3>
-                <div className="value-chart-wrap topx-chart mm-cal-chart">
-                  <div className="pool-legend">
-                    <span>
-                      <i className="bar-a" /> Favourite won
-                    </span>
-                    <span>
-                      <i className="line" /> Perfect
-                    </span>
-                  </div>
-                  <ResponsiveContainer width="100%" height={300}>
-                    <ComposedChart
-                      data={(wm.calibration.bins || [])
-                        .map((b) => ({
-                          label: b.label,
-                          perfect: (b.lo + b.hi) / 2,
-                          a: b.n >= 10 ? b.observed : null,
-                          aN: b.n,
-                          aPred: b.predicted,
-                        }))
-                        // buckets with fewer than 10 maps stay in the table but would draw misleading bars
-                        .filter((d) => d.aN >= 10)}
-                      margin={{ top: 26, right: 18, left: 6, bottom: 22 }}
-                    >
-                      <CartesianGrid stroke="#232a34" strokeDasharray="3 3" />
-                      <XAxis
-                        dataKey="label"
-                        tick={{ fill: "#9fb2c9", fontSize: 11 }}
-                        axisLine={{ stroke: "#3a4452" }}
-                        tickLine={{ stroke: "#3a4452" }}
-                        label={{ value: "Probability given to the favourite  ·  bars: how often it won", position: "insideBottom", offset: -14, fill: "#7f97bd", fontSize: 11 }}
-                      />
-                      <YAxis
-                        domain={[0.4, 1]}
-                        ticks={[0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]}
-                        tick={{ fill: "#9fb2c9", fontSize: 11 }}
-                        axisLine={{ stroke: "#3a4452" }}
-                        tickLine={{ stroke: "#3a4452" }}
-                        tickFormatter={(v) => `${Math.round(Number(v) * 100)}%`}
-                        width={44}
-                      />
-                      <Tooltip
-                        cursor={{ fill: "rgba(255, 107, 26, 0.06)" }}
-                        content={({ active, payload, label }) => {
-                          if (!active || !payload || payload.length === 0) return null;
-                          const d = payload[0]?.payload || {};
-                          const line = (name, obs, n, pred) =>
-                            obs == null ? `${name}: fewer than 10 maps` : `${name}: won ${pct(obs, 1)} of ${Number(n).toLocaleString()} (stated ${pct(pred, 1)})`;
-                          return (
-                            <div className="pool-tooltip">
-                              <div className="pool-tooltip-title">Favourite at {label}</div>
-                              <div>{line("Favourite", d.a, d.aN, d.aPred)}</div>
-                            </div>
-                          );
-                        }}
-                      />
-                      <Bar dataKey="a" name="Favourite won" fill="#ff6b1a" isAnimationActive={false} />
-                      <Line
-                        type="linear"
-                        dataKey="perfect"
-                        name="Perfect"
-                        stroke="#f2f5f9"
-                        strokeWidth={1.5}
-                        strokeDasharray="5 4"
-                        dot={false}
-                        isAnimationActive={false}
-                      />
-                    </ComposedChart>
-                  </ResponsiveContainer>
-                </div>
-                <table className="mm-table mm-compare">
-                  <thead>
-                    <tr>
-                      <th>Favourite at</th>
-                      <th>Maps</th>
-                      <th>Stated</th>
-                      <th>Won</th>
-                      <th>Gap</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {(wm.calibration.bins || [])
-                      .filter((b) => b.n > 0)
-                      .map((b) => (
-                        <tr key={b.label}>
-                          <td>{b.label}</td>
-                          <td>{Number(b.n).toLocaleString()}</td>
-                          <td>{pct(b.predicted, 1)}</td>
-                          <td>{pct(b.observed, 1)}</td>
-                          <td className={Math.abs(Number(b.observed) - Number(b.predicted)) > 0.05 ? "mm-warn" : ""}>
-                            {Number(b.observed) - Number(b.predicted) >= 0 ? "+" : ""}
-                            {((Number(b.observed) - Number(b.predicted)) * 100).toFixed(1)}
-                          </td>
-                        </tr>
-                      ))}
-                  </tbody>
-                </table>
+                {(() => {
+                  const bins = (wm.calibration.bins || [])
+                    .filter((b) => Number(b.n || 0) > 0)
+                    .map((b) => {
+                      const n = Number(b.n || 0);
+                      const won = Number(b.observed);
+                      const stated = Number(b.predicted);
+                      const se = Math.sqrt(Math.max(won * (1 - won), 0.04) / n);
+                      const noise = 1.96 * se;
+                      return { ...b, n, won, stated, noise, gap: won - stated, err: [Math.min(noise, won), Math.min(noise, 1 - won)] };
+                    });
+                  const points = bins.filter((b) => b.n >= 10);
+                  const dot = (p) => {
+                    const r = 4 + Math.min(9, Math.sqrt(p.payload.n) / 2);
+                    return <circle cx={p.cx} cy={p.cy} r={r} fill="#ff6b1a" stroke="#14181f" strokeWidth={1.5} />;
+                  };
+                  return (
+                    <div className="mm-cal">
+                      <div className="value-chart-wrap topx-chart mm-cal-chart">
+                        <div className="pool-legend">
+                          <span>
+                            <i className="dot orange" /> Favourite won
+                          </span>
+                          <span>
+                            <i className="whisker" /> 95% noise
+                          </span>
+                          <span>
+                            <i className="line" /> Perfect
+                          </span>
+                        </div>
+                        <ResponsiveContainer width="100%" height={430}>
+                          <ComposedChart data={points} margin={{ top: 18, right: 18, left: 14, bottom: 22 }}>
+                            <CartesianGrid stroke="#232a34" strokeDasharray="3 3" />
+                            <XAxis
+                              dataKey="stated"
+                              type="number"
+                              domain={[0.5, 1]}
+                              ticks={[0.5, 0.6, 0.7, 0.8, 0.9, 1]}
+                              tick={{ fill: "#9fb2c9", fontSize: 11 }}
+                              axisLine={{ stroke: "#3a4452" }}
+                              tickLine={{ stroke: "#3a4452" }}
+                              tickFormatter={(v) => `${Math.round(Number(v) * 100)}%`}
+                              label={{ value: "Stated", position: "insideBottom", offset: -12, fill: "#7f97bd", fontSize: 11 }}
+                            />
+                            <YAxis
+                              dataKey="won"
+                              type="number"
+                              domain={[0.4, 1]}
+                              ticks={[0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]}
+                              tick={{ fill: "#9fb2c9", fontSize: 11 }}
+                              axisLine={{ stroke: "#3a4452" }}
+                              tickLine={{ stroke: "#3a4452" }}
+                              tickFormatter={(v) => `${Math.round(Number(v) * 100)}%`}
+                              width={44}
+                              label={{ value: "Won", angle: -90, position: "left", offset: 0, fill: "#7f97bd", fontSize: 11 }}
+                            />
+                            <Tooltip
+                              cursor={false}
+                              content={({ active, payload }) => {
+                                if (!active || !payload || payload.length === 0) return null;
+                                const d = payload[0]?.payload || {};
+                                return (
+                                  <div className="pool-tooltip">
+                                    <div className="pool-tooltip-title">Favourite at {d.label}</div>
+                                    <div>Won {pct(d.won, 1)} of {fmtInt(d.n)} maps</div>
+                                    <div>Stated {pct(d.stated, 1)} · noise ±{(d.noise * 100).toFixed(1)}</div>
+                                  </div>
+                                );
+                              }}
+                            />
+                            <ReferenceLine segment={[{ x: 0.5, y: 0.5 }, { x: 1, y: 1 }]} stroke="#f2f5f9" strokeWidth={1.5} strokeDasharray="5 4" ifOverflow="visible" />
+                            <Scatter data={points} dataKey="won" shape={dot} isAnimationActive={false}>
+                              <ErrorBar dataKey="err" direction="y" width={6} stroke="#8fa3bf" strokeWidth={1.5} />
+                            </Scatter>
+                          </ComposedChart>
+                        </ResponsiveContainer>
+                      </div>
+                      <table className="mm-table mm-cal-table">
+                        <thead>
+                          <tr>
+                            <th>Bucket</th>
+                            <th>Maps</th>
+                            <th>Stated</th>
+                            <th>Won</th>
+                            <th>Gap</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {bins.map((b) => (
+                            <tr key={b.label} className={b.n < 10 ? "mm-faint" : ""}>
+                              <td>{b.label}</td>
+                              <td>{fmtInt(b.n)}</td>
+                              <td>{pct(b.stated, 1)}</td>
+                              <td>{pct(b.won, 1)}</td>
+                              <td className={Math.abs(b.gap) > b.noise ? "mm-warn" : ""}>
+                                {b.gap >= 0 ? "+" : ""}
+                                {(b.gap * 100).toFixed(1)}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  );
+                })()}
               </div>
             )}
             {rankEffectLevelBands.length > 0 && (

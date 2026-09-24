@@ -83,13 +83,14 @@ def _sigmoid(z: float) -> float:
 # maps each against fourteen inputs overfit; coefficients flipped sign between
 # maps and the held-out score fell below the rank-only baseline).
 _MAP_MODEL_L2 = 1e-2
-# The lab's one split: the holdout is the latest N USABLE maps (both teams'
-# historical map stats for the map, and the veto), taken as whole matches
-# from the newest backwards; training is every match before them. Counting
-# usable maps keeps the holdout the same size whether or not the newest
-# matches' data has been fetched yet; 1,000 maps pins winner accuracy to
-# about +/-1.5 points. Chosen 2026-09-21; not user-adjustable.
-_MAP_MODEL_TEST_MAPS = 1000
+# The lab's evaluation is walk-forward: usable maps in date order, the oldest
+# _MAP_MODEL_INITIAL_TRAIN share fits the first model, then each of
+# _MAP_MODEL_BLOCKS chronological blocks is scored by a model fitted on
+# everything before it. Every scored map is out of sample and the scored set
+# is ~60% of the pool, so the calibration tails have samples (a 1,000-map
+# holdout left 20-40 maps in the 75%+ buckets). Chosen 2026-09-24.
+_MAP_MODEL_INITIAL_TRAIN = 0.4
+_MAP_MODEL_BLOCKS = 6
 
 
 def _lab_match_key(obj: Dict[str, Any]) -> str:
@@ -4033,15 +4034,17 @@ def _calibration_report(pairs: List[tuple[float, float]]) -> Dict[str, Any]:
 
 
 def _evaluate_map_model_set(
-    models: Dict[str, Dict[str, Any]],
-    test_samples: List[Dict[str, Any]],
+    blocks: List[tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], List[Dict[str, Any]]]],
     *,
     include_rows: bool = False,
-    score_models: Dict[str, Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
-    """Evaluate win probabilities from `models`; scorelines come from
-    `score_models` (the round-share fit) when provided, else from `models`."""
+    """Score every block's samples with that block's models (win probability
+    from the map-result fit, scorelines from the round-share fit) and pool the
+    results. blocks = [(models, score_models, samples)] oldest first; the
+    rows table shows the newest 200 maps."""
     eval_rows = []
+    test_samples = [sample for _m, _s, samples in blocks for sample in samples]
+    models = blocks[-1][0] if blocks else {"__global__": {}}
     abs_score_error = 0.0
     abs_round_share_error = 0.0
     winner_correct = 0
@@ -4050,61 +4053,64 @@ def _evaluate_map_model_set(
     series_pairs: List[tuple[float, float]] = []
     by_map: Dict[str, Dict[str, Any]] = {}
     series_groups: Dict[str, Dict[str, Any]] = {}
-    for sample in test_samples:
-        map_name = str(sample["map"])
-        model = models.get(map_name) or models["__global__"]
-        values = _round_share_feature_values(sample)
-        p_map = _model_map_win_probability(model, values)
-        score_set = score_models or models
-        score_model = score_set.get(map_name) or score_set["__global__"]
-        p_round = _predict_from_round_share_features(score_model, values)
-        pred_s1, pred_s2 = _approx_scoreline_from_round_probability(p_round)
-        actual_s1 = int(sample["score1"])
-        actual_s2 = int(sample["score2"])
-        actual_outcome = int(sample.get("outcome") or (1 if actual_s1 > actual_s2 else -1 if actual_s1 < actual_s2 else 0))
-        pred_outcome = 1 if p_map >= 0.5 else -1
-        actual_map_target = 1.0 if actual_outcome > 0 else 0.0 if actual_outcome < 0 else 0.5
-        score_error = abs(pred_s1 - actual_s1) + abs(pred_s2 - actual_s2)
-        round_share_error = abs(p_round - float(sample["round_share"]))
-        abs_score_error += score_error
-        abs_round_share_error += round_share_error
-        winner_correct += 1 if pred_outcome == actual_outcome else 0
-        brier_sum += (p_map - actual_map_target) ** 2
-        map_pairs.append((float(p_map), float(actual_map_target)))
-        series_url = str(sample.get("match_url") or "")
-        if series_url:
-            group = series_groups.setdefault(
-                series_url,
-                {"probs": [], "series_score1": sample.get("series_score1"), "series_score2": sample.get("series_score2")},
-            )
-            group["probs"].append(p_map)
-        bucket = by_map.setdefault(
-            map_name,
-            {"map": map_name, "n": 0, "score_error": 0.0, "winner_correct": 0},
-        )
-        bucket["n"] += 1
-        bucket["score_error"] += score_error
-        bucket["winner_correct"] += 1 if pred_outcome == actual_outcome else 0
-        if include_rows and len(eval_rows) < 200:
-            eval_rows.append(
-                {
-                    "match_date": sample.get("match_date"),
-                    "match_url": sample.get("match_url"),
-                    "team1": sample.get("team1"),
-                    "team2": sample.get("team2"),
-                    "map": map_name,
-                    "actual_score": f"{actual_s1}-{actual_s2}",
-                    "predicted_score": f"{pred_s1}-{pred_s2}",
-                    "predicted_winner": sample.get("team1") if pred_outcome > 0 else sample.get("team2"),
-                    "actual_winner": sample.get("team1") if actual_outcome > 0 else sample.get("team2") if actual_outcome < 0 else None,
-                    "team1_round_win_probability": p_round,
-                    "team1_map_win_probability": p_map,
-                    "feature_breakdown": _round_share_feature_breakdown(model, sample),
-                    "score_distribution": _scoreline_distribution_from_round_probability(p_round),
-                    "score_error": score_error,
-                    "model_scope": model.get("scope"),
-                }
-            )
+    newest = blocks[-1][2][-200:][::-1] if blocks else []
+    newest_ids = {id(sample) for sample in newest}
+    for block_models, score_models, samples in blocks:
+      for sample in samples:
+          map_name = str(sample["map"])
+          model = block_models.get(map_name) or block_models["__global__"]
+          values = _round_share_feature_values(sample)
+          p_map = _model_map_win_probability(model, values)
+          score_set = score_models or block_models
+          score_model = score_set.get(map_name) or score_set["__global__"]
+          p_round = _predict_from_round_share_features(score_model, values)
+          pred_s1, pred_s2 = _approx_scoreline_from_round_probability(p_round)
+          actual_s1 = int(sample["score1"])
+          actual_s2 = int(sample["score2"])
+          actual_outcome = int(sample.get("outcome") or (1 if actual_s1 > actual_s2 else -1 if actual_s1 < actual_s2 else 0))
+          pred_outcome = 1 if p_map >= 0.5 else -1
+          actual_map_target = 1.0 if actual_outcome > 0 else 0.0 if actual_outcome < 0 else 0.5
+          score_error = abs(pred_s1 - actual_s1) + abs(pred_s2 - actual_s2)
+          round_share_error = abs(p_round - float(sample["round_share"]))
+          abs_score_error += score_error
+          abs_round_share_error += round_share_error
+          winner_correct += 1 if pred_outcome == actual_outcome else 0
+          brier_sum += (p_map - actual_map_target) ** 2
+          map_pairs.append((float(p_map), float(actual_map_target)))
+          series_url = str(sample.get("match_url") or "")
+          if series_url:
+              group = series_groups.setdefault(
+                  series_url,
+                  {"probs": [], "series_score1": sample.get("series_score1"), "series_score2": sample.get("series_score2")},
+              )
+              group["probs"].append(p_map)
+          bucket = by_map.setdefault(
+              map_name,
+              {"map": map_name, "n": 0, "score_error": 0.0, "winner_correct": 0},
+          )
+          bucket["n"] += 1
+          bucket["score_error"] += score_error
+          bucket["winner_correct"] += 1 if pred_outcome == actual_outcome else 0
+          if include_rows and id(sample) in newest_ids:
+              eval_rows.append(
+                  {
+                      "match_date": sample.get("match_date"),
+                      "match_url": sample.get("match_url"),
+                      "team1": sample.get("team1"),
+                      "team2": sample.get("team2"),
+                      "map": map_name,
+                      "actual_score": f"{actual_s1}-{actual_s2}",
+                      "predicted_score": f"{pred_s1}-{pred_s2}",
+                      "predicted_winner": sample.get("team1") if pred_outcome > 0 else sample.get("team2"),
+                      "actual_winner": sample.get("team1") if actual_outcome > 0 else sample.get("team2") if actual_outcome < 0 else None,
+                      "team1_round_win_probability": p_round,
+                      "team1_map_win_probability": p_map,
+                      "feature_breakdown": _round_share_feature_breakdown(model, sample),
+                      "score_distribution": _scoreline_distribution_from_round_probability(p_round),
+                      "score_error": score_error,
+                      "model_scope": model.get("scope"),
+                  }
+              )
 
     # Series-level (BO1/BO3/BO5) evaluation: maps of the same match are grouped;
     # the average predicted map-win probability feeds a best-of-N formula, with
@@ -4144,6 +4150,7 @@ def _evaluate_map_model_set(
             }
         )
     map_metrics.sort(key=lambda r: r["n"], reverse=True)
+    eval_rows.sort(key=lambda r: str(r.get("match_date") or ""), reverse=True)
     return {
         "metrics": {
             "n_maps": len(test_samples),
@@ -4266,12 +4273,10 @@ def ensure_map_model_evaluation() -> Dict[str, Any]:
 
 
 def _run_map_model_lab():
-    """One chronological split, fixed by usable maps: walking from the newest
-    match backwards, the test slice is the smallest set of whole matches that
-    holds at least _MAP_MODEL_TEST_MAPS usable maps, and the training slice
-    is every match before it. Whole matches, so series-level metrics see
-    complete series. (A random split lets the fit learn a period from its
-    own neighbours and reports a few points too high.)"""
+    """Walk-forward evaluation over the usable maps in date order (see
+    _MAP_MODEL_INITIAL_TRAIN): each block is scored by a model fitted only on
+    the maps before it, so every scored map is out of sample and the fit
+    never sees its own period."""
     db_matches = int(count_hltv_results())
     all_rows = list_hltv_results(limit=db_matches, offset=0) if db_matches > 0 else []
     historical_map_stats_by_window, historical_cache_summary = _build_historical_team_map_stats_by_window(
@@ -4292,74 +4297,48 @@ def _run_map_model_lab():
         require_veto=True,
         prematch_ratings_by_match=prematch_ratings_by_match,
     )
-    kept_per_match: Dict[str, int] = {}
-    for sample in all_kept:
-        key = _lab_match_key(sample)
-        kept_per_match[key] = kept_per_match.get(key, 0) + 1
-    # Newest first: whole matches until the holdout holds enough usable maps.
-    n_test_rows = 0
-    test_kept = 0
-    for row in all_rows:
-        if test_kept >= int(_MAP_MODEL_TEST_MAPS):
-            break
-        n_test_rows += 1
-        test_kept += kept_per_match.get(_lab_match_key(row), 0)
-    test_rows = all_rows[:n_test_rows]
-    train_rows = all_rows[n_test_rows:]
-    test_keys = {_lab_match_key(r) for r in test_rows}
-    test_candidate_samples = [s for s in all_candidates if _lab_match_key(s) in test_keys]
-    train_candidate_samples = [s for s in all_candidates if _lab_match_key(s) not in test_keys]
-    test_samples = [s for s in all_kept if _lab_match_key(s) in test_keys]
-    train_samples = [s for s in all_kept if _lab_match_key(s) not in test_keys]
-    test_offset = 0
-    test_limit = len(test_rows)
-    train_offset = len(test_rows)
-    train_limit = len(train_rows)
-    # Win probabilities come from models trained directly on the map result;
-    # the round-share models are kept for scoreline prediction only.
-    models = _fit_map_model_set(train_samples, target="map_win")
-    score_models = _fit_map_model_set(train_samples)
-    if not test_samples:
+    # Oldest first (rows come newest first; maps of a match keep their order).
+    position = {_lab_match_key(r): i for i, r in enumerate(all_rows)}
+    all_kept.sort(key=lambda sample: -position.get(_lab_match_key(sample), 0))
+    n = len(all_kept)
+    start = int(n * _MAP_MODEL_INITIAL_TRAIN)
+    size = (n - start) // max(1, _MAP_MODEL_BLOCKS)
+    if n < 200 or size < 20:
         raise HTTPException(
             status_code=400,
-            detail="No evaluation maps have historical six-month map stats for both teams. Fetch missing historical map stats, or fix team identity mappings.",
+            detail="Not enough usable maps to evaluate. Fetch missing historical map stats and vetoes first.",
         )
-
-    evaluation = _evaluate_map_model_set(
-        models,
-        test_samples,
-        include_rows=True,
-        score_models=score_models,
-    )
+    blocks = []
+    for b in range(_MAP_MODEL_BLOCKS):
+        lo = start + b * size
+        hi = n if b == _MAP_MODEL_BLOCKS - 1 else lo + size
+        train = all_kept[:lo]
+        # Win probabilities come from models trained directly on the map result;
+        # the round-share models are kept for scoreline prediction only.
+        blocks.append((_fit_map_model_set(train, target="map_win"), _fit_map_model_set(train), all_kept[lo:hi]))
+    evaluation = _evaluate_map_model_set(blocks, include_rows=True)
+    scored = all_kept[start:]
+    last_models = blocks[-1][0]
     return {
         "status": "ok",
         "db_matches": db_matches,
         "split": {
-            "mode": "ordered",
-            "test_maps_target": int(_MAP_MODEL_TEST_MAPS),
-            "test_maps": len(test_samples),
-            "test_matches": len(test_rows),
-            "train_matches": len(train_rows),
+            "mode": "walk_forward",
+            "initial_train_share": _MAP_MODEL_INITIAL_TRAIN,
+            "blocks": _MAP_MODEL_BLOCKS,
+            "usable_maps": n,
+            "test_maps": len(scored),
+            "test_matches": len({_lab_match_key(sample) for sample in scored}),
+            "train_matches": len({_lab_match_key(sample) for sample in all_kept[:start]}),
         },
         "map_pool": MAP_POOL,
-        "train": {
-            "limit": train_limit,
-            "offset": train_offset,
-            "matches_loaded": len(train_rows),
-            "map_samples": len(train_samples),
-        },
-        "test": {
-            "limit": test_limit,
-            "offset": test_offset,
-            "matches_loaded": len(test_rows),
-            "map_samples": len(test_samples),
-        },
-        "formula": models["__global__"],
-        "rank_effect_curve": _build_rank_effect_curve(models["__global__"], train_samples),
+        "train": {"matches_loaded": len({_lab_match_key(sample) for sample in all_kept[:start]}), "map_samples": start},
+        "test": {"matches_loaded": len({_lab_match_key(sample) for sample in scored}), "map_samples": len(scored)},
+        "formula": last_models["__global__"],
+        "rank_effect_curve": _build_rank_effect_curve(last_models["__global__"], all_kept[: start + (_MAP_MODEL_BLOCKS - 1) * size]),
         "metrics": evaluation["metrics"],
         "input_summary": {
-            "train": _map_model_input_summary(train_samples, candidates=train_candidate_samples),
-            "test": _map_model_input_summary(test_samples, candidates=test_candidate_samples),
+            "pool": _map_model_input_summary(all_kept, candidates=all_candidates),
             "map_feature_shape": "directional_deltas",
             "historical_map_stats": historical_cache_summary,
         },
