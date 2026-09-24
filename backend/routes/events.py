@@ -3550,103 +3550,6 @@ def _build_rank_effect_curve(model: Dict[str, Any], samples: List[Dict[str, Any]
     }
 
 
-def _iter_series_contexts(
-    rows: List[Dict[str, Any]],
-    historical_map_stats_by_window: Dict[tuple[str, str, str], Dict[str, Dict[str, float]]] | None = None,
-    prematch_ratings_by_match: Dict[str, Dict[str, Any]] | None = None,
-) -> Dict[str, Dict[str, Any]]:
-    """Per-match pre-match feature bundles covering the WHOLE map pool.
-
-    Unlike map samples (played maps only), these let the evaluator predict a
-    win probability for every candidate map and simulate the veto.
-    """
-    contexts: Dict[str, Dict[str, Any]] = {}
-    for r in rows:
-        url = str(r.get("match_url") or "").strip()
-        t1 = str(r.get("team1") or "").strip()
-        t2 = str(r.get("team2") or "").strip()
-        h1 = _to_float_or_none(r.get("hltv_rank_1"))
-        h2 = _to_float_or_none(r.get("hltv_rank_2"))
-        v1 = _to_float_or_none(r.get("vrs_rank_1"))
-        v2 = _to_float_or_none(r.get("vrs_rank_2"))
-        if not url or not t1 or not t2 or h1 is None or h2 is None:
-            continue
-        if v1 is None or v2 is None:
-            v1, v2 = h1, h2
-        k1 = _norm_team_name(t1)
-        k2 = _norm_team_name(t2)
-        window = _historical_map_stats_window(r.get("match_date")) if historical_map_stats_by_window is not None else None
-        if window:
-            start_date, end_date = window
-            team1_stats = (historical_map_stats_by_window or {}).get((k1, start_date, end_date))
-            team2_stats = (historical_map_stats_by_window or {}).get((k2, start_date, end_date))
-        else:
-            team1_stats = None
-            team2_stats = None
-        ratings_entry = (prematch_ratings_by_match or {}).get(url)
-        shared = {
-            "hltv_gap": float(h2 - h1),
-            "hltv_gap_level": float((h2 - h1) * ((h1 + h2) / 2.0)),
-            "vrs_gap": float(v2 - v1),
-            "vrs_gap_level": float((v2 - v1) * ((v1 + v2) / 2.0)),
-            **_log_rank_features(h1, h2),
-            "player_rating_gap": _player_rating_gap(ratings_entry),
-        }
-        per_map: Dict[str, Dict[str, float]] = {}
-        for map_name in MAP_POOL:
-            features = _map_stat_features(team1_stats, team2_stats, map_name)
-            per_map[map_name] = {
-                "map_win_gap": float(features.get("map_win_gap") or 0.0),
-                "pick_gap": float(features.get("pick_gap") or 0.0),
-                "ban_gap": float(features.get("ban_gap") or 0.0),
-                "played_pct_gap": float(features.get("played_pct_gap") or 0.0),
-            }
-        series_score1 = _to_float_or_none(r.get("score1"))
-        series_score2 = _to_float_or_none(r.get("score2"))
-        played_maps = []
-        for m in _parse_stored_maps(r.get("maps_json")):
-            map_name = _canonical_map_name(m.get("map"))
-            if map_name in MAP_POOL:
-                played_maps.append(map_name)
-        contexts[url] = {
-            "match_url": url,
-            "match_date": r.get("match_date"),
-            "team_keys": (k1, k2),
-            "team_stats": (team1_stats, team2_stats),
-            "shared": shared,
-            "per_map": per_map,
-            "series_score1": int(series_score1) if series_score1 is not None else None,
-            "series_score2": int(series_score2) if series_score2 is not None else None,
-            "played_maps": played_maps,
-        }
-    return contexts
-
-
-# ---- the veto model -------------------------------------------------------------
-# At every veto step the acting team chooses one map from what is left. A
-# conditional-logit scorer per action (ban, pick) ranks the alternatives from
-# point-in-time inputs: both teams' six-month pick/ban/win/played share on the
-# map, what each team played recently, each team's ban and pick habits over its
-# last vetoes (its first ban above all), and the map model's win probability.
-# Measured 2026-09-24 on a chronological split against the previous rule (ban
-# the opponent's strongest map by win probability, pick your own): bans right
-# 71% vs 43%, picks 57% vs 48%, maps actually played predicted 57% vs 38%.
-VETO_FEATURES: Tuple[str, ...] = (
-    "own_pick", "own_ban", "own_win", "own_share", "opp_pick", "opp_ban", "opp_win", "opp_share",
-    "own_recent", "own_days", "own_ban5", "own_pick5", "opp_recent", "opp_days", "opp_ban5", "opp_pick5", "p_win",
-    "own_ban3", "own_ban10", "own_pick3", "own_pick10", "own_first_ban", "own_first_pick", "opp_ban3", "opp_pick3", "opp_first_ban",
-    "step_no", "n_remaining", "is_bo1",
-)
-# Standard HLTV orders, side 0 acting first: bans until one map is left (Bo1),
-# ban ban pick pick ban ban + decider (Bo3), ban ban pick pick pick pick + decider (Bo5).
-_VETO_ORDER: Dict[int, List[tuple[str, int]]] = {
-    1: [("ban", 0), ("ban", 1)] * 3,
-    2: [("ban", 0), ("ban", 1), ("pick", 0), ("pick", 1), ("ban", 0), ("ban", 1)],
-    3: [("ban", 0), ("ban", 1), ("pick", 0), ("pick", 1), ("pick", 0), ("pick", 1)],
-}
-_VETO_MIN_CHOICES = 500
-
-
 def _veto_empty_context() -> Dict[str, Any]:
     return {"maps": [], "vetoes": []}
 
@@ -3885,16 +3788,15 @@ def _veto_bundles(
     return bundles
 
 
-def _fit_veto_model(instances: List[Dict[str, Any]], before_date: str | None = None) -> Dict[str, Any] | None:
+def _fit_veto_model(instances: List[Dict[str, Any]]) -> Dict[str, Any] | None:
     """Conditional logit per action: softmax over the remaining maps, features
-    standardised, small ridge. before_date limits training to earlier
-    vetoes (the lab's holdout discipline). None when there is too little."""
+    standardised, small ridge. None when there is too little."""
     import numpy as np
     from scipy.optimize import minimize
 
     model: Dict[str, Any] = {"features": list(VETO_FEATURES), "choices": {}}
     for action in ("ban", "pick"):
-        subset = [i for i in instances if i["action"] == action and (before_date is None or i["date"] < before_date)]
+        subset = [i for i in instances if i["action"] == action]
         if len(subset) < _VETO_MIN_CHOICES:
             return None
         xs = [np.array(i["X"], dtype=float) for i in subset]
@@ -4007,15 +3909,15 @@ def _veto_play_probabilities(veto_model: Dict[str, Any], distribution: List[tupl
     return out
 
 
-def _fit_veto_calibration(veto_model: Dict[str, Any], bundles: List[Dict[str, Any]], before_date: str | None = None, last: int = 1500) -> None:
+def _fit_veto_calibration(veto_model: Dict[str, Any], bundles: List[Dict[str, Any]], last: int = 1500) -> None:
     """Platt map on the tree's P(map played): the step probabilities are
     calibrated one at a time but multiply into overconfident map-level
     probabilities (steps are not independent). Fitted on the last `last`
-    vetoes before `before_date`, replayed in their actual order."""
+    vetoes, replayed in their actual order."""
     import numpy as np
     from scipy.optimize import minimize
 
-    usable = [b for b in bundles if before_date is None or b["date"] < before_date][-last:]
+    usable = bundles[-last:]
     xs: List[float] = []
     ys: List[float] = []
     veto_model.pop("calibration", None)
@@ -4072,87 +3974,6 @@ def _best_of_series_win_probability(p_map: float, wins_needed: int) -> float:
     return float(
         sum(math.comb(total_maps, k) * p**k * (1.0 - p) ** (total_maps - k) for k in range(wins_needed, total_maps + 1))
     )
-
-
-def _veto_sim_series_metrics(
-    models: Dict[str, Dict[str, Any]],
-    series_contexts: Dict[str, Dict[str, Any]],
-    veto: Dict[str, Any] | None,
-) -> Dict[str, Any] | None:
-    """True pre-match series prediction. The veto model gives every draft a
-    probability (team A acting first); the series probability is the
-    expectation over those drafts. Also scores P(map played) against the
-    maps that were played (Brier, against the uniform guess) and the most
-    likely draft's hit rate."""
-    if not veto or not veto.get("model"):
-        return None
-    veto_model = veto["model"]
-    contexts_by_url = veto.get("contexts") or {}
-    n = 0
-    correct = 0
-    brier_sum = 0.0
-    map_match_sum = 0.0
-    map_match_n = 0
-    play_pairs: List[tuple[float, float]] = []
-    uniform_pairs: List[tuple[float, float]] = []
-    for url, ctx in series_contexts.items():
-        s1 = ctx.get("series_score1")
-        s2 = ctx.get("series_score2")
-        if s1 is None or s2 is None or int(s1) == int(s2):
-            continue
-        wins_needed = _series_wins_needed(s1, s2)
-        shared = ctx.get("shared") or {}
-        per_map = ctx.get("per_map") or {}
-        k1, k2 = ctx.get("team_keys") or ("", "")
-        t1_stats, t2_stats = ctx.get("team_stats") or (None, None)
-        neutral_p = {m: _model_map_win_probability(models.get(m) or models["__global__"], {**shared, **f, "picked_by_a": 0.0}) for m, f in per_map.items()}
-        if not neutral_p:
-            continue
-        veto_ctx = contexts_by_url.get(url) or {}
-        sides = [
-            {"stats": t1_stats, "ctx": veto_ctx.get(k1) or _veto_empty_context(), "p_win": lambda m: neutral_p.get(m, 0.5) - 0.5},
-            {"stats": t2_stats, "ctx": veto_ctx.get(k2) or _veto_empty_context(), "p_win": lambda m: 0.5 - neutral_p.get(m, 0.5)},
-        ]
-        pool = sorted(per_map)
-        distribution = _veto_distribution(veto_model, pool, _VETO_ORDER.get(max(1, min(3, wins_needed)), _VETO_ORDER[2]), str(ctx.get("match_date") or "")[:10], sides, wins_needed)
-        if not distribution:
-            continue
-
-        def series_p(played: List[tuple[str, float]]) -> float:
-            probs = [_model_map_win_probability(models.get(m) or models["__global__"], {**shared, **(per_map.get(m) or {}), "picked_by_a": float(flag)}) for m, flag in played]
-            need = 2 * wins_needed - 1
-            if len(probs) < need:
-                probs = probs + [sum(probs) / len(probs)] * (need - len(probs))
-            return _series_win_probability(probs[:need], wins_needed)
-
-        p_series = sum(prob * series_p(played) for prob, played in distribution)
-        actual = 1.0 if int(s1) > int(s2) else 0.0
-        n += 1
-        correct += 1 if (1.0 if p_series >= 0.5 else 0.0) == actual else 0
-        brier_sum += (p_series - actual) ** 2
-        played = [m for m in (ctx.get("played_maps") or []) if m in per_map]
-        if played:
-            likely = max(distribution, key=lambda x: x[0])[1]
-            predicted_names = {m for m, _flag in likely}
-            map_match_sum += len(predicted_names.intersection(played)) / float(len(set(played)))
-            map_match_n += 1
-            probs = _veto_play_probabilities(veto_model, distribution)
-            for m in pool:
-                y = 1.0 if m in played else 0.0
-                play_pairs.append(((probs.get(m) or {}).get("play", 0.0), y))
-                uniform_pairs.append((len(set(played)) / float(len(pool)), y))
-    play_report = _calibration_report(play_pairs) if play_pairs else None
-    return {
-        "n": n,
-        "winner_accuracy": (correct / n) if n else None,
-        "brier": (brier_sum / n) if n else None,
-        "map_match_rate": (map_match_sum / map_match_n) if map_match_n else None,
-        "map_play_brier": (sum((p - y) ** 2 for p, y in play_pairs) / len(play_pairs)) if play_pairs else None,
-        "map_play_uniform_brier": (sum((p - y) ** 2 for p, y in uniform_pairs) / len(uniform_pairs)) if uniform_pairs else None,
-        "map_play_ece": (play_report or {}).get("ece"),
-        "choices_trained": dict(veto_model.get("choices") or {}),
-        "calibration": veto_model.get("calibration"),
-    }
 
 
 def _calibration_report(pairs: List[tuple[float, float]]) -> Dict[str, Any]:
@@ -4216,13 +4037,10 @@ def _evaluate_map_model_set(
     test_samples: List[Dict[str, Any]],
     *,
     include_rows: bool = False,
-    series_contexts: Dict[str, Dict[str, Any]] | None = None,
     score_models: Dict[str, Dict[str, Any]] | None = None,
-    veto: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Evaluate win probabilities from `models`; scorelines come from
-    `score_models` (the round-share fit) when provided, else from `models`;
-    `veto` = {"model", "contexts"} drives the simulated-veto series metric."""
+    `score_models` (the round-share fit) when provided, else from `models`."""
     eval_rows = []
     abs_score_error = 0.0
     abs_round_share_error = 0.0
@@ -4338,7 +4156,6 @@ def _evaluate_map_model_set(
             "series_brier": (series_brier_sum / series_n) if series_n else None,
             "calibration": _calibration_report(map_pairs),
             "series_calibration": _calibration_report(series_pairs),
-            "veto_sim": _veto_sim_series_metrics(models, series_contexts, veto) if series_contexts else None,
         },
         "maps": map_metrics,
         "rows": eval_rows,
@@ -4508,25 +4325,11 @@ def _run_map_model_lab():
             detail="No evaluation maps have historical six-month map stats for both teams. Fetch missing historical map stats, or fix team identity mappings.",
         )
 
-    test_series_contexts = _iter_series_contexts(
-        test_rows,
-        historical_map_stats_by_window=historical_map_stats_by_window,
-        prematch_ratings_by_match=prematch_ratings_by_match,
-    )
-    # The veto model, fitted on vetoes before the holdout like everything else.
-    veto_instances, veto_contexts, _final = _replay_vetoes(all_rows, historical_map_stats_by_window, prematch_ratings_by_match, models["__global__"])
-    holdout_start = min((d for d in (str(r.get("match_date") or "")[:10] for r in test_rows) if d), default=None)
-    veto_model = _fit_veto_model(veto_instances, before_date=holdout_start)
-    if veto_model:
-        bundles = _veto_bundles(all_rows, historical_map_stats_by_window, prematch_ratings_by_match, veto_contexts, models["__global__"])
-        _fit_veto_calibration(veto_model, bundles, before_date=holdout_start)
     evaluation = _evaluate_map_model_set(
         models,
         test_samples,
         include_rows=True,
-        series_contexts=test_series_contexts,
         score_models=score_models,
-        veto={"model": veto_model, "contexts": veto_contexts},
     )
     return {
         "status": "ok",

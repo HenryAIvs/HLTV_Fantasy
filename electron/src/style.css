@@ -4163,7 +4163,7 @@ button:disabled {
 .mm-job-current { color: #8fa3bf; }
 .mm-job-error { color: #fca5a5; }
 .mm-job-actions { display: flex; gap: 8px; justify-self: end; }
-.mm-metric-groups { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
+.mm-metric-groups { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
 .mm-metric-group { background: #171c24; border: 1px solid #2c3441; border-left: 3px solid #ff6b1a; padding: 12px 14px; }
 .mm-metric-group .topx-tile-value { font-variant-numeric: tabular-nums; }
 .mm-metric-rows { margin-top: 10px; border-top: 1px solid #242b35; }

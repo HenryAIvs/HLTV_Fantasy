@@ -12667,18 +12667,6 @@ function ModelLabTab() {
                       ["Winner picked", pct(wm.series_winner_accuracy, 1)],
                     ],
                   },
-                  {
-                    key: "prematch",
-                    title: "Pre-match, veto simulated",
-                    n: `${fmtInt(wm.veto_sim?.n)} series`,
-                    brier: wm.veto_sim?.brier,
-                    rows: [
-                      ["Winner picked", pct(wm.veto_sim?.winner_accuracy, 1)],
-                      ["Maps played, Brier", wm.veto_sim?.map_play_brier != null ? num(wm.veto_sim.map_play_brier, 3) : "-"],
-                      ["Maps played, calibration error", wm.veto_sim?.map_play_ece != null ? pct(wm.veto_sim.map_play_ece, 1) : "-"],
-                      ["Likeliest draft matched", pct(wm.veto_sim?.map_match_rate, 1)],
-                    ],
-                  },
                 ]
                   .filter((g) => g.brier != null)
                   .map((g) => (
