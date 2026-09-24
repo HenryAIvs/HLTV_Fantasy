@@ -12617,12 +12617,6 @@ function ModelLabTab() {
         <div className="card sub">
           <div className="mm-app-head">
             <h3>App model</h3>
-            <span className={`mm-run-note${appModel?.stale ? " stale" : ""}`}>
-              {appModel?.exists
-                ? `Trained ${new Date(appModel.trained_at * 1000).toLocaleString()} on ${fmtInt(appModel.maps)} maps from ${fmtInt(appModel.matches)} matches · ${fmtInt(appModel.teams_rated)} teams rated` +
-                  (appModel.stale ? " · data changed since; refreshes after tonight's fetch." : ".")
-                : "No app model trained yet; it is built after the first results import."}
-            </span>
           </div>
           {(appModel?.weights?.features || []).length > 0 && (
             <table className="mm-table mm-weights">
