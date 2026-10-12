@@ -1,7 +1,7 @@
 {
   "name": "cs-fantasy",
   "productName": "CS Fantasy Toolkit",
-  "version": "0.1.51",
+  "version": "0.1.52",
   "description": "Counter-Strike fantasy valuations, brackets and roster optimisation.",
   "homepage": "https://csfantasy.co.uk/",
   "author": "HenryAIvs",
@@ -18,7 +18,8 @@
     "app": "npm run renderer:build && electron .",
     "dist": "npm run renderer:build && electron-builder --win --publish never",
     "dist:dir": "npm run renderer:build && electron-builder --win --dir",
-    "release": "npm run renderer:build && electron-builder --win --publish always"
+    "release": "npm run renderer:build && electron-builder --win --publish always",
+    "postinstall": "node scripts/prune-lockfiles.cjs"
   },
   "build": {
     "appId": "uk.aivs.csfantasy",
@@ -71,15 +72,14 @@
     ]
   },
   "devDependencies": {
-    "@vitejs/plugin-react": "^4.2.0",
+    "@vitejs/plugin-react": "^5.2.0",
     "cross-env": "^7.0.3",
     "electron": "^30.0.0",
     "electron-builder": "^26.0.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "recharts": "^3.7.0",
-    "regression": "^2.0.1",
-    "vite": "^5.0.0"
+    "vite": "^8.3.4"
   },
   "dependencies": {
     "electron-updater": "^6.3.0"
