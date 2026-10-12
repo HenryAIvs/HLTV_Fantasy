@@ -4822,7 +4822,7 @@ def get_event_kind(event_id: int):
         "playoff_size": detected["playoff_size"],
         "playoff_byes": detected.get("playoff_byes", 0),
         "bracket_kind": detected.get("bracket_kind") or "single",
-        "grand_final_bo": detected.get("grand_final_bo"),
+        "grand_final_bo": detected.get("grand_final_bo") or (detected.get("playoff_bo_rules") or {}).get("grandFinal"),
         "routing_error": detected.get("routing_error"),
         "combined_playoffs": detected.get("combined_playoffs", False),
         "combined_supported": detected.get("combined_supported", False),

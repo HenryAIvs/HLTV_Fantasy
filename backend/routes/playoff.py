@@ -268,7 +268,11 @@ def bake_event_playoff(
         return {"status": "skipped", "event_id": event_id, "reason": "bracket not published yet (TBD slots)"}
     try:
         payload = _normalize_playoff_payload(
-            {"team_slots": ids, "bracket_kind": auto.get("bracket_kind") or "single", "has_third_place_decider": False}
+            {
+                "team_slots": ids, "bracket_kind": auto.get("bracket_kind") or "single",
+                "has_third_place_decider": bool(detected.get("playoff_third_place")),
+                "final_bo": _detected_final_bo(event_id), "event_id": event_id,
+            }
         )
     except HTTPException as exc:
         return {"status": "skipped", "event_id": event_id, "reason": f"invalid bracket: {exc.detail}"}
@@ -646,6 +650,7 @@ def _exact_weighted_player_totals(
     progress_callback=None,
     quarters_override: List[tuple] | None = None,
     sf_pairs_resolver=None,
+    final_bo: int = 3,
 ) -> tuple[Dict[int, Dict], Dict, int, List[Dict]]:
     base_states = initialize_teams(team_slots, vrs_ranks)
     player_rows_by_id, team_rank_by_id = _build_playoff_lookup_context(team_slots)
@@ -735,7 +740,7 @@ def _exact_weighted_player_totals(
                         f_states = _clone_team_states(s2_states)
                         f_winner, f_loser, f_p_win_a, f_branch_p = _play_match_deterministic(
                             f_states, s1_winner, s2_winner, final_winner, remaining_rounds_after=0, prob_cache=prob_cache,
-                            player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id
+                            player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id, match_type=_bo_type(final_bo),
                         )
 
                         if has_third_place_decider:
@@ -905,6 +910,7 @@ def _exact_bracket6_player_totals(
     team_slots: List[int],
     vrs_ranks: Dict[int, int],
     progress_callback=None,
+    final_bo: int = 3,
 ) -> tuple[Dict[int, Dict], Dict, int, List[Dict]]:
     """Exact enumeration of the 6-team byes bracket (Porto/Cologne playoffs).
 
@@ -927,6 +933,7 @@ def _exact_bracket6_player_totals(
         return _play_match_deterministic(
             states, a, b, winner, remaining_rounds_after=remaining_after, prob_cache=prob_cache,
             player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id,
+            match_type=_bo_type(final_bo) if remaining_after == 0 else "bo3",
         )
 
     def mk(w, l, p, teams):
@@ -1084,6 +1091,7 @@ def _simulate_bracket_n(
     team_rank_by_id: Dict[int, int],
     has_third_place_decider: bool,
     rng,
+    final_bo: int = 3,
 ) -> tuple[Dict[int, TeamState], Dict[str, List[dict]]]:
     """One random single-elim bracket for any power-of-two field. Round names
     generalise by size (round_of_16 → quarters → semis → final). The two
@@ -1095,18 +1103,18 @@ def _simulate_bracket_n(
     match_results: Dict[str, List[dict]] = {}
     rand_fn = (rng or random).random
 
-    def play(a_id: int, b_id: int, remaining_after: int):
+    def play(a_id: int, b_id: int, remaining_after: int, match_type: str = "bo3"):
         A, B = team_states[a_id], team_states[b_id]
         mna, mnb = A.matches_played + 1, B.matches_played + 1
-        result = simulate_match_outcome(A, B, "bo3", rng=rand_fn)
+        result = simulate_match_outcome(A, B, match_type, rng=rand_fn)
         if result.winner_id == A.team_id:
             winner, loser, dwa, dwb = A, B, True, False
         else:
             winner, loser, dwa, dwb = B, A, False, True
         winner.record_win(loser.team_id)
         loser.record_loss(winner.team_id)
-        apply_fantasy_points_for_team(A, B.team_id, result.win_probability, dwa, mna, "bo3", player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id)
-        apply_fantasy_points_for_team(B, A.team_id, 1.0 - result.win_probability, dwb, mnb, "bo3", player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id)
+        apply_fantasy_points_for_team(A, B.team_id, result.win_probability, dwa, mna, match_type, player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id)
+        apply_fantasy_points_for_team(B, A.team_id, 1.0 - result.win_probability, dwb, mnb, match_type, player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id)
         _apply_elimination_penalty(loser, remaining_after)
         return winner.team_id, loser.team_id, result.win_probability
 
@@ -1120,7 +1128,7 @@ def _simulate_bracket_n(
         winners, matches = [], []
         for i in range(0, len(current), 2):
             a, b = current[i], current[i + 1]
-            w, l, p = play(a, b, remaining_after)
+            w, l, p = play(a, b, remaining_after, _bo_type(final_bo) if remaining_after == 0 else "bo3")
             winners.append(w)
             matches.append({"winner": w, "loser": l, "p_win_a": p, "teams": [a, b]})
             if teams_in_round == 4:
@@ -1147,6 +1155,7 @@ def _mc_chunk_worker(
     seed: int,
     store_outcomes: bool,
     total_sims: int,
+    final_bo: int = 3,
 ) -> tuple[Dict[int, Dict[int, Dict[str, float]]], List[Dict]]:
     """One Monte-Carlo chunk, run in a worker process: n_sims random brackets,
     returning the raw accumulator sums plus (optionally) the sampled outcomes.
@@ -1159,7 +1168,7 @@ def _mc_chunk_worker(
     for _ in range(n_sims):
         _reset_states_inplace(states)
         _, mr = _simulate_bracket_n(
-            team_slots, states, player_rows_by_id, team_rank_by_id, has_third_place_decider, rng=rng
+            team_slots, states, player_rows_by_id, team_rank_by_id, has_third_place_decider, rng=rng, final_bo=final_bo
         )
         player_points: Dict[str, float] = {}
         player_components: Dict[str, Dict[str, float]] = {}
@@ -1200,6 +1209,7 @@ def _monte_carlo_parallel(
     store_outcomes: bool,
     progress_callback,
     workers: int,
+    final_bo: int = 3,
 ) -> tuple[Dict[int, Dict], Dict, int, List[Dict]]:
     """Fan the Monte-Carlo sims out over a process pool (Python threads can't
     speed up this CPU-bound loop) and merge the chunk accumulators."""
@@ -1217,7 +1227,7 @@ def _monte_carlo_parallel(
             ex.submit(
                 _mc_chunk_worker,
                 team_slots, vrs_ranks, has_third_place_decider,
-                size, seed_root + i, store_outcomes, n_sims,
+                size, seed_root + i, store_outcomes, n_sims, final_bo,
             ): size
             for i, size in enumerate(sizes)
         }
@@ -1266,6 +1276,7 @@ def _monte_carlo_bracket_totals(
     n_sims: int = _BRACKET_MC_SIMS,
     store_outcomes: bool = True,
     progress_callback=None,
+    final_bo: int = 3,
 ) -> tuple[Dict[int, Dict], Dict, int, List[Dict]]:
     """Monte-Carlo player EVs for a large bracket, matching the exact function's
     return contract. Each sampled bracket is one 'outcome' with probability
@@ -1275,7 +1286,7 @@ def _monte_carlo_bracket_totals(
     workers = max(1, min(8, (os.cpu_count() or 2) - 1))
     if n_sims >= _MC_PARALLEL_MIN_SIMS and workers > 1:
         return _monte_carlo_parallel(
-            team_slots, vrs_ranks, has_third_place_decider, n_sims, store_outcomes, progress_callback, workers
+            team_slots, vrs_ranks, has_third_place_decider, n_sims, store_outcomes, progress_callback, workers, final_bo=final_bo
         )
     accum: Dict[int, Dict[int, Dict[str, float]]] = {tid: {} for tid in team_slots}
     outcomes: List[Dict] = []
@@ -1287,7 +1298,7 @@ def _monte_carlo_bracket_totals(
     for s in range(n_sims):
         _reset_states_inplace(states)
         _, mr = _simulate_bracket_n(
-            team_slots, states, player_rows_by_id, team_rank_by_id, has_third_place_decider, rng=random
+            team_slots, states, player_rows_by_id, team_rank_by_id, has_third_place_decider, rng=random, final_bo=final_bo
         )
         player_points: Dict[str, float] = {}
         player_components: Dict[str, Dict[str, float]] = {}
@@ -1362,6 +1373,7 @@ def _exact_bracket_n_player_totals(
     vrs_ranks: Dict[int, int],
     has_third_place_decider: bool = False,
     progress_callback=None,
+    final_bo: int = 3,
 ) -> tuple[Dict[int, Dict], Dict, int, List[Dict], Dict]:
     """Exact enumeration of a full power-of-two single-elimination bracket of
     any size (16 teams = 15 matches = 32,768 outcomes). A match's points depend
@@ -1405,8 +1417,8 @@ def _exact_bracket_n_player_totals(
     run_mp = [0] * n_players
     memo: Dict[tuple, tuple] = {}
 
-    def pairing(a: int, b: int, winner: int, num_a: int, num_b: int, rem: int) -> tuple:
-        key = (a, b, winner, num_a, num_b, rem)
+    def pairing(a: int, b: int, winner: int, num_a: int, num_b: int, rem: int, match_type: str = "bo3") -> tuple:
+        key = (a, b, winner, num_a, num_b, rem, match_type)
         hit = memo.get(key)
         if hit is not None:
             return hit
@@ -1416,7 +1428,7 @@ def _exact_bracket_n_player_totals(
         }
         _w, _l, p_a, _branch = _play_match_deterministic(
             states, a, b, winner, remaining_rounds_after=rem, prob_cache=prob_cache,
-            player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id,
+            player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id, match_type=match_type,
         )
         rows = []
         for ts in states.values():
@@ -1478,7 +1490,7 @@ def _exact_bracket_n_player_totals(
         rem = rounds_total - r - 1
         num = r + 1
         for bit, w in enumerate((a, b)):
-            rows, p_a = pairing(a, b, w, num, num, rem)
+            rows, p_a = pairing(a, b, w, num, num, rem, _bo_type(final_bo) if rem == 0 else "bo3")
             branch = p_a if w == a else 1.0 - p_a
             apply_rows(rows, 1.0)
             winners.append(w)
@@ -1694,6 +1706,7 @@ def _bracket_player_totals(
     quarters_override: List[tuple] | None = None,
     sf_pairs_resolver=None,
     mc_sims: int | None = None,
+    final_bo: int = 3,
 ) -> tuple[Dict[int, Dict], Dict, int, List[Dict], Dict | None]:
     """Route a bracket to the right engine. 6 teams: the byes enumerator.
     8 teams and the Bounty variant: the enumerator that keeps per-match
@@ -1704,7 +1717,7 @@ def _bracket_player_totals(
     n = len(team_slots)
     if n == 6:
         results, best, count, outcomes = _exact_bracket6_player_totals(
-            team_slots, vrs_ranks, progress_callback=progress_callback
+            team_slots, vrs_ranks, progress_callback=progress_callback, final_bo=final_bo
         )
         return results, best, count, outcomes, None
     if n == 8 and (quarters_override or sf_pairs_resolver or True):
@@ -1714,11 +1727,13 @@ def _bracket_player_totals(
             progress_callback=progress_callback,
             quarters_override=quarters_override,
             sf_pairs_resolver=sf_pairs_resolver,
+            final_bo=final_bo,
         )
         return results, best, count, outcomes, None
     if n <= _EXACT_N_MAX_TEAMS and n >= 2 and (n & (n - 1)) == 0:
         return _exact_bracket_n_player_totals(
-            team_slots, vrs_ranks, has_third_place_decider=has_third_place_decider, progress_callback=progress_callback
+            team_slots, vrs_ranks, has_third_place_decider=has_third_place_decider, progress_callback=progress_callback,
+            final_bo=final_bo,
         )
     results, best, count, outcomes = _monte_carlo_bracket_totals(
         team_slots, vrs_ranks,
@@ -1726,8 +1741,48 @@ def _bracket_player_totals(
         n_sims=int(mc_sims) if mc_sims else _BRACKET_MC_SIMS,
         store_outcomes=store_outcomes,
         progress_callback=progress_callback,
+        final_bo=final_bo,
     )
     return results, best, count, outcomes, None
+
+
+def _bo_type(final_bo) -> str:
+    """Series type for a best-of value (Bo3 unless the page says otherwise)."""
+    try:
+        v = int(final_bo or 3)
+    except Exception:  # noqa: BLE001
+        v = 3
+    return f"bo{v}" if v in (1, 3, 5) else "bo3"
+
+
+def _detected_final_bo(event_id) -> int:
+    """The grand final's best-of from the event page: the double-elimination
+    bracket's own value, else the formats table's "Grand final BoN" line, else
+    the playoff default (3)."""
+    try:
+        from backend.data.event_db import get_event_detail
+        from backend.routes import events as events_routes
+
+        event = get_event_detail(int(event_id))
+        detected = events_routes._detect_event_tournament_kind_cached(event) if event else {}
+        rules = detected.get("playoff_bo_rules") or {}
+        value = int(detected.get("grand_final_bo") or rules.get("grandFinal") or rules.get("default") or 3)
+    except Exception:  # noqa: BLE001
+        value = 3
+    return value if value in (1, 3, 5) else 3
+
+
+def _detected_third_place(event_id) -> bool:
+    """Whether the event page lists a third-place decider (formats table or an
+    auxiliary bracket)."""
+    try:
+        from backend.data.event_db import get_event_detail
+        from backend.routes import events as events_routes
+
+        event = get_event_detail(int(event_id))
+        return bool(event and events_routes._detect_event_tournament_kind_cached(event).get("playoff_third_place"))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _bracket_kind(value) -> str:
@@ -1742,13 +1797,22 @@ def _normalize_playoff_payload(payload: dict) -> dict:
     bracket_kind = _bracket_kind(payload.get("bracket_kind"))
     if bracket_kind == "double" and len(slots) != 8:
         raise HTTPException(status_code=400, detail="The double-elimination bracket needs exactly 8 teams")
-    has_third_place_decider = bool(payload.get("has_third_place_decider", False))
+    # The decider and the final's best-of come from the event page unless the
+    # caller pins them (the operator's checkbox does).
+    event_id = payload.get("event_id") or _event_key()
+    if "has_third_place_decider" in payload:
+        has_third_place_decider = bool(payload.get("has_third_place_decider"))
+    else:
+        has_third_place_decider = _detected_third_place(event_id)
     if len(slots) == 6 or bracket_kind == "double":
         has_third_place_decider = False  # the byes bracket and double elimination have no decider
+    raw_bo = payload.get("final_bo")
+    final_bo = int(raw_bo) if str(raw_bo) in ("1", "3", "5") else _detected_final_bo(event_id)
     normalized = {
         "team_slots": [int(x) for x in slots],
         "has_third_place_decider": has_third_place_decider,
         "bracket_kind": bracket_kind,
+        "final_bo": final_bo,
     }
     mc_sims = _clamp_mc_sims(payload.get("mc_sims"))
     if mc_sims:
@@ -1918,6 +1982,7 @@ def _exact_double8_player_totals(
     team_slots: List[int],
     vrs_ranks: Dict[int, int],
     progress_callback=None,
+    grand_final_bo: int = 3,
 ) -> tuple[Dict[int, Dict], Dict, int, List[Dict], Dict]:
     """Exact enumeration of the whole 8-team double-elimination bracket: 14
     matches, 16,384 outcomes. Every distinct pairing (teams, winner, each
@@ -1975,8 +2040,8 @@ def _exact_double8_player_totals(
     winners: Dict[str, int] = {}
     losers: Dict[str, int] = {}
 
-    def pairing(a: int, b: int, winner: int, num_a: int, num_b: int, rem: int) -> tuple:
-        key = (a, b, winner, num_a, num_b, rem)
+    def pairing(a: int, b: int, winner: int, num_a: int, num_b: int, rem: int, match_type: str = "bo3") -> tuple:
+        key = (a, b, winner, num_a, num_b, rem, match_type)
         hit = memo.get(key)
         if hit is not None:
             return hit
@@ -1986,7 +2051,7 @@ def _exact_double8_player_totals(
         }
         _w, _l, p_a, _branch = _play_match_deterministic(
             states, a, b, winner, remaining_rounds_after=rem, prob_cache=prob_cache,
-            player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id,
+            player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id, match_type=match_type,
         )
         idx: List[int] = []
         comps: List[List[float]] = []
@@ -2041,7 +2106,7 @@ def _exact_double8_player_totals(
         rem = _DOUBLE8_REM[stage]
         pad_spec = _DOUBLE8_PAD_AFTER.get(stage)
         for w in (a, b):
-            idx, comps, p_a, _meta = pairing(a, b, w, num_a, num_b, rem)
+            idx, comps, p_a, _meta = pairing(a, b, w, num_a, num_b, rem, _bo_type(grand_final_bo) if stage == "grand_final" else "bo3")
             p_node = prob * (p_a if w == a else 1.0 - p_a)
             run[:, idx] += comps
             run_mp[idx] += 1
@@ -2122,7 +2187,7 @@ def _exact_double8_player_totals(
             oc[0] += mass
             if tid == w:
                 oc[1] += mass
-        idx, comps, _p_a, meta = memo[(a, b, w, num_a, num_b, rem)]
+        idx, comps, _p_a, meta = memo[(a, b, w, num_a, num_b, rem, _bo_type(grand_final_bo) if stage == "grand_final" else "bo3")]
         for r in range(len(idx)):
             j = int(idx[r])
             pid_str = str(pids[j])
@@ -2285,7 +2350,7 @@ def _double8_pad_team(ts: TeamState, games: int, stage_key: str) -> None:
         )
 
 
-def _deterministic_double8_outcome(team_slots: List[int], vrs_ranks: Dict[int, int], match_winners: List[int]) -> Dict:
+def _deterministic_double8_outcome(team_slots: List[int], vrs_ranks: Dict[int, int], match_winners: List[int], grand_final_bo: int = 3) -> Dict:
     """Play the double-elimination bracket implied by the user's 14 picks (play
     order) with real team states and return one outcome dict in the stored
     shape (probability, bracket, players, player_components, player_breakdown),
@@ -2308,6 +2373,7 @@ def _deterministic_double8_outcome(team_slots: List[int], vrs_ranks: Dict[int, i
         w, l, p_win_a, branch_p = _play_match_deterministic(
             states, a, b, picked, remaining_rounds_after=_DOUBLE8_REM[stage], prob_cache=prob_cache,
             player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id,
+            match_type=_bo_type(grand_final_bo) if stage == "grand_final" else "bo3",
         )
         path_prob *= branch_p
         winners[key] = w
@@ -2576,13 +2642,14 @@ def _finish_stage_cell(cell: Dict[str, float], denom: float, boost_meta: dict | 
 def _compute_playoff_result(payload: dict, progress_callback=None) -> dict:
     slots = payload["team_slots"]
     has_third_place_decider = bool(payload.get("has_third_place_decider", False))
+    final_bo = int(_bo_type(payload.get("final_bo"))[2:])
 
     # vrs_ranks not relevant here (use default 999)
     vrs_ranks = {tid: 999 for tid in slots}
 
     if _bracket_kind(payload.get("bracket_kind")) == "double":
         exact_players, best_bracket, outcomes_count, outcomes, extra = _exact_double8_player_totals(
-            slots, vrs_ranks, progress_callback=progress_callback
+            slots, vrs_ranks, progress_callback=progress_callback, grand_final_bo=final_bo
         )
         stage_stats = extra.pop("stage_stats")
         return {
@@ -2592,6 +2659,7 @@ def _compute_playoff_result(payload: dict, progress_callback=None) -> dict:
             "outcomes_count": outcomes_count,
             "outcomes": outcomes,
             "has_third_place_decider": False,
+            "final_bo": final_bo,
             "bracket_kind": "double",
             **extra,
             "stage_stats": stage_stats,
@@ -2611,6 +2679,7 @@ def _compute_playoff_result(payload: dict, progress_callback=None) -> dict:
         quarters_override=quarters_override,
         sf_pairs_resolver=sf_pairs_resolver,
         mc_sims=_clamp_mc_sims(payload.get("mc_sims")),
+        final_bo=final_bo,
     )
     n = len(slots)
     exact = extra is not None or n in (6, 8)
@@ -2621,6 +2690,7 @@ def _compute_playoff_result(payload: dict, progress_callback=None) -> dict:
         "outcomes_count": outcomes_count,
         "outcomes": outcomes,
         "has_third_place_decider": has_third_place_decider,
+        "final_bo": final_bo,
     }
     if extra:
         out.update(extra)
@@ -3241,7 +3311,7 @@ def _stored_outcome_detail(latest: dict, idx: int) -> dict:
         template = results.get("bracket_template") or _double8_template(team_slots)
         br = _decode_double8_code(code, template)
         flat = [next(m["winner"] for m in br[stage] if m["key"] == key) for key, stage, _fa, _fb in _DOUBLE8_MATCHES]
-        return _deterministic_double8_outcome(team_slots, vrs, flat)
+        return _deterministic_double8_outcome(team_slots, vrs, flat, grand_final_bo=int(lp.get("final_bo") or 3))
     template = results.get("bracket_template") or {
         "team_slots": team_slots,
         "third_place": bool(lp.get("has_third_place_decider")),
@@ -3255,7 +3325,9 @@ def _stored_outcome_detail(latest: dict, idx: int) -> dict:
         round_winners.append([int(m["winner"]) for m in ms])
         alive = [int(m["winner"]) for m in ms]
     third = int(((br.get("third_place") or [{}])[0]).get("winner") or 0)
-    return _deterministic_completed_outcome(team_slots, vrs, round_winners, bool(template.get("third_place")), third)
+    return _deterministic_completed_outcome(
+        team_slots, vrs, round_winners, bool(template.get("third_place")), third, final_bo=int(lp.get("final_bo") or 3)
+    )
 
 
 @router.post("/outcome-player-detail")
@@ -3363,6 +3435,7 @@ def winning_player_detail(payload: dict | None = None, event_id: int | None = No
     if tid is None or tid not in team_slots:
         raise HTTPException(status_code=404, detail="That player is not in the stored bracket.")
     double = _bracket_kind(lp.get("bracket_kind")) == "double"
+    final_bo = int(lp.get("final_bo") or 3)
     template = results.get("bracket_template") or (
         _double8_template(team_slots)
         if double
@@ -3373,15 +3446,15 @@ def winning_player_detail(payload: dict | None = None, event_id: int | None = No
     prob_cache: Dict[tuple[int, int], float] = {}
     memo: Dict[tuple, dict] = {}
 
-    def pairing(a: int, b: int, w: int, na: int, nb: int, rem: int) -> dict:
-        key = (a, b, w, na, nb, rem)
+    def pairing(a: int, b: int, w: int, na: int, nb: int, rem: int, match_type: str = "bo3") -> dict:
+        key = (a, b, w, na, nb, rem, match_type)
         hit = memo.get(key)
         if hit is not None:
             return hit
         states = {a: _fresh_bracket_state(base_states, a, na - 1), b: _fresh_bracket_state(base_states, b, nb - 1)}
         _play_match_deterministic(
             states, a, b, w, remaining_rounds_after=rem, prob_cache=prob_cache,
-            player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id,
+            player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id, match_type=match_type,
         )
         rows: Dict[int, dict] = {}
         for ts in states.values():
@@ -3513,7 +3586,13 @@ def winning_player_detail(payload: dict | None = None, event_id: int | None = No
                 rem = _DOUBLE8_REM[stage]
                 if tid in (a, b):
                     slot = na if tid == a else nb
-                    row = adjust(pairing(a, b, w, na, nb, rem)[pid], slot, False)
+                    row = adjust(
+                        pairing(
+                            a, b, w, na, nb, rem,
+                            _bo_type(final_bo) if (stage == "grand_final" or (not double and rem == 0 and stage != "third_place")) else "bo3",
+                        )[pid],
+                        slot, False,
+                    )
                     row["slot"] = slot
                     real_rows.append(row)
                     add_match(stage, row, b if tid == a else a, w == tid, p_c)
@@ -3541,7 +3620,13 @@ def winning_player_detail(payload: dict | None = None, event_id: int | None = No
                     rem = 0 if stage == "third_place" else max(0, rounds_total - r_i - 1)
                     if tid in (a, b):
                         slot = na if tid == a else nb
-                        row = adjust(pairing(a, b, w, na, nb, rem)[pid], slot, False)
+                        row = adjust(
+                        pairing(
+                            a, b, w, na, nb, rem,
+                            _bo_type(final_bo) if (stage == "grand_final" or (not double and rem == 0 and stage != "third_place")) else "bo3",
+                        )[pid],
+                        slot, False,
+                    )
                         row["slot"] = slot
                         add_match(stage, row, b if tid == a else a, w == tid, p_c)
                         if w != tid and rem > 0:
@@ -3661,6 +3746,7 @@ def _deterministic_completed_outcome(
     round_winners: List[List[int]],
     has_third_place_decider: bool,
     third_place_winner: int,
+    final_bo: int = 3,
 ) -> Dict:
     """Play the single bracket implied by the user's picks and return one outcome
     dict in the same shape as a stored exact/Monte-Carlo outcome. Because it
@@ -3698,6 +3784,7 @@ def _deterministic_completed_outcome(
                 states, a, b, picked, remaining_rounds_after=remaining_after,
                 prob_cache=prob_cache, player_rows_by_id=player_rows_by_id,
                 team_rank_by_id=team_rank_by_id,
+                match_type=_bo_type(final_bo) if remaining_after == 0 else "bo3",
             )
             path_prob *= branch_p
             winners.append(w)
@@ -3804,11 +3891,14 @@ def _selected_completed_outcome_from_latest(payload: dict | None = None) -> tupl
     vrs_ranks = {tid: 999 for tid in team_slots}
     if _bracket_kind(latest_payload.get("bracket_kind")) == "double":
         picks = [int(x) for x in (body.get("match_winners") or [])]
-        return latest, _deterministic_double8_outcome(team_slots, vrs_ranks, picks)
+        return latest, _deterministic_double8_outcome(
+            team_slots, vrs_ranks, picks, grand_final_bo=int(latest_payload.get("final_bo") or 3)
+        )
     has_third_place = bool(latest_payload.get("has_third_place_decider", False))
     round_winners, third_place_winner = _completed_bracket_round_winners(body, team_slots)
     outcome = _deterministic_completed_outcome(
-        team_slots, vrs_ranks, round_winners, has_third_place, third_place_winner
+        team_slots, vrs_ranks, round_winners, has_third_place, third_place_winner,
+        final_bo=int(latest_payload.get("final_bo") or 3),
     )
     return latest, outcome
 

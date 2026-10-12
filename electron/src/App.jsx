@@ -4709,6 +4709,8 @@ function PlayoffTab({
   detectedBracketKind = "single",
   grandFinalBo = 3,
   routingError = "",
+  // The event page lists a third-place decider (kind detector).
+  playoffThirdPlace = false,
 }) {
   const isBounty = variant === "bounty";
   const [playoffTab, setPlayoffTab] = useState("stage");
@@ -4790,7 +4792,10 @@ function PlayoffTab({
       setPlayoffAutofillBusy(false);
     }
   };
-  const [hasThirdPlaceDecider, setHasThirdPlaceDecider] = useState(false);
+  const [hasThirdPlaceDecider, setHasThirdPlaceDecider] = useState(Boolean(playoffThirdPlace));
+  useEffect(() => {
+    setHasThirdPlaceDecider(Boolean(playoffThirdPlace));
+  }, [playoffThirdPlace]);
   // Bounty draft state: seeds 5-7 pick their QF opponent (seed 8 gets the
   // leftover), and per QF-winner scenario the first SF drafter's pick.
   const [draftPicks, setDraftPicks] = useState(["", "", ""]);
@@ -5058,7 +5063,7 @@ function PlayoffTab({
   );
   const matchCardTitle = (teamsInRound, matchIdx) =>
     teamsInRound === 2 ? "Final" : `${roundShortForTeams(teamsInRound)} ${matchIdx + 1}`;
-  const matchCardMeta = (teamsInRound) => (teamsInRound === 2 ? "BO5" : "BO3");
+  const matchCardMeta = (teamsInRound) => (teamsInRound === 2 ? `BO${grandFinalBo || 3}` : "BO3");
   // Seeding view (Run tab): round 0 has the seed selects; later rounds show the
   // muted winner placeholders. Auto-distributed via .pb-bracket for any size.
   const renderSeedingBracket = () => {
@@ -5132,7 +5137,7 @@ function PlayoffTab({
               <div className="pb-match-wrap">
                 <BracketMatchCard
                   title="FINAL"
-                  meta="BO5"
+                  meta={`BO${grandFinalBo || 3}`}
                   rows={
                     <>
                       <BracketTeamRow placeholder="Winner SF 1" muted />
@@ -15430,7 +15435,14 @@ function TournamentTab({ teams, teamLookup, players, sortTeams, applyFilters, on
           playoffLayoutDetected={kindInfo?.playoff_layout || "cross"}
         />
       )}
-      {kind === "playoff" && <PlayoffTab {...sharedProps} detectedBracketSize={kindInfo?.playoff_size} />}
+      {kind === "playoff" && (
+        <PlayoffTab
+          {...sharedProps}
+          detectedBracketSize={kindInfo?.playoff_size}
+          playoffThirdPlace={Boolean(kindInfo?.playoff_third_place)}
+          grandFinalBo={Number(kindInfo?.grand_final_bo || 3)}
+        />
+      )}
       {kind === "double_elim" && (
         <PlayoffTab
           {...sharedProps}
