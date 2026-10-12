@@ -5151,6 +5151,20 @@ function PlayoffTab({
                     />
                   </div>
                 ))}
+                {hasThirdPlaceDecider && !isBounty && (
+                  <div className={`pb-match-wrap pb-aux${r === totalRounds - 1 ? "" : " pb-spacer"}`} aria-hidden={r !== totalRounds - 1}>
+                    <BracketMatchCard
+                      title="3rd place"
+                      meta="BO3"
+                      rows={
+                        <>
+                          <BracketTeamRow placeholder="Loser SF 1" muted />
+                          <BracketTeamRow placeholder="Loser SF 2" muted />
+                        </>
+                      }
+                    />
+                  </div>
+                )}
               </div>
             </div>
           );
@@ -5196,27 +5210,27 @@ function PlayoffTab({
                       </div>
                     );
                   })}
+                  {hasThirdPlaceDecider && !isBounty && (
+                    <div className={`pb-match-wrap pb-aux${r === totalRounds - 1 ? "" : " pb-spacer"}`} aria-hidden={r !== totalRounds - 1}>
+                      <BracketMatchCard
+                        title="3rd place"
+                        rows={thirdPair.map((teamId, idx) => (
+                          <CompletedBracketTeamRow
+                            key={`cmp-third-${r}-${idx}`}
+                            teamId={r === totalRounds - 1 ? teamId : ""}
+                            selected={r === totalRounds - 1 && Boolean(teamId) && String(completedBracket.third) === String(teamId)}
+                            onSelect={(val) => setCompletedThird(val)}
+                            placeholder={idx === 0 ? "Loser SF 1" : "Loser SF 2"}
+                          />
+                        ))}
+                      />
+                    </div>
+                  )}
                 </div>
               </div>
             );
           })}
         </div>
-        {hasThirdPlaceDecider && !isBounty && (
-          <div className="pb-thirdplace">
-            <BracketMatchCard
-              title="Third-place decider"
-              rows={thirdPair.map((teamId, idx) => (
-                <CompletedBracketTeamRow
-                  key={`cmp-third-${idx}`}
-                  teamId={teamId}
-                  selected={Boolean(teamId) && String(completedBracket.third) === String(teamId)}
-                  onSelect={(val) => setCompletedThird(val)}
-                  placeholder={idx === 0 ? "Semi-final 1 loser" : "Semi-final 2 loser"}
-                />
-              ))}
-            />
-          </div>
-        )}
       </>
     );
   };
@@ -13441,7 +13455,7 @@ function OutcomeBracketVisual({ bracket, teamLookup, teams, highlightTeamId }) {
     <div className="group-brackets">
       <div>
         <div className="pb-bracket">
-          {rounds.map((stage) => (
+          {rounds.map((stage, ri) => (
             <div className="pb-round" key={stage}>
               <div className="pb-round-title">{STAGE_FULL[stage] || stage}</div>
               <div className="pb-matches">
@@ -13450,11 +13464,15 @@ function OutcomeBracketVisual({ bracket, teamLookup, teams, highlightTeamId }) {
                     {card(m, (bracket[stage] || []).length === 1 ? STAGE_FULL[stage] || stage : `${STAGE_SHORT[stage] || stage} ${i + 1}`, stage === "final" ? "BO5" : "BO3")}
                   </div>
                 ))}
+                {third && (
+                  <div className={`pb-match-wrap pb-aux${ri === rounds.length - 1 ? "" : " pb-spacer"}`} aria-hidden={ri !== rounds.length - 1}>
+                    {card(third, "3rd place", "BO3")}
+                  </div>
+                )}
               </div>
             </div>
           ))}
         </div>
-        {third && <div className="pb-thirdplace">{card(third, "Third place", "BO3")}</div>}
       </div>
     </div>
   );
@@ -13760,15 +13778,15 @@ function PlayoffSkeleton({ format, groupCount, qualsPerGroup, stopTeams = 1, bo 
                     <GroupMatchCard title={m.title} meta={m.meta} rows={m.rows} />
                   </div>
                 ))}
+                {thirdPlace && (
+                  <div className={`pb-match-wrap pb-aux${r === rounds.length - 1 ? "" : " pb-spacer"}`} aria-hidden={r !== rounds.length - 1}>
+                    <GroupMatchCard title="3rd place" meta={`BO${boThird}`} rows={[ph("Loser SF 1", "a"), ph("Loser SF 2", "b")]} />
+                  </div>
+                )}
               </div>
             </div>
           ))}
         </div>
-        {thirdPlace && (
-          <div className="pb-thirdplace">
-            <GroupMatchCard title="3rd place" meta={`BO${boThird}`} rows={[ph("Loser SF 1", "a"), ph("Loser SF 2", "b")]} />
-          </div>
-        )}
       </div>
     </div>
   );

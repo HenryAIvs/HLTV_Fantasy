@@ -1274,17 +1274,22 @@ table.players-table {
   border-top: 2px solid #39424f;
 }
 
-/* Third-place decider card sits on its own below the bracket so it never
-   disturbs the auto-distributed alignment of the main rounds. */
-.pb-thirdplace {
-  display: flex;
-  justify-content: center;
-  margin-top: 14px;
+/* Third-place decider: an extra match under the final. Every other round
+   carries a hidden copy as a bottom spacer, so the columns keep the same
+   height and the connectors still meet their feeders. */
+.pb-match-wrap.pb-aux {
+  flex: 0 0 auto;
+  margin-top: 6px;
 }
 
-.pb-thirdplace .playoff-match-card {
-  width: 260px;
-  max-width: 100%;
+.pb-match-wrap.pb-aux::before,
+.pb-match-wrap.pb-aux > .playoff-match-card::before,
+.pb-match-wrap.pb-aux > .playoff-match-card::after {
+  display: none;
+}
+
+.pb-match-wrap.pb-spacer {
+  visibility: hidden;
 }
 
 .team-detail-block {
