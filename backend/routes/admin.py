@@ -1100,6 +1100,9 @@ def _import_money_draft_data(
             hltv_event_url=hltv_event_url,
         )
         set_active_event(int(event_id))
+    from backend.services import event_rosters
+
+    event_rosters.invalidate()
 
     return {"imported_players": imported_players, "imported_teams": imported_teams}
 
@@ -1645,6 +1648,55 @@ def delete_dev_flag(key: str):
     from backend.services import dev_flags
 
     return {"status": "ok", "removed": dev_flags.clear_flag(key)}
+
+
+@router.get("/team-aliases")
+def get_team_aliases():
+    """Team renames: an earlier name's results, rankings and map history count
+    for the current team (see data/team_aliases.py)."""
+    from backend.data import team_aliases
+
+    return {"aliases": team_aliases.list_aliases()}
+
+
+@router.post("/team-aliases")
+def add_team_alias(payload: Dict[str, Any]):
+    from backend.data import team_aliases
+
+    body = payload or {}
+    try:
+        record = team_aliases.add_alias(int(body.get("old_team_id") or 0), int(body.get("new_team_id") or 0))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    _after_alias_change()
+    return {"status": "ok", "alias": record}
+
+
+@router.delete("/team-aliases/{old_key}")
+def delete_team_alias(old_key: str):
+    from backend.data import team_aliases
+
+    removed = team_aliases.remove_alias(old_key)
+    _after_alias_change()
+    return {"status": "ok", "removed": removed}
+
+
+def _after_alias_change() -> None:
+    """A rename changes which results belong to a team: drop the per-team
+    caches and retrain the win model in the background."""
+    from backend.routes import events as events_routes
+    from backend.services import event_rosters, team_strength
+
+    team_strength.clear_caches()
+    event_rosters.invalidate()
+
+    def _retrain() -> None:
+        try:
+            events_routes.ensure_production_map_model()
+        except Exception:  # noqa: BLE001
+            _admin_logger.warning("Model retrain after a team rename failed", exc_info=True)
+
+    threading.Thread(target=_retrain, name="alias-retrain", daemon=True).start()
 
 
 @router.get("/users")

@@ -24,6 +24,7 @@ from backend.services.hltv_rankings import (
 )
 from backend.data.db import connect as event_db_connect
 from backend.data.singleton_state import SingletonState
+from backend.data import team_aliases
 from backend.data.event_db import (
     get_historical_team_map_stats_keys,
     clear_hltv_results,
@@ -63,9 +64,9 @@ HLTV_RESULTS_IMPORT_JOB_DIR = Path(__file__).resolve().parents[2] / ".runtime" /
 
 
 def _norm_team_name(name: str) -> str:
-    s = str(name or "").strip().lower()
-    s = re.sub(r"[^a-z0-9]+", "", s)
-    return s
+    """Normalised team name with renames resolved (data/team_aliases.py), so
+    an organisation's earlier name keys the same team everywhere."""
+    return team_aliases.canonical(re.sub(r"[^a-z0-9]+", "", str(name or "").strip().lower()))
 
 
 def _sigmoid(z: float) -> float:
@@ -227,8 +228,8 @@ def _build_current_points_maps() -> Tuple[Dict[str, int], Dict[str, int]]:
     vrs_map: Dict[str, int] = {}
     for t in teams:
         key = _norm_team_name(t.get("name") or "")
-        if not key:
-            continue
+        if not key or team_aliases.is_alias_source(team_aliases.normalize(t.get("name") or "")):
+            continue  # a renamed team's old-name row never shadows its current one
         hp = t.get("hltv_points")
         vp = t.get("vrs_points")
         if hp is not None:
@@ -4253,6 +4254,7 @@ def _lab_data_signature() -> Dict[str, int]:
         "vetoes": int(vetoes or 0),
         "windows": int(windows or 0),
         "features": int(_MAP_MODEL_FEATURE_VERSION),
+        "aliases": int(team_aliases.signature()),
     }
 
 

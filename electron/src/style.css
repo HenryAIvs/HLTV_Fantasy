@@ -1371,6 +1371,41 @@ table.players-table {
   gap: 12px;
 }
 
+.team-alias-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.team-alias-row select {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 200px;
+}
+
+.team-alias-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  color: #e9edf3;
+}
+
+.team-alias-remove {
+  background: none;
+  border: none;
+  color: #8fa3bf;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0;
+  cursor: pointer;
+}
+
+.team-alias-remove:hover {
+  color: #f2f5f9;
+}
+
 .team-stat-card {
   border: 1px solid #313a47;
   border-radius: 10px;

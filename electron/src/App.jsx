@@ -9310,6 +9310,8 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
     p3: "",
     p4: "",
     p5: "",
+    formerly: [],
+    renamed_to: null,
   });
   const playerLookup = useMemo(() => {
     const m = {};
@@ -9618,10 +9620,36 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
           p3: t.player3_id ? String(t.player3_id) : "",
           p4: t.player4_id ? String(t.player4_id) : "",
           p5: t.player5_id ? String(t.player5_id) : "",
+          formerly: Array.isArray(t.formerly) ? t.formerly : [],
+          renamed_to: t.renamed_to || null,
         });
       }
     }
   }, [selectedTeam, teams]);
+
+  // Team renames: the earlier name's results, rankings and map history count
+  // for this team (backend data/team_aliases.py).
+  const [aliasPick, setAliasPick] = useState("");
+  const addTeamAlias = async () => {
+    const oldId = Number(aliasPick);
+    const newId = Number(teamForm.team_id);
+    if (!oldId || !newId) return;
+    try {
+      await api.post("/admin/team-aliases", { old_team_id: oldId, new_team_id: newId });
+      setAliasPick("");
+      if (refresh) await refresh();
+    } catch (e) {
+      notify(`Could not link: ${e?.message || "unknown error"}`);
+    }
+  };
+  const removeTeamAlias = async (oldKey) => {
+    try {
+      await api.delete(`/admin/team-aliases/${encodeURIComponent(oldKey)}`);
+      if (refresh) await refresh();
+    } catch (e) {
+      notify(`Could not unlink: ${e?.message || "unknown error"}`);
+    }
+  };
 
   const openPlayerDetailsFromTeam = (playerId) => {
     const pid = Number(playerId);
@@ -10193,6 +10221,41 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
                     <div className="team-stat-label">VRS Points</div>
                     <div className="team-stat-value">{teamForm.vrs_points || "-"}</div>
                   </div>
+                </div>
+              </section>
+
+              <section className="team-detail-block">
+                <h4 className="team-detail-heading">Formerly</h4>
+                <div className="team-alias-row">
+                  {(teamForm.formerly || []).map((a) => (
+                    <span className="pill team-alias-pill" key={a.old_key}>
+                      {a.old_name || a.old_key}
+                      <button type="button" className="team-alias-remove" onClick={() => removeTeamAlias(a.old_key)} aria-label="Unlink">
+                        &times;
+                      </button>
+                    </span>
+                  ))}
+                  {teamForm.renamed_to && (
+                    <span className="pill team-alias-pill">Now {teamForm.renamed_to.new_name}</span>
+                  )}
+                  {!teamForm.renamed_to && (
+                    <>
+                      <select value={aliasPick} onChange={(e) => setAliasPick(e.target.value)}>
+                        <option value="">Team</option>
+                        {teams
+                          .filter((t) => Number(t.team_id) !== Number(teamForm.team_id) && !t.renamed_to)
+                          .sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")))
+                          .map((t) => (
+                            <option key={t.team_id} value={t.team_id}>
+                              {t.name}
+                            </option>
+                          ))}
+                      </select>
+                      <button type="button" className="secondary" disabled={!aliasPick} onClick={addTeamAlias}>
+                        Link
+                      </button>
+                    </>
+                  )}
                 </div>
               </section>
 

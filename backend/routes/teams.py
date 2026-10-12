@@ -384,9 +384,58 @@ def _resolve_missing_hltv_ids(items: list[dict]) -> list[dict]:
     return resolved
 
 
+def _team_rows_by_key(teams: list) -> dict:
+    """Team rows by canonical name key; a renamed team's old-name row never
+    shadows its current row."""
+    from backend.data import team_aliases
+
+    out: dict = {}
+    for t in teams:
+        raw = team_aliases.normalize(t.get("name") or "")
+        if not raw:
+            continue
+        k = team_aliases.canonical(raw)
+        if raw == k or k not in out:
+            out[k] = t
+    return out
+
+
+def _ranking_target(name: str, teams_by_name: dict, teams_by_key: dict) -> dict:
+    """The stored team a ranking entry updates: after a rename the old name's
+    entry lands on the current team's row."""
+    from backend.data import team_aliases
+
+    raw = team_aliases.normalize(name)
+    if team_aliases.is_alias_source(raw):
+        return teams_by_key.get(team_aliases.canonical(raw)) or teams_by_name.get(name.lower()) or {}
+    return teams_by_name.get(name.lower()) or {}
+
+
+def _with_aliases(rows: list) -> list:
+    """Attach each team's earlier names (`formerly`) and, for an old-name row,
+    the team it became (`renamed_to`)."""
+    from backend.data import team_aliases
+
+    aliases = team_aliases.list_aliases()
+    by_new: dict = {}
+    by_old: dict = {}
+    for a in aliases:
+        by_new.setdefault(int(a.get("new_team_id") or 0), []).append(a)
+        by_old[int(a.get("old_team_id") or 0)] = a
+    for t in rows:
+        tid = int(t.get("team_id") or 0)
+        t["formerly"] = [
+            {"old_key": a["old_key"], "old_team_id": a.get("old_team_id"), "old_name": a.get("old_name")}
+            for a in by_new.get(tid, [])
+        ]
+        r = by_old.get(tid)
+        t["renamed_to"] = {"new_team_id": r.get("new_team_id"), "new_name": r.get("new_name")} if r else None
+    return rows
+
+
 @router.get("/")
 def list_teams():
-    return get_all_teams()
+    return _with_aliases(get_all_teams())
 
 
 @router.get("/hltv-ranking/by-date")
@@ -421,6 +470,7 @@ def refresh_hltv_for_all_teams_today():
     today = date.today()
     teams = get_all_teams()
     teams_by_name = {(t.get("name") or "").strip().lower(): t for t in teams if (t.get("name") or "").strip()}
+    teams_by_key = _team_rows_by_key(teams)
     logger.info("HLTV refresh requested: date=%s existing_teams=%d", today.isoformat(), len(teams))
 
     results = []
@@ -476,11 +526,16 @@ def refresh_hltv_for_all_teams_today():
         if not name:
             continue
         try:
-            existing = teams_by_name.get(name.lower()) or {}
+            existing = _ranking_target(name, teams_by_name, teams_by_key)
             before_exists = bool(existing)
-            hltv_team_id = data.get("hltv_team_id") or existing.get("hltv_team_id")
+            routed = bool(existing) and (existing.get("name") or "").strip().lower() != name.lower()
+            hltv_team_id = (
+                (existing.get("hltv_team_id") or data.get("hltv_team_id"))
+                if routed
+                else (data.get("hltv_team_id") or existing.get("hltv_team_id"))
+            )
             add_or_update_team(
-                name=name,
+                name=existing.get("name") or name,
                 hltv_rank=int(data.get("hltv_rating") or 999),
                 hltv_points=int(data.get("points") or 0),
                 vrs_rank=int(existing.get("vrs_rank") or 999),
@@ -553,6 +608,7 @@ def refresh_vrs_for_all_teams_today():
     today = date.today()
     teams = get_all_teams()
     teams_by_name = {(t.get("name") or "").strip().lower(): t for t in teams if (t.get("name") or "").strip()}
+    teams_by_key = _team_rows_by_key(teams)
     logger.info("VRS refresh requested: date=%s existing_teams=%d", today.isoformat(), len(teams))
 
     results = []
@@ -607,10 +663,10 @@ def refresh_vrs_for_all_teams_today():
         if not name:
             continue
         try:
-            existing = teams_by_name.get(name.lower()) or {}
+            existing = _ranking_target(name, teams_by_name, teams_by_key)
             before_exists = bool(existing)
             add_or_update_team(
-                name=name,
+                name=existing.get("name") or name,
                 hltv_rank=int(existing.get("hltv_rank") or 999),
                 hltv_points=int(existing.get("hltv_points") or 0),
                 vrs_rank=int(data.get("vrs_rank") or 999),
@@ -1290,7 +1346,7 @@ def fetch_team(team_id: int):
     team = get_team_by_id(team_id)
     if not team:
         raise HTTPException(status_code=404, detail="Team not found")
-    return team
+    return _with_aliases([team])[0]
 
 
 @router.post("/{team_id}/refresh-map-stats")

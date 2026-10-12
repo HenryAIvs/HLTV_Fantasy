@@ -11,6 +11,7 @@ import threading
 import time
 from typing import Any, Dict, Tuple
 
+from backend.data import team_aliases
 from backend.data.db import connect as _connect
 
 
@@ -40,6 +41,7 @@ class rank_overrides:
 
 _WINS_NEEDED = {"bo1": 1, "bo3": 2, "bo5": 3}
 _UNRANKED = 100  # a team with no HLTV rank is treated as a weak one
+_RANK_PLACEHOLDER = 999  # the teams table's "no rank yet" default (import, rankings refresh)
 _PROFILE_TTL_SECONDS = 300.0  # rankings and map stats change nightly
 _profile_cache: Dict[int, Tuple[float, Dict[str, Any]]] = {}
 _prob_cache: Dict[tuple, float] = {}
@@ -76,14 +78,34 @@ def _team_profile(team_id: int) -> Dict[str, Any]:
             rank = int(value)
         except Exception:
             return None
-        return rank if rank > 0 else None
+        return rank if 0 < rank < _RANK_PLACEHOLDER else None
 
-    profile = {
-        "key": events._norm_team_name(str(row["name"] or "")) if row is not None else "",
-        "hltv_rank": (_rank(row["hltv_rank"]) if row is not None else None) or _UNRANKED,
-        "vrs_rank": _rank(row["vrs_rank"]) if row is not None else None,
-        "map_stats": events._parse_team_map_stats(row["map_stats_json"]) if row is not None else {},
-    }
+    key = events._norm_team_name(str(row["name"] or "")) if row is not None else ""
+    hltv_rank = _rank(row["hltv_rank"]) if row is not None else None
+    vrs_rank = _rank(row["vrs_rank"]) if row is not None else None
+    map_stats = events._parse_team_map_stats(row["map_stats_json"]) if row is not None else {}
+    # A renamed team inherits what its earlier name's row still holds, until
+    # the rankings refresh and the map-stats import catch up with the new name.
+    for alias in (team_aliases.former(key) if key else []):
+        if hltv_rank is not None and vrs_rank is not None and map_stats:
+            break
+        old_id = alias.get("old_team_id")
+        if not old_id or int(old_id) == int(team_id):
+            continue
+        conn = _connect()
+        try:
+            old = conn.execute(
+                "SELECT hltv_rank, vrs_rank, map_stats_json FROM teams WHERE team_id = ?", (int(old_id),)
+            ).fetchone()
+        finally:
+            conn.close()
+        if old is None:
+            continue
+        hltv_rank = hltv_rank if hltv_rank is not None else _rank(old["hltv_rank"])
+        vrs_rank = vrs_rank if vrs_rank is not None else _rank(old["vrs_rank"])
+        if not map_stats:
+            map_stats = events._parse_team_map_stats(old["map_stats_json"])
+    profile = {"key": key, "hltv_rank": hltv_rank or _UNRANKED, "vrs_rank": vrs_rank, "map_stats": map_stats}
     with _cache_lock:
         _profile_cache[int(team_id)] = (now, profile)
     return profile

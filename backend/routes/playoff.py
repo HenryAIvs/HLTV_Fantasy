@@ -13,6 +13,7 @@ from typing import List, Dict
 
 from fastapi import APIRouter, HTTPException
 
+from backend.services import event_rosters
 from backend.data.db import connect as _connect
 from backend.data.player_db import get_player
 from backend.data.singleton_state import SingletonState
@@ -447,8 +448,10 @@ def _build_playoff_lookup_context(team_slots: List[int]) -> tuple[Dict[int, dict
             tid = int(r["team_id"])
             rank = r["hltv_rank"]
             team_rank_by_id[tid] = int(rank) if rank is not None else 100
-            for col in ("player1_id", "player2_id", "player3_id", "player4_id", "player5_id"):
-                pid = r[col]
+            # the event's own roster when the team plays the event being valued
+            override = event_rosters.roster_for(tid)
+            roster = list(override) if override is not None else [r[col] for col in ("player1_id", "player2_id", "player3_id", "player4_id", "player5_id")]
+            for pid in roster:
                 if pid:
                     player_ids.add(int(pid))
 
@@ -3823,9 +3826,11 @@ def _player_team_map_from_latest(latest_results: Dict, latest_payload: Dict) -> 
         except Exception:
             continue
         team = get_team_by_id(tid) or {}
-        for key in ("player1_id", "player2_id", "player3_id", "player4_id", "player5_id"):
+        override = event_rosters.roster_for(tid)  # the event's own roster when it lists the team
+        roster = list(override) if override is not None else [team.get(key) for key in ("player1_id", "player2_id", "player3_id", "player4_id", "player5_id")]
+        for pid_raw in roster:
             try:
-                pid = int(team.get(key) or 0)
+                pid = int(pid_raw or 0)
             except Exception:
                 continue
             if pid > 0:

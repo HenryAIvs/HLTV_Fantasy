@@ -24,7 +24,7 @@ from fastapi import APIRouter, HTTPException
 from backend.data.db import connect as _connect
 from backend.data.player_db import get_player
 from backend.data.singleton_state import SingletonState
-from backend.services import team_strength
+from backend.services import event_rosters, team_strength
 from backend.services import roster_kernels as rk
 from backend.routes.playoff import (
     _build_playoff_lookup_context,
@@ -1752,11 +1752,16 @@ def _compute_groups_result_inner(
                 bucket["role"] += prob * float(comps["role"])
                 bucket["booster"] += prob * float(comps["booster"])
         for tid in group:
-            team_row = get_team_by_id(int(tid)) or {}
-            roster_pids = {
-                int(team_row.get(key) or 0)
-                for key in ("player1_id", "player2_id", "player3_id", "player4_id", "player5_id")
-            }
+            # the event's own roster when the team plays the event being valued
+            override = event_rosters.roster_for(int(tid))
+            if override is not None:
+                roster_pids = {int(p) for p in override}
+            else:
+                team_row = get_team_by_id(int(tid)) or {}
+                roster_pids = {
+                    int(team_row.get(key) or 0)
+                    for key in ("player1_id", "player2_id", "player3_id", "player4_id", "player5_id")
+                }
             players_out: Dict[int, Dict[str, float]] = {}
             for pid, sums in accum.items():
                 if pid not in roster_pids:
@@ -2809,6 +2814,8 @@ def _sample_joint_outcomes(results: dict, n: int, seed: int = 20240101) -> tuple
                 if row is None:
                     missing += 1
                     continue
+                if not row:
+                    continue  # neither side has fantasy players (teams outside the game)
                 role_at = 3 if len(next(iter(row.values()))) >= 4 else 2
                 for pid, comps in row.items():
                     vec[pid][i] += comps[0]

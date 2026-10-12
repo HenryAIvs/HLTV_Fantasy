@@ -180,6 +180,13 @@ def load_team_players(team_id: int) -> Dict[int, PlayerState]:
             team_row["player4_id"],
             team_row["player5_id"],
         ]
+        # The event's own roster (stand-ins included) when the team plays the
+        # event being valued; see services/event_rosters.py.
+        from backend.services import event_rosters
+
+        override = event_rosters.roster_for(int(team_id))
+        if override is not None:
+            player_ids = list(override)
 
         players: Dict[int, PlayerState] = {}
 

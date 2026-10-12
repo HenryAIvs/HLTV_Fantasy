@@ -1144,8 +1144,10 @@ def clear_hltv_results() -> int:
 
 
 def _norm_team_name(name: str) -> str:
-    s = str(name or "").strip().lower()
-    return re.sub(r"[^a-z0-9]+", "", s)
+    """Normalised team name with renames resolved (see team_aliases.py)."""
+    from backend.data import team_aliases
+
+    return team_aliases.key(name)
 
 
 def upsert_hltv_rankings_snapshot(

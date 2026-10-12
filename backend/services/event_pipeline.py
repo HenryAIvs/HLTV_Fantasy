@@ -24,6 +24,8 @@ from __future__ import annotations
 import time
 from typing import Any, Callable, Dict, Optional, Tuple
 
+from backend.services import event_rosters
+
 
 def _groups_hooks() -> Dict[str, Any]:
     from backend.routes import groups
@@ -171,7 +173,8 @@ def bake_event(event_id: int, trigger: str = "import", only_if_missing: bool = F
             "reason": f"{kind} events are not automated yet; run them from the operator app",
         }
     try:
-        return hooks["bake"](event_id, trigger=trigger, only_if_missing=only_if_missing, refresh_inputs=refresh_inputs)
+        with event_rosters.for_event(event_id):
+            return hooks["bake"](event_id, trigger=trigger, only_if_missing=only_if_missing, refresh_inputs=refresh_inputs)
     except Exception as exc:  # noqa: BLE001 - the scheduler must always get a status
         return {"status": "error", "event_id": event_id, "kind": kind, "reason": str(exc)[:300]}
 
