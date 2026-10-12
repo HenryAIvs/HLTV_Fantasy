@@ -194,6 +194,12 @@ def _normalize_groups_payload(payload: dict) -> dict:
     third_place = payload.get("playoff_third_place")
     if third_place is None:
         third_place = combined and _detected_third_place(payload.get("event_id") or _state_key())
+    layout = str(payload.get("playoff_layout") or "").strip().lower()
+    if layout not in PLAYOFF_LAYOUTS:
+        layout = _stored_playoff_layout(payload.get("event_id") or _state_key())
+    final_bo = payload.get("playoff_final_bo")
+    if final_bo is None:
+        final_bo = _detected_final_bo(payload.get("event_id") or _state_key())
     if combined and not combined_shape_supported(group_format, len(groups)):
         raise HTTPException(
             status_code=400,
@@ -230,9 +236,36 @@ def _normalize_groups_payload(payload: dict) -> dict:
         "combined_playoffs": combined,
         "playoff_stop_teams": stop_teams,
         "playoff_third_place": bool(third_place),
+        "playoff_layout": layout,
+        "playoff_final_bo": int(final_bo) if int(final_bo or 3) in (1, 3, 5) else 3,
         # The stored run is keyed by this event (see _state_key).
         "event_id": _state_key(),
     }
+
+
+def _stored_playoff_layout(event_id) -> str:
+    """The event's semi-final layout (operator-set), else the default cross."""
+    try:
+        from backend.data.event_db import get_event_playoff_layout
+
+        value = str(get_event_playoff_layout(int(event_id)) or "").strip().lower()
+    except Exception:  # noqa: BLE001
+        value = ""
+    return value if value in PLAYOFF_LAYOUTS else DEFAULT_PLAYOFF_LAYOUT
+
+
+def _detected_final_bo(event_id) -> int:
+    """The grand final's best-of from the event page's formats table (3 when unlisted)."""
+    try:
+        from backend.data.event_db import get_event_detail
+        from backend.routes import events as events_routes
+
+        event = get_event_detail(int(event_id))
+        rules = (events_routes._detect_event_tournament_kind_cached(event) if event else {}).get("playoff_bo_rules") or {}
+        value = int(rules.get("grandFinal") or rules.get("default") or 3)
+    except Exception:  # noqa: BLE001
+        value = 3
+    return value if value in (1, 3, 5) else 3
 
 
 def _detected_third_place(event_id) -> bool:
@@ -802,7 +835,21 @@ _SUPPORTED_COMBINED_SHAPES: Dict[tuple, str] = {
     ("gsl4", 4): "4 GSL groups, top 2 → 8-team bracket: QF1 A1 v D2, QF2 C1 v B2, QF3 B1 v C2, QF4 D1 v A2, "
                  "semis QF1 v QF2 and QF3 v QF4, optional third-place decider "
                  "(verified on Stake Pulse Beat II, 2026-09-25/26)",
+    ("gsl4", 2): "2 GSL groups, top 2 → 4-team bracket; the semi-final layout is the organiser's and is set per "
+                 "event: cross (A1 v B2, B1 v A2) or same-group (A1 v A2, B1 v B2, as iBUYPOWER Masters FML 2026 "
+                 "played it); optional third-place decider",
 }
+
+# Semi-finals of the 2 × GSL → 4 bracket, by layout. HLTV's bracket shows the
+# pairing only once the groups are drawn into it, so the layout is stored per
+# event (events.playoff_layout) and defaults to the cross.
+_GSL4X2_SEMIS = {
+    "cross": [((0, 0), (1, 1)), ((1, 0), (0, 1))],
+    "same_group": [((0, 0), (0, 1)), ((1, 0), (1, 1))],
+}
+PLAYOFF_LAYOUTS = tuple(_GSL4X2_SEMIS)
+DEFAULT_PLAYOFF_LAYOUT = "cross"
+_DECIDER_REM = -1  # the decider's "rounds remaining": nothing follows it, and it never collides with the final (0)
 
 # Quarter-finals of the 4 × GSL → 8 bracket as ((group, rank), (group, rank)),
 # groups in draw order A..D, rank 0 = group winner. Read off Stake Pulse Beat
@@ -870,7 +917,9 @@ def _fresh_bracket_state(base_states: Dict[int, TeamState], tid: int, prior_matc
     return ts
 
 
-def _combined_bracket_template(x: int, quals_per_group: int, rounds_total: int, group_format: str) -> Dict[str, Any]:
+def _combined_bracket_template(
+    x: int, quals_per_group: int, rounds_total: int, group_format: str, layout: str = DEFAULT_PLAYOFF_LAYOUT
+) -> Dict[str, Any]:
     """Bracket template shared by the exact valuation and the joint sampler:
     rounds of (left, right) feeders — ("seed", group, rank) or ("win", round,
     match) — the round each seed enters (byes enter later) and each seed's
@@ -892,8 +941,13 @@ def _combined_bracket_template(x: int, quals_per_group: int, rounds_total: int, 
             [(("win", 1, 0), ("win", 1, 1))],
         ][:rounds_total]
         entry_round = {}
-        if rounds_total == 3:
-            decider = (("lose", 1, 0), ("lose", 1, 1))  # the semi-final losers
+    elif group_format == "gsl4" and x == 2 and quals_per_group == 2:
+        semis = _GSL4X2_SEMIS.get(str(layout or ""), _GSL4X2_SEMIS[DEFAULT_PLAYOFF_LAYOUT])
+        rounds = [
+            [(("seed",) + a, ("seed",) + b) for a, b in semis],
+            [(("win", 0, 0), ("win", 0, 1))],
+        ][:rounds_total]
+        entry_round = {}
     else:
         seeded = [(g, r) for r in range(quals_per_group) for g in range(x)]  # seed-major, like the old sim
         n = len(seeded)
@@ -908,29 +962,38 @@ def _combined_bracket_template(x: int, quals_per_group: int, rounds_total: int, 
         for g in range(x)
         for rank in range(quals_per_group)
     }
+    # A third-place decider pairs the two semi-final losers: the round before
+    # the final, when the bracket plays out to a final.
+    if rounds_total >= 2 and len(rounds) == rounds_total and len(rounds[-1]) == 1 and len(rounds[-2]) == 2:
+        decider = (("lose", rounds_total - 2, 0), ("lose", rounds_total - 2, 1))
     return {
         "rounds": rounds, "entry_round": entry_round, "prior_matches": prior_matches,
-        "byes_to_semis": byes_to_semis, "decider": decider,
+        "byes_to_semis": byes_to_semis, "decider": decider, "layout": layout,
     }
+
+
+def _decider_match_number(template: Dict[str, Any], seed: tuple, rounds_total: int) -> int:
+    """A semi-final loser's match number in the decider: its group matches,
+    then every bracket round but the final, then the decider."""
+    return int(template["prior_matches"][seed]) + rounds_total - int(template["entry_round"].get(seed, 0))
 
 
 def _decider_pairing_weights(
     tuple_probs: List[Dict[tuple, float]],
     template: Dict[str, Any],
     match_prob,
+    rounds_total: int,
 ) -> Dict[tuple, float]:
-    """Exact pairing weights for the third-place decider of the 8-team
-    bracket: the two semi-final losers meet, keyed like the bracket weights
-    (x, y, winner, match_num_x, match_num_y, 0). The qualifier tuples couple
-    the two halves (a group's winner and runner-up are different teams), so
-    the seedings are enumerated — at most 12^4 for four GSL groups — and
-    within one seeding the halves are independent."""
+    """Exact pairing weights for the third-place decider: the two semi-final
+    losers meet, keyed like the bracket weights (x, y, winner, match_num_x,
+    match_num_y, _DECIDER_REM). The qualifier tuples couple the halves of the
+    bracket (a group's winner and runner-up are different teams), so the
+    seedings are enumerated — at most 12^4 for four GSL groups — and within
+    one seeding the feeders of a match are independent."""
     import itertools
 
-    quarters = template["rounds"][0]
-    semis = template["rounds"][1]
-    prior_matches = template["prior_matches"]
-    sf_feeds = [(left[2], right[2]) for left, right in semis]
+    rounds = template["rounds"]
+    decider = template["decider"]
     out: Dict[tuple, float] = {}
     group_items = [list(tp.items()) for tp in tuple_probs]
     for combo in itertools.product(*group_items):
@@ -942,32 +1005,44 @@ def _decider_pairing_weights(
                 seed[(g, rank)] = int(tid)
         if prob <= 0.0:
             continue
-        qf_win: List[Dict[int, float]] = []
-        for left, right in quarters:
-            a, b = seed[(left[1], left[2])], seed[(right[1], right[2])]
-            pa = match_prob(a, b)
-            qf_win.append({a: pa, b: 1.0 - pa})
-        sf_lose: List[Dict[int, float]] = []
-        for qa, qb in sf_feeds:
-            d: Dict[int, float] = {}
-            for u, pu in qf_win[qa].items():
-                for v, pv in qf_win[qb].items():
-                    puv = pu * pv
-                    p_u = match_prob(u, v)
-                    d[v] = d.get(v, 0.0) + puv * p_u
-                    d[u] = d.get(u, 0.0) + puv * (1.0 - p_u)
-            sf_lose.append(d)
+        memo: Dict[tuple, tuple] = {}  # (round, match) -> (winner dist, loser dist)
+
+        def feeder(f: tuple) -> Dict[int, float]:
+            if f[0] == "seed":
+                return {seed[(f[1], f[2])]: 1.0}
+            return played(f[1], f[2])[0]
+
+        def played(r: int, m: int) -> tuple:
+            if (r, m) not in memo:
+                left, right = rounds[r][m]
+                win: Dict[int, float] = {}
+                lose: Dict[int, float] = {}
+                for u, pu in feeder(left).items():
+                    for v, pv in feeder(right).items():
+                        puv = pu * pv
+                        if puv <= 0.0:
+                            continue
+                        p_u = match_prob(u, v)
+                        win[u] = win.get(u, 0.0) + puv * p_u
+                        win[v] = win.get(v, 0.0) + puv * (1.0 - p_u)
+                        lose[v] = lose.get(v, 0.0) + puv * p_u
+                        lose[u] = lose.get(u, 0.0) + puv * (1.0 - p_u)
+                memo[(r, m)] = (win, lose)
+            return memo[(r, m)]
+
         team_seed = {t: sd for sd, t in seed.items()}
-        for x, px in sf_lose[0].items():
-            nx = prior_matches[team_seed[x]] + 3
-            for y, py in sf_lose[1].items():
+        lose_a = played(decider[0][1], decider[0][2])[1]
+        lose_b = played(decider[1][1], decider[1][2])[1]
+        for x, px in lose_a.items():
+            nx = _decider_match_number(template, team_seed[x], rounds_total)
+            for y, py in lose_b.items():
                 w = prob * px * py
                 if w <= 0.0:
                     continue
-                ny = prior_matches[team_seed[y]] + 3
+                ny = _decider_match_number(template, team_seed[y], rounds_total)
                 p_x = match_prob(x, y)
-                kx = (x, y, x, nx, ny, 0)
-                ky = (x, y, y, nx, ny, 0)
+                kx = (x, y, x, nx, ny, _DECIDER_REM)
+                ky = (x, y, y, nx, ny, _DECIDER_REM)
                 out[kx] = out.get(kx, 0.0) + w * p_x
                 out[ky] = out.get(ky, 0.0) + w * (1.0 - p_x)
     return out
@@ -985,6 +1060,8 @@ def _exact_combined_playoffs(
     workers: int | None = None,
     group_format: str = "de8_top3",
     third_place: bool = False,
+    layout: str = DEFAULT_PLAYOFF_LAYOUT,
+    final_bo: int = 3,
 ) -> Dict[str, Any]:
     """Exact expected playoff points for every player.
 
@@ -1032,23 +1109,30 @@ def _exact_combined_playoffs(
     specs = [bracket_exact.GroupSpec(groups[g], quals_per_group, tuple_probs[g]) for g in range(x)]
 
     # 2. Bracket template (feeders are ("seed", group, rank) or ("win", round, match)).
-    template = _combined_bracket_template(x, quals_per_group, rounds_total, group_format)
+    template = _combined_bracket_template(x, quals_per_group, rounds_total, group_format, layout)
     rounds, entry_round, prior_matches = template["rounds"], template["entry_round"], template["prior_matches"]
     roots = bracket_exact.build_tree(rounds, entry_round, prior_matches)
 
     # 3. Win-probability matrices between groups, from the shared cache
-    #    (canonical direction, see playoff.cached_win_prob).
-    def match_prob(a: int, b: int) -> float:
-        return cached_win_prob(prob_cache, a, b)  # a == b only ever meets a zero-probability context
+    #    (canonical direction, see playoff.cached_win_prob). The final may be
+    #    a longer series than the rest of the bracket.
+    final_bo = int(final_bo) if int(final_bo or 3) in (1, 3, 5) else 3
+    final_match_type = f"bo{final_bo}"
+
+    def match_type_for(rem: int) -> str:
+        return final_match_type if rem == 0 else "bo3"
+
+    def match_prob(a: int, b: int, rem: int = 1) -> float:
+        return cached_win_prob(prob_cache, a, b, match_type_for(rem))  # a == b only ever meets a zero-probability context
 
     pwin_cache: Dict[tuple, Any] = {}
 
-    def pwin(g: int, h: int):
-        key = (g, h)
+    def pwin(g: int, h: int, rem: int):
+        key = (g, h, match_type_for(rem))
         if key not in pwin_cache:
             import numpy as np
 
-            m = np.array([[match_prob(a, b) for b in specs[h].teams] for a in specs[g].teams], dtype=np.float64)
+            m = np.array([[match_prob(a, b, rem) for b in specs[h].teams] for a in specs[g].teams], dtype=np.float64)
             pwin_cache[key] = m
         return pwin_cache[key]
 
@@ -1059,7 +1143,7 @@ def _exact_combined_playoffs(
     # final, as in the Playoff tab's single-elimination bracket.
     decider_weights: Dict[tuple, float] = {}
     if third_place and template.get("decider"):
-        decider_weights = _decider_pairing_weights(tuple_probs, template, match_prob)
+        decider_weights = _decider_pairing_weights(tuple_probs, template, match_prob, rounds_total)
     has_decider = bool(decider_weights)
     n_rows = rounds_total + (1 if has_decider else 0)
 
@@ -1076,6 +1160,7 @@ def _exact_combined_playoffs(
         _play_match_deterministic(
             states, a, b, winner, remaining_rounds_after=rem, prob_cache=prob_cache,
             player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id,
+            match_type=match_type_for(rem) if rem >= 0 else "bo3",  # the decider is a Bo3 after the final's round
         )
         out: Dict[int, tuple] = {}
         for ts in states.values():
@@ -1249,6 +1334,8 @@ def _exact_combined_playoffs(
         "bracket_size": bracket_size,
         "rounds": rounds_total,
         "third_place": has_decider,
+        "layout": template.get("layout"),
+        "final_bo": final_bo,
         "round_labels": round_labels,
         "round_reach": {str(tid): row for tid, row in round_reach.items()},
         "round_wins": {str(tid): row for tid, row in round_wins.items()},
@@ -1260,6 +1347,12 @@ def _exact_combined_playoffs(
         # win-probability matrix between all teams.
         "pairing_table": pairing_table,
         "win_probs": {str(a): {str(b): match_prob(a, b) for b in all_team_ids if b != a} for a in all_team_ids},
+        # the final's series odds when it is a different best-of (the joint sampler plays it with these)
+        "final_win_probs": (
+            {str(a): {str(b): match_prob(a, b, 0) for b in all_team_ids if b != a} for a in all_team_ids}
+            if final_bo != 3
+            else None
+        ),
         "stop_teams": stop_teams,
         "player_ev": player_ev,
         # Per-round expected points by component (penalty excluded), the
@@ -1460,6 +1553,8 @@ def bake_event_valuations(
             {
                 "groups": groups_ids, "group_format": fmt, "combined_playoffs": combined, "playoff_stop_teams": 1,
                 "playoff_third_place": bool(detected.get("playoff_third_place")), "event_id": event_id,
+                "playoff_layout": _stored_playoff_layout(event_id),
+                "playoff_final_bo": int(((detected.get("playoff_bo_rules") or {}).get("grandFinal")) or 3),
             }
         )
     except HTTPException as exc:
@@ -1790,6 +1885,8 @@ def _compute_groups_result_inner(
             quals_per_group=quals_per_group,
             group_format=group_format,
             third_place=bool(payload.get("playoff_third_place")),
+            layout=str(payload.get("playoff_layout") or DEFAULT_PLAYOFF_LAYOUT),
+            final_bo=int(payload.get("playoff_final_bo") or 3),
             progress_callback=(
                 (lambda done, total: progress_callback(len(groups) + (1 if done >= total else 0), total_units))
                 if progress_callback
@@ -1840,6 +1937,7 @@ def _compute_groups_result_inner(
         "stage_stats": _assemble_stage_stats(group_format, stage_acc, playoff_summary, teams_out, team_rank_by_id),
         "combined_playoffs": combined,
         "playoff_third_place": bool((playoff_summary or {}).get("third_place")),
+        "playoff_layout": (playoff_summary or {}).get("layout"),
         "playoff": playoff_summary,
         "method": "exact_enumeration_per_group" + ("_plus_exact_playoffs" if combined else ""),
     }
@@ -2716,12 +2814,17 @@ def _sample_joint_outcomes(results: dict, n: int, seed: int = 20240101) -> tuple
     has_playoff = bool(po.get("pairing_table") and po.get("win_probs"))
     if has_playoff:
         rounds_total = int(po.get("rounds") or 1)
-        template = _combined_bracket_template(x, quals, rounds_total, fmt)
+        template = _combined_bracket_template(x, quals, rounds_total, fmt, str(po.get("layout") or DEFAULT_PLAYOFF_LAYOUT))
         rounds, entry_round, prior_matches = template["rounds"], template["entry_round"], template["prior_matches"]
         byes = bool(template["byes_to_semis"])
     else:
         rounds_total, rounds, entry_round, prior_matches, byes = 0, [], {}, {}, False
     win_probs = {int(a): {int(b): float(p) for b, p in row.items()} for a, row in (po.get("win_probs") or {}).items()}
+    final_win_probs = (
+        {int(a): {int(b): float(p) for b, p in row.items()} for a, row in (po.get("final_win_probs") or {}).items()}
+        if po.get("final_win_probs")
+        else None
+    )
     table = {
         tuple(int(t) for t in k.split(",")): {int(pid): v for pid, v in row.items()}
         for k, row in (po.get("pairing_table") or {}).items()
@@ -2806,7 +2909,8 @@ def _sample_joint_outcomes(results: dict, n: int, seed: int = 20240101) -> tuple
                 sa, sb = team_seed[a], team_seed[b]
                 na = prior_matches[sa] + r - entry_round.get(sa, 0) + 1
                 nb = prior_matches[sb] + r - entry_round.get(sb, 0) + 1
-                w = a if u[i, ui] < win_probs[a][b] else b
+                probs = final_win_probs if (rem == 0 and final_win_probs) else win_probs
+                w = a if u[i, ui] < probs[a][b] else b
                 ui += 1
                 winners[(r, m)] = w
                 losers[(r, m)] = b if w == a else a
@@ -2839,11 +2943,11 @@ def _sample_joint_outcomes(results: dict, n: int, seed: int = 20240101) -> tuple
         if decider and all(k in losers for k in ((decider[0][1], decider[0][2]), (decider[1][1], decider[1][2]))):
             ta = losers[(decider[0][1], decider[0][2])]
             tb = losers[(decider[1][1], decider[1][2])]
-            na = prior_matches[team_seed[ta]] + 3
-            nb = prior_matches[team_seed[tb]] + 3
+            na = _decider_match_number(template, team_seed[ta], rounds_total)
+            nb = _decider_match_number(template, team_seed[tb], rounds_total)
             w = ta if u[i, ui] < win_probs[ta][tb] else tb
             ui += 1
-            row = table.get((ta, tb, w, na, nb, 0))
+            row = table.get((ta, tb, w, na, nb, _DECIDER_REM))
             if row is None:
                 missing += 1
             else:

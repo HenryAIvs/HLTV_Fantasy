@@ -201,7 +201,9 @@ def compute_pairing_weights(
     weights[(a, b, winner, match_num_a, match_num_b, rounds_remaining)] = P(that
     match happens with that result); advance[team] = P(team wins a root match);
     bye_weight[team] = P(team occupies a bye slot).
-    pwin(g, h) -> array (n_g, n_h): P(team i of group g beats team j of h)."""
+    pwin(g, h, rem) -> array (n_g, n_h): P(team i of group g beats team j of
+    h) in a match with `rem` rounds still to play after it (0 = the final,
+    whose best-of may differ)."""
     weights: Dict[tuple, float] = {}
     advance: Dict[int, float] = {}
     bye_weight: Dict[int, float] = {}
@@ -230,7 +232,7 @@ def compute_pairing_weights(
         pair_w = _pair_weights(specs, left_slots, FL, right_slots, FR)
         for (xi, yi), W in pair_w.items():
             x, y = left_slots[xi], right_slots[yi]
-            pm = pwin(x.group, y.group)
+            pm = pwin(x.group, y.group, rem)
             num_x = x.prior_matches + r - x.entry_round + 1
             num_y = y.prior_matches + r - y.entry_round + 1
             for i, j in np.argwhere(W > 0.0):
@@ -261,7 +263,7 @@ def compute_pairing_weights(
         F = np.zeros(shape + [len(slots)], dtype=np.float64)
         for xi, x in enumerate(left_slots):
             for yi, y in enumerate(right_slots):
-                pm = pwin(x.group, y.group)
+                pm = pwin(x.group, y.group, rem)
                 base = f"{sub_L},{sub_R},{letter[x]}{letter[y]}->{all_sub}"
                 F[..., xi] += np.einsum(base, FL[..., xi], FR[..., yi], pm, optimize="optimal")
                 F[..., len(left_slots) + yi] += np.einsum(base, FL[..., xi], FR[..., yi], 1.0 - pm, optimize="optimal")

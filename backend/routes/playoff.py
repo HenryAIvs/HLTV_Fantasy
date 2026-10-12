@@ -567,9 +567,12 @@ def _clone_team_states(team_states: Dict[int, TeamState]) -> Dict[int, TeamState
     return cloned
 
 
-def cached_win_prob(prob_cache: Dict[tuple[int, int], float] | None, a_id: int, b_id: int) -> float:
-    """P(a beats b, Bo3) via the shared cache, always evaluated in a canonical
-    direction (lower team id first) and mirrored as 1 - p.
+def cached_win_prob(
+    prob_cache: Dict[tuple, float] | None, a_id: int, b_id: int, match_type: str = "bo3"
+) -> float:
+    """P(a beats b) in a series of `match_type` (Bo3 unless a round says
+    otherwise) via the shared cache, always evaluated in a canonical direction
+    (lower team id first) and mirrored as 1 - p.
 
     The win-probability model is not symmetric — p(a, b) and 1 - p(b, a) can
     differ by a few percent — so caching whichever direction a caller asked
@@ -579,14 +582,16 @@ def cached_win_prob(prob_cache: Dict[tuple[int, int], float] | None, a_id: int, 
     """
     if a_id == b_id:
         return 0.5
-    key = (a_id, b_id)
+    mt = str(match_type or "bo3").lower()
+    tag = () if mt == "bo3" else (mt,)
+    key = (a_id, b_id) + tag
     if prob_cache is not None and key in prob_cache:
         return prob_cache[key]
     lo, hi = (a_id, b_id) if a_id < b_id else (b_id, a_id)
-    p_lo = calculate_win_probability(lo, hi, "bo3")
+    p_lo = calculate_win_probability(lo, hi, mt)
     if prob_cache is not None:
-        prob_cache[(lo, hi)] = p_lo
-        prob_cache[(hi, lo)] = 1.0 - p_lo
+        prob_cache[(lo, hi) + tag] = p_lo
+        prob_cache[(hi, lo) + tag] = 1.0 - p_lo
     return p_lo if a_id == lo else 1.0 - p_lo
 
 
@@ -599,12 +604,13 @@ def _play_match_deterministic(
     prob_cache: Dict[tuple[int, int], float] | None = None,
     player_rows_by_id: Dict[int, dict] | None = None,
     team_rank_by_id: Dict[int, int] | None = None,
+    match_type: str = "bo3",
 ) -> tuple[int, int, float, float]:
     A = team_states[a_id]
     B = team_states[b_id]
     match_num_a = A.matches_played + 1
     match_num_b = B.matches_played + 1
-    prob_a = cached_win_prob(prob_cache, a_id, b_id)
+    prob_a = cached_win_prob(prob_cache, a_id, b_id, match_type)
 
     if winner_id == a_id:
         winner, loser = A, B
@@ -621,11 +627,11 @@ def _play_match_deterministic(
     loser.record_loss(winner.team_id)
 
     apply_fantasy_points_for_team(
-        A, B.team_id, prob_a, did_win_a, match_num_a, "bo3",
+        A, B.team_id, prob_a, did_win_a, match_num_a, match_type,
         player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id
     )
     apply_fantasy_points_for_team(
-        B, A.team_id, 1.0 - prob_a, did_win_b, match_num_b, "bo3",
+        B, A.team_id, 1.0 - prob_a, did_win_b, match_num_b, match_type,
         player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id
     )
     _apply_elimination_penalty(loser, remaining_rounds_after)

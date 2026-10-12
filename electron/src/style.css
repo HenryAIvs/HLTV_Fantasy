@@ -1371,6 +1371,17 @@ table.players-table {
   gap: 12px;
 }
 
+.playoff-layout-row {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 0 10px;
+}
+
+.playoff-layout-row select {
+  width: auto;
+  min-width: 280px;
+}
+
 .team-alias-row {
   display: flex;
   align-items: center;

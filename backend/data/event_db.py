@@ -40,6 +40,21 @@ def ensure_event_schema() -> None:
         # Human-readable event name derived from the linked HLTV event URL.
         if "name" not in event_col_names:
             conn.execute("ALTER TABLE events ADD COLUMN name TEXT")
+        # Semi-final layout of a 2-group GSL → 4-team combined playoff
+        # ("cross" | "same_group"); NULL = the default (routes/groups.py).
+        if "playoff_layout" not in event_col_names:
+            conn.execute("ALTER TABLE events ADD COLUMN playoff_layout TEXT")
+        # Fantasy events removed by the operator: the nightly discovery must not
+        # import them again while HLTV still lists them.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS deleted_events (
+                event_id   INTEGER PRIMARY KEY,
+                name       TEXT,
+                deleted_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS event_teams (
@@ -473,6 +488,56 @@ def set_event_tournament_kind(event_id: int, kind: Optional[str]) -> None:
             (value, int(event_id)),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def get_event_playoff_layout(event_id: int) -> Optional[str]:
+    conn = connect()
+    try:
+        row = conn.execute("SELECT playoff_layout FROM events WHERE event_id = ?", (int(event_id),)).fetchone()
+        return (row["playoff_layout"] or None) if row else None
+    finally:
+        conn.close()
+
+
+def set_event_playoff_layout(event_id: int, layout: Optional[str]) -> None:
+    conn = connect()
+    try:
+        conn.execute("UPDATE events SET playoff_layout = ? WHERE event_id = ?", (layout or None, int(event_id)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_event(event_id: int) -> Dict[str, Any]:
+    """Remove a fantasy event, its rosters and prices, and remember the id so
+    the nightly discovery leaves it alone. Match results and team data are
+    shared across events and stay."""
+    eid = int(event_id)
+    conn = connect()
+    try:
+        row = conn.execute("SELECT name FROM events WHERE event_id = ?", (eid,)).fetchone()
+        name = row["name"] if row else None
+        counts = {
+            "event_teams": conn.execute("DELETE FROM event_teams WHERE event_id = ?", (eid,)).rowcount,
+            "event_player_prices": conn.execute("DELETE FROM event_player_prices WHERE event_id = ?", (eid,)).rowcount,
+            "events": conn.execute("DELETE FROM events WHERE event_id = ?", (eid,)).rowcount,
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO deleted_events (event_id, name, deleted_at) VALUES (?, ?, datetime('now'))",
+            (eid, name),
+        )
+        conn.commit()
+        return {"event_id": eid, "name": name, "removed": counts}
+    finally:
+        conn.close()
+
+
+def list_deleted_event_ids() -> List[int]:
+    conn = connect()
+    try:
+        return [int(r["event_id"]) for r in conn.execute("SELECT event_id FROM deleted_events").fetchall()]
     finally:
         conn.close()
 

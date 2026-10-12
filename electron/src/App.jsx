@@ -8075,6 +8075,25 @@ function EventsTab({ refreshData, notify, players, teams = [], onOpenPlayer, onO
     return groups;
   }, [activeEventDetail, teams, players]);
 
+  const removeEvent = async (ev) => {
+    if (PUBLIC_BUILD) return;
+    if (!window.confirm(`Remove ${ev.name || ev.event_id} from the event list?`)) return;
+    setBusy(true);
+    setMessage("");
+    try {
+      const res = await api.delete(`/events/${Number(ev.event_id)}`);
+      if (res?.detail) {
+        setMessage(String(res.detail));
+        return;
+      }
+      await refreshData();
+    } catch (e) {
+      setMessage(`Could not remove: ${e?.message || "unknown error"}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const activateEvent = async (targetEventId) => {
     if (PUBLIC_BUILD) return;
     setBusy(true);
@@ -8158,6 +8177,13 @@ function EventsTab({ refreshData, notify, players, teams = [], onOpenPlayer, onO
                               disabled={busy || activeEventId === ev.event_id}
                             >
                               {activeEventId === ev.event_id ? "Active" : "Set Active"}
+                            </button>
+                            <button
+                              className="danger"
+                              onClick={() => removeEvent(ev)}
+                              disabled={busy || activeEventId === ev.event_id}
+                            >
+                              Remove
                             </button>
                           </div>
                         )}
@@ -13748,7 +13774,7 @@ function GroupBracketVisual({ format, slotIds, nameOf, hltvIdByTeamId, combined,
 // card + connector system as the Playoff tab. Mirrors the simulator's
 // templates: the top-3 shape is the 6-team byes bracket; other shapes flatten
 // qualifiers seed-major and pair i vs N-1-i, with stopTeams ending early.
-function PlayoffSkeleton({ format, groupCount, qualsPerGroup, stopTeams = 1, bo = null, thirdPlace = false }) {
+function PlayoffSkeleton({ format, groupCount, qualsPerGroup, stopTeams = 1, bo = null, thirdPlace = false, layout = "cross" }) {
   const boDefault = Number(bo?.default || 3);
   const boFinal = Number(bo?.grandFinal || boDefault);
   const boThird = Number(bo?.thirdPlace || boDefault);
@@ -13777,6 +13803,22 @@ function PlayoffSkeleton({ format, groupCount, qualsPerGroup, stopTeams = 1, bo 
           { key: "sf1", title: "SF 1", meta: `BO${boDefault}`, rows: [ph(`${seedLabel(1, 0)} (bye)`, "a", false), ph("Winner QF 1", "b")] },
           { key: "sf2", title: "SF 2", meta: `BO${boDefault}`, rows: [ph(`${seedLabel(0, 0)} (bye)`, "a", false), ph("Winner QF 2", "b")] },
         ],
+      },
+      {
+        title: "Grand final",
+        matches: [{ key: "f", title: "Final", meta: `BO${boFinal}`, rows: [ph("Winner SF 1", "a"), ph("Winner SF 2", "b")] }],
+      },
+    ];
+  } else if (format === "gsl4" && groupCount === 2 && qualsPerGroup === 2 && stopTeams === 1) {
+    // The organiser's choice (events.playoff_layout): cross or same-group semis.
+    const sf = layout === "same_group" ? [[[0, 0], [0, 1]], [[1, 0], [1, 1]]] : [[[0, 0], [1, 1]], [[1, 0], [0, 1]]];
+    rounds = [
+      {
+        title: "Semi-finals",
+        matches: sf.map(([a, b], m) => ({
+          key: `sf${m + 1}`, title: `SF ${m + 1}`, meta: `BO${boDefault}`,
+          rows: [ph(seedLabel(...a), "a", false), ph(seedLabel(...b), "b", false)],
+        })),
       },
       {
         title: "Grand final",
@@ -13881,6 +13923,8 @@ function GroupsTab({
   playoffBo = null,
   // The event page lists a third-place decider for the playoff.
   playoffThirdPlace = false,
+  // Semi-final layout of a 2-group GSL playoff ("cross" | "same_group"), stored per event.
+  playoffLayoutDetected = "cross",
 }) {
   const [groupsTab, setGroupsTab] = useState("stage");
   const [events, setEvents] = useState([]);
@@ -13892,6 +13936,25 @@ function GroupsTab({
   const qualsPerGroup = { gsl4: 2, de8: 4, de8_top3: 3 }[groupFormat] || 2;
   const [combinedPlayoffs, setCombinedPlayoffs] = useState(false);
   const [playoffStopTeams, setPlayoffStopTeams] = useState("1");
+  const [playoffLayout, setPlayoffLayout] = useState(playoffLayoutDetected || "cross");
+  useEffect(() => {
+    setPlayoffLayout(playoffLayoutDetected || "cross");
+  }, [playoffLayoutDetected]);
+  const [layoutBusy, setLayoutBusy] = useState(false);
+  const changePlayoffLayout = async (value) => {
+    const prev = playoffLayout;
+    setPlayoffLayout(value);
+    setLayoutBusy(true);
+    try {
+      await api.post(`/events/${selectedEventId}/playoff-layout`, { layout: value }, 600000);
+      await loadLatest();
+    } catch (e) {
+      setPlayoffLayout(prev);
+      notify?.(`Could not set the layout: ${e?.message || "unknown error"}`);
+    } finally {
+      setLayoutBusy(false);
+    }
+  };
   const [slots, setSlots] = useState(Array(8).fill(""));
   const [results, setResults] = useState(null);
   const [updatedAt, setUpdatedAt] = useState("");
@@ -13899,7 +13962,7 @@ function GroupsTab({
   // verified against a real HLTV bracket (backend allowlist): today that is
   // 2 groups of 8 with top 3 -> 6-team bracket. Anything else is refused and
   // flagged for development rather than simulated under a guessed seeding.
-  const combinedAllowed = (groupFormat === "de8_top3" && groupCount === 2) || (groupFormat === "gsl4" && groupCount === 4);
+  const combinedAllowed = (groupFormat === "de8_top3" && groupCount === 2) || (groupFormat === "gsl4" && (groupCount === 2 || groupCount === 4));
   // Detection says this one fantasy game scores the playoffs too: default the
   // toggle on, unless a stored simulation already made a choice (loadLatest
   // overwrites it from the saved payload right after).
@@ -14097,6 +14160,7 @@ function GroupsTab({
     setCombinedPlayoffs(Boolean(payload.combined_playoffs));
     setBakedInfo(payload.baked || null);
     if (payload.playoff_stop_teams) setPlayoffStopTeams(String(payload.playoff_stop_teams));
+    if (payload.playoff_layout) setPlayoffLayout(String(payload.playoff_layout));
     setResults(data.results || null);
     setUpdatedAt(data.updated_at ? new Date(Number(data.updated_at) * 1000).toISOString() : "");
     return savedGroups.length > 0;
@@ -14794,6 +14858,14 @@ function GroupsTab({
                     {collapsedCards.playoff ? "▸" : "▾"}
                   </span>
                 </button>
+                {!collapsedCards.playoff && groupFormat === "gsl4" && groupCount === 2 && !PUBLIC_BUILD && (
+                  <div className="playoff-layout-row">
+                    <select value={playoffLayout} disabled={layoutBusy} onChange={(e) => changePlayoffLayout(e.target.value)}>
+                      <option value="cross">Semis: 1st v 2nd of the other group</option>
+                      <option value="same_group">Semis: 1st v 2nd of the same group</option>
+                    </select>
+                  </div>
+                )}
                 {!collapsedCards.playoff && (
                   <PlayoffSkeleton
                     format={groupFormat}
@@ -14802,6 +14874,7 @@ function GroupsTab({
                     stopTeams={groupFormat === "de8_top3" ? 1 : Number(playoffStopTeams) || 1}
                     bo={playoffBo}
                     thirdPlace={playoffThirdPlace}
+                    layout={playoffLayout}
                   />
                 )}
               </div>
@@ -15354,6 +15427,7 @@ function TournamentTab({ teams, teamLookup, players, sortTeams, applyFilters, on
           groupBo={Number(kindInfo?.group_bo_rules?.default || 3)}
           playoffBo={kindInfo?.playoff_bo_rules || null}
           playoffThirdPlace={Boolean(kindInfo?.playoff_third_place)}
+          playoffLayoutDetected={kindInfo?.playoff_layout || "cross"}
         />
       )}
       {kind === "playoff" && <PlayoffTab {...sharedProps} detectedBracketSize={kindInfo?.playoff_size} />}

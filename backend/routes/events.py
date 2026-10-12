@@ -33,8 +33,12 @@ from backend.data.event_db import (
     get_cached_hltv_rankings_on_or_before_date,
     get_cached_vrs_rankings_on_or_before_date,
     get_active_event_id,
+    delete_event,
     get_event_detail,
+    get_event_playoff_layout,
     get_event_tournament_kind,
+    list_deleted_event_ids,
+    set_event_playoff_layout,
     get_player_latest_teams,
     set_event_tournament_kind,
     get_hltv_result_by_url,
@@ -4824,6 +4828,7 @@ def get_event_kind(event_id: int):
         "combined_supported": detected.get("combined_supported", False),
         "combined_shape": detected.get("combined_shape", ""),
         "playoff_third_place": detected.get("playoff_third_place", False),
+        "playoff_layout": _event_playoff_layout(int(event_id)),
         "stage_scoped": detected.get("stage_scoped", False),
         "stage_scope_reason": detected.get("stage_scope_reason", ""),
         "team_count": detected["team_count"],
@@ -4833,6 +4838,62 @@ def get_event_kind(event_id: int):
         "group_bo_rules": detected.get("group_bo_rules"),
         "playoff_bo_rules": detected.get("playoff_bo_rules"),
     }
+
+
+def _event_playoff_layout(event_id: int) -> str:
+    from backend.routes.groups import DEFAULT_PLAYOFF_LAYOUT, PLAYOFF_LAYOUTS
+
+    value = str(get_event_playoff_layout(event_id) or "").strip().lower()
+    return value if value in PLAYOFF_LAYOUTS else DEFAULT_PLAYOFF_LAYOUT
+
+
+@router.post("/{event_id}/playoff-layout")
+def set_event_playoff_layout_route(event_id: int, payload: Dict[str, Any] | None = None):
+    """Set the semi-final layout of a 2-group combined playoff ("cross" or
+    "same_group") and re-bake the event's valuations with it."""
+    from backend.routes.groups import PLAYOFF_LAYOUTS
+    from backend.services import event_pipeline
+
+    event = get_event_detail(int(event_id))
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    layout = str((payload or {}).get("layout") or "").strip().lower()
+    if layout not in PLAYOFF_LAYOUTS:
+        raise HTTPException(status_code=400, detail=f"layout must be one of {', '.join(PLAYOFF_LAYOUTS)}")
+    set_event_playoff_layout(int(event_id), layout)
+    bake = event_pipeline.bake_event(int(event_id), trigger="manual")
+    return {**get_event_kind(int(event_id)), "bake": bake}
+
+
+@router.delete("/{event_id}")
+def remove_event(event_id: int):
+    """Remove a fantasy event the operator will not value (finished without a
+    run, or imported by mistake) and every stored run keyed by it. The active
+    event cannot be removed."""
+    from backend.routes import groups as groups_routes
+    from backend.routes import playoff as playoff_routes
+    from backend.routes import simulation as simulation_routes
+    from backend.services import event_rosters
+
+    eid = int(event_id)
+    if not get_event_detail(eid):
+        raise HTTPException(status_code=404, detail="Event not found")
+    if get_active_event_id() == eid:
+        raise HTTPException(status_code=409, detail="The active event cannot be removed; activate another event first")
+    stores = [
+        groups_routes._GROUPS_STATE, groups_routes._GROUPS_BEST_STATE, groups_routes._GROUPS_BEST_META,
+        groups_routes._INPUT_SNAPSHOT, simulation_routes._SIM_STATE,
+    ] + [store for variant in playoff_routes._STATE_SETS.values() for store in variant.values()]
+    for store in stores:
+        try:
+            store.delete(key=eid)
+        except Exception:  # noqa: BLE001
+            logger.warning("Could not drop %s for event %s", getattr(store, "table", store), eid, exc_info=True)
+    removed = delete_event(eid)
+    with _KIND_CACHE_LOCK:
+        _KIND_CACHE.pop(eid, None)
+    event_rosters.invalidate()
+    return {"status": "ok", **removed}
 
 
 @router.post("/{event_id}/kind")
@@ -4959,7 +5020,8 @@ def discover_and_import_new_fantasy_events() -> Dict[str, Any]:
     for m in re.finditer(r'href="/fantasy/(\d+)/gameredirect"[^>]*>.*?text-ellipsis">([^<]+)<', html or ""):
         nav_names.setdefault(int(m.group(1)), m.group(2).strip())
     existing = {int(e["event_id"]) for e in list_events()}
-    new_ids = [fid for fid in found if fid not in existing]
+    removed = set(list_deleted_event_ids())  # pruned by the operator: never re-imported
+    new_ids = [fid for fid in found if fid not in existing and fid not in removed]
     prev_active = get_active_event_id()
     imported: List[int] = []
     failed: List[Dict[str, Any]] = []
