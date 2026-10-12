@@ -3551,6 +3551,31 @@ def _build_rank_effect_curve(model: Dict[str, Any], samples: List[Dict[str, Any]
     }
 
 
+# ---- the veto model -------------------------------------------------------------
+# At every veto step the acting team chooses one map from what is left. A
+# conditional-logit scorer per action (ban, pick) ranks the alternatives from
+# point-in-time inputs: both teams' six-month pick/ban/win/played share on the
+# map, what each team played recently, each team's ban and pick habits over its
+# last vetoes (its first ban above all), and the map model's win probability.
+# Measured 2026-09-24 on a chronological split against the previous rule (ban
+# the opponent's strongest map by win probability, pick your own): bans right
+# 71% vs 43%, picks 57% vs 48%, maps actually played predicted 57% vs 38%.
+VETO_FEATURES: Tuple[str, ...] = (
+    "own_pick", "own_ban", "own_win", "own_share", "opp_pick", "opp_ban", "opp_win", "opp_share",
+    "own_recent", "own_days", "own_ban5", "own_pick5", "opp_recent", "opp_days", "opp_ban5", "opp_pick5", "p_win",
+    "own_ban3", "own_ban10", "own_pick3", "own_pick10", "own_first_ban", "own_first_pick", "opp_ban3", "opp_pick3", "opp_first_ban",
+    "step_no", "n_remaining", "is_bo1",
+)
+# Standard HLTV orders, side 0 acting first: bans until one map is left (Bo1),
+# ban ban pick pick ban ban + decider (Bo3), ban ban pick pick pick pick + decider (Bo5).
+_VETO_ORDER: Dict[int, List[tuple[str, int]]] = {
+    1: [("ban", 0), ("ban", 1)] * 3,
+    2: [("ban", 0), ("ban", 1), ("pick", 0), ("pick", 1), ("ban", 0), ("ban", 1)],
+    3: [("ban", 0), ("ban", 1), ("pick", 0), ("pick", 1), ("pick", 0), ("pick", 1)],
+}
+_VETO_MIN_CHOICES = 500
+
+
 def _veto_empty_context() -> Dict[str, Any]:
     return {"maps": [], "vetoes": []}
 
@@ -4580,6 +4605,10 @@ def _detect_event_tournament_kind(event: Dict[str, Any]) -> Dict[str, Any]:
         "combined_playoffs": combined,
         "combined_supported": combined_supported,
         "combined_shape": combined_shape,
+        # A third-place decider: the formats table's "3rd place decider match
+        # BoN" line, or an auxiliary bracket named for it on the page.
+        "playoff_third_place": bool((structure.get("playoff_bo_rules") or {}).get("thirdPlace"))
+        or any(b.get("aux") for b in (structure.get("brackets") or []) if b.get("bracket") == "single_elim"),
         "stage_scoped": stage_scoped,
         "stage_scope_reason": scope_reason,
         "team_count": team_count,
@@ -4792,6 +4821,7 @@ def get_event_kind(event_id: int):
         "combined_playoffs": detected.get("combined_playoffs", False),
         "combined_supported": detected.get("combined_supported", False),
         "combined_shape": detected.get("combined_shape", ""),
+        "playoff_third_place": detected.get("playoff_third_place", False),
         "stage_scoped": detected.get("stage_scoped", False),
         "stage_scope_reason": detected.get("stage_scope_reason", ""),
         "team_count": detected["team_count"],

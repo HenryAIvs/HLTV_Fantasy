@@ -2034,7 +2034,11 @@ function GroupPlayerBreakdownModal({ player, teamLookup, teams, onClose }) {
     const avgRow = oppPlay > 0.0005 ? { play: oppPlay, win: oppAvg("win"), winPts: oppAvg("winPts"), rating: oppAvg("rating") } : null;
     const covered = play + bye + elimProb;
     const elsewhere = (s.phase === "group" || s.bracket) && covered < 0.9995 ? 1 - covered : 0;
-    const elsewhereLabel = s.bracket === "lower" ? "Upper bracket" : s.phase === "group" ? "Lower bracket" : "Lower bracket or out";
+    const elsewhereLabel =
+      s.bracket === "lower" ? "Upper bracket"
+      : s.phase === "group" ? "Lower bracket"
+      : s.label === "3rd place" ? "Final or out earlier"
+      : "Out earlier";
     const perMatch = {
       rating: play > 0.0005 ? Number(cell.rating || 0) / play : 0,
       win: play > 0.0005 ? (Number(cell.win || 0) - elimPts) / play : 0,
@@ -2157,7 +2161,9 @@ function GroupPlayerBreakdownModal({ player, teamLookup, teams, onClose }) {
     sec.stages.push(s);
   });
   const built = sections.map((sec) => {
-    const isBracket = sec.id === "group" || sec.stages.some((st) => st.bracket || st.opener);
+    // A section is a bracket grid when a stage sits on an upper/lower side;
+    // the playoff rounds ("playoff" side) read as one row of cards.
+    const isBracket = sec.id === "group" || sec.stages.some((st) => (st.bracket && st.bracket !== "playoff") || st.opener);
     if (!isBracket) {
       const cards = sec.stages.map(cardFor).filter(Boolean);
       if (sec.id === "playoff" && playoffPadCard && cards.length > 0) cards.splice(Math.min(1, cards.length), 0, playoffPadCard);
@@ -13679,9 +13685,10 @@ function GroupBracketVisual({ format, slotIds, nameOf, hltvIdByTeamId, combined,
 // card + connector system as the Playoff tab. Mirrors the simulator's
 // templates: the top-3 shape is the 6-team byes bracket; other shapes flatten
 // qualifiers seed-major and pair i vs N-1-i, with stopTeams ending early.
-function PlayoffSkeleton({ format, groupCount, qualsPerGroup, stopTeams = 1, bo = null }) {
+function PlayoffSkeleton({ format, groupCount, qualsPerGroup, stopTeams = 1, bo = null, thirdPlace = false }) {
   const boDefault = Number(bo?.default || 3);
   const boFinal = Number(bo?.grandFinal || boDefault);
+  const boThird = Number(bo?.thirdPlace || boDefault);
   const empty = {};
   const ph = (text, key, muted = true) => (
     <GroupTeamRow key={key} teamId={0} placeholder={text} muted={muted} hltvIdByTeamId={empty} />
@@ -13706,6 +13713,30 @@ function PlayoffSkeleton({ format, groupCount, qualsPerGroup, stopTeams = 1, bo 
         matches: [
           { key: "sf1", title: "SF 1", meta: `BO${boDefault}`, rows: [ph(`${seedLabel(1, 0)} (bye)`, "a", false), ph("Winner QF 1", "b")] },
           { key: "sf2", title: "SF 2", meta: `BO${boDefault}`, rows: [ph(`${seedLabel(0, 0)} (bye)`, "a", false), ph("Winner QF 2", "b")] },
+        ],
+      },
+      {
+        title: "Grand final",
+        matches: [{ key: "f", title: "Final", meta: `BO${boFinal}`, rows: [ph("Winner SF 1", "a"), ph("Winner SF 2", "b")] }],
+      },
+    ];
+  } else if (format === "gsl4" && groupCount === 4 && qualsPerGroup === 2 && stopTeams === 1) {
+    // As HLTV ran Stake Pulse Beat II: A1 v D2, C1 v B2, B1 v C2, D1 v A2,
+    // the semis pairing QF1 with QF2 and QF3 with QF4 (groups.py's layout).
+    const qf = [[[0, 0], [3, 1]], [[2, 0], [1, 1]], [[1, 0], [2, 1]], [[3, 0], [0, 1]]];
+    rounds = [
+      {
+        title: "Quarter-finals",
+        matches: qf.map(([a, b], m) => ({
+          key: `qf${m + 1}`, title: `QF ${m + 1}`, meta: `BO${boDefault}`,
+          rows: [ph(seedLabel(...a), "a", false), ph(seedLabel(...b), "b", false)],
+        })),
+      },
+      {
+        title: "Semi-finals",
+        matches: [
+          { key: "sf1", title: "SF 1", meta: `BO${boDefault}`, rows: [ph("Winner QF 1", "a"), ph("Winner QF 2", "b")] },
+          { key: "sf2", title: "SF 2", meta: `BO${boDefault}`, rows: [ph("Winner QF 3", "a"), ph("Winner QF 4", "b")] },
         ],
       },
       {
@@ -13756,6 +13787,11 @@ function PlayoffSkeleton({ format, groupCount, qualsPerGroup, stopTeams = 1, bo 
             </div>
           ))}
         </div>
+        {thirdPlace && (
+          <div className="pb-thirdplace">
+            <GroupMatchCard title="3rd place" meta={`BO${boThird}`} rows={[ph("Loser SF 1", "a"), ph("Loser SF 2", "b")]} />
+          </div>
+        )}
       </div>
     </div>
   );
@@ -13778,8 +13814,10 @@ function GroupsTab({
   combinedShape = "",
   // Best-of for group matches from the event's formats table (default Bo3).
   groupBo = 3,
-  // Playoff best-of rules { default, grandFinal } for the bracket skeleton.
+  // Playoff best-of rules { default, grandFinal, thirdPlace } for the bracket skeleton.
   playoffBo = null,
+  // The event page lists a third-place decider for the playoff.
+  playoffThirdPlace = false,
 }) {
   const [groupsTab, setGroupsTab] = useState("stage");
   const [events, setEvents] = useState([]);
@@ -13798,7 +13836,7 @@ function GroupsTab({
   // verified against a real HLTV bracket (backend allowlist): today that is
   // 2 groups of 8 with top 3 -> 6-team bracket. Anything else is refused and
   // flagged for development rather than simulated under a guessed seeding.
-  const combinedAllowed = groupFormat === "de8_top3" && groupCount === 2;
+  const combinedAllowed = (groupFormat === "de8_top3" && groupCount === 2) || (groupFormat === "gsl4" && groupCount === 4);
   // Detection says this one fantasy game scores the playoffs too: default the
   // toggle on, unless a stored simulation already made a choice (loadLatest
   // overwrites it from the saved payload right after).
@@ -14700,6 +14738,7 @@ function GroupsTab({
                     qualsPerGroup={qualsPerGroup}
                     stopTeams={groupFormat === "de8_top3" ? 1 : Number(playoffStopTeams) || 1}
                     bo={playoffBo}
+                    thirdPlace={playoffThirdPlace}
                   />
                 )}
               </div>
@@ -14732,11 +14771,13 @@ function GroupsTab({
                   // the top-3 format), reaching the final, and the title.
                   const qualify = Object.values(place).reduce((acc, v) => acc + Number(v || 0), 0);
                   const first = Number(place["1"] || 0);
-                  const finalReach = reach.length > 0 ? Number(reach[reach.length - 1] || 0) : null;
+                  // The last bracket round is the final; a third-place decider is listed after it.
+                  const lastRound = Math.max(1, Number(results.playoff?.rounds || labels.length)) - 1;
+                  const finalReach = reach.length > 0 ? Number(reach[lastRound] || 0) : null;
                   const earlyStop = Number(results.playoff?.stop_teams || 1) > 1;
                   const odds = [[results.playoff ? "Playoffs" : "Qualify", qualify, false], ["Win group", first, false]];
                   if (results.playoff) {
-                    if (finalReach != null && !earlyStop) odds.push([labels[labels.length - 1] || "Final", finalReach, false]);
+                    if (finalReach != null && !earlyStop) odds.push([labels[lastRound] || "Final", finalReach, false]);
                     odds.push([earlyStop ? "Qualify" : "Title", title, true]);
                   }
                   const rows = Object.entries(data.players || {}).sort(
@@ -15249,6 +15290,7 @@ function TournamentTab({ teams, teamLookup, players, sortTeams, applyFilters, on
           playoffDetected={{ size: Number(kindInfo?.playoff_size || 0), byes: Number(kindInfo?.playoff_byes || 0) }}
           groupBo={Number(kindInfo?.group_bo_rules?.default || 3)}
           playoffBo={kindInfo?.playoff_bo_rules || null}
+          playoffThirdPlace={Boolean(kindInfo?.playoff_third_place)}
         />
       )}
       {kind === "playoff" && <PlayoffTab {...sharedProps} detectedBracketSize={kindInfo?.playoff_size} />}

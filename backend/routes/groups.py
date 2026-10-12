@@ -8,6 +8,7 @@ per group (average EV, ceiling) stay exact for any number of groups.
 
 import heapq
 import itertools
+import logging
 import json
 import re
 import math
@@ -190,6 +191,9 @@ def _normalize_groups_payload(payload: dict) -> dict:
         groups.append(ids)
     combined = bool(payload.get("combined_playoffs"))
     stop_teams = int(payload.get("playoff_stop_teams") or 1)
+    third_place = payload.get("playoff_third_place")
+    if third_place is None:
+        third_place = combined and _detected_third_place(payload.get("event_id") or _state_key())
     if combined and not combined_shape_supported(group_format, len(groups)):
         raise HTTPException(
             status_code=400,
@@ -225,9 +229,22 @@ def _normalize_groups_payload(payload: dict) -> dict:
         "group_format": group_format,
         "combined_playoffs": combined,
         "playoff_stop_teams": stop_teams,
+        "playoff_third_place": bool(third_place),
         # The stored run is keyed by this event (see _state_key).
         "event_id": _state_key(),
     }
+
+
+def _detected_third_place(event_id) -> bool:
+    """Whether the event's page lists a third-place decider for its playoff."""
+    try:
+        from backend.data.event_db import get_event_detail
+        from backend.routes import events as events_routes
+
+        event = get_event_detail(int(event_id))
+        return bool(event and events_routes._detect_event_tournament_kind_cached(event).get("playoff_third_place"))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # Match-slot labels per group format, in play order (the enumerators' keys).
@@ -256,7 +273,7 @@ _GROUP_STAGE_ROUNDS: Dict[str, List[tuple]] = {
         ("lb_final", "LB Final", "Lower final", "lower", ["lower_final"]),
     ],
 }
-_PLAYOFF_ROUND_FULL = {"QF": "Quarter-final", "SF": "Semi-final", "Final": "Final", "R16": "Round of 16", "R32": "Round of 32"}
+_PLAYOFF_ROUND_FULL = {"QF": "Quarter-final", "SF": "Semi-final", "Final": "Final", "R16": "Round of 16", "R32": "Round of 32", "3rd place": "Third-place decider"}
 
 
 def _booster_meta(row: dict, p: Any) -> Optional[tuple]:
@@ -782,7 +799,19 @@ _PLAYOFF_BYE_PADDING_POINTS = 6.0
 _SUPPORTED_COMBINED_SHAPES: Dict[tuple, str] = {
     ("de8_top3", 2): "2 groups of 8, top 3 → 6-team bracket, group winners bye to the semis "
                      "(verified on FISSURE Playground 3 and BLAST Open Porto 2026)",
+    ("gsl4", 4): "4 GSL groups, top 2 → 8-team bracket: QF1 A1 v D2, QF2 C1 v B2, QF3 B1 v C2, QF4 D1 v A2, "
+                 "semis QF1 v QF2 and QF3 v QF4, optional third-place decider "
+                 "(verified on Stake Pulse Beat II, 2026-09-25/26)",
 }
+
+# Quarter-finals of the 4 × GSL → 8 bracket as ((group, rank), (group, rank)),
+# groups in draw order A..D, rank 0 = group winner. Read off Stake Pulse Beat
+# II's played bracket (fantasy 656 / HLTV 9222): A1 v D2, C1 v B2, B1 v C2,
+# D1 v A2, then the semis pair QF1 with QF2 and QF3 with QF4. The Thunderpick
+# World Championship 2026 closed qualifier used the same quarter-finals but
+# crossed the semis the other way (A/D together, B/C together), so this layout
+# is the Stake series' and another organiser's bracket needs its own check.
+_GSL4X4_QUARTERS = [((0, 0), (3, 1)), ((2, 0), (1, 1)), ((1, 0), (2, 1)), ((3, 0), (0, 1))]
 
 
 def combined_shape_key(group_format: str, group_count: int) -> tuple:
@@ -848,6 +877,7 @@ def _combined_bracket_template(x: int, quals_per_group: int, rounds_total: int, 
     group matches already played (its playoff matches continue the booster
     slot numbering)."""
     byes_to_semis = quals_per_group == 3
+    decider = None
     if byes_to_semis:
         rounds = [
             [(("seed", 0, 1), ("seed", 1, 2)), (("seed", 1, 1), ("seed", 0, 2))],  # QF1: A2 v B3, QF2: B2 v A3
@@ -855,6 +885,15 @@ def _combined_bracket_template(x: int, quals_per_group: int, rounds_total: int, 
             [(("win", 1, 0), ("win", 1, 1))],
         ]
         entry_round = {(0, 0): 1, (1, 0): 1}
+    elif group_format == "gsl4" and x == 4 and quals_per_group == 2:
+        rounds = [
+            [(("seed",) + a, ("seed",) + b) for a, b in _GSL4X4_QUARTERS],
+            [(("win", 0, 0), ("win", 0, 1)), (("win", 0, 2), ("win", 0, 3))],
+            [(("win", 1, 0), ("win", 1, 1))],
+        ][:rounds_total]
+        entry_round = {}
+        if rounds_total == 3:
+            decider = (("lose", 1, 0), ("lose", 1, 1))  # the semi-final losers
     else:
         seeded = [(g, r) for r in range(quals_per_group) for g in range(x)]  # seed-major, like the old sim
         n = len(seeded)
@@ -869,7 +908,69 @@ def _combined_bracket_template(x: int, quals_per_group: int, rounds_total: int, 
         for g in range(x)
         for rank in range(quals_per_group)
     }
-    return {"rounds": rounds, "entry_round": entry_round, "prior_matches": prior_matches, "byes_to_semis": byes_to_semis}
+    return {
+        "rounds": rounds, "entry_round": entry_round, "prior_matches": prior_matches,
+        "byes_to_semis": byes_to_semis, "decider": decider,
+    }
+
+
+def _decider_pairing_weights(
+    tuple_probs: List[Dict[tuple, float]],
+    template: Dict[str, Any],
+    match_prob,
+) -> Dict[tuple, float]:
+    """Exact pairing weights for the third-place decider of the 8-team
+    bracket: the two semi-final losers meet, keyed like the bracket weights
+    (x, y, winner, match_num_x, match_num_y, 0). The qualifier tuples couple
+    the two halves (a group's winner and runner-up are different teams), so
+    the seedings are enumerated — at most 12^4 for four GSL groups — and
+    within one seeding the halves are independent."""
+    import itertools
+
+    quarters = template["rounds"][0]
+    semis = template["rounds"][1]
+    prior_matches = template["prior_matches"]
+    sf_feeds = [(left[2], right[2]) for left, right in semis]
+    out: Dict[tuple, float] = {}
+    group_items = [list(tp.items()) for tp in tuple_probs]
+    for combo in itertools.product(*group_items):
+        prob = 1.0
+        seed: Dict[tuple, int] = {}
+        for g, (tup, p) in enumerate(combo):
+            prob *= float(p)
+            for rank, tid in enumerate(tup):
+                seed[(g, rank)] = int(tid)
+        if prob <= 0.0:
+            continue
+        qf_win: List[Dict[int, float]] = []
+        for left, right in quarters:
+            a, b = seed[(left[1], left[2])], seed[(right[1], right[2])]
+            pa = match_prob(a, b)
+            qf_win.append({a: pa, b: 1.0 - pa})
+        sf_lose: List[Dict[int, float]] = []
+        for qa, qb in sf_feeds:
+            d: Dict[int, float] = {}
+            for u, pu in qf_win[qa].items():
+                for v, pv in qf_win[qb].items():
+                    puv = pu * pv
+                    p_u = match_prob(u, v)
+                    d[v] = d.get(v, 0.0) + puv * p_u
+                    d[u] = d.get(u, 0.0) + puv * (1.0 - p_u)
+            sf_lose.append(d)
+        team_seed = {t: sd for sd, t in seed.items()}
+        for x, px in sf_lose[0].items():
+            nx = prior_matches[team_seed[x]] + 3
+            for y, py in sf_lose[1].items():
+                w = prob * px * py
+                if w <= 0.0:
+                    continue
+                ny = prior_matches[team_seed[y]] + 3
+                p_x = match_prob(x, y)
+                kx = (x, y, x, nx, ny, 0)
+                ky = (x, y, y, nx, ny, 0)
+                out[kx] = out.get(kx, 0.0) + w * p_x
+                out[ky] = out.get(ky, 0.0) + w * (1.0 - p_x)
+    return out
 
 
 def _exact_combined_playoffs(
@@ -883,6 +984,7 @@ def _exact_combined_playoffs(
     progress_callback=None,
     workers: int | None = None,
     group_format: str = "de8_top3",
+    third_place: bool = False,
 ) -> Dict[str, Any]:
     """Exact expected playoff points for every player.
 
@@ -951,6 +1053,15 @@ def _exact_combined_playoffs(
         return pwin_cache[key]
 
     weights, advance, bye_weight = bracket_exact.compute_pairing_weights(specs, roots, rounds_total, pwin)
+    # Third-place decider (semi-final losers), scored as one more playoff
+    # match after the final's round: no further rounds, so no elimination
+    # penalty on its loser; the semi-final loss keeps its -3 for the missed
+    # final, as in the Playoff tab's single-elimination bracket.
+    decider_weights: Dict[tuple, float] = {}
+    if third_place and template.get("decider"):
+        decider_weights = _decider_pairing_weights(tuple_probs, template, match_prob)
+    has_decider = bool(decider_weights)
+    n_rows = rounds_total + (1 if has_decider else 0)
 
     # 4. Per-pairing points (memoised: only a few hundred distinct pairings).
     all_team_ids = [tid for group in groups for tid in group]
@@ -1007,10 +1118,11 @@ def _exact_combined_playoffs(
     pairing_table: Dict[str, Dict[str, List[float]]] = {}  # "a,b,winner,num_a,num_b,rem" -> pid -> [total, rating, win, role]
     bye_sf: Dict[int, List[float]] = {}  # team -> [P(lose the semi), P(win the semi)] on the bye path
     bye_pts: Dict[int, Dict[int, List[List[float]]]] = {}  # team -> pid -> [[semi-loss path], [final path]] component sums
-    for key, w in weights.items():
+    all_weights = [(key, w, rounds_total - key[5] - 1) for key, w in weights.items()]
+    all_weights += [(key, w, rounds_total) for key, w in decider_weights.items()]
+    for key, w, r in all_weights:
         a, b, winner, na, nb, rem = key
-        r = rounds_total - rem - 1
-        rw = round_wins.setdefault(winner, [0.0] * rounds_total)
+        rw = round_wins.setdefault(winner, [0.0] * n_rows)
         rw[r] += w
         for tid, num in ((a, na), (b, nb)):
             mr = match_reach.setdefault(tid, {})
@@ -1118,10 +1230,9 @@ def _exact_combined_playoffs(
     # pairing's probability. Bye teams enter at the semis, so their QF reach
     # is 0 while their SF reach includes the bye.
     round_reach: Dict[int, List[float]] = {}
-    for (a, b, _winner, _na, _nb, rem), w in weights.items():
-        r = rounds_total - rem - 1
+    for (a, b, _winner, _na, _nb, _rem), w, r in all_weights:
         for tid in (a, b):
-            row = round_reach.setdefault(tid, [0.0] * rounds_total)
+            row = round_reach.setdefault(tid, [0.0] * n_rows)
             row[r] += w  # weights are P(match with that result); summing both winners gives P(match)
     if byes_to_semis:
         round_labels = ["QF", "SF", "Final"]
@@ -1130,11 +1241,14 @@ def _exact_combined_playoffs(
         for r in range(rounds_total):
             teams_in_round = bracket_size >> r
             round_labels.append({2: "Final", 4: "SF", 8: "QF", 16: "R16", 32: "R32"}.get(teams_in_round, f"R{teams_in_round}"))
+    if has_decider:
+        round_labels.append("3rd place")
     return {
         "method": "exact_contraction",
-        "pairings": len(weights),
+        "pairings": len(weights) + len(decider_weights),
         "bracket_size": bracket_size,
         "rounds": rounds_total,
+        "third_place": has_decider,
         "round_labels": round_labels,
         "round_reach": {str(tid): row for tid, row in round_reach.items()},
         "round_wins": {str(tid): row for tid, row in round_wins.items()},
@@ -1343,7 +1457,10 @@ def bake_event_valuations(
         return {"status": "unsupported", "event_id": event_id, "reason": reason}
     try:
         payload = _normalize_groups_payload(
-            {"groups": groups_ids, "group_format": fmt, "combined_playoffs": combined, "playoff_stop_teams": 1}
+            {
+                "groups": groups_ids, "group_format": fmt, "combined_playoffs": combined, "playoff_stop_teams": 1,
+                "playoff_third_place": bool(detected.get("playoff_third_place")), "event_id": event_id,
+            }
         )
     except HTTPException as exc:
         return {"status": "skipped", "event_id": event_id, "reason": f"invalid shape: {exc.detail}"}
@@ -1356,7 +1473,8 @@ def bake_event_valuations(
         result = _compute_groups_result(payload, snapshot=snapshot)
         model = _finalize_joint_precompute(result, event_id)
     except Exception as exc:  # noqa: BLE001
-        return {"status": "error", "event_id": event_id, "reason": str(exc)[:300]}
+        logging.getLogger(__name__).warning("Bake failed for event %s", event_id, exc_info=True)
+        return {"status": "error", "event_id": event_id, "reason": f"{type(exc).__name__}: {str(exc)[:280]}"}
     _GROUPS_STATE.save(payload, result, key=event_id)
     saved = _GROUPS_STATE.load(key=event_id)
     if model is not None and saved:
@@ -1408,14 +1526,18 @@ def _assemble_stage_stats(
     all_keys = [st["key"] for st in stages]
     fold = {mk: rk for rk, _lbl, _full, _side, mks in rounds for mk in mks}
     lower_order = [rk for rk, _lbl, _full, side, _slots in rounds if side == "lower"]
+    # The third-place decider is an extra match, not a round anyone misses.
+    penalty_keys = po_keys[:-1] if po.get("third_place") else po_keys
 
     def missed_after(rk: str) -> List[str]:
         """Rounds a team knocked out in `rk` never plays (the penalty is -3 each)."""
         if rk in lower_order:
-            return lower_order[lower_order.index(rk) + 1:] + po_keys
+            return lower_order[lower_order.index(rk) + 1:] + penalty_keys
+        if rk in penalty_keys:
+            return penalty_keys[penalty_keys.index(rk) + 1:]
         if rk in po_keys:
-            return po_keys[po_keys.index(rk) + 1:]
-        return list(po_keys)
+            return []
+        return list(penalty_keys)
 
     def folded(raw: Dict[str, float]) -> Dict[str, float]:
         out: Dict[str, float] = {}
@@ -1662,6 +1784,7 @@ def _compute_groups_result_inner(
             stop_teams=int(payload.get("playoff_stop_teams") or 1),
             quals_per_group=quals_per_group,
             group_format=group_format,
+            third_place=bool(payload.get("playoff_third_place")),
             progress_callback=(
                 (lambda done, total: progress_callback(len(groups) + (1 if done >= total else 0), total_units))
                 if progress_callback
@@ -1711,6 +1834,7 @@ def _compute_groups_result_inner(
         "place_odds": place_odds,
         "stage_stats": _assemble_stage_stats(group_format, stage_acc, playoff_summary, teams_out, team_rank_by_id),
         "combined_playoffs": combined,
+        "playoff_third_place": bool((playoff_summary or {}).get("third_place")),
         "playoff": playoff_summary,
         "method": "exact_enumeration_per_group" + ("_plus_exact_playoffs" if combined else ""),
     }
@@ -2653,7 +2777,8 @@ def _sample_joint_outcomes(results: dict, n: int, seed: int = 20240101) -> tuple
                 mp[pid] += mp_mat[idx, j]
                 mr[pid] += mr_mat[idx, j]
     n_matches = sum(len(r) for r in rounds)
-    u = rng.random((n, max(n_matches, 1)))
+    decider = template.get("decider") if (has_playoff and po.get("third_place")) else None
+    u = rng.random((n, max(n_matches + (1 if decider else 0), 1)))
     missing = 0
     # Python loop over samples: ~5 matches × 10 players each — fine for 20k.
     for i in range(n):
@@ -2665,6 +2790,7 @@ def _sample_joint_outcomes(results: dict, n: int, seed: int = 20240101) -> tuple
                     seed_team[(g, rank)] = int(q[rank])
         team_seed = {t: sd for sd, t in seed_team.items()}
         winners: Dict[tuple, int] = {}
+        losers: Dict[tuple, int] = {}
         played: Dict[int, List[float]] = {}  # pid -> [rating, role, games] on the bye path (padding basis)
         ui = 0
         for r, matches in enumerate(rounds):
@@ -2678,6 +2804,7 @@ def _sample_joint_outcomes(results: dict, n: int, seed: int = 20240101) -> tuple
                 w = a if u[i, ui] < win_probs[a][b] else b
                 ui += 1
                 winners[(r, m)] = w
+                losers[(r, m)] = b if w == a else a
                 row = table.get((a, b, w, na, nb, rem))
                 if row is None:
                     missing += 1
@@ -2702,6 +2829,24 @@ def _sample_joint_outcomes(results: dict, n: int, seed: int = 20240101) -> tuple
                                 acc[0] += comps[1]
                                 acc[1] += comps[role_at]
                                 acc[2] += 1.0
+        if decider and all(k in losers for k in ((decider[0][1], decider[0][2]), (decider[1][1], decider[1][2]))):
+            ta = losers[(decider[0][1], decider[0][2])]
+            tb = losers[(decider[1][1], decider[1][2])]
+            na = prior_matches[team_seed[ta]] + 3
+            nb = prior_matches[team_seed[tb]] + 3
+            w = ta if u[i, ui] < win_probs[ta][tb] else tb
+            ui += 1
+            row = table.get((ta, tb, w, na, nb, 0))
+            if row is None:
+                missing += 1
+            else:
+                for pid, comps in row.items():
+                    vec[pid][i] += comps[0]
+                    if decomposed:
+                        rw[pid][i] += comps[1] + comps[2]
+                        rt[pid][i] += comps[1]
+                        mp[pid][i] += 1
+                        mr[pid][i] += 1.0
         if byes:
             for sd, t in seed_team.items():
                 if entry_round.get(sd, 0) <= 0:
