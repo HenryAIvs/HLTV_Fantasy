@@ -20,11 +20,24 @@ const parseJsonSafe = async (res) => {
   try {
     return JSON.parse(text);
   } catch {
-    return { detail: text };
+    // An HTML page here is Cloudflare's (rate limited, access denied, origin
+    // down), never the backend's: report the condition, not the markup.
+    const throttled = /rate limit|error code: ?1015|too many requests/i.test(text);
+    return {
+      detail: throttled
+        ? "The server is busy. Please try again in a moment."
+        : `The server returned an unexpected response (HTTP ${res.status}).`,
+      _html: true,
+    };
   }
 };
 
-const requestJson = async (path, init = {}, timeoutMs = 60000) => {
+// Throttled responses (the backend's 429, Cloudflare's rate-limit page) are
+// retried a couple of times with a pause instead of failing the whole page.
+const RETRY_DELAYS_MS = [2000, 4000];
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const requestJson = async (path, init = {}, timeoutMs = 60000, attempt = 0) => {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   let res;
@@ -52,6 +65,11 @@ const requestJson = async (path, init = {}, timeoutMs = 60000) => {
   }
   const data = await parseJsonSafe(res);
   if (!res.ok) {
+    const throttled = res.status === 429 || res.status === 503 || (data?._html && /busy/.test(String(data?.detail || "")));
+    if (throttled && attempt < RETRY_DELAYS_MS.length) {
+      await sleep(RETRY_DELAYS_MS[attempt]);
+      return requestJson(path, init, timeoutMs, attempt + 1);
+    }
     const detail = data?.detail || `HTTP ${res.status}`;
     throw new Error(String(detail));
   }

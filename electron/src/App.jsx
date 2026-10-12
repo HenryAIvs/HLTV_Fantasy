@@ -173,7 +173,7 @@ function TeamLogo({ hltvTeamId, name, size = 22, className = "" }) {
   return (
     <img
       className={`team-logo-img ${className}`}
-      src={`${ASSETS_BASE}/team/${id}?v=2`}
+      src={`${ASSETS_BASE}/team/${id}.png?v=2`}
       width={size}
       height={size}
       alt=""
@@ -197,7 +197,7 @@ function PlayerPhoto({ playerId, name, size = 26, className = "" }) {
   return (
     <img
       className={`player-photo-img ${className}`}
-      src={`${ASSETS_BASE}/player/${id}?v=2`}
+      src={`${ASSETS_BASE}/player/${id}.jpg?v=2`}
       width={size}
       height={size}
       alt=""
@@ -7894,13 +7894,18 @@ function EventsTab({ refreshData, notify, players, teams = [], onOpenPlayer, onO
   }, [events]);
 
   const loadEvents = async () => {
-    const res = await api.get("/events/");
-    if (res?.detail) {
-      setMessage(String(res.detail));
-      return;
+    try {
+      const res = await api.get("/events/");
+      if (res?.detail) {
+        setMessage(String(res.detail));
+        return;
+      }
+      setEvents(res.events || []);
+      setActiveEventId(res.active_event_id ?? null);
+      setMessage("");
+    } catch (e) {
+      setMessage(`Could not load events: ${e?.message || "unknown error"}`);
     }
-    setEvents(res.events || []);
-    setActiveEventId(res.active_event_id ?? null);
   };
 
   useEffect(() => {

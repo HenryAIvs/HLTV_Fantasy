@@ -1,6 +1,7 @@
 """Serve locally cached HLTV images (team logos, player photos) to the UI."""
 
 import hashlib
+import re
 from email.utils import formatdate
 from pathlib import Path
 
@@ -42,14 +43,25 @@ def _image_response(kind: str, key: int, request: Request) -> Response:
     return Response(content=data, media_type=sniff_content_type(data), headers=headers)
 
 
+def _asset_id(value: str) -> int:
+    """The numeric id of an asset path segment, with or without a file
+    extension: the app asks for /assets/player/123.jpg so Cloudflare caches
+    the image at its edge (it caches by extension, and cached requests do not
+    count against the rate-limit rule)."""
+    m = re.match(r"^(\d+)(?:\.[A-Za-z0-9]{1,5})?$", str(value or ""))
+    if not m:
+        raise HTTPException(status_code=404, detail="Unknown asset")
+    return int(m.group(1))
+
+
 @router.get("/team/{hltv_team_id}")
-def team_logo(hltv_team_id: int, request: Request):
-    return _image_response("team", hltv_team_id, request)
+def team_logo(hltv_team_id: str, request: Request):
+    return _image_response("team", _asset_id(hltv_team_id), request)
 
 
 @router.get("/player/{player_id}")
-def player_photo(player_id: int, request: Request):
-    return _image_response("player", player_id, request)
+def player_photo(player_id: str, request: Request):
+    return _image_response("player", _asset_id(player_id), request)
 
 
 @router.get("/status")
