@@ -1524,7 +1524,10 @@ def _exact_bracket_n_player_totals(
             }
         results[tid] = {"team_id": tid, "wins": 0, "losses": 0, "players": players_out}
     outcomes = [{"probability": float(probs[i]), "code": int(i)} for i in range(n_out)]
-    template = {"team_slots": [int(t) for t in team_slots], "third_place": bool(has_third_place_decider), "rounds": rounds_total}
+    template = {
+        "team_slots": [int(t) for t in team_slots], "third_place": bool(has_third_place_decider), "rounds": rounds_total,
+        "final_bo": int(_bo_type(final_bo)[2:]),
+    }
     best_bracket = _decode_bracket_code(int(np.argmax(probs)), template, prob_cache)
     extra = {
         "outcome_matrix": {
@@ -1551,12 +1554,14 @@ def _decode_bracket_code(code: int, template: Dict, prob_cache: Dict | None = No
     decider = bool(template.get("third_place"))
     n_matches = (n - 1) + (1 if decider else 0)
     prob_cache = prob_cache if prob_cache is not None else {}
+    final_type = _bo_type(template.get("final_bo"))
     match_results: Dict[str, List[dict]] = {}
     alive = list(team_slots)
     m = 0
     semi_losers: List[int] = []
     while len(alive) > 1:
         rname = _round_name_for(len(alive))
+        match_type = final_type if len(alive) == 2 else "bo3"
         winners, matches = [], []
         for i in range(0, len(alive), 2):
             a, b = alive[i], alive[i + 1]
@@ -1564,7 +1569,7 @@ def _decode_bracket_code(code: int, template: Dict, prob_cache: Dict | None = No
             m += 1
             w, l = (b, a) if bit else (a, b)
             winners.append(w)
-            matches.append({"winner": w, "loser": l, "p_win_a": cached_win_prob(prob_cache, a, b), "teams": [a, b]})
+            matches.append({"winner": w, "loser": l, "p_win_a": cached_win_prob(prob_cache, a, b, match_type), "teams": [a, b]})
             if len(alive) == 4:
                 semi_losers.append(l)
         match_results[rname] = matches
@@ -1945,6 +1950,7 @@ def _decode_double8_code(code: int, template: Dict, prob_cache: Dict | None = No
     team_slots = [int(t) for t in template.get("team_slots") or []]
     matches = template.get("matches") or [[k, s, list(fa), list(fb)] for k, s, fa, fb in _DOUBLE8_MATCHES]
     prob_cache = prob_cache if prob_cache is not None else {}
+    gf_type = _bo_type(template.get("grand_final_bo"))
     n_matches = len(matches)
     winners: Dict[str, int] = {}
     losers: Dict[str, int] = {}
@@ -1956,7 +1962,8 @@ def _decode_double8_code(code: int, template: Dict, prob_cache: Dict | None = No
         w, l = (b, a) if bit else (a, b)
         winners[key] = w
         losers[key] = l
-        out.setdefault(stage, []).append({"key": key, "winner": w, "loser": l, "p_win_a": cached_win_prob(prob_cache, a, b), "teams": [a, b]})
+        p_a = cached_win_prob(prob_cache, a, b, gf_type if stage == "grand_final" else "bo3")
+        out.setdefault(stage, []).append({"key": key, "winner": w, "loser": l, "p_win_a": p_a, "teams": [a, b]})
     return out
 
 
@@ -2159,6 +2166,7 @@ def _exact_double8_player_totals(
         results[tid] = {"team_id": tid, "wins": 0, "losses": 0, "players": players_out}
     outcomes = [{"probability": float(probs[i]), "code": int(i)} for i in range(n_out)]
     template = _double8_template(team_slots)
+    template["grand_final_bo"] = int(_bo_type(grand_final_bo)[2:])
     best_bracket = _decode_double8_code(int(np.argmax(probs)), template, prob_cache)
 
     # ---- stage stats in the Point Sources modal's contract: per team the
@@ -3316,6 +3324,7 @@ def _stored_outcome_detail(latest: dict, idx: int) -> dict:
         "team_slots": team_slots,
         "third_place": bool(lp.get("has_third_place_decider")),
         "rounds": int(round(math.log2(max(len(team_slots), 2)))),
+        "final_bo": int(lp.get("final_bo") or 3),
     }
     br = _decode_bracket_code(code, template)
     round_winners: List[List[int]] = []
@@ -3439,7 +3448,7 @@ def winning_player_detail(payload: dict | None = None, event_id: int | None = No
     template = results.get("bracket_template") or (
         _double8_template(team_slots)
         if double
-        else {"team_slots": team_slots, "third_place": bool(lp.get("has_third_place_decider")), "rounds": int(round(math.log2(max(len(team_slots), 2))))}
+        else {"team_slots": team_slots, "third_place": bool(lp.get("has_third_place_decider")), "rounds": int(round(math.log2(max(len(team_slots), 2)))), "final_bo": int(lp.get("final_bo") or 3)}
     )
     base_states = initialize_teams(team_slots, {t: 999 for t in team_slots})
     player_rows_by_id, team_rank_by_id = _build_playoff_lookup_context(team_slots)
