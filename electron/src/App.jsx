@@ -2774,13 +2774,6 @@ function GroupStageTab({
               {eventSeeds ? "event seeding" : "VRS-rank seeding"}
             </div>
           </div>
-          <Input label="# Sims" value={sims} onChange={setSims} />
-          <div className="field">
-            <span>Run</span>
-            {!PUBLIC_BUILD && (<button className="primary" onClick={run} disabled={busy || selected.length < 2}>
-              {busy ? "Running..." : "Run Swiss Group Stage"}
-            </button>)}
-          </div>
         </div>
         {eventSwissInfo && (
           <p className="muted">
@@ -3269,32 +3262,7 @@ function TopTeamsTab({ teamLookup, selected, bo, sims, results, onOpenPlayer }) 
       <div className="stack">
         {!results && (
           <div className="card sub">
-            <p className="muted">{PUBLIC_BUILD ? NOT_PUBLISHED : "Run Swiss Group Stage in the Group Stage tab first."}</p>
-          </div>
-        )}
-        {results && (
-          <div className="card sub">
-            <p className="muted">
-              Using Group Stage setup: {selected.length} teams, {sims} simulations, mode{" "}
-              {bo === "elim_qual" ? "BO3 on Elimination/Qualification Matches" : bo === "all" ? "BO3 on All Matches" : "No BO3 (All BO1)"}.
-            </p>
-          </div>
-        )}
-        {results && (
-          <div className="actions">
-            <button className="primary" onClick={findTopTeams} disabled={busy}>
-              {busy ? "Working..." : "Generate & Store Team Combos"}
-            </button>
-            <button
-              className="danger"
-              onClick={async () => {
-                if (cacheId) await api.delete(`/best-team/cache/${cacheId}`);
-                clearStoredData();
-              }}
-              disabled={!cacheId}
-            >
-              Delete Stored Data
-            </button>
+            <p className="muted">{NOT_PUBLISHED}</p>
           </div>
         )}
         {generationBusy && (
@@ -6361,107 +6329,6 @@ function PlayoffTab({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slots, hasThirdPlaceDecider, bracketKind, busy, storedSize, isBounty, results, latestPayload]);
 
-  const runSharedCombinations = async () => {
-    if (PUBLIC_BUILD) return;
-    setBusy(true);
-    setTopMessage("");
-    setAllTeams(null);
-    setBaseTeams(null);
-    setSharedComboCount(0);
-    setPage(0);
-    setProcessedCombos(0);
-    setTotalCombos(0);
-    setTopEtaSeconds(null);
-    setComboPhase("queued");
-    try {
-      const start = await api.post("/playoff/best-team/from-latest/start", {
-        include_player_ids: Array.from(effectiveAppliedFilters.include),
-        exclude_player_ids: Array.from(effectiveAppliedFilters.exclude),
-        mode: "most_outcomes",
-        variant,
-      });
-      if (start?.detail) {
-        setTopMessage(String(start.detail));
-        setTopTeams([]);
-        setAllTeams([]);
-        setBaseTeams([]);
-        setFilteredCount(0);
-        return;
-      }
-      const jobId = start?.job_id;
-      if (!jobId) {
-        setTopMessage("Failed to start combination generation job.");
-        return;
-      }
-      if (start?.reused) {
-        setTopMessage("A combination job is already running. Reusing that job.");
-      }
-
-      let done = false;
-      const startedAtMs = Date.now();
-      while (!done) {
-        const status = await api.get(`/playoff/best-team/job/${jobId}`);
-        if (status?.detail) {
-          setTopMessage(String(status.detail));
-          return;
-        }
-        const processed = Number(status.processed_combinations || 0);
-        const total = Number(status.total_combinations || 0);
-        setComboPhase(String(status.phase || status.status || ""));
-        setProcessedCombos(processed);
-        setTotalCombos(total);
-        if (processed > 0 && total > processed) {
-          const elapsedSec = Math.max(0.001, (Date.now() - startedAtMs) / 1000);
-          const rate = processed / elapsedSec;
-          if (rate > 0) setTopEtaSeconds((total - processed) / rate);
-        } else if (total > 0 && processed >= total) {
-          setTopEtaSeconds(0);
-        }
-
-        if (status.status === "failed") {
-          setTopMessage(status.error || "Top 5 generation failed.");
-          setTopTeams([]);
-          setAllTeams([]);
-          setBaseTeams([]);
-          setFilteredCount(0);
-          return;
-        }
-        if (status.status === "completed") {
-          const latest = await api.get("/playoff/best-team/from-latest/latest");
-          setBaseTeams([]);
-          setSharedComboCount(Number(latest?.total_teams || 0));
-          setSharedCombosUpdatedAt(latest?.updated_at ? new Date(Number(latest.updated_at) * 1000).toISOString() : new Date().toISOString());
-          await querySharedCombinations(0);
-          setTopMessage("");
-          done = true;
-          break;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 200));
-      }
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  // Self-running combinations: kick off whenever the stored valuations are
-  // newer than the stored combination set (or no combinations exist yet).
-  const combosLaunchRef = useRef(false);
-  useEffect(() => {
-    if (busy || !results) return;
-    if (storedSize === null) return; // stored-sim hydration pending
-    if (
-      sharedCombosUpdatedAt &&
-      updatedAt &&
-      new Date(sharedCombosUpdatedAt).getTime() >= new Date(updatedAt).getTime()
-    )
-      return;
-    if (combosLaunchRef.current) return;
-    combosLaunchRef.current = true;
-    runSharedCombinations().finally(() => {
-      combosLaunchRef.current = false;
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [busy, results, updatedAt, sharedCombosUpdatedAt, storedSize]);
 
   const resetStoredPlayoff = async () => {
     if (PUBLIC_BUILD) return;
@@ -7047,7 +6914,7 @@ function PlayoffTab({
                 <div className="actions">
                   {!baseTeams && (
                     <p className="muted">
-                      {PUBLIC_BUILD ? "Roster rankings for this bracket have not been published yet." : "Run Combinations once above to score this bracket."}
+                      Roster rankings for this bracket have not been published yet.
                     </p>
                   )}
                   {baseTeams && !completedComplete && <p className="muted">Complete the bracket to score the saved combinations.</p>}
@@ -15007,24 +14874,6 @@ function GroupsTab({
                 </div>
                 {groupsTopSubtab !== "completed" && (
                 <>
-                <div className="actions">
-                  {!liveMode && !PUBLIC_BUILD && (
-                    <button className="primary" onClick={runCombinations} disabled={busy}>
-                      {busy && comboProgress.total > 0
-                        ? `Running Combinations... ${comboProgress.done.toLocaleString()} / ${comboProgress.total.toLocaleString()}`
-                        : "Run Combinations"}
-                    </button>
-                  )}
-                  {!liveMode && combosUpdatedAt && (
-                    <p className="muted">Combinations stored: {new Date(combosUpdatedAt).toLocaleString()}</p>
-                  )}
-                  {!liveMode && poolReduction && (
-                    <p className="muted">
-                      Pruned pool from {poolReduction.from} to {poolReduction.to} players before enumerating (dominated
-                      players removed — the optimal team is provably retained).
-                    </p>
-                  )}
-                </div>
                 <div className="card sub">
                   <h3>Top Teams - {(groupsTopSubtabs.find((t) => t.key === groupsTopSubtab) || {}).label || "Best Average Value"}</h3>
                   <div className="top5-filters">
@@ -15253,7 +15102,6 @@ function GroupsTab({
                 <button className="primary" onClick={scoreCompleted} disabled={!allGroupsComplete || !combosReady}>
                   Score Completed Groups
                 </button>
-                {!combosReady && <span className="muted">Run Combinations in Top 5 Teams first.</span>}
                 {combosReady && !allGroupsComplete && <span className="muted">Pick every match winner first.</span>}
               </div>
             )}

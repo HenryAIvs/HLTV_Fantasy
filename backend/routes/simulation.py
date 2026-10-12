@@ -74,6 +74,73 @@ def _normalize_sim_payload(payload: dict) -> dict:
     }
 
 
+# Simulation count for an automatic (baked) Swiss run.
+BAKE_SIMS = 20000
+
+
+def bake_event_swiss(
+    event_id: int, trigger: str = "import", only_if_missing: bool = False, refresh_inputs: bool = False
+) -> dict:
+    """Swiss counterpart of groups.bake_event_valuations, called through
+    event_pipeline.bake_event: the event page's seed order and Bo rules, the
+    stage simulated, then the roster combinations the Top 5 tab reads. Never
+    raises; the scheduler records the returned status."""
+    from backend.routes import best_team as best_team_routes
+    from backend.routes import events as events_routes
+
+    started = time.time()
+    event_id = int(event_id)
+    if only_if_missing and load_latest_simulation(event_id):
+        return {"status": "exists", "event_id": event_id, "reason": "already baked; not refreshed"}
+    try:
+        ctx = events_routes.get_event_swiss_context(event_id)
+    except HTTPException as exc:
+        return {"status": "skipped", "event_id": event_id, "reason": f"swiss stage: {exc.detail}"}
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "skipped", "event_id": event_id, "reason": f"swiss stage: {str(exc)[:200]}"}
+    team_ids = [int(t) for t in (ctx.get("team_ids") or []) if t]
+    if len(team_ids) < 2:
+        return {"status": "skipped", "event_id": event_id, "reason": "no teams of the swiss stage match our teams"}
+    seeds = {int(t): int(s) for t, s in (ctx.get("seed_by_team_id") or {}).items()}
+    try:
+        payload = _normalize_sim_payload(
+            {"team_ids": team_ids, "vrs_ranks": seeds, "bo3_mode": ctx.get("bo3_mode") or "elim_qual", "n_sims": BAKE_SIMS}
+        )
+    except HTTPException as exc:
+        return {"status": "skipped", "event_id": event_id, "reason": f"invalid swiss setup: {exc.detail}"}
+    payload["event_id"] = event_id
+    payload["baked"] = {"trigger": trigger, "at": started, "refresh_inputs": bool(refresh_inputs)}
+    if ctx.get("unmatched"):
+        payload["unmatched"] = list(ctx.get("unmatched") or [])
+    try:
+        result = simulate_swiss_fantasy(
+            team_ids=payload["team_ids"],
+            vrs_ranks=payload["vrs_ranks"],
+            bo3_mode=payload["bo3_mode"],
+            n_sims=int(payload["n_sims"]),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "event_id": event_id, "reason": f"swiss run failed: {str(exc)[:300]}"}
+    save_latest_simulation(payload, result, event_id)
+    sim_seconds = round(time.time() - started, 1)
+    try:
+        combos = best_team_routes._compute_best_teams_from_results(result, {})
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "event_id": event_id, "reason": f"combinations failed: {str(exc)[:300]}", "sim_seconds": sim_seconds}
+    return {
+        "status": "ok",
+        "event_id": event_id,
+        "kind": "swiss",
+        "teams": len(team_ids),
+        "sims": int(payload["n_sims"]),
+        "bo3_mode": payload["bo3_mode"],
+        "rosters": int(combos.get("total_teams") or 0),
+        "unmatched": payload.get("unmatched") or [],
+        "sim_seconds": sim_seconds,
+        "seconds": round(time.time() - started, 1),
+    }
+
+
 def _run_sim_job(job_id: str, payload: dict) -> None:
     def _update_progress(processed: int, total: int) -> None:
         with SIM_JOBS_LOCK:

@@ -2,6 +2,7 @@ import base64
 import heapq
 import itertools
 import json
+import logging
 import math
 import os
 import random
@@ -284,18 +285,12 @@ def bake_event_playoff(
         return {"status": "error", "event_id": event_id, "reason": f"bracket run failed: {str(exc)[:300]}"}
     save_latest_playoff(payload, result, "main", event_id)
     bracket_seconds = round(time.time() - started, 1)
-    # Roster combinations: what the Top 5 tabs read. Same options as the app's
-    # Run Combinations button; one run serves all three ranking modes.
-    body = {"mode": "most_outcomes", "variant": "main", "event_id": event_id}
+    # Roster combinations: what the Top 5 tabs read (one run serves all three
+    # ranking modes; filters are applied at query time).
     try:
-        options = parse_optimizer_payload(body)
-        players_info = _build_players_info_from_sim_results(result.get("teams", {}) or {}, options["exclude"])
-        combos = _optimize_playoff_teams_by_outcomes(
-            players_info, result, options["include"], options["budget"], options["max_per_team"], "most_outcomes"
-        )
+        combos = _store_playoff_combos(result, "main", event_id)
     except Exception as exc:  # noqa: BLE001
         return {"status": "error", "event_id": event_id, "reason": f"combinations failed: {str(exc)[:300]}", "bracket_seconds": bracket_seconds}
-    save_latest_playoff_best_team(body, combos, "main", event_id)
     return {
         "status": "ok",
         "event_id": event_id,
@@ -2742,6 +2737,20 @@ def run_playoff(payload: dict):
     return response
 
 
+def _store_playoff_combos(result: dict, variant: str = "main", event_id=None) -> dict:
+    """Rank every valid roster against the stored bracket outcomes and store
+    the set the Top 5 tab reads; the tab's filters and ranking modes are
+    applied to it at query time."""
+    body = {"mode": "most_outcomes", "variant": variant, "event_id": event_id}
+    options = parse_optimizer_payload(body)
+    players_info = _build_players_info_from_sim_results(result.get("teams", {}) or {}, options["exclude"])
+    combos = _optimize_playoff_teams_by_outcomes(
+        players_info, result, options["include"], options["budget"], options["max_per_team"], "most_outcomes"
+    )
+    save_latest_playoff_best_team(body, combos, variant, event_id)
+    return combos
+
+
 def _run_playoff_job(job_id: str, payload: dict) -> None:
     def _update_progress(processed: int, total: int) -> None:
         with PLAYOFF_JOBS_LOCK:
@@ -2763,6 +2772,13 @@ def _run_playoff_job(job_id: str, payload: dict) -> None:
     try:
         result = _compute_playoff_result(payload, progress_callback=_update_progress)
         save_latest_playoff(payload, result, payload.get("variant"))
+        # the Top 5 tab's combinations follow every run, not a separate click
+        try:
+            _store_playoff_combos(result, _variant(payload.get("variant")))
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "Combinations failed after a %s bracket run", _variant(payload.get("variant")), exc_info=True
+            )
         with PLAYOFF_JOBS_LOCK:
             job = PLAYOFF_JOBS.get(job_id)
             if not job:

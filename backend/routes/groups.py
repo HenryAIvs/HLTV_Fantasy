@@ -1577,11 +1577,18 @@ def bake_event_valuations(
         _JOINT_MODEL_CACHE[(event_id, saved["updated_at"])] = model
     # the app's first Top 5 open comes from the cache: seed the default queries now
     top5_warm = _seed_live_queries(event_id, saved) if saved else {}
+    # Small pools: the stored roster combinations the Top 5 tab reads.
+    try:
+        combinations = _precompute_groups_best_team(event_id)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("Combinations failed for event %s", event_id, exc_info=True)
+        combinations = {"error": str(exc)[:200]}
     playoff = result.get("playoff") or {}
     return {
         "status": "ok",
         "event_id": event_id,
         "top5_warm_seconds": top5_warm,
+        "combinations": combinations,
         "group_format": fmt,
         "combined_playoffs": combined,
         "pairings": playoff.get("pairings"),
@@ -3697,7 +3704,30 @@ def _booster_prerequisites(
     return reach_by_team, rates_by_pid, role_scores_by_pid, bound_offset
 
 
-def _run_groups_best_team_job(job_id: str, payload: dict) -> None:
+def _precompute_groups_best_team(event_id: int) -> Dict[str, Any]:
+    """Store the roster combinations the Top 5 tab reads, synchronously, for
+    an event whose pool is small enough to enumerate (large pools are solved
+    live per query and need nothing stored)."""
+    latest = _GROUPS_STATE.load(key=int(event_id))
+    if not latest:
+        return {"skipped": "no stored run"}
+    if _is_live_pool(latest["results"] or {}):
+        return {"skipped": "live pool"}
+    job_id = uuid.uuid4().hex
+    with GROUPS_BEST_TEAM_JOBS_LOCK:
+        GROUPS_BEST_TEAM_JOBS[job_id] = {
+            "status": "queued", "error": "", "progress": 0.0, "processed_combinations": 0,
+            "total_combinations": 0, "result": None, "created_at": time.time(), "updated_at": time.time(),
+        }
+    _run_groups_best_team_job(job_id, {}, state_key=int(event_id))
+    with GROUPS_BEST_TEAM_JOBS_LOCK:
+        job = GROUPS_BEST_TEAM_JOBS.pop(job_id, None) or {}
+    if job.get("status") != "completed":
+        raise RuntimeError(job.get("error") or "combinations failed")
+    return {"rosters": int(((job.get("result") or {}).get("processed_combinations")) or 0)}
+
+
+def _run_groups_best_team_job(job_id: str, payload: dict, state_key: Optional[int] = None) -> None:
     def _update(processed: int, total: int) -> None:
         with GROUPS_BEST_TEAM_JOBS_LOCK:
             job = GROUPS_BEST_TEAM_JOBS.get(job_id)
@@ -3715,7 +3745,7 @@ def _run_groups_best_team_job(job_id: str, payload: dict) -> None:
         job["status"] = "running"
         job["updated_at"] = time.time()
     try:
-        state_key = _state_key()
+        state_key = int(state_key) if state_key else _state_key()
         latest = _GROUPS_STATE.load(key=state_key)
         if not latest:
             raise HTTPException(status_code=404, detail="No stored group stage found. Run the groups simulation first.")

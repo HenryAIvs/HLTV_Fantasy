@@ -42,8 +42,7 @@ def _playoff_hooks() -> Dict[str, Any]:
 def _swiss_hooks() -> Dict[str, Any]:
     from backend.routes import simulation
 
-    # Not automated yet: run from the operator app (Swiss tab).
-    return {"bake": None, "exists": lambda eid: simulation._SIM_STATE.exists(eid)}
+    return {"bake": simulation.bake_event_swiss, "exists": lambda eid: simulation._SIM_STATE.exists(eid)}
 
 
 def _bounty_hooks() -> Dict[str, Any]:
