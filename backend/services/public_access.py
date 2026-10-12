@@ -208,7 +208,7 @@ class PublicAccessMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         if request.method == "OPTIONS" or is_operator(request):
             return await call_next(request)
-        path = request.url.path
+        path = request.scope["path"]  # routed path, never rebuilt from the Host header
         if not is_public_route(request.method, path):
             return JSONResponse({"detail": "This action is only available to the server operator."}, status_code=403)
         from backend.routes.auth import sign_in_required
