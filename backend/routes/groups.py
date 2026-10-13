@@ -4175,6 +4175,28 @@ def _seed_live_queries(key: int, latest_sim: Optional[dict] = None) -> Dict[str,
     return timings
 
 
+# Per-player headline for each ranking mode of a stored roster set.
+_MODE_PLAYER_FIELD = {"average": "total_ev", "single_outcome": "ceiling_score", "most_outcomes": "win_score"}
+
+
+def _with_mode_scores(team: dict, mode: str) -> dict:
+    """A copy of a stored roster whose per-player headline (mode_score) is the
+    requested mode's figure: the average EV, the best-single-outcome score or
+    the most-likely-winner score. The planning pass leaves the ceiling figure
+    there, which only the single-outcome view should show (the live path
+    already relabels per mode)."""
+    field = _MODE_PLAYER_FIELD.get(mode, "total_ev")
+    players = []
+    for p in team.get("players") or []:
+        q = dict(p)
+        value = q.get(field)
+        if value is None:
+            value = q.get("total_ev")
+        q["mode_score"] = float(value or 0.0)
+        players.append(q)
+    return {**team, "players": players}
+
+
 @router.post("/best-team/query")
 def query_groups_best_team(payload: dict | None = None, event_id: Optional[int] = None):
     body = dict(payload or {})
@@ -4205,8 +4227,8 @@ def query_groups_best_team(payload: dict | None = None, event_id: Optional[int] 
         "updated_at": latest["updated_at"],
         "total_teams": len(teams),
         "filtered_count": len(sorted_teams),
-        "top_teams": sorted_teams[:10],
-        "page_teams": _page_items(sorted_teams, page, page_size),
+        "top_teams": [_with_mode_scores(t, mode) for t in sorted_teams[:10]],
+        "page_teams": [_with_mode_scores(t, mode) for t in _page_items(sorted_teams, page, page_size)],
         "page": max(0, page),
         "page_size": max(1, min(500, page_size)),
     }

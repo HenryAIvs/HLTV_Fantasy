@@ -15033,20 +15033,30 @@ function GroupsTab({
                                       </div>
                                       <div className="event-player-rating">{score.toFixed(2)}</div>
                                       <div className="event-player-stats ev-mini">
-                                        {(comboMode === "single_outcome" && p.ceiling_parts && p.ceiling_parts.rating != null
-                                          ? [
-                                              ["Rating", p.ceiling_parts.rating],
-                                              ["Win", p.ceiling_parts.win],
-                                              ["Role", p.ceiling_parts.role],
-                                              ["Boost", p.ceiling_parts.booster],
-                                            ]
-                                          : [
-                                              ["Rating", p.rating_ev],
-                                              ["Win", p.win_ev],
-                                              ["Role", p.role_ev],
-                                              ["Boost", boost],
-                                            ]
-                                        ).map(([label, value]) => (
+                                        {(() => {
+                                          // The minis split the same figure the headline shows: the
+                                          // best single outcome's parts, the winning outcomes' parts,
+                                          // or the average components.
+                                          const parts =
+                                            comboMode === "single_outcome" && p.ceiling_parts && p.ceiling_parts.rating != null
+                                              ? p.ceiling_parts
+                                              : comboMode === "most_outcomes" && p.win_parts && p.win_parts.rating != null
+                                                ? p.win_parts
+                                                : null;
+                                          return parts
+                                            ? [
+                                                ["Rating", parts.rating],
+                                                ["Win", parts.win],
+                                                ["Role", parts.role],
+                                                ["Boost", parts.booster],
+                                              ]
+                                            : [
+                                                ["Rating", p.rating_ev],
+                                                ["Win", p.win_ev],
+                                                ["Role", p.role_ev],
+                                                ["Boost", boost],
+                                              ];
+                                        })().map(([label, value]) => (
                                           <div className="event-player-stat" key={label}>
                                             <div className="event-player-mini">{Number(value || 0).toFixed(1)}</div>
                                             <div className="event-player-stat-label">{label}</div>
