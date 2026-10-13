@@ -1976,9 +1976,17 @@ def _event_inputs(event_id: int, team_ids: List[int], refresh: bool = False) -> 
     _INPUT_SNAPSHOT.ensure_table()  # idempotent; the table is new
     existing = _INPUT_SNAPSHOT.load(key=int(event_id))
     if existing and started and not refresh:
+        snapshot = existing["result"]
+        if "average_bucket_pct" not in snapshot:
+            # frozen before the curve travelled with the snapshot: pin the curve
+            # the run is valued with now, so a later refit cannot move it
+            from backend.services.rating_curve import get_average_bucket_pct
+
+            snapshot["average_bucket_pct"] = {str(t): float(v) for t, v in get_average_bucket_pct().items()}
+            _INPUT_SNAPSHOT.save(dict(existing.get("payload") or {}), snapshot, key=int(event_id))
         meta = dict((existing.get("payload") or {}))
         meta.update({"frozen": True, "started": True, "start_at": start})
-        return existing["result"], meta
+        return snapshot, meta
     snapshot = _take_input_snapshot(event_id, team_ids)
     meta = {"event_id": int(event_id), "taken_at": time.time(), "frozen": started, "started": started, "start_at": start}
     _INPUT_SNAPSHOT.save(meta, snapshot, key=int(event_id))
