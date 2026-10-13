@@ -350,7 +350,7 @@ def _booster_list(bucket: Dict[int, list]) -> List[Dict[str, Any]]:
 def _new_stage_acc() -> Dict[str, Any]:
     return {
         "reach": {}, "wins": {}, "players": {}, "penalty": {}, "padding": {}, "boost": {},
-        "elim": {}, "pad_prob": {}, "opp": {}, "opp_pts": {}, "role": {},
+        "elim": {}, "pad_prob": {}, "opp": {}, "opp_pts": {}, "role": {}, "slot": {},
     }
 
 
@@ -358,9 +358,20 @@ def _accumulate_group_stage_stats(acc: Dict[str, Any], prob: float, states: Dict
     """Attribute one exact group outcome to match slots: which matches each
     team played (and won) and against whom, each player's points per match
     (and per opponent) from the scorer's per-match breakdown rows, the booster
-    each match used, where the team got knocked out (an ELIMINATION row follows
-    the match that ended its run) and the padding added straight to totals for
-    matches a quick qualifier skips."""
+    each match used (and the match slot each key is for the player), where the
+    team got knocked out (an ELIMINATION row follows the match that ended its
+    run) and the padding added straight to totals for matches a quick
+    qualifier skips.
+
+    An `acc` carrying `_records` records instead: one accumulator per outcome
+    (probability 1) appended in enumeration order, so any subset of the
+    outcomes can be re-weighted later (see _group_stage_records)."""
+    records = acc.get("_records")
+    if records is not None:
+        sub = _new_stage_acc()
+        _accumulate_group_stage_stats(sub, 1.0, states, matches)
+        records.append(sub)
+        return
     team_keys: Dict[int, List[str]] = {}
     for m in matches:
         for tid in m.get("teams") or []:
@@ -402,6 +413,7 @@ def _accumulate_group_stage_stats(acc: Dict[str, Any], prob: float, states: Dict
                 key = keys[idx]
                 idx += 1
                 last_key = key
+                acc.setdefault("slot", {}).setdefault(pid, {})[key] = int(r.get("match_number") or idx)
                 comps = (float(r.get("rating_points") or 0), float(r.get("win_points") or 0),
                          float(r.get("role_points") or 0), float(r.get("booster_points") or 0))
                 cell = per_key.setdefault(key, [0.0, 0.0, 0.0, 0.0, 0.0])
@@ -436,6 +448,501 @@ def _accumulate_group_stage_stats(acc: Dict[str, Any], prob: float, states: Dict
                 if any(abs(d) > 1e-9 for d in pad_delta):
                     acc["pad_prob"][tid] = acc["pad_prob"].get(tid, 0.0) + prob
                 team_done = True
+
+
+def _merge_stage_acc(dest: Dict[str, Any], src: Dict[str, Any], w: float, pid: Optional[int] = None) -> None:
+    """dest += w × src, one outcome's record: the team-level stats of every
+    team, the player-level stats of `pid` only (of every player when None)."""
+    if w <= 0.0:
+        return
+    for field in ("reach", "wins"):
+        for tid, per_key in src[field].items():
+            d = dest[field].setdefault(tid, {})
+            for k, v in per_key.items():
+                d[k] = d.get(k, 0.0) + w * v
+    for tid, per_key in src["elim"].items():
+        d = dest["elim"].setdefault(tid, {})
+        for k, c in per_key.items():
+            cell = d.setdefault(k, [0.0, 0.0])
+            cell[0] += w * c[0]
+            cell[1] += w * c[1]
+    for tid, v in src["pad_prob"].items():
+        dest["pad_prob"][tid] = dest["pad_prob"].get(tid, 0.0) + w * v
+    for tid, per_key in src["opp"].items():
+        d = dest["opp"].setdefault(tid, {})
+        for k, per_opp in per_key.items():
+            dk = d.setdefault(k, {})
+            for o, c in per_opp.items():
+                cell = dk.setdefault(o, [0.0, 0.0])
+                cell[0] += w * c[0]
+                cell[1] += w * c[1]
+    for p in ([pid] if pid is not None else list(src["players"].keys())):
+        per_key = src["players"].get(p)
+        if per_key is None:
+            continue
+        d = dest["players"].setdefault(p, {})
+        for k, v in per_key.items():
+            cell = d.setdefault(k, [0.0, 0.0, 0.0, 0.0, 0.0])
+            for i in range(5):
+                cell[i] += w * v[i]
+        dest["penalty"][p] = dest["penalty"].get(p, 0.0) + w * float(src["penalty"].get(p) or 0.0)
+        pad = dest["padding"].setdefault(p, [0.0, 0.0, 0.0, 0.0])
+        for i, v in enumerate(src["padding"].get(p) or [0.0, 0.0, 0.0, 0.0]):
+            pad[i] += w * v
+        db = dest["boost"].setdefault(p, {})
+        for k, bucket in (src["boost"].get(p) or {}).items():
+            dk = db.setdefault(k, {})
+            for bid, v in bucket.items():
+                cell = dk.get(bid)
+                if cell is None:
+                    dk[bid] = [w * v[0], v[1], v[2], v[3], v[4]]
+                else:
+                    cell[0] += w * v[0]
+        do = dest["opp_pts"].setdefault(p, {})
+        for k, per_opp in (src["opp_pts"].get(p) or {}).items():
+            dk = do.setdefault(k, {})
+            for o, v in per_opp.items():
+                cell = dk.setdefault(o, [0.0, 0.0, 0.0, 0.0])
+                for i in range(4):
+                    cell[i] += w * v[i]
+        if p not in dest["role"] and p in src["role"]:
+            dest["role"][p] = src["role"][p]
+        ds = dest.setdefault("slot", {}).setdefault(p, {})
+        for k, s in ((src.get("slot") or {}).get(p) or {}).items():
+            ds.setdefault(k, s)
+
+
+_STAGE_RECORDS_CACHE: Dict[Any, Dict[int, List[Dict[str, Any]]]] = {}  # (event, updated_at) -> {group: records}
+
+
+def _group_stage_records(results: dict, cache_key: Any, event_id: Optional[int]) -> Dict[int, List[Dict[str, Any]]]:
+    """Per group, one stage-stats record per exact outcome (probability 1) in
+    the stored outcomes' order: the run's enumerator re-run with the run's
+    own inputs (its snapshot rows, the team ranks it was valued with, the
+    event's rosters), so any subset of the outcomes — the ones a roster wins —
+    can be re-weighted into the per-round view. Cached per stored run."""
+    if cache_key is not None and cache_key in _STAGE_RECORDS_CACHE:
+        return _STAGE_RECORDS_CACHE[cache_key]
+    groups = [[int(t) for t in g] for g in (results.get("groups") or [])]
+    fmt = str(results.get("group_format") or "gsl4")
+    enumerate_group = {
+        "gsl4": _enumerate_group_outcomes,
+        "de8": _enumerate_group8_outcomes,
+        "de8_top3": _enumerate_group8_top3_outcomes,
+    }.get(fmt, _enumerate_group_outcomes)
+    all_team_ids = [tid for g in groups for tid in g]
+    snapshot_players = (results.get("input_snapshot") or {}).get("players") or {}
+    stage_teams = (results.get("stage_stats") or {}).get("teams") or {}
+    ranks = {int(t): int(row["rank"]) for t, row in stage_teams.items() if (row or {}).get("rank") is not None}
+    if snapshot_players and len(ranks) == len(all_team_ids):
+        player_rows_by_id = {int(pid): dict(row) for pid, row in snapshot_players.items()}
+        team_rank_by_id = {int(t): ranks[int(t)] for t in all_team_ids}
+        overrides: Optional[Dict[int, int]] = team_rank_by_id
+    else:
+        player_rows_by_id, team_rank_by_id = _build_playoff_lookup_context(all_team_ids)
+        overrides = None
+    extra_rounds = int((results.get("playoff") or {}).get("rounds") or 0) if results.get("combined_playoffs") else 0
+    out: Dict[int, List[Dict[str, Any]]] = {}
+    prob_cache: Dict = {}
+    from backend.services.rating_curve import average_bucket_pct_override
+
+    curve = (results.get("input_snapshot") or {}).get("average_bucket_pct")  # runs baked before it was stored: the fitted curve
+    with event_rosters.for_event(event_id), team_strength.rank_overrides(overrides), average_bucket_pct_override(curve):
+        for g_idx, group in enumerate(groups):
+            acc: Dict[str, Any] = {"_records": []}
+            enumerate_group(
+                group, g_idx, player_rows_by_id, team_rank_by_id, prob_cache, extra_rounds=extra_rounds, stage_acc=acc,
+            )
+            out[g_idx] = acc["_records"]
+    if cache_key is not None:
+        if len(_STAGE_RECORDS_CACHE) >= 2:
+            _STAGE_RECORDS_CACHE.pop(next(iter(_STAGE_RECORDS_CACHE)))
+        _STAGE_RECORDS_CACHE[cache_key] = out
+    return out
+
+
+def _plan_for_player(results: dict, pid: int, body: dict) -> Dict[str, Any]:
+    """The roster plan a breakdown is scored under: the assigned role's
+    per-match points (with its major / minor shares) and the roster's booster
+    per match slot — each None when the request names none, so the player's
+    own best role / own boosters stand."""
+    from backend.services.match_engine import BOOSTER_NAMES
+    from backend.services.swiss_booster_assignment import BOOSTER_POINT_VALUE
+
+    prow = _snapshot_player_row(results, pid) or {}
+    plan: Dict[str, Any] = {"role_id": None, "role_pm": None, "major": 0.0, "minor": 0.0, "by_slot": None}
+    role_id = body.get("role_id")
+    if role_id is not None and str(role_id).strip() != "":
+        role_id = int(role_id)
+        plan["role_id"] = role_id
+        plan["role_pm"] = float(extract_role_scores_for_player(prow).get(role_id, 0.0))
+        try:
+            rr = (json.loads(prow.get("roles_json") or "{}") or {}).get(str(role_id)) or {}
+            plan["major"], plan["minor"] = float(rr.get("major") or 0.0), float(rr.get("minor") or 0.0)
+        except Exception:  # noqa: BLE001
+            pass
+    assignments = [a for a in (body.get("booster_assignments") or []) if int(a.get("player_id") or 0) == pid]
+    if assignments:
+        rates = parse_booster_rates(prow.get("boosters_json"))
+        by_slot: Dict[int, tuple] = {}
+        for a in assignments:
+            if a.get("booster_id") is None:
+                continue
+            bid = int(a["booster_id"])
+            rate = float(rates.get(bid, 0.0))
+            by_slot[int(a.get("match_number") or 0)] = (bid, BOOSTER_NAMES.get(bid, f"Booster {bid}"), rate, BOOSTER_POINT_VALUE * rate)
+        plan["by_slot"] = by_slot
+    return plan
+
+
+def _apply_plan_to_stage_acc(acc: Dict[str, Any], pid: int, tid: int, plan: Dict[str, Any]) -> None:
+    """Re-score the player's merged group cells under the roster's plan: the
+    assigned role's per-match points in place of their own best role (role
+    points are per match played, so every cell scales), and the roster's
+    booster for each match slot in place of their own (a padded match earns
+    none, as in the roster planner)."""
+    role_pm = plan.get("role_pm")
+    by_slot = plan.get("by_slot")
+    own = acc["role"].get(pid)
+    own_pm = float(own[3]) if own else 0.0
+    if role_pm is None:
+        scale = 1.0
+    else:
+        scale = (role_pm / own_pm) if abs(own_pm) > 1e-9 else 0.0
+    reach = acc["reach"].get(tid) or {}
+    slots = (acc.get("slot") or {}).get(pid) or {}
+    for key, cell in (acc["players"].get(pid) or {}).items():
+        cell[2] *= scale
+        if by_slot is not None:
+            play = float(reach.get(key, 0.0))
+            slot = int(slots.get(key, 0))
+            b = by_slot.get(slot)
+            cell[3] = play * b[3] if b else 0.0
+            acc["boost"].setdefault(pid, {})[key] = {b[0]: [play, b[1], b[2], slot, 0.0]} if b else {}
+        cell[4] = cell[0] + cell[1] + cell[2] + cell[3]
+    for key, per_opp in (acc["opp_pts"].get(pid) or {}).items():
+        b = by_slot.get(int(slots.get(key, 0))) if by_slot is not None else None
+        for o, v in per_opp.items():
+            v[2] *= scale
+            if by_slot is not None:
+                play = float(((acc["opp"].get(tid) or {}).get(key) or {}).get(o, [0.0, 0.0])[0])
+                v[3] = play * b[3] if b else 0.0
+    pad = acc["padding"].get(pid)
+    if pad is not None:
+        pad[2] *= scale
+        if by_slot is not None:
+            pad[3] = 0.0
+    if role_pm is not None:
+        acc["role"][pid] = (plan.get("role_id"), float(plan.get("major") or 0.0), float(plan.get("minor") or 0.0), role_pm)
+
+
+def _replay_playoff_paths(
+    results: dict, model: tuple, idx_arr, w_sample, pid: int, tid: int, plan: Dict[str, Any], by_group: Dict[int, List[dict]],
+) -> tuple:
+    """The player's playoff rounds over the given samples (weights w_sample):
+    each sample's recorded bracket path replayed match by match from the
+    stored pairing table — the very points the joint sampler scored — under
+    the roster's plan, in the keys _assemble_stage_stats reads. Returns
+    (playoff summary, probability of the bracket path) — the probability is
+    only meaningful for a single sample."""
+    po = results.get("playoff") or {}
+    groups = [[int(t) for t in g] for g in (results.get("groups") or [])]
+    x = len(groups)
+    fmt = str(results.get("group_format") or "gsl4")
+    quals = {"gsl4": 2, "de8": 4, "de8_top3": 3}.get(fmt, 2)
+    rounds_total = int(po.get("rounds") or 1)
+    template = _combined_bracket_template(x, quals, rounds_total, fmt, str(po.get("layout") or DEFAULT_PLAYOFF_LAYOUT))
+    rounds, entry_round, prior_matches = template["rounds"], template["entry_round"], template["prior_matches"]
+    byes = bool(template["byes_to_semis"])
+    decider = template.get("decider") if po.get("third_place") else None
+    table = {
+        tuple(int(t) for t in k.split(",")): {int(p): v for p, v in row.items()}
+        for k, row in (po.get("pairing_table") or {}).items()
+    }
+    win_probs = {int(a): {int(b): float(p) for b, p in row.items()} for a, row in (po.get("win_probs") or {}).items()}
+    final_win_probs = (
+        {int(a): {int(b): float(p) for b, p in row.items()} for a, row in (po.get("final_win_probs") or {}).items()}
+        if po.get("final_win_probs")
+        else None
+    )
+    paths = model[3]["paths"]
+    group_idx = paths["group_idx"]
+    bracket = paths["bracket"]
+    role_pm = plan.get("role_pm")
+    by_slot = plan.get("by_slot")
+    n_rows = rounds_total + (1 if decider else 0)
+    round_reach = [0.0] * n_rows
+    round_wins = [0.0] * n_rows
+    round_elim: Dict[int, List[float]] = {}
+    round_opp: Dict[int, Dict[int, List[float]]] = {}
+    stage_ev: Dict[int, List[float]] = {}
+    opp_pts: Dict[int, Dict[int, List[float]]] = {}
+    boost: Dict[int, Dict[int, list]] = {}
+    penalty_total = 0.0
+    bye_prob = 0.0
+    pad_sum = [0.0, 0.0, 0.0, 0.0]
+    champion = 0.0
+    path_prob = 1.0
+    missing = 0
+
+    def score(r: int, row: list, opp: int, slot: int, won: bool, pen: float, w: float) -> List[float]:
+        nonlocal penalty_total
+        rating = float(row[1])
+        win_match = float(row[2]) - pen
+        role = float(role_pm) if role_pm is not None else float(row[3])
+        if by_slot is not None:
+            b = by_slot.get(slot)
+            booster = b[3] if b else 0.0
+        else:
+            b = None
+            booster = float(row[0]) - float(row[1]) - float(row[2]) - float(row[3])
+        cell = stage_ev.setdefault(r, [0.0, 0.0, 0.0, 0.0, 0.0])
+        cell[0] += w * rating
+        cell[1] += w * win_match
+        cell[2] += w * role
+        cell[3] += w * booster
+        cell[4] += w * (rating + win_match + role + booster)
+        round_reach[r] += w
+        if won:
+            round_wins[r] += w
+        oc = round_opp.setdefault(r, {}).setdefault(opp, [0.0, 0.0])
+        oc[0] += w
+        if won:
+            oc[1] += w
+        op = opp_pts.setdefault(r, {}).setdefault(opp, [0.0, 0.0, 0.0, 0.0])
+        op[0] += w * rating
+        op[1] += w * win_match
+        op[2] += w * role
+        op[3] += w * booster
+        if b is not None:
+            bucket = boost.setdefault(r, {})
+            cell_b = bucket.get(b[0])
+            if cell_b is None:
+                bucket[b[0]] = [w, b[1], b[2], slot, 0.0]
+            else:
+                cell_b[0] += w
+        if pen:
+            ecell = round_elim.setdefault(r, [0.0, 0.0])
+            ecell[0] += w
+            ecell[1] += w * pen
+            penalty_total += w * pen
+        return [rating, win_match, role]
+
+    for pos, i in enumerate(idx_arr):
+        i = int(i)
+        w = float(w_sample[pos])
+        seed_team: Dict[tuple, int] = {}
+        for g in range(x):
+            q = by_group[g][int(group_idx[g][i])].get("qualified") or []
+            for rank in range(quals):
+                if rank < len(q):
+                    seed_team[(g, rank)] = int(q[rank])
+        team_seed = {t: sd for sd, t in seed_team.items()}
+        winners: Dict[tuple, int] = {}
+        losers: Dict[tuple, int] = {}
+        my_rows: List[List[float]] = []
+        ui = 0
+        for r, matches in enumerate(rounds):
+            rem = rounds_total - r - 1
+            for m, (left, right) in enumerate(matches):
+                a = seed_team[(left[1], left[2])] if left[0] == "seed" else winners[(left[1], left[2])]
+                b = seed_team[(right[1], right[2])] if right[0] == "seed" else winners[(right[1], right[2])]
+                wnr = int(bracket[i, ui])
+                ui += 1
+                if wnr not in (a, b):
+                    continue
+                winners[(r, m)] = wnr
+                losers[(r, m)] = b if wnr == a else a
+                sa, sb = team_seed[a], team_seed[b]
+                na = prior_matches[sa] + r - entry_round.get(sa, 0) + 1
+                nb = prior_matches[sb] + r - entry_round.get(sb, 0) + 1
+                probs_m = final_win_probs if (rem == 0 and final_win_probs) else win_probs
+                p_a = float(probs_m.get(a, {}).get(b, 0.5))
+                path_prob *= p_a if wnr == a else (1.0 - p_a)
+                if tid not in (a, b):
+                    continue
+                row = (table.get((a, b, wnr, na, nb, rem)) or {}).get(pid)
+                if row is None:
+                    missing += 1
+                    continue
+                won = wnr == tid
+                pen = -3.0 * rem if (not won and rem > 0) else 0.0
+                my_rows.append(score(r, row, b if tid == a else a, na if tid == a else nb, won, pen, w))
+                if rem == 0 and won:
+                    champion += w
+        if decider and all(k in losers for k in ((decider[0][1], decider[0][2]), (decider[1][1], decider[1][2]))):
+            ta = losers[(decider[0][1], decider[0][2])]
+            tb = losers[(decider[1][1], decider[1][2])]
+            wnr = int(bracket[i, ui])
+            ui += 1
+            if wnr in (ta, tb):
+                p_a = float(win_probs.get(ta, {}).get(tb, 0.5))
+                path_prob *= p_a if wnr == ta else (1.0 - p_a)
+                if tid in (ta, tb):
+                    na = _decider_match_number(template, team_seed[ta], rounds_total)
+                    nb = _decider_match_number(template, team_seed[tb], rounds_total)
+                    row = (table.get((ta, tb, wnr, na, nb, _DECIDER_REM)) or {}).get(pid)
+                    if row is None:
+                        missing += 1
+                    else:
+                        score(rounds_total, row, tb if tid == ta else ta, na if tid == ta else nb, wnr == tid, 0.0, w)
+        if byes:
+            sd = team_seed.get(tid)
+            if sd is not None and entry_round.get(sd, 0) > 0:
+                fg = (by_group[sd[0]][int(group_idx[sd[0]][i])].get("first_games") or {}).get(str(pid)) or [0.0] * 5
+                games = float(fg[4]) + float(len(my_rows))
+                rating_avg = ((float(fg[0]) + sum(rr[0] for rr in my_rows)) / games) if games > 0 else 0.0
+                if role_pm is not None:
+                    role_avg = float(role_pm)
+                else:
+                    role_avg = ((float(fg[2]) + sum(rr[2] for rr in my_rows)) / games) if games > 0 else 0.0
+                pad_sum[0] += w * rating_avg
+                pad_sum[1] += w * _PLAYOFF_BYE_PADDING_POINTS
+                pad_sum[2] += w * role_avg
+                bye_prob += w
+    if missing:
+        logging.getLogger(__name__).warning("winning-player-detail: %d pairings missing from the stored table", missing)
+    summary = {
+        "round_labels": po.get("round_labels") or [],
+        "third_place": bool(decider),
+        "round_reach": {str(tid): round_reach},
+        "round_wins": {str(tid): round_wins},
+        "round_elim": {str(tid): {str(r): {"prob": c[0], "points": c[1]} for r, c in round_elim.items()}},
+        "round_opp": {str(tid): {str(r): {str(o): {"play": c[0], "win": c[1]} for o, c in opps.items()} for r, opps in round_opp.items()}},
+        "bye_prob": {str(tid): bye_prob},
+        "advance_rate": {str(tid): champion},
+        "player_stage_ev": {
+            str(pid): {str(r): {"rating": c[0], "win": c[1], "role": c[2], "booster": c[3], "total": c[4]} for r, c in stage_ev.items()}
+        },
+        "player_penalty": {str(pid): penalty_total},
+        "player_playoff_padding": (
+            {str(pid): {"rating": pad_sum[0], "win": pad_sum[1], "role": pad_sum[2], "booster": pad_sum[3], "total": sum(pad_sum)}}
+            if bye_prob > 0
+            else {}
+        ),
+        "player_round_opp_pts": {
+            str(pid): {
+                str(r): {str(o): {"rating": v[0], "win": v[1], "role": v[2], "booster": v[3], "total": sum(v)} for o, v in opps.items()}
+                for r, opps in opp_pts.items()
+            }
+        },
+        "player_stage_boost": {str(pid): {str(r): _booster_list(bucket) for r, bucket in boost.items()}},
+    }
+    return summary, path_prob
+
+
+def _conditional_player_detail(
+    results: dict, cache_key: Any, event_id: Optional[int], pid: int, idxs: List[int], body: dict, single: bool = False,
+) -> Dict[str, Any]:
+    """A player's Point Sources over a subset of the event's outcomes — the
+    joint outcomes a roster wins, or its single best one — under the roster's
+    plan, in the stored stage_stats' per-round shape: the group rounds
+    re-weighted from the exact per-outcome records, the playoff rounds
+    replayed from each sample's recorded bracket path. The components add up
+    to the roster card's `winning` / `outcome` points: same samples, same
+    scoring."""
+    import numpy as np
+
+    teams_out = results.get("teams") or {}
+    tid = None
+    for t, tdata in teams_out.items():
+        if str(pid) in {str(k) for k in (tdata.get("players") or {})}:
+            tid = int(t)
+            break
+    if tid is None:
+        raise HTTPException(status_code=404, detail="That player is not in the stored run.")
+    groups = results.get("groups") or []
+    fmt = str(results.get("group_format") or "gsl4")
+    po = results.get("playoff") or {}
+    model = _event_outcome_model(results, cache_key)
+    probs = np.asarray(model[1][0], dtype=np.float64)
+    n_total = int(len(probs))
+    idxs = [int(i) for i in idxs if 0 <= int(i) < n_total]
+    if not idxs:
+        raise HTTPException(status_code=400, detail="outcome_indexes is required")
+    decomp = model[3] or {}
+    paths = decomp.get("paths")
+    by_group: Dict[int, List[dict]] = {}
+    for o in results.get("outcomes") or []:
+        by_group.setdefault(int(o.get("group") or 0), []).append(o)
+    idx_arr = np.asarray(idxs, dtype=np.int64)
+    if paths is not None:
+        # sampled joint outcomes, 1/N each: a group outcome's weight is its share of the samples
+        w_sample = np.full(len(idxs), 1.0 / len(idxs), dtype=np.float64)
+        mass = len(idxs) / float(n_total)
+        group_w = {
+            g: np.bincount(np.asarray(paths["group_idx"][g])[idx_arr], minlength=len(olist)).astype(np.float64) / float(len(idxs))
+            for g, olist in by_group.items()
+        }
+    else:
+        if len(groups) != 1 or po.get("pairing_table"):
+            raise HTTPException(status_code=409, detail="The stored run carries no outcome paths; re-bake the event first.")
+        pw = probs[idx_arr]
+        tot = float(pw.sum())
+        if tot <= 0:
+            raise HTTPException(status_code=400, detail="The given outcomes carry no probability.")
+        w_sample = pw / tot
+        mass = tot
+        gw = np.zeros(len(by_group.get(0) or []), dtype=np.float64)
+        np.add.at(gw, idx_arr, w_sample)
+        group_w = {0: gw}
+    plan = _plan_for_player(results, pid, body)
+    records = _group_stage_records(results, cache_key, event_id)
+    acc = _new_stage_acc()
+    for g, recs in records.items():
+        wg = group_w.get(g)
+        if wg is None:
+            continue
+        for o_idx in np.nonzero(wg > 0)[0]:
+            if int(o_idx) < len(recs):
+                _merge_stage_acc(acc, recs[int(o_idx)], float(wg[o_idx]), pid)
+    _apply_plan_to_stage_acc(acc, pid, tid, plan)
+    probability: Optional[float] = None
+    if single:
+        probability = 1.0
+        for g, wg in group_w.items():
+            o_idx = int(np.argmax(wg))
+            probability *= float((by_group[g][o_idx] or {}).get("probability") or 0.0)
+    po_cond = None
+    if paths is not None and po.get("pairing_table") and po.get("win_probs"):
+        po_cond, path_prob = _replay_playoff_paths(results, model, idx_arr, w_sample, pid, tid, plan, by_group)
+        if single:
+            probability = float(probability or 0.0) * float(path_prob)
+    ranks = {
+        int(t): int(row["rank"])
+        for t, row in ((results.get("stage_stats") or {}).get("teams") or {}).items()
+        if (row or {}).get("rank") is not None
+    }
+    stats = _assemble_stage_stats(fmt, acc, po_cond, teams_out, ranks)
+    prow = stats["players"].get(str(pid)) or {"stages": {}, "padding": None, "penalty": 0.0}
+    trow = stats["teams"].get(str(tid)) or {}
+    comps = {"rating": 0.0, "win": 0.0, "role": 0.0, "booster": 0.0}
+    for cell in (prow.get("stages") or {}).values():
+        for k in comps:
+            comps[k] += float(cell.get(k) or 0.0)
+    for pad in (prow.get("padding"), prow.get("playoff_padding")):
+        if pad:
+            for k in comps:
+                comps[k] += float(pad.get(k) or 0.0)
+    comps["total"] = comps["rating"] + comps["win"] + comps["role"] + comps["booster"]
+    return {
+        "n_outcomes": len(idxs),
+        "mass": float(mass),
+        "probability": probability,
+        "team_id": tid,
+        "components": comps,
+        "stage_list": stats["stages"],
+        "stage_ev": prow.get("stages") or {},
+        "team_rounds": trow.get("rounds") or {},
+        "team_ranks": {str(t): r for t, r in ranks.items()},
+        "role_info": prow.get("role"),
+        "padding": prow.get("padding"),
+        "padding_prob": float(trow.get("padding_prob") or 0.0),
+        "penalty": float(prow.get("penalty") or 0.0),
+        "playoff_padding": prow.get("playoff_padding"),
+        "playoff_pad_prob": float(trow.get("playoff_padding_prob") or 0.0),
+        "playoff_penalty": float(prow.get("playoff_penalty") or 0.0),
+    }
 
 
 def _real_game_sums(states: Dict[int, TeamState], tid: int) -> Dict[str, List[float]]:
@@ -1448,9 +1955,13 @@ def _take_input_snapshot(event_id: int, team_ids: List[int]) -> Dict[str, Any]:
         if price is not None:
             out["price"] = int(price)
         players[str(pid)] = out
+    from backend.services.rating_curve import get_average_bucket_pct
+
     return {
         "players": players,
         "team_ranks": {str(tid): int(rank) for tid, rank in team_rank_by_id.items()},
+        # the rating-vs-rank curve the rows are scored through (refit nightly)
+        "average_bucket_pct": {str(t): float(v) for t, v in get_average_bucket_pct().items()},
     }
 
 
@@ -1801,20 +2312,25 @@ def _compute_groups_result(payload: dict, progress_callback=None, snapshot: Opti
         player_rows_by_id, team_rank_by_id = _lookup_context_from_snapshot(snapshot, all_team_ids)
     else:
         player_rows_by_id, team_rank_by_id = _build_playoff_lookup_context(all_team_ids)
-    with team_strength.rank_overrides(team_rank_by_id if snapshot else None):
+    from backend.services.rating_curve import average_bucket_pct_override
+
+    curve = (snapshot or {}).get("average_bucket_pct")
+    with team_strength.rank_overrides(team_rank_by_id if snapshot else None), average_bucket_pct_override(curve):
         result = _compute_groups_result_inner(
             payload, progress_callback, snapshot, groups, group_format, quals_per_group, enumerate_group,
             combined, all_team_ids, player_rows_by_id, team_rank_by_id,
         )
     if snapshot:
         # The rows this run was valued with travel with the results so the live
-        # Top 5 (prices, roles, boosters) matches the stored expected points.
+        # Top 5 (prices, roles, boosters) matches the stored expected points,
+        # and the outcomes can be re-enumerated exactly (winning-player-detail).
         meta = payload.get("inputs") or {}
         result["input_snapshot"] = {
             "taken_at": meta.get("taken_at"),
             "frozen": bool(meta.get("frozen")),
             "start_at": meta.get("start_at"),
             "players": snapshot.get("players") or {},
+            "average_bucket_pct": curve,
         }
     return result
 
@@ -2895,6 +3411,9 @@ def _sample_joint_outcomes(results: dict, n: int, seed: int = 20240101) -> tuple
     n_matches = sum(len(r) for r in rounds)
     decider = template.get("decider") if (has_playoff and po.get("third_place")) else None
     u = rng.random((n, max(n_matches + (1 if decider else 0), 1)))
+    # each sample's bracket path: the winner of every match in draw order (then
+    # the decider), so a subset of samples can be replayed (winning-player-detail)
+    path = np.zeros((n, max(n_matches + (1 if decider else 0), 1)), dtype=np.int32)
     missing = 0
     # Python loop over samples: ~5 matches × 10 players each — fine for 20k.
     for i in range(n):
@@ -2919,6 +3438,7 @@ def _sample_joint_outcomes(results: dict, n: int, seed: int = 20240101) -> tuple
                 nb = prior_matches[sb] + r - entry_round.get(sb, 0) + 1
                 probs = final_win_probs if (rem == 0 and final_win_probs) else win_probs
                 w = a if u[i, ui] < probs[a][b] else b
+                path[i, ui] = w
                 ui += 1
                 winners[(r, m)] = w
                 losers[(r, m)] = b if w == a else a
@@ -2954,6 +3474,7 @@ def _sample_joint_outcomes(results: dict, n: int, seed: int = 20240101) -> tuple
             na = _decider_match_number(template, team_seed[ta], rounds_total)
             nb = _decider_match_number(template, team_seed[tb], rounds_total)
             w = ta if u[i, ui] < win_probs[ta][tb] else tb
+            path[i, ui] = w
             ui += 1
             row = table.get((ta, tb, w, na, nb, _DECIDER_REM))
             if row is None:
@@ -2989,7 +3510,11 @@ def _sample_joint_outcomes(results: dict, n: int, seed: int = 20240101) -> tuple
         import logging
 
         logging.getLogger(__name__).warning("joint sampler: %d pairings missing from the stored table", missing)
-    decomp = {"rw": rw, "rt": rt, "mp": mp, "mr": mr} if decomposed else None
+    decomp = (
+        {"rw": rw, "rt": rt, "mp": mp, "mr": mr, "paths": {"group_idx": idx_by_group, "bracket": path}}
+        if decomposed
+        else None
+    )
     return {0: vec}, {0: np.full(n, 1.0 / n, dtype=np.float64)}, {pid: 0 for pid in vec}, decomp
 
 
@@ -3502,6 +4027,8 @@ def _plan_scored_rosters(
             roster_scores.set_kind(player, "outcome", (m.get("peak_parts") or {}).get(pid), float(m["peak"].get(pid, 0.0)))
             roster_scores.set_kind(player, "winning", (m.get("win_parts") or {}).get(pid))
         r["ceiling_outcome_index"] = int(m["argmax"])
+        # the model's outcomes this roster tops (the winning-player-detail input)
+        r["winning_outcome_indexes"] = [int(i) for i in (m.get("wins_idx") or [])]
         r["win_conditional_ev"] = float(sum(float(v.get("total") or 0.0) for v in (m.get("win_parts") or {}).values()))
         out.append(r)
     return out
@@ -4097,11 +4624,20 @@ def _live_groups_query(results: dict, body: dict, mode: str, cache_key: Any = No
         "mode": mode,
         "total_teams": len(rosters),
         "filtered_count": len(sorted_teams),
-        "top_teams": sorted_teams[:10],
-        "page_teams": _page_items(sorted_teams, page, page_size),
+        "top_teams": _rows_for_mode(sorted_teams[:10], mode),
+        "page_teams": _rows_for_mode(_page_items(sorted_teams, page, page_size), mode),
         "page": max(0, page),
         "page_size": max(1, min(500, page_size)),
     }
+
+
+def _rows_for_mode(rows: List[Dict[str, Any]], mode: str) -> List[Dict[str, Any]]:
+    """The roster rows a query returns: the outcome indexes a roster wins (the
+    per-player breakdown's input, up to the whole sample across the page)
+    travel only with Most Likely Winner."""
+    if mode == "most_outcomes":
+        return rows
+    return [{k: v for k, v in r.items() if k != "winning_outcome_indexes"} for r in rows]
 
 
 def _live_query_cache_key(key: int, updated_at: Any, mode: str, body: dict) -> tuple:
@@ -4204,11 +4740,47 @@ def query_groups_best_team(payload: dict | None = None, event_id: Optional[int] 
         "updated_at": latest["updated_at"],
         "total_teams": len(teams),
         "filtered_count": len(sorted_teams),
-        "top_teams": sorted_teams[:10],
-        "page_teams": _page_items(sorted_teams, page, page_size),
+        "top_teams": _rows_for_mode(sorted_teams[:10], mode),
+        "page_teams": _rows_for_mode(_page_items(sorted_teams, page, page_size), mode),
         "page": max(0, page),
         "page_size": max(1, min(500, page_size)),
     }
+
+
+@router.post("/best-team/winning-player-detail")
+def groups_winning_player_detail(payload: dict | None = None, event_id: Optional[int] = None):
+    """A roster player's Point Sources over the outcomes the roster wins
+    (Most Likely Winner): {player_id, outcome_indexes, role_id,
+    booster_assignments[, event_id]} → the Point Sources modal's contract."""
+    body = dict(payload or {})
+    key = _state_key(event_id or body.get("event_id"))
+    latest = _GROUPS_STATE.load(key=key)
+    if not latest:
+        raise HTTPException(status_code=404, detail="No stored group stage found.")
+    idxs = body.get("outcome_indexes") or []
+    if not idxs:
+        raise HTTPException(status_code=400, detail="outcome_indexes is required")
+    return _conditional_player_detail(
+        latest["results"] or {}, (key, latest["updated_at"]), key, int(body.get("player_id") or 0), [int(i) for i in idxs], body,
+    )
+
+
+@router.post("/best-team/outcome-player-detail")
+def groups_outcome_player_detail(payload: dict | None = None, event_id: Optional[int] = None):
+    """A roster player's Point Sources in one outcome (the roster's best, for
+    Best Single Outcome): {player_id, outcome_index, role_id,
+    booster_assignments[, event_id]}; `probability` is that exact outcome's."""
+    body = dict(payload or {})
+    key = _state_key(event_id or body.get("event_id"))
+    latest = _GROUPS_STATE.load(key=key)
+    if not latest:
+        raise HTTPException(status_code=404, detail="No stored group stage found.")
+    if body.get("outcome_index") is None:
+        raise HTTPException(status_code=400, detail="outcome_index is required")
+    return _conditional_player_detail(
+        latest["results"] or {}, (key, latest["updated_at"]), key, int(body.get("player_id") or 0),
+        [int(body["outcome_index"])], body, single=True,
+    )
 
 
 def _find_completed_group_outcomes(results: dict, picks_by_group: List[List[int]]) -> List[Dict[str, Any]]:

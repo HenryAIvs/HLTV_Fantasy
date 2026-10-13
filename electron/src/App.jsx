@@ -14616,7 +14616,9 @@ function GroupsTab({
     const minor = Number(rr.minor || 0);
     return { ...ctx, major, minor, per_match: 5 * major + 2 * minor - 2 * (1 - major - minor) };
   };
-  const openGroupPlayer = (p, rosterCtx = null) => {
+  // The average view: the stored run's stage stats, re-scored client-side
+  // under the roster's plan when opened from a roster.
+  const openGroupPlayerAverage = (p, rosterCtx = null) => {
     const comps = playerEvByPid[Number(p.player_id)] || {};
     const stageStats = results?.stage_stats || null;
     const stageRow = stageStats?.players?.[String(p.player_id)] || null;
@@ -14646,6 +14648,74 @@ function GroupsTab({
       playoff_penalty: Number(stageRow?.playoff_penalty || 0),
       roster: rosterCtx ? withRosterRole(rosterCtx, p.player_id) : null,
     });
+  };
+  // From a roster card the breakdown follows the ranking mode: Most Likely
+  // Winner shows the player over the outcomes this roster wins, Best Single
+  // Outcome in the roster's best outcome — scored server-side under the
+  // roster's plan (its role, its booster per match), so the parts add up to
+  // the card's figure. Average, or a failure, falls back to the average view.
+  const openGroupPlayer = (p, rosterCtx = null, team = null) => {
+    const conditional = (path, extra, note) => {
+      api
+        .post(
+          path,
+          {
+            player_id: Number(p.player_id),
+            role_id: rosterCtx?.role_id ?? null,
+            booster_assignments: team?.booster_assignments || [],
+            ...extra,
+          },
+          120000
+        )
+        .then((data) => {
+          if (!data || data.detail) {
+            openGroupPlayerAverage(p, rosterCtx);
+            return;
+          }
+          const c = data.components || {};
+          setBreakdownPlayer({
+            player_id: p.player_id,
+            name: p.name,
+            team_id: p.team_id,
+            role_id: data.role_info?.role_id ?? rosterCtx?.role_id ?? p.role_id ?? null,
+            rating: Number(c.rating || 0),
+            win: Number(c.win || 0),
+            role: Number(c.role || 0),
+            booster: Number(c.booster || 0),
+            total: Number(c.total || 0),
+            stage_list: data.stage_list || [],
+            stage_ev: data.stage_ev || {},
+            team_rounds: data.team_rounds || {},
+            team_ranks: data.team_ranks || {},
+            padding_prob: Number(data.padding_prob || 0),
+            role_info: data.role_info || null,
+            padding: data.padding || null,
+            penalty: Number(data.penalty || 0),
+            playoff_padding: data.playoff_padding || null,
+            playoff_pad_prob: Number(data.playoff_pad_prob || 0),
+            playoff_penalty: Number(data.playoff_penalty || 0),
+            hero_note: note(data),
+            roster: null,
+          });
+        })
+        .catch(() => openGroupPlayerAverage(p, rosterCtx));
+    };
+    if (team && comboMode === "most_outcomes" && Array.isArray(team.winning_outcome_indexes) && team.winning_outcome_indexes.length > 0) {
+      conditional("/groups/best-team/winning-player-detail", { outcome_indexes: team.winning_outcome_indexes }, (d) => {
+        const pct = Number(team.outcome_win_probability ?? d.mass ?? 0) * 100;
+        return `in the ${Number(d.n_outcomes || 0).toLocaleString()} outcomes this roster wins · ${pct.toFixed(1)}%`;
+      });
+      return;
+    }
+    if (team && comboMode === "single_outcome" && team.ceiling_outcome_index != null) {
+      conditional("/groups/best-team/outcome-player-detail", { outcome_index: Number(team.ceiling_outcome_index) }, (d) => {
+        const pct = Number(d.probability || 0) * 100;
+        const shown = pct >= 1 ? pct.toFixed(1) : pct >= 0.01 ? pct.toFixed(2) : pct > 0 ? pct.toPrecision(2) : "0";
+        return `this roster's best outcome · ${shown}% chance`;
+      });
+      return;
+    }
+    openGroupPlayerAverage(p, rosterCtx);
   };
   const renderPlayerLinks = (list) =>
     (list || []).map((p, i) => (
@@ -15021,7 +15091,7 @@ function GroupsTab({
                                     <div
                                       className="event-player-card clickable"
                                       key={p.player_id}
-                                      onClick={() => openGroupPlayer(p, rosterCtx)}
+                                      onClick={() => openGroupPlayer(p, rosterCtx, team)}
                                     >
                                       <PlayerPhoto playerId={Number(p.player_id)} name={p.name} size={52} />
                                       <div className="event-player-name">{p.name}</div>

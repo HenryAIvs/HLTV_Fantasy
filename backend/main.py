@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
 from backend.routes import players, teams, simulation, bracket, best_team, playoff, groups, admin, events, schedule, assets
 from backend.services.backend_port import APP_ID, HOST, PORT_FILE, select_port, write_port_info
@@ -125,6 +126,10 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    # Outermost: the big JSON pages (a Top 5 roster page with its winning-
+    # sample lists is ~2 MB, a slim stored run similar) travel the tunnel at
+    # about a quarter of the size; every client decodes gzip transparently.
+    app.add_middleware(GZipMiddleware, minimum_size=4096)
     for router, prefix, tag in ROUTERS:
         app.include_router(router, prefix=prefix, tags=[tag])
 

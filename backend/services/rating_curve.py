@@ -37,6 +37,27 @@ def get_average_bucket_pct() -> Dict[int, float]:
     return dict(_AVERAGE_BUCKET_PCT)
 
 
+class average_bucket_pct_override:
+    """Context manager: `with average_bucket_pct_override(pct): ...` values
+    with that curve (a stored run's snapshot) instead of the fitted one; None
+    leaves the fitted curve in place."""
+
+    def __init__(self, pct: Optional[Dict[Any, Any]]):
+        self.pct = None if pct is None else {int(k): float(v) for k, v in dict(pct).items()}
+
+    def __enter__(self):
+        global _AVERAGE_BUCKET_PCT
+        self._saved = _AVERAGE_BUCKET_PCT
+        if self.pct is not None:
+            _AVERAGE_BUCKET_PCT = self.pct
+        return self
+
+    def __exit__(self, *exc):
+        global _AVERAGE_BUCKET_PCT
+        _AVERAGE_BUCKET_PCT = self._saved
+        return False
+
+
 def fit_average_bucket_pct(player_rows) -> Dict[int, float]:
     """Maps-weighted mean of (bucket_delta / overall) per tier — the fractional
     amount the typical player's rating deviates from their overall vs that tier,
