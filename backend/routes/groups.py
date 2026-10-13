@@ -3821,11 +3821,14 @@ def _run_groups_best_team_job(job_id: str, payload: dict, state_key: Optional[in
         valid_teams.sort(key=lambda team: float(team.get("average_ev") or 0.0), reverse=True)
 
         # Most-likely-winner: probability each roster is the single best pick
-        # across the joint outcome space. Only the strongest-by-average teams can
-        # realistically win, so score just the top contenders (rest stay 0).
-        for team in valid_teams:
-            team["outcome_win_probability"] = 0.0
-        contenders = [] if planned is not None else valid_teams[:_WIN_PROB_CANDIDATES]
+        # across the joint outcome space. The planner already scored it for
+        # every roster it ranked; otherwise only the strongest-by-average teams
+        # can realistically win, so score just the top contenders (rest stay 0).
+        contenders = []
+        if planned is None:
+            for team in valid_teams:
+                team["outcome_win_probability"] = 0.0
+            contenders = valid_teams[:_WIN_PROB_CANDIDATES]
         if contenders:
             contender_pids = [[int(p.get("player_id") or 0) for p in (t.get("players") or [])] for t in contenders]
             win_probs = _compute_group_win_probs(contender_pids, model[0], model[2], model[1])
