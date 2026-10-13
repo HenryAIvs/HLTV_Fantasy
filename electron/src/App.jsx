@@ -2199,6 +2199,99 @@ function GroupPlayerBreakdownModal({ player, teamLookup, teams, onClose }) {
   });
   const hasStages = built.some((sec) => (sec.isBracket ? Boolean(sec.opener) || sec.upper.length > 0 || sec.lower.length > 0 : sec.cards.length > 0));
   const matchRows = Array.isArray(player.match_rows) ? player.match_rows : [];
+  // Conditioned outcomes (the outcomes a roster wins, its single best one):
+  // the team's runs through the event, most common first — each match with
+  // its opponent, result and the player's points, the paddings and the
+  // out-early penalty — in place of the per-round cards. Shares sum to one;
+  // the share-weighted totals are the hero figures.
+  const runs = Array.isArray(player.runs) ? player.runs : null;
+  const runsRest = player.runs_rest || null;
+  const sharePct = (v) => {
+    const p = Number(v || 0) * 100;
+    return `${p >= 10 ? p.toFixed(0) : p >= 1 ? p.toFixed(1) : p.toFixed(2)}%`;
+  };
+  const runStage = (m) => m.label || STAGE_SHORT[m.stage] || STAGE_FULL[m.stage] || m.stage;
+  const runChip = (m, j) => {
+    const oppId = Number(m.opponent_team_id || 0);
+    const info = oppId > 0 ? teamInfo(oppId) : null;
+    return (
+      <span className={`run-chip ${m.won ? "win" : "loss"}`} key={`m-${j}`} title={m.booster_name ? `${runStage(m)} · ${m.booster_name}` : runStage(m)}>
+        <span className="run-chip-stage">{runStage(m)}</span>
+        <span className="run-chip-main">
+          <span className="run-chip-result">{m.won ? "W" : "L"}</span>
+          {info ? <TeamLogo hltvTeamId={info?.hltv_team_id} name={teamLookup[oppId]} size={18} /> : null}
+          <span className="run-chip-opp">{teamLookup[oppId] || oppId}</span>
+          {Number(m.opponent_share ?? 1) < 0.995 ? <span className="run-chip-share">{Math.round(Number(m.opponent_share) * 100)}%</span> : null}
+        </span>
+        <span className={`run-chip-pts${Number(m.total) < -0.005 ? " neg" : ""}`}>{num(m.total)}</span>
+      </span>
+    );
+  };
+  const adjustChip = (key, label, value) => (
+    <span className="run-chip adjust" key={key}>
+      <span className="run-chip-stage">{label}</span>
+      <span className={`run-chip-pts${Number(value) < -0.005 ? " neg" : ""}`}>{num(value)}</span>
+    </span>
+  );
+  const runCells = (t) =>
+    ["rating", "win", "role", "booster", "total"].map((k) => (
+      <span className="run-cell num" key={k}>
+        <span className={`match-v${k === "total" ? " strong" : ""}${Number(t?.[k]) < -0.005 ? " neg" : ""}`}>{num(t?.[k], 2)}</span>
+      </span>
+    ));
+  const runsSection = runs ? (
+    <div className="stack">
+      <h4>Runs</h4>
+      <div className="run-table">
+        <div className="run-trow head">
+          <span>Share</span>
+          <span>Run</span>
+          <span className="num">Rating</span>
+          <span className="num">Win</span>
+          <span className="num">Role</span>
+          <span className="num">Booster</span>
+          <span className="num">Total</span>
+        </div>
+        {runs.map((run, i) => (
+          <div className="run-trow" key={i}>
+            <span className="run-cell">
+              <span className="match-v accent">{sharePct(run.share)}</span>
+            </span>
+            <span className="run-chips">
+              {(run.matches || []).map(runChip)}
+              {(run.pads || [])
+                .filter((p) => Math.abs(Number(p.total || 0)) > 0.005)
+                .map((p, j) => adjustChip(`p-${j}`, p.label || "Padding", p.total))}
+              {Math.abs(Number(run.penalty || 0)) > 0.005 ? adjustChip("pen", "Out early", run.penalty) : null}
+            </span>
+            {runCells(run.totals || {})}
+          </div>
+        ))}
+        {runsRest ? (
+          <div className="run-trow muted">
+            <span className="run-cell">
+              <span className="match-v">{sharePct(runsRest.share)}</span>
+            </span>
+            <span className="run-chips">
+              <span className="match-v small">Other runs ({runsRest.count})</span>
+            </span>
+            {runCells(runsRest.totals || {})}
+          </div>
+        ) : null}
+        <div className="run-trow total">
+          <span className="run-cell">
+            <span className="match-v small">Weighted</span>
+          </span>
+          <span className="run-chips">
+            <span className="match-sub">
+              {runs.length + (runsRest ? runsRest.count : 0)} run{runs.length + (runsRest ? runsRest.count : 0) === 1 ? "" : "s"}
+            </span>
+          </span>
+          {runCells({ rating, win, role, booster, total })}
+        </div>
+      </div>
+    </div>
+  ) : null;
   const dash = <span className="round-cell-dash">—</span>;
   const renderCard = (c) => (
     <div className={`round-card${c.extra ? " extra" : ""}`} key={c.key}>
@@ -2379,10 +2472,11 @@ function GroupPlayerBreakdownModal({ player, teamLookup, teams, onClose }) {
             total={total}
           />
           {player.note && <p className="muted">{player.note}</p>}
-          {!hasStages && !player.note && matchRows.length === 0 && (
+          {!hasStages && !player.note && matchRows.length === 0 && !runs && (
             <p className="muted">Re-run the valuation to see the per-round split.</p>
           )}
-          {built.map((sec) =>
+          {runsSection}
+          {!runs && built.map((sec) =>
             sec.isBracket ? (
               (sec.opener || sec.upper.length > 0 || sec.lower.length > 0) && (
                 <div className="stack round-row" key={sec.id}>
@@ -5515,6 +5609,8 @@ function PlayoffTab({
         team_ranks: { ...team_ranks, ...(wd.team_ranks || {}) },
         role_info: roleInfo,
         hero_note: `in the ${Number(wd.n_outcomes || 0).toLocaleString()} brackets this roster wins · ${pct.toFixed(1)}%`,
+        runs: wd.runs || null,
+        runs_rest: wd.runs_rest || null,
         padding: null,
         padding_prob: 0,
         playoff_padding: null,
@@ -14695,6 +14791,8 @@ function GroupsTab({
             playoff_pad_prob: Number(data.playoff_pad_prob || 0),
             playoff_penalty: Number(data.playoff_penalty || 0),
             hero_note: note(data),
+            runs: data.runs || null,
+            runs_rest: data.runs_rest || null,
             roster: null,
           });
         })

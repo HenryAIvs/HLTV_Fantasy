@@ -3463,8 +3463,10 @@ def winning_player_detail(payload: dict | None = None, event_id: int | None = No
         if double
         else {"team_slots": team_slots, "third_place": bool(lp.get("has_third_place_decider")), "rounds": int(round(math.log2(max(len(team_slots), 2)))), "final_bo": int(lp.get("final_bo") or 3)}
     )
-    base_states = initialize_teams(team_slots, {t: 999 for t in team_slots})
-    player_rows_by_id, team_rank_by_id = _build_playoff_lookup_context(team_slots)
+    # the rosters as the run valued them (the event's own), not today's teams table
+    with event_rosters.for_event(_event_key(body.get("event_id"))):
+        base_states = initialize_teams(team_slots, {t: 999 for t in team_slots})
+        player_rows_by_id, team_rank_by_id = _build_playoff_lookup_context(team_slots)
     prob_cache: Dict[tuple[int, int], float] = {}
     memo: Dict[tuple, dict] = {}
 
@@ -3546,6 +3548,20 @@ def winning_player_detail(payload: dict | None = None, event_id: int | None = No
     boost: Dict[str, Dict[tuple, float]] = {st: {} for st in stages}
     ranks: Dict[int, Any] = {}
     mass = 0.0
+    # the team's runs through the bracket over these outcomes (the clear view)
+    from backend.services import player_runs
+
+    run_map: Dict[tuple, Dict[str, Any]] = {}
+    cur: Dict[str, Any] = {"matches": [], "pads": []}
+
+    def note_match(stage: str, row: dict, opp: int, won: bool, slot: int, rem: int) -> None:
+        pen = (-3.0 * len(missed_after.get(stage, [])[: max(0, rem)])) if (not won and rem > 0) else 0.0
+        cur["matches"].append({
+            "stage": stage, "slot": slot, "opponent_team_id": int(opp), "won": bool(won),
+            "rating": float(row["rating"]), "win": float(row["win"]), "role": float(row["role"]), "booster": float(row["booster"]),
+            "booster_name": row.get("booster_name") if row.get("booster_id") is not None else None,
+            "total": float(row["rating"]) + float(row["win"]) + float(row["role"]) + float(row["booster"]), "penalty": pen,
+        })
 
     def add_match(stage: str, row: dict, opp: int, won: bool, weight: float) -> None:
         c = cells[stage]
@@ -3596,6 +3612,7 @@ def winning_player_detail(payload: dict | None = None, event_id: int | None = No
         code = int(stored.get("code") if stored.get("code") is not None else idx)
         played = {t: 0 for t in team_slots}
         real_rows: List[dict] = []
+        cur = {"matches": [], "pads": []}
         if double:
             br = _decode_double8_code(code, template)
             for key, stage, _fa, _fb in _DOUBLE8_MATCHES:
@@ -3608,16 +3625,17 @@ def winning_player_detail(payload: dict | None = None, event_id: int | None = No
                 rem = _DOUBLE8_REM[stage]
                 if tid in (a, b):
                     slot = na if tid == a else nb
-                    row = adjust(
-                        pairing(
-                            a, b, w, na, nb, rem,
-                            _bo_type(final_bo) if (stage == "grand_final" or (not double and rem == 0 and stage != "third_place")) else "bo3",
-                        )[pid],
-                        slot, False,
-                    )
+                    prow_m = pairing(
+                        a, b, w, na, nb, rem,
+                        _bo_type(final_bo) if (stage == "grand_final" or (not double and rem == 0 and stage != "third_place")) else "bo3",
+                    ).get(pid)
+                    if prow_m is None:
+                        continue  # the player is not on the team's roster for this run
+                    row = adjust(prow_m, slot, False)
                     row["slot"] = slot
                     real_rows.append(row)
                     add_match(stage, row, b if tid == a else a, w == tid, p_c)
+                    note_match(stage, row, b if tid == a else a, w == tid, slot, rem)
                     if w != tid and rem > 0:
                         add_penalty(stage, rem, p_c)
                 pad_spec = _DOUBLE8_PAD_AFTER.get(stage)
@@ -3629,6 +3647,10 @@ def winning_player_detail(payload: dict | None = None, event_id: int | None = No
                         "role": (float(role_pm) if role_pm is not None else sum(r["role"] for r in real_rows) / games),
                     }
                     add_pad(pad_spec[0], pad, p_c)
+                    cur["pads"].append({
+                        "stage": pad_spec[0], "label": "Bye", "rating": pad["rating"], "win": pad["win"], "role": pad["role"],
+                        "booster": 0.0, "total": pad["rating"] + pad["win"] + pad["role"],
+                    })
         else:
             br = _decode_bracket_code(code, template)
             rounds_total = int(template.get("rounds") or len([s for s in stages if s != "third_place"]))
@@ -3642,20 +3664,25 @@ def winning_player_detail(payload: dict | None = None, event_id: int | None = No
                     rem = 0 if stage == "third_place" else max(0, rounds_total - r_i - 1)
                     if tid in (a, b):
                         slot = na if tid == a else nb
-                        row = adjust(
-                        pairing(
+                        prow_m = pairing(
                             a, b, w, na, nb, rem,
                             _bo_type(final_bo) if (stage == "grand_final" or (not double and rem == 0 and stage != "third_place")) else "bo3",
-                        )[pid],
-                        slot, False,
-                    )
+                        ).get(pid)
+                        if prow_m is None:
+                            continue
+                        row = adjust(prow_m, slot, False)
                         row["slot"] = slot
                         add_match(stage, row, b if tid == a else a, w == tid, p_c)
+                        note_match(stage, row, b if tid == a else a, w == tid, slot, rem)
                         if w != tid and rem > 0:
                             add_penalty(stage, rem, p_c)
+        player_runs.add_run(
+            run_map, cur["matches"], cur["pads"], sum(float(m.get("penalty") or 0.0) for m in cur["matches"]), p_c,
+        )
 
     if mass <= 0:
         raise HTTPException(status_code=400, detail="The given outcomes carry no probability.")
+    runs_out = player_runs.finish_runs(run_map, mass)
     stage_ev: Dict[str, Dict[str, Any]] = {}
     team_rounds: Dict[str, Dict[str, Any]] = {}
     for st in stages:
@@ -3692,6 +3719,8 @@ def winning_player_detail(payload: dict | None = None, event_id: int | None = No
         "team_ranks": {str(t): r for t, r in ranks.items()},
         "components": comps,
         "team_id": tid,
+        "runs": runs_out["runs"],
+        "runs_rest": runs_out["rest"],
     }
 
 

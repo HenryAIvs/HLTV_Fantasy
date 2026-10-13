@@ -3846,6 +3846,61 @@ button:disabled {
 .match-sub.pos { color: #3fbf7f; }
 .match-sub.neg { color: #e0705a; }
 
+/* Point Sources over conditioned outcomes: the team's runs through the event */
+.run-table {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr) repeat(5, 84px);
+  border: 1px solid #242b35;
+  background: #12161d;
+}
+.run-trow {
+  display: grid;
+  grid-template-columns: subgrid;
+  grid-column: 1 / -1;
+  align-items: center;
+  column-gap: 14px;
+  padding: 9px 16px;
+  border-top: 1px solid #1f2530;
+}
+.run-trow.head {
+  padding: 7px 16px;
+  border-top: 0;
+  background: #171c24;
+  color: #8fa3bf;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.run-trow.head .num { text-align: right; }
+.run-trow.muted .match-v { color: #8fa3bf; }
+.run-trow.total { background: #171c24; border-top: 1px solid #2c3441; }
+.run-cell { display: flex; align-items: center; min-width: 0; }
+.run-cell.num { justify-content: flex-end; text-align: right; }
+.run-chips { display: flex; flex-wrap: wrap; align-items: stretch; gap: 6px; min-width: 0; }
+.run-chip {
+  display: inline-flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  padding: 5px 10px 5px 8px;
+  border: 1px solid #2c3441;
+  border-left: 3px solid #6d7d95;
+  background: #171c24;
+  min-width: 0;
+}
+.run-chip.win { border-left-color: #3fbf7f; }
+.run-chip.loss { border-left-color: #e0705a; }
+.run-chip-stage { color: #8fa3bf; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
+.run-chip-main { display: inline-flex; align-items: center; gap: 6px; }
+.run-chip-result { font-family: var(--display); font-stretch: condensed; font-weight: 700; font-size: 14px; width: 12px; }
+.run-chip.win .run-chip-result { color: #3fbf7f; }
+.run-chip.loss .run-chip-result { color: #e0705a; }
+.run-chip-opp { font-size: 12.5px; font-weight: 600; color: #e9edf3; white-space: nowrap; }
+.run-chip-share { color: #8fa3bf; font-size: 10.5px; white-space: nowrap; }
+.run-chip-pts { font-family: var(--display); font-stretch: condensed; font-weight: 700; font-size: 15px; line-height: 1.1; color: #e9edf3; }
+.run-chip-pts.neg { color: #e0705a; }
+
 /* Most Likely Winner: finishing-position bars per team over the roster's winning brackets */
 .combo-team .event-team-row { grid-template-columns: 320px 1fr; }
 .combo-team .combo-cost { white-space: nowrap; }
