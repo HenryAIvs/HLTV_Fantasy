@@ -15,6 +15,7 @@ from typing import List, Dict
 from fastapi import APIRouter, HTTPException
 
 from backend.services import event_rosters
+from backend.services import roster_scores
 from backend.data.db import connect as _connect
 from backend.data.player_db import get_player
 from backend.data.singleton_state import SingletonState
@@ -3158,14 +3159,10 @@ def _optimize_playoff_teams_by_outcomes(
         peak = scores_at_peak[i] or {}
         for player in serialized.get("players") or []:
             pid = int(player.get("player_id") or 0)
-            cs = float(peak.get(pid, 0.0))
-            player["ceiling_score"] = cs
-            player["ceiling_parts"] = (parts_at_peak[i] or {}).get(pid)
-            wp = (parts_at_win[i] or {}).get(pid)
-            if wp:
-                player["win_parts"] = wp
-                player["win_score"] = float(wp.get("total") or 0.0)
-            player["mode_score"] = cs if mode == "single_outcome" else float(player.get("total_ev") or 0.0)
+            # the roster's best outcome and the outcomes it wins, per player
+            roster_scores.refresh_average(player)
+            roster_scores.set_kind(player, "outcome", (parts_at_peak[i] or {}).get(pid), float(peak.get(pid, 0.0)))
+            roster_scores.set_kind(player, "winning", (parts_at_win[i] or {}).get(pid))
         serialized["ceiling_outcome_index"] = int(argmax[i])
         serialized["win_conditional_ev"] = float(sum(float(v.get("total") or 0.0) for v in (parts_at_win[i] or {}).values()))
         serialized["average_ev"] = float(avg[i])
@@ -4049,9 +4046,11 @@ def _compute_completed_bracket_from_latest(payload: dict | None = None, progress
         progress_callback=progress_callback,
         include_error_suffix="in selected bracket outcome",
     )
+    # Scored against the one picked bracket: the flat fields hold that
+    # outcome's components, so they are the player's `outcome` points.
     for team in result.get("all_teams") or result.get("top_teams") or []:
         for player in team.get("players") or []:
-            player["mode_score"] = float(player.get("total_ev") or 0.0)
+            player["outcome"] = roster_scores.parts_from_flat(player)
     # The completed-bracket UI only consumes top_teams/player_values; keeping
     # every roster would persist and return a second multi-hundred-MB blob.
     result.pop("all_teams", None)
@@ -4433,7 +4432,7 @@ def query_latest_best_team_for_completed_bracket(payload: dict | None = None, ev
             pid = int(player.get("player_id") or 0)
             score = float(scores_by_pid.get(pid, 0.0))
             comps = components_by_pid.get(pid) or {}
-            player_out = {**player, "mode_score": score, "total_ev": score}
+            player_out = {**player, "outcome": roster_scores.outcome_of(comps, score)}
             if comps:
                 player_out.update(
                     {

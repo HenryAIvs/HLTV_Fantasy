@@ -180,6 +180,14 @@ class SingletonState:
             else:
                 self._cache.pop(k, None)
 
+    def keys(self) -> list:
+        """Every stored key (one row per key when keyed)."""
+        conn = connect()
+        try:
+            return [int(r["singleton_id"]) for r in conn.execute(f"SELECT singleton_id FROM {self.table}").fetchall()]
+        finally:
+            conn.close()
+
     def delete(self, key: Optional[int] = None) -> None:
         k = self._key(key)
         conn = connect()

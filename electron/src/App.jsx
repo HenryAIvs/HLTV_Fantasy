@@ -146,6 +146,27 @@ const API_BASE =
 // Both components fall back to an initials chip when the image isn't cached.
 const ASSETS_BASE = `${API_BASE}/assets`;
 
+// The three kinds of points a Top 5 roster player carries (backend
+// services/roster_scores.py), each split into rating / win / role / booster /
+// total: `average` over every outcome, `outcome` in one specific outcome (the
+// roster's best one, or the completed one the operator picked), `winning`
+// over the outcomes the roster wins. A ranking mode shows exactly one kind.
+const POINTS_KIND_BY_MODE = { average: "average", single_outcome: "outcome", most_outcomes: "winning", completed: "outcome" };
+const NO_POINTS = { rating: null, win: null, role: null, booster: null, total: 0 };
+const rosterPoints = (player, mode) => {
+  const kind = POINTS_KIND_BY_MODE[mode] || "average";
+  const value = player?.[kind] || player?.average || NO_POINTS;
+  // A kind stored as a total alone (no split) shows the average's split.
+  if (value.rating == null && kind !== "average" && player?.average) return { ...player.average, total: value.total };
+  return value;
+};
+const POINTS_PARTS = [
+  ["Rating", "rating"],
+  ["Win", "win"],
+  ["Role", "role"],
+  ["Boost", "booster"],
+];
+
 const initialsOf = (name) => {
   const parts = String(name || "").trim().split(/\s+/).filter(Boolean);
   if (parts.length >= 2) return `${parts[0][0] || ""}${parts[1][0] || ""}`.toUpperCase();
@@ -2944,7 +2965,7 @@ function TopTeamsTab({ teamLookup, selected, bo, sims, results, onOpenPlayer }) 
     if (!row) return;
     setSourcePlayerBreakdown({
       ...row,
-      points: Number(row.points ?? row.total_ev ?? row.mode_score ?? 0),
+      points: Number(row.points ?? row.total_ev ?? 0),
       rating: Number(row.rating ?? row.rating_ev ?? 0),
       win: Number(row.win ?? row.win_ev ?? 0),
       role: Number(row.role ?? row.role_ev ?? 0),
@@ -5290,7 +5311,7 @@ function PlayoffTab({
       player_id: Number.isFinite(pid) ? pid : row.player_id,
       name: row.name || playerLookup[pid] || `Player ${row.player_id || ""}`,
       team_id: Number(row.team_id || playerTeamById[pid] || 0),
-      points: Number(row.points ?? row.total_ev ?? row.mode_score ?? 0),
+      points: Number(row.points ?? row.total_ev ?? 0),
     });
   };
   const openProjectedRosterBreakdown = (player, team) => {
@@ -5911,11 +5932,7 @@ function PlayoffTab({
     }
     return Number(team?.average_ev ?? team?.total_ev ?? 0);
   };
-  const playoffPlayerModeScore = (player) => {
-    if (playoffBestMode === "single_outcome") return Number(player?.ceiling_score ?? player?.mode_score ?? player?.total_ev ?? 0);
-    if (playoffBestMode === "most_outcomes") return Number(player?.win_score ?? player?.mode_score ?? player?.total_ev ?? 0);
-    return Number(player?.mode_score ?? player?.total_ev ?? 0);
-  };
+  const playoffPlayerModeScore = (player) => Number(rosterPoints(player, playoffBestMode).total || 0);
   const playoffOutcomeCount = Number(results?.outcomes_count || (hasThirdPlaceDecider ? 256 : 128));
   const formatOutcomeWins = (value) => {
     const n = Number(value || 0);
@@ -7024,7 +7041,7 @@ function PlayoffTab({
                                       <td>{teamLookup[p.team_id] || p.team_id}</td>
                                       <td>{roleLabel(p.role_name)}</td>
                                       <td>{p.price}</td>
-                                      <td>{Number(p.mode_score ?? p.total_ev ?? 0).toFixed(2)}</td>
+                                      <td>{Number(rosterPoints(p, "completed").total || 0).toFixed(2)}</td>
                                     </tr>
                                   ))}
                                 </tbody>
@@ -7097,7 +7114,7 @@ function PlayoffTab({
                                 <td>{teamLookup[p.team_id] || p.team_id}</td>
                                 <td>{roleLabel(p.role_name)}</td>
                                 <td>{p.price}</td>
-                                <td>{Number(p.mode_score ?? p.total_ev ?? 0).toFixed(2)}</td>
+                                <td>{Number(rosterPoints(p, "completed").total || 0).toFixed(2)}</td>
                               </tr>
                             ))}
                           </tbody>
@@ -7274,27 +7291,7 @@ function PlayoffTab({
                           </div>
                           <div className="event-player-rating">{playoffPlayerModeScore(p).toFixed(2)}</div>
                           <div className="event-player-stats ev-mini">
-                            {(playoffBestMode === "single_outcome" && p.ceiling_parts && p.ceiling_parts.rating != null
-                              ? [
-                                  ["Rating", p.ceiling_parts.rating],
-                                  ["Win", p.ceiling_parts.win],
-                                  ["Role", p.ceiling_parts.role],
-                                  ["Boost", p.ceiling_parts.booster],
-                                ]
-                              : playoffBestMode === "most_outcomes" && p.win_parts && p.win_parts.rating != null
-                                ? [
-                                    ["Rating", p.win_parts.rating],
-                                    ["Win", p.win_parts.win],
-                                    ["Role", p.win_parts.role],
-                                    ["Boost", p.win_parts.booster],
-                                  ]
-                              : [
-                                  ["Rating", p.rating_ev],
-                                  ["Win", p.win_ev],
-                                  ["Role", p.role_ev],
-                                  ["Boost", p.booster_ev],
-                                ]
-                            ).map(([label, value]) => (
+                            {POINTS_PARTS.map(([label, part]) => [label, rosterPoints(p, playoffBestMode)[part]]).map(([label, value]) => (
                               <div className="event-player-stat" key={label}>
                                 <div className="event-player-mini">{Number(value || 0).toFixed(1)}</div>
                                 <div className="event-player-stat-label">{label}</div>
@@ -15003,10 +15000,12 @@ function GroupsTab({
                                       : roleIdFromName(p.role_name);
                                   const assigned = boostByPid[Number(p.player_id)];
                                   const boost = assigned != null ? assigned : Number(p.booster_ev || 0);
-                                  // serialised rosters already fold the assigned booster into total_ev
+                                  // the kind of points this ranking mode shows; a serialised roster
+                                  // already folds the assigned booster into its average
+                                  const pts = rosterPoints(p, comboMode);
                                   const score =
-                                    Number(p.mode_score ?? p.total_ev ?? 0) +
-                                    (assigned != null && !(Number(p.booster_ev) > 0) ? assigned : 0);
+                                    Number(pts.total || 0) +
+                                    (comboMode === "average" && assigned != null && !(Number(p.booster_ev) > 0) ? assigned : 0);
                                   const rosterCtx =
                                     (team.booster_assignments || []).length > 0
                                       ? {
@@ -15033,30 +15032,10 @@ function GroupsTab({
                                       </div>
                                       <div className="event-player-rating">{score.toFixed(2)}</div>
                                       <div className="event-player-stats ev-mini">
-                                        {(() => {
-                                          // The minis split the same figure the headline shows: the
-                                          // best single outcome's parts, the winning outcomes' parts,
-                                          // or the average components.
-                                          const parts =
-                                            comboMode === "single_outcome" && p.ceiling_parts && p.ceiling_parts.rating != null
-                                              ? p.ceiling_parts
-                                              : comboMode === "most_outcomes" && p.win_parts && p.win_parts.rating != null
-                                                ? p.win_parts
-                                                : null;
-                                          return parts
-                                            ? [
-                                                ["Rating", parts.rating],
-                                                ["Win", parts.win],
-                                                ["Role", parts.role],
-                                                ["Boost", parts.booster],
-                                              ]
-                                            : [
-                                                ["Rating", p.rating_ev],
-                                                ["Win", p.win_ev],
-                                                ["Role", p.role_ev],
-                                                ["Boost", boost],
-                                              ];
-                                        })().map(([label, value]) => (
+                                        {POINTS_PARTS.map(([label, part]) => [
+                                          label,
+                                          part === "booster" && comboMode === "average" ? boost : pts[part],
+                                        ]).map(([label, value]) => (
                                           <div className="event-player-stat" key={label}>
                                             <div className="event-player-mini">{Number(value || 0).toFixed(1)}</div>
                                             <div className="event-player-stat-label">{label}</div>
@@ -15159,7 +15138,7 @@ function GroupsTab({
                             <button type="button" className="inline-link-btn" onClick={() => openCompletedPlayer(p)}>
                               {p.name}
                             </button>{" "}
-                            {Number(p.mode_score || 0).toFixed(1)}
+                            {Number(rosterPoints(p, "completed").total || 0).toFixed(1)}
                           </span>
                         ))}
                       </p>

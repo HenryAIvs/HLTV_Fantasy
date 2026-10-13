@@ -20,6 +20,7 @@ from backend.services.scheduler import scheduler
 from backend.services.public_access import PublicAccessMiddleware, admin_token
 from backend.routes import auth as auth_routes
 from backend.data.auth_db import ensure_auth_schema
+from backend.services import roster_scores
 
 SCHEMA_INITIALIZERS = (
     ensure_schema,
@@ -94,6 +95,10 @@ async def _lifespan(app: FastAPI):
         except Exception:  # noqa: BLE001
             logging.getLogger(__name__).warning("Could not refresh the map model evaluation", exc_info=True)
         events.warm_kind_cache()  # ~1 s; needed by the first Tournament open
+        try:
+            roster_scores.migrate_stored_roster_sets()  # one-off per stored roster set (see the module)
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning("Could not migrate stored roster sets", exc_info=True)
         groups.warm_caches()  # ~10 s: outcome sample + the three default Top 5 queries
         try:
             playoff.seed_playoff_queries()  # parse the combos blob + cache the default queries

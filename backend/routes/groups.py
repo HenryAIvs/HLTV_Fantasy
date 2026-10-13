@@ -25,6 +25,7 @@ from backend.data.db import connect as _connect
 from backend.data.player_db import get_player
 from backend.data.singleton_state import SingletonState
 from backend.services import event_rosters, team_strength
+from backend.services import roster_scores
 from backend.services import roster_kernels as rk
 from backend.routes.playoff import (
     _build_playoff_lookup_context,
@@ -3393,7 +3394,7 @@ def _topk_rosters_bnb(
                 old_role_ev = float(player.get("role_ev") or 0.0)
                 player["role_ev"] = float(new_role_ev)
                 player["total_ev"] = float(player.get("total_ev") or 0.0) - old_role_ev + float(new_role_ev)
-            player["mode_score"] = float(player.get("total_ev") or 0.0)
+            roster_scores.refresh_average(player)
             adjusted_total += float(player.get("total_ev") or 0.0)
         serialized["total_ev"] = float(adjusted_total)
         serialized["average_ev"] = float(adjusted_total)
@@ -3497,13 +3498,9 @@ def _plan_scored_rosters(
         r["outcome_wins"] = float(m["wins_count"])
         for player in r.get("players") or []:
             pid = int(player.get("player_id") or 0)
-            player["ceiling_score"] = float(m["peak"].get(pid, 0.0))
-            player["mode_score"] = float(m["peak"].get(pid, 0.0))
-            player["ceiling_parts"] = (m.get("peak_parts") or {}).get(pid)
-            wp = (m.get("win_parts") or {}).get(pid)
-            if wp:
-                player["win_parts"] = wp
-                player["win_score"] = float(wp.get("total") or 0.0)
+            # the roster's best outcome and the outcomes it wins, per player
+            roster_scores.set_kind(player, "outcome", (m.get("peak_parts") or {}).get(pid), float(m["peak"].get(pid, 0.0)))
+            roster_scores.set_kind(player, "winning", (m.get("win_parts") or {}).get(pid))
         r["ceiling_outcome_index"] = int(m["argmax"])
         r["win_conditional_ev"] = float(sum(float(v.get("total") or 0.0) for v in (m.get("win_parts") or {}).values()))
         out.append(r)
@@ -3637,7 +3634,7 @@ def _rosters_by_outcome(
 
 def _attach_ceiling_details(team: Dict[str, Any], model: tuple) -> None:
     """ceiling_points, the probability of that outcome, and each player's score
-    in it (mode_score / ceiling_score), from the roster's best outcome per group."""
+    in it (its `outcome` points), from the roster's best outcome per group."""
     import numpy as np
 
     vectors, probs, group_of_player = model[0], model[1], model[2]
@@ -3667,8 +3664,7 @@ def _attach_ceiling_details(team: Dict[str, Any], model: tuple) -> None:
     for player in team.get("players") or []:
         pid = int(player.get("player_id") or 0)
         if pid in per_player:
-            player["ceiling_score"] = per_player[pid]
-            player["mode_score"] = per_player[pid]
+            roster_scores.set_kind(player, "outcome", None, per_player[pid])
 
 
 def _booster_prerequisites(
@@ -4175,28 +4171,6 @@ def _seed_live_queries(key: int, latest_sim: Optional[dict] = None) -> Dict[str,
     return timings
 
 
-# Per-player headline for each ranking mode of a stored roster set.
-_MODE_PLAYER_FIELD = {"average": "total_ev", "single_outcome": "ceiling_score", "most_outcomes": "win_score"}
-
-
-def _with_mode_scores(team: dict, mode: str) -> dict:
-    """A copy of a stored roster whose per-player headline (mode_score) is the
-    requested mode's figure: the average EV, the best-single-outcome score or
-    the most-likely-winner score. The planning pass leaves the ceiling figure
-    there, which only the single-outcome view should show (the live path
-    already relabels per mode)."""
-    field = _MODE_PLAYER_FIELD.get(mode, "total_ev")
-    players = []
-    for p in team.get("players") or []:
-        q = dict(p)
-        value = q.get(field)
-        if value is None:
-            value = q.get("total_ev")
-        q["mode_score"] = float(value or 0.0)
-        players.append(q)
-    return {**team, "players": players}
-
-
 @router.post("/best-team/query")
 def query_groups_best_team(payload: dict | None = None, event_id: Optional[int] = None):
     body = dict(payload or {})
@@ -4227,8 +4201,8 @@ def query_groups_best_team(payload: dict | None = None, event_id: Optional[int] 
         "updated_at": latest["updated_at"],
         "total_teams": len(teams),
         "filtered_count": len(sorted_teams),
-        "top_teams": [_with_mode_scores(t, mode) for t in sorted_teams[:10]],
-        "page_teams": [_with_mode_scores(t, mode) for t in _page_items(sorted_teams, page, page_size)],
+        "top_teams": sorted_teams[:10],
+        "page_teams": _page_items(sorted_teams, page, page_size),
         "page": max(0, page),
         "page_size": max(1, min(500, page_size)),
     }
@@ -4318,7 +4292,7 @@ def query_groups_best_team_completed(payload: dict | None = None, event_id: Opti
                 pid = int(player.get("player_id") or 0)
                 score = float(scores_by_pid.get(pid, 0.0))
                 total += score
-                players.append({**player, "mode_score": score, "total_ev": score})
+                players.append({**player, "outcome": roster_scores.outcome_of(components_by_pid.get(pid), score)})
             scored.append({**team, "players": players, "total_ev": total, "bracket_score": total})
         scored = _filter_saved_combo_teams(scored, set(), set(), str(body.get("search") or ""))
         scored.sort(key=lambda team: float(team.get("bracket_score") or 0.0), reverse=True)
@@ -4335,7 +4309,7 @@ def query_groups_best_team_completed(payload: dict | None = None, event_id: Opti
                 pid = int(player.get("player_id") or 0)
                 score = float(scores_by_pid.get(pid, 0.0))
                 total += score
-                players.append({**player, "mode_score": score, "total_ev": score})
+                players.append({**player, "outcome": roster_scores.outcome_of(components_by_pid.get(pid), score)})
             scored.append({**team, "players": players, "total_ev": total, "bracket_score": total})
         scored.sort(key=lambda team: float(team.get("bracket_score") or 0.0), reverse=True)
         combos_total = len(teams)

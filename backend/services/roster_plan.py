@@ -14,6 +14,7 @@ Two layers shared by every Top 5 (groups, playoff, bounty, swiss):
 The functions above `plan_for_roster` were moved here from groups.py unchanged.
 """
 from __future__ import annotations
+from backend.services import roster_scores
 
 from typing import Any, Dict, List, Optional
 
@@ -243,7 +244,7 @@ def _score_roster_exact(
             old_role_ev = float(player.get("role_ev") or 0.0)
             player["role_ev"] = float(new_role_ev)
             player["total_ev"] = float(player.get("total_ev") or 0.0) - old_role_ev + float(new_role_ev)
-        player["mode_score"] = float(player.get("total_ev") or 0.0)
+        roster_scores.refresh_average(player)
     serialized["average_ev"] = float(avg_ev)
     serialized["mode_metric"] = float(avg_ev)
     return serialized

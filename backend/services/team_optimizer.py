@@ -1,4 +1,5 @@
 import itertools
+from backend.services import roster_scores
 import math
 from typing import Callable, Iterable
 
@@ -52,7 +53,7 @@ def serialize_roster(
     players = []
     for pid, role_name in zip(pids, roles):
         meta = players_by_id.get(str(pid), {})
-        players.append(serialize_roster_player(meta, str(role_name), per_player_booster.get(int(pid))))
+        players.append(roster_scores.refresh_average(serialize_roster_player(meta, str(role_name), per_player_booster.get(int(pid)))))
     return {
         "total_ev": float(total_ev),
         "cost": int(cost),
