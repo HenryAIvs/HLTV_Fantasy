@@ -18,7 +18,7 @@ def _compute_role_score(major: float, minor: float) -> float:
     return 5.0 * major + 2.0 * minor - 2.0 * (1.0 - major - minor)
 
 
-def extract_role_scores_for_player(player_row: Dict) -> Dict[int, float]:
+def extract_role_scores_for_player(player_row: Dict, leader: Optional[Dict[str, float]] = None) -> Dict[int, float]:
     """
     From a player DB row (with roles_json), build a mapping:
        our_role_index -> role_score
@@ -43,6 +43,9 @@ def extract_role_scores_for_player(player_row: Dict) -> Dict[int, float]:
         roles_obj = json.loads(roles_json_str)
     except Exception:
         return out
+    if leader is not None and isinstance(roles_obj, dict):
+        # the team's result odds in this event replace HLTV's Leader history
+        roles_obj = {**roles_obj, "3": {"major": float(leader.get("major") or 0.0), "minor": float(leader.get("minor") or 0.0)}}
 
     for rid_str, data in roles_obj.items():
         if not isinstance(data, dict):

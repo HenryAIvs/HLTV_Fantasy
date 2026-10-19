@@ -208,6 +208,11 @@ def load_team_players(team_id: int) -> Dict[int, PlayerState]:
 
             boosters_obj = _parse_json(d.get("boosters_json"))
             roles_obj = _parse_json(d.get("roles_json"))
+            # The Leader role's percentages are the team's result odds in the
+            # event being valued, when a run has set them (services/leader_role).
+            from backend.services import leader_role
+
+            roles_obj = leader_role.apply_to_roles(roles_obj, int(team_id))
 
             role_id, major_pct, minor_pct = _compute_best_role_major_minor(roles_obj)
             # 8 slots: a Swiss run is at most 5 matches, but one fantasy game

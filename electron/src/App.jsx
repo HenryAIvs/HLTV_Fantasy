@@ -14909,7 +14909,13 @@ function GroupsTab({
     } catch {
       rolesObj = {};
     }
-    const rr = rolesObj[String(ctx.role_id)] || {};
+    let rr = rolesObj[String(ctx.role_id)] || {};
+    // the Leader role's percentages are the team's result odds in this event
+    if (Number(ctx.role_id) === 3 && results?.leader_odds) {
+      const tid = Object.keys(results.teams || {}).find((t) => (results.teams[t]?.players || {})[String(pid)] != null);
+      const lead = tid ? results.leader_odds[String(tid)] : null;
+      if (lead) rr = { major: Number(lead.major || 0), minor: Number(lead.minor || 0) };
+    }
     const major = Number(rr.major || 0);
     const minor = Number(rr.minor || 0);
     return { ...ctx, major, minor, per_match: 5 * major + 2 * minor - 2 * (1 - major - minor) };

@@ -550,8 +550,11 @@ def _group_stage_records(results: dict, cache_key: Any, event_id: Optional[int])
     prob_cache: Dict = {}
     from backend.services.rating_curve import average_bucket_pct_override
 
+    from backend.services import leader_role
+
     curve = (results.get("input_snapshot") or {}).get("average_bucket_pct")  # runs baked before it was stored: the fitted curve
-    with event_rosters.for_event(event_id), team_strength.rank_overrides(overrides), average_bucket_pct_override(curve):
+    with event_rosters.for_event(event_id), team_strength.rank_overrides(overrides), average_bucket_pct_override(curve), \
+            leader_role.use(leader_role.loaded(results.get("leader_odds"))):
         for g_idx, group in enumerate(groups):
             acc: Dict[str, Any] = {"_records": []}
             enumerate_group(
@@ -573,15 +576,20 @@ def _plan_for_player(results: dict, pid: int, body: dict) -> Dict[str, Any]:
     from backend.services.match_engine import BOOSTER_NAMES
     from backend.services.swiss_booster_assignment import BOOSTER_POINT_VALUE
 
+    from backend.services import leader_role
+
     prow = _snapshot_player_row(results, pid) or {}
+    team_of = next((int(t) for t, td in (results.get("teams") or {}).items() if str(pid) in {str(k) for k in (td.get("players") or {})}), 0)
+    lead = leader_role.for_team(team_of, leader_role.loaded(results.get("leader_odds")))
     plan: Dict[str, Any] = {"role_id": None, "role_pm": None, "major": 0.0, "minor": 0.0, "by_slot": None}
     role_id = body.get("role_id")
     if role_id is not None and str(role_id).strip() != "":
         role_id = int(role_id)
         plan["role_id"] = role_id
-        plan["role_pm"] = float(extract_role_scores_for_player(prow).get(role_id, 0.0))
+        plan["role_pm"] = float(extract_role_scores_for_player(prow, leader=lead).get(role_id, 0.0))
         try:
-            rr = (json.loads(prow.get("roles_json") or "{}") or {}).get(str(role_id)) or {}
+            roles_obj = leader_role.apply_to_roles(json.loads(prow.get("roles_json") or "{}") or {}, team_of, {team_of: lead} if lead else None)
+            rr = roles_obj.get(str(role_id)) or {}
             plan["major"], plan["minor"] = float(rr.get("major") or 0.0), float(rr.get("minor") or 0.0)
         except Exception:  # noqa: BLE001
             pass
@@ -2427,10 +2435,14 @@ def _compute_paths_result(payload: dict, snapshot: Dict[str, Any], event_id: int
     player_rows_by_id, team_rank_by_id = _lookup_context_from_snapshot(snapshot, team_ids)
     curve = (snapshot or {}).get("average_bucket_pct")
     prob_cache: Dict = {}
+    from backend.services import leader_role
+
     with team_strength.rank_overrides(team_rank_by_id), average_bucket_pct_override(curve):
         paths, seeds, block = _paths_build(payload, team_ids, prob_cache, regenerate=False)
-        base_states = initialize_teams(team_ids, seeds)
-        sc = paths_engine.score(paths, base_states, player_rows_by_id, team_rank_by_id, prob_cache)
+        leader_odds = _paths_leader_odds(team_ids, block)
+        with leader_role.use(leader_odds):
+            base_states = initialize_teams(team_ids, seeds)
+            sc = paths_engine.score(paths, base_states, player_rows_by_id, team_rank_by_id, prob_cache)
         model = paths_engine.build_model(sc)
         means = model[3]["means"]
         teams_out: Dict[int, Dict[str, Any]] = {}
@@ -2469,6 +2481,7 @@ def _compute_paths_result(payload: dict, snapshot: Dict[str, Any], event_id: int
         "playoff": None,
         "method": "swiss_monte_carlo" if fmt == "swiss" else "bracket_exact",
         "paths_summary": summary,
+        "leader_odds": leader_role.stored(leader_odds),
         **block,
         "input_snapshot": {
             "taken_at": meta.get("taken_at"),
@@ -2494,10 +2507,27 @@ def _paths_for(results: dict):
     prob_cache: Dict = {}
     paths, seeds, block = _paths_build(results, team_ids, prob_cache, regenerate=True)
     fmt_block = results.get("swiss") if results.get("group_format") == "swiss" else results.get("bracket")
+    from backend.services import leader_role
+
     event_id = int((fmt_block or {}).get("event_id") or 0) or None
-    with event_rosters.for_event(event_id), team_strength.rank_overrides(overrides), average_bucket_pct_override(curve):
+    leader_odds = leader_role.loaded(results.get("leader_odds"))  # runs baked before: HLTV's percentages, as stored
+    with event_rosters.for_event(event_id), team_strength.rank_overrides(overrides), average_bucket_pct_override(curve), \
+            leader_role.use(leader_odds):
         base_states = initialize_teams(team_ids, seeds)
         return paths_engine.score(paths, base_states, player_rows_by_id, team_rank_by_id, prob_cache)
+
+
+def _paths_leader_odds(team_ids: List[int], block: Dict[str, Any]) -> Dict[int, Dict[str, float]]:
+    """A path-format run's Leader percentages from its win matrices: the Bo3
+    matrix (the deciding series) when the format plays one, else Bo1."""
+    from backend.services import leader_role
+
+    fmt_block = block.get("swiss") or block.get("bracket") or {}
+    win_probs = fmt_block.get("win_probs") or {}
+    series = 3 if "bo3" in win_probs else 1
+    matrix = win_probs.get(f"bo{series}") or []
+    pos = {int(t): i for i, t in enumerate(team_ids)}
+    return leader_role.field_odds(team_ids, lambda a, b: float(matrix[pos[a]][pos[b]]), 2 if series == 3 else 1)
 
 
 def _paths_model(results: dict) -> tuple:
@@ -2761,14 +2791,20 @@ def _compute_groups_result(payload: dict, progress_callback=None, snapshot: Opti
         player_rows_by_id, team_rank_by_id = _lookup_context_from_snapshot(snapshot, all_team_ids)
     else:
         player_rows_by_id, team_rank_by_id = _build_playoff_lookup_context(all_team_ids)
+    from backend.services import leader_role
     from backend.services.rating_curve import average_bucket_pct_override
 
     curve = (snapshot or {}).get("average_bucket_pct")
+    prob_cache: Dict = {}
     with team_strength.rank_overrides(team_rank_by_id if snapshot else None), average_bucket_pct_override(curve):
-        result = _compute_groups_result_inner(
-            payload, progress_callback, snapshot, groups, group_format, quals_per_group, enumerate_group,
-            combined, all_team_ids, player_rows_by_id, team_rank_by_id,
-        )
+        # the Leader role's percentages: each team's 2-0 / 2-1 / loss odds against the field
+        leader_odds = leader_role.field_odds(all_team_ids, lambda a, b: cached_win_prob(prob_cache, a, b, "bo3"), 2)
+        with leader_role.use(leader_odds):
+            result = _compute_groups_result_inner(
+                payload, progress_callback, snapshot, groups, group_format, quals_per_group, enumerate_group,
+                combined, all_team_ids, player_rows_by_id, team_rank_by_id, prob_cache=prob_cache,
+            )
+    result["leader_odds"] = leader_role.stored(leader_odds)
     if snapshot:
         # The rows this run was valued with travel with the results so the live
         # Top 5 (prices, roles, boosters) matches the stored expected points,
@@ -2786,9 +2822,9 @@ def _compute_groups_result(payload: dict, progress_callback=None, snapshot: Opti
 
 def _compute_groups_result_inner(
     payload, progress_callback, snapshot, groups, group_format, quals_per_group, enumerate_group,
-    combined, all_team_ids, player_rows_by_id, team_rank_by_id,
+    combined, all_team_ids, player_rows_by_id, team_rank_by_id, prob_cache: Optional[Dict] = None,
 ) -> dict:
-    prob_cache: Dict = {}
+    prob_cache = prob_cache if prob_cache is not None else {}
     outcomes: List[Dict[str, Any]] = []
     teams_out: Dict[int, Dict[str, Any]] = {}
     stage_acc = _new_stage_acc()
@@ -4665,11 +4701,14 @@ def _booster_prerequisites(
         reach_by_team = _team_match_reach_probs(results)
     rates_by_pid: Dict[int, Dict[int, float]] = {}
     role_scores_by_pid: Dict[int, Dict[int, float]] = {}
+    from backend.services import leader_role
+
+    leader_odds = leader_role.loaded(results.get("leader_odds"))
     for p in players_info:
         pid = int(p["player_id"])
         row = _snapshot_player_row(results, pid) or {}
         rates_by_pid[pid] = parse_booster_rates(row.get("boosters_json"))
-        role_scores_by_pid[pid] = extract_role_scores_for_player(row)
+        role_scores_by_pid[pid] = extract_role_scores_for_player(row, leader=leader_role.for_team(int(p.get("team_id") or 0), leader_odds))
         p["booster_ub"] = _player_booster_ub(int(p.get("team_id", 0)), reach_by_team, rates_by_pid[pid])
     # Reference rosters for the price tuning: the strongest by the plain bound.
     loose = {int(p["player_id"]): float(p.get("total_ev") or 0.0) + float(p.get("booster_ub") or 0.0) for p in players_info}
