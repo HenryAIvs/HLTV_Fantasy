@@ -4666,16 +4666,37 @@ def get_event_swiss_context(event_id: int):
 
     stage = max(structure["swiss"], key=_overlap)
 
-    # Map HLTV team ids (seed order) -> our team ids by normalized name.
-    ours_by_name = {}
-    for t in get_all_teams():
-        ours_by_name[_norm_team_name(str(t.get("name") or ""))] = int(t["team_id"])
+    # Map HLTV team ids (seed order) -> our team ids. Several team rows can
+    # share a normalised name (a re-spelt team imported as a new row), so a
+    # name resolves like the event's own roster mapping does: the exact
+    # spelling first, then the row the fantasy game prices, then any.
+    from backend.services import event_rosters
+
+    all_teams = list(get_all_teams())
+    listed = set(event_rosters.rosters(int(event_id)).keys())
+    by_norm: Dict[str, list] = {}
+    for t in all_teams:
+        by_norm.setdefault(_norm_team_name(str(t.get("name") or "")), []).append(t)
+
+    def _resolve(hltv_tid, name: str):
+        pool = list(by_norm.get(_norm_team_name(name), []))
+        if not pool and hltv_tid:
+            pool = [t for t in all_teams if str(t.get("hltv_team_id") or "") == str(hltv_tid)]
+        for pick in (
+            [t for t in pool if str(t.get("name") or "") == name],
+            [t for t in pool if int(t["team_id"]) in listed],
+            pool,
+        ):
+            if pick:
+                return int(pick[0]["team_id"])
+        return None
+
     seeds = []
     unmatched = []
     order = stage.get("seedings") or list(stage["teams"].keys())
     for ordinal, hltv_tid in enumerate(order, start=1):
         name = stage["teams"].get(hltv_tid) or ""
-        our_id = ours_by_name.get(_norm_team_name(name))
+        our_id = _resolve(hltv_tid, name)
         seeds.append({"seed": ordinal, "hltv_team_id": hltv_tid, "name": name, "team_id": our_id})
         if not our_id:
             unmatched.append(name)

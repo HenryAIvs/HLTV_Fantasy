@@ -13890,11 +13890,88 @@ function PlayoffSkeleton({ format, groupCount, qualsPerGroup, stopTeams = 1, bo 
   );
 }
 
+// Swiss stage (a group format of the groups engine): the seed order with
+// each team's record odds and qualify chance from the stored run.
+function SwissStageView({ results, teams, teamLookup }) {
+  const sw = results?.swiss || null;
+  if (!sw) {
+    return (
+      <div className="card sub">
+        <p className="muted">{PUBLIC_BUILD ? NOT_PUBLISHED : "Not baked yet."}</p>
+      </div>
+    );
+  }
+  const order = (results.groups?.[0] || []).map(Number);
+  const teamInfo = (tid) => (teams || []).find((t) => Number(t.team_id) === Number(tid));
+  const pct = (v) => `${(Number(v || 0) * 100).toFixed(1)}%`;
+  const modeLabel = { all: "Bo3", none: "Bo1", elim_qual: "Bo1 · deciders Bo3" }[sw.bo3_mode] || sw.bo3_mode || "";
+  const wins = ["3-0", "3-1", "3-2"];
+  const losses = ["2-3", "1-3", "0-3"];
+  return (
+    <div className="card sub group-card">
+      <div className="group-card-head">
+        <h3>{sw.stage_name && sw.stage_name !== "SixteenEight" ? sw.stage_name : "Swiss"}</h3>
+        <span className="pill">
+          {sw.team_count} teams · top {sw.advance_count} · {modeLabel}
+        </span>
+      </div>
+      <table className="swiss-seed-table">
+        <thead>
+          <tr>
+            <th className="num">#</th>
+            <th>Team</th>
+            {wins.map((r) => (
+              <th className="num" key={r}>
+                {r}
+              </th>
+            ))}
+            <th className="num strong">Qualify</th>
+            {losses.map((r) => (
+              <th className="num" key={r}>
+                {r}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {order.map((tid, i) => {
+            const rec = sw.records?.[String(tid)] || {};
+            const info = teamInfo(tid);
+            return (
+              <tr key={tid}>
+                <td className="num muted">{sw.seeds?.[String(tid)] ?? i + 1}</td>
+                <td className="team">
+                  <TeamLogo hltvTeamId={info?.hltv_team_id} name={teamLookup[tid]} size={18} />
+                  <span>{teamLookup[tid] || tid}</span>
+                </td>
+                {wins.map((r) => (
+                  <td className="num" key={r}>
+                    {pct(rec[r])}
+                  </td>
+                ))}
+                <td className="num strong">{pct(sw.qualify?.[String(tid)])}</td>
+                {losses.map((r) => (
+                  <td className="num" key={r}>
+                    {pct(rec[r])}
+                  </td>
+                ))}
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function GroupsTab({
   teams,
   teamLookup,
   players,
   refresh,
+  // "groups" (the GSL / double-elimination groups) or "swiss": the stage the
+  // stored run models; the Top 5, Player Value and Point Sources are shared.
+  stageKind = "groups",
   groupVariant = null,
   // From the kind detector: does this ONE fantasy game also score the playoff
   // bracket on the same event page (no separate "Playoffs - ..." fantasy
@@ -13974,7 +14051,7 @@ function GroupsTab({
     { key: "single_outcome", label: "Best Single Outcome" },
     { key: "most_outcomes", label: "Most Likely Winner" },
     { key: "completed", label: "Completed Groups" },
-  ];
+  ].filter((sub) => sub.key !== "completed" || stageKind !== "swiss");
   const setGroupsTopMode = (key) => {
     setGroupsTopSubtab(key);
     if (key !== "completed") setComboMode(key);
@@ -14138,7 +14215,7 @@ function GroupsTab({
     if (!data?.exists) return false;
     const payload = data.payload || {};
     if (payload.group_format) {
-      setGroupFormat(["de8", "de8_top3"].includes(payload.group_format) ? payload.group_format : "gsl4");
+      setGroupFormat(["de8", "de8_top3", "swiss"].includes(payload.group_format) ? payload.group_format : "gsl4");
     }
     const savedGroups = payload.groups || [];
     if (savedGroups.length > 0) {
@@ -14205,7 +14282,7 @@ function GroupsTab({
     (async () => {
       try {
         const populated = await loadLatest();
-        if (!populated) await loadEventAutofill();
+        if (!populated && stageKind !== "swiss") await loadEventAutofill();
       } finally {
         setReady(true);
       }
@@ -14274,7 +14351,7 @@ function GroupsTab({
     setCompletedResult(null);
     setTopMessage("");
     // Start over from HLTV's current draw (live re-sync if it has TBD slots).
-    await loadEventAutofill();
+    if (stageKind !== "swiss") await loadEventAutofill();
   };
 
   const runCombinations = async () => {
@@ -14850,7 +14927,7 @@ function GroupsTab({
   };
 
   return (
-    <Section title="Double-Elimination Groups (BO3)">
+    <Section title={stageKind === "swiss" ? "Swiss Stage" : "Double-Elimination Groups (BO3)"}>
       <div className="stack">
         {!ready && <p className="muted">Loading group stage...</p>}
         {ready && (
@@ -14859,7 +14936,7 @@ function GroupsTab({
             completed-groups picker as a Top 5 sub-tab). */}
         <div className="tab-bar small">
           <button className={groupsTab === "stage" ? "tab active" : "tab"} onClick={() => setGroupsTab("stage")}>
-            Group Stage
+            {stageKind === "swiss" ? "Swiss Stage" : "Group Stage"}
           </button>
           <button className={groupsTab === "value" ? "tab active" : "tab"} onClick={() => setGroupsTab("value")}>
             Player Value
@@ -14869,7 +14946,10 @@ function GroupsTab({
           </button>
         </div>
 
-        {groupsTab === "stage" && (
+        {groupsTab === "stage" && groupFormat === "swiss" && (
+          <SwissStageView results={results} teams={teams} teamLookup={teamLookup} />
+        )}
+        {groupsTab === "stage" && groupFormat !== "swiss" && (
           <>
             {/* Display-only, like the Playoff tab: the draw comes from the HLTV
                 event page, loaded on open and re-synced automatically while any
@@ -15445,7 +15525,16 @@ function TournamentTab({ teams, teamLookup, players, sortTeams, applyFilters, on
           Detected format: {kindInfo?.label || kind} — no simulator supports this format yet.
         </p>
       )}
-      {kind === "swiss" && <SwissTab {...sharedProps} />}
+      {kind === "swiss" && (
+        <GroupsTab
+          teams={teams}
+          teamLookup={teamLookup}
+          players={players}
+          refresh={refresh}
+          stageKind="swiss"
+          groupBo={Number(kindInfo?.swiss_bo_rules?.default || 3)}
+        />
+      )}
       {kind === "groups" && (
         <GroupsTab
           teams={teams}

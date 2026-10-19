@@ -479,6 +479,15 @@ tr:hover { background: #10141a; }
   white-space: nowrap;
 }
 
+/* Swiss stage: seed order with record odds */
+.swiss-seed-table { width: 100%; border-collapse: collapse; margin-top: 12px; font-variant-numeric: tabular-nums; }
+.swiss-seed-table th, .swiss-seed-table td { padding: 7px 10px; border-top: 1px solid #1f2530; white-space: nowrap; }
+.swiss-seed-table th { color: #8fa3bf; font-size: 10px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; text-align: left; border-top: 0; }
+.swiss-seed-table .num { text-align: right; }
+.swiss-seed-table td.team { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.swiss-seed-table td.muted { color: #8fa3bf; }
+.swiss-seed-table .strong { color: #ff8a47; font-weight: 700; }
+
 .swiss-player-table .player-col {
   overflow: hidden;
   text-overflow: ellipsis;

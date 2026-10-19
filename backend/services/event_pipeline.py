@@ -58,7 +58,7 @@ FORMATS: Dict[str, Callable[[], Dict[str, Any]]] = {
     "groups": _groups_hooks,
     "playoff": _playoff_hooks,
     "double_elim": _playoff_hooks,
-    "swiss": _swiss_hooks,
+    "swiss": _groups_hooks,  # the Swiss stage is a group format of the groups engine (services/swiss_engine)
     "bounty": _bounty_hooks,
 }
 
