@@ -1,7 +1,7 @@
 {
   "name": "cs-fantasy",
   "productName": "CS Fantasy Toolkit",
-  "version": "0.1.61",
+  "version": "0.1.62",
   "description": "Counter-Strike fantasy valuations, brackets and roster optimisation.",
   "homepage": "https://csfantasy.co.uk/",
   "author": "HenryAIvs",
@@ -65,7 +65,7 @@
     "publish": [
       {
         "provider": "github",
-        "owner": "HenryAIvs",
+        "owner": "HenryWilliamsPersonal",
         "repo": "HLTV_Fantasy",
         "releaseType": "release"
       }
