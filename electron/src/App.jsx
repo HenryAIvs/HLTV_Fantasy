@@ -13898,6 +13898,94 @@ function PlayoffSkeleton({ format, groupCount, qualsPerGroup, stopTeams = 1, bo 
   );
 }
 
+// Stage formats the path engine values (services/paths_engine): the stage tab
+// shows a format-specific view, everything else on the page is shared.
+const PATH_FORMATS = ["swiss", "bracket"];
+
+// Bracket stage: the most likely bracket of the stored run.
+function BracketStageView({ results, teams, teamLookup }) {
+  const br = results?.bracket || null;
+  if (!br) {
+    return (
+      <div className="card sub">
+        <p className="muted">{PUBLIC_BUILD ? NOT_PUBLISHED : "Not baked yet."}</p>
+      </div>
+    );
+  }
+  return (
+    <div className="card sub group-card">
+      <div className="group-card-head">
+        <h3>Most Likely Bracket</h3>
+        <span className="muted">{(Number(br.best_probability || 0) * 100).toFixed(2)}%</span>
+      </div>
+      <OutcomeBracketVisual bracket={br.best} teamLookup={teamLookup} teams={teams} />
+    </div>
+  );
+}
+
+// Completed-bracket picker: every match of the stored bracket in play order,
+// each a pick between the two teams its earlier picks feed into it.
+function BracketPicker({ bracket, teamLookup, picks, onPick }) {
+  const matches = bracket?.matches || [];
+  const stages = bracket?.stages || [];
+  const slots = (bracket?.team_slots || []).map(Number);
+  const winners = {};
+  const losers = {};
+  const resolved = matches.map(([key, stage, fa, fb]) => {
+    const side = (f) => (f[0] === "seed" ? slots[Number(f[1])] : f[0] === "win" ? winners[String(f[1])] : losers[String(f[1])]) || null;
+    const a = side(fa);
+    const b = side(fb);
+    const picked = Number(picks[key] || 0);
+    const w = picked && (picked === a || picked === b) ? picked : null;
+    if (w) {
+      winners[key] = w;
+      losers[key] = w === a ? b : a;
+    }
+    const label = (f) => (f[0] === "seed" ? "TBD" : `${f[0] === "win" ? "Winner" : "Loser"} of ${DOUBLE8_MATCH_TITLE[f[1]] || f[1]}`);
+    return { key, stage, a, b, w, pa: label(fa), pb: label(fb) };
+  });
+  const byStage = {};
+  resolved.forEach((m) => {
+    (byStage[m.stage] = byStage[m.stage] || []).push(m);
+  });
+  const titleOf = (m, i, s) => DOUBLE8_MATCH_TITLE[m.key] || (byStage[s.key].length === 1 ? s.full : `${s.label} ${i + 1}`);
+  return (
+    <div className="pb-bracket">
+      {stages
+        .filter((s) => !s.pad && byStage[s.key])
+        .map((s) => (
+          <div className="pb-round" key={s.key}>
+            <div className="pb-round-title">{s.full}</div>
+            <div className="pb-matches">
+              {byStage[s.key].map((m, i) => (
+                <div className="pb-match-wrap" key={m.key}>
+                  <div className="gsl-match">
+                    <span className="gsl-label">{titleOf(m, i, s)}</span>
+                    <span className="gsl-pick">
+                      {[
+                        [m.a, m.pa],
+                        [m.b, m.pb],
+                      ].map(([tid, placeholder], rowIdx) => (
+                        <button
+                          key={rowIdx}
+                          disabled={!tid}
+                          className={tid && m.w === tid ? "active" : ""}
+                          onClick={() => tid && onPick(m.key, tid)}
+                        >
+                          {tid ? teamLookup[tid] || tid : placeholder}
+                        </button>
+                      ))}
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+    </div>
+  );
+}
+
 // Swiss stage (a group format of the groups engine): the seed order with
 // each team's record odds and qualify chance from the stored run.
 function SwissStageView({ results, teams, teamLookup }) {
@@ -14054,7 +14142,7 @@ function GroupsTab({
     { key: "average", label: "Average Player Value" },
     { key: "single_outcome", label: "Best Single Outcome" },
     { key: "most_outcomes", label: "Most Likely Winner" },
-    { key: "completed", label: "Completed Groups" },
+    { key: "completed", label: stageKind === "bracket" ? "Completed Bracket" : "Completed Groups" },
   ].filter((sub) => sub.key !== "completed" || stageKind !== "swiss");
   const setGroupsTopMode = (key) => {
     setGroupsTopSubtab(key);
@@ -14219,7 +14307,7 @@ function GroupsTab({
     if (!data?.exists) return false;
     const payload = data.payload || {};
     if (payload.group_format) {
-      setGroupFormat(["de8", "de8_top3", "swiss"].includes(payload.group_format) ? payload.group_format : "gsl4");
+      setGroupFormat(["de8", "de8_top3", "swiss", "bracket"].includes(payload.group_format) ? payload.group_format : "gsl4");
     }
     const savedGroups = payload.groups || [];
     if (savedGroups.length > 0) {
@@ -14286,7 +14374,7 @@ function GroupsTab({
     (async () => {
       try {
         const populated = await loadLatest();
-        if (!populated && stageKind !== "swiss") await loadEventAutofill();
+        if (!populated && stageKind === "groups") await loadEventAutofill();
       } finally {
         setReady(true);
       }
@@ -14355,7 +14443,7 @@ function GroupsTab({
     setCompletedResult(null);
     setTopMessage("");
     // Start over from HLTV's current draw (live re-sync if it has TBD slots).
-    if (stageKind !== "swiss") await loadEventAutofill();
+    if (stageKind === "groups") await loadEventAutofill();
   };
 
   const runCombinations = async () => {
@@ -14526,13 +14614,33 @@ function GroupsTab({
     setCompletedResult(null);
   };
 
+  // Bracket formats: one pick per match (match key -> winner), downstream
+  // picks cleared when an earlier match changes.
+  const [bracketPicks, setBracketPicks] = useState({});
+  const pickBracketMatch = (key, tid) => {
+    setBracketPicks((prev) => {
+      const order = (results?.bracket?.matches || []).map((m) => m[0]);
+      const at = order.indexOf(key);
+      const next = {};
+      order.forEach((k, i) => {
+        if (i < at && prev[k]) next[k] = prev[k];
+      });
+      next[key] = tid;
+      return next;
+    });
+    setCompletedResult(null);
+  };
+  const bracketComplete =
+    groupFormat === "bracket" && (results?.bracket?.matches || []).length > 0 && (results?.bracket?.matches || []).every((m) => Boolean(bracketPicks[m[0]]));
   const scoreCompleted = async () => {
     setCompletedMessage("");
     try {
       const data = await api.post(
         "/groups/best-team/completed-query",
         {
-          group_winners: activeCompletedDerived.map((g) => g.picks.map(Number)),
+          ...(groupFormat === "bracket"
+            ? { bracket_picks: bracketPicks }
+            : { group_winners: activeCompletedDerived.map((g) => g.picks.map(Number)) }),
           search: comboSearch,
           page: 0,
           page_size: 200,
@@ -14778,8 +14886,8 @@ function GroupsTab({
   // group-place odds, so the favourites read top-down like the Playoff tab.
   const valuationTeamOrder = useMemo(() => {
     if (!results?.teams) return [];
-    if (results.group_format === "swiss") {
-      const q = results.swiss?.qualify || {};
+    if (PATH_FORMATS.includes(results.group_format)) {
+      const q = results.paths_summary?.advance || {};
       return Object.keys(results.teams).sort((x, y) => Number(q[y] || 0) - Number(q[x] || 0));
     }
     const score = (tid) => {
@@ -14943,8 +15051,71 @@ function GroupsTab({
     });
   };
 
+  const renderCompletedResults = () => (
+    <>
+            {completedMessage && <p className="muted">{completedMessage}</p>}
+            {completedResult && (
+              <>
+                <div className="card sub">
+                  <h3>Best Team For These Results</h3>
+                  <p className="muted">
+                    Outcome probability {(Number(completedResult.outcome_probability || 0) * 100).toFixed(3)}% of{" "}
+                    {Number(completedResult.outcomes_count || 0).toLocaleString()} stored outcomes.
+                  </p>
+                  {(completedResult.top_teams || []).slice(0, 10).map((team, idx) => (
+                    <div key={idx} className="card sub">
+                      <h4>
+                        #{idx + 1} Score {Number(team.bracket_score || 0).toFixed(2)} | Cost {team.cost}
+                      </h4>
+                      <p className="muted">
+                        {(team.players || []).map((p, i) => (
+                          <span key={`${p.player_id}-${i}`}>
+                            {i > 0 ? ", " : ""}
+                            <button type="button" className="inline-link-btn" onClick={() => openCompletedPlayer(p)}>
+                              {p.name}
+                            </button>{" "}
+                            {Number(rosterPoints(p, "completed").total || 0).toFixed(1)}
+                          </span>
+                        ))}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+                <div className="card sub">
+                  <h3>Player Scores</h3>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Player</th>
+                        <th>Cost</th>
+                        <th>Points</th>
+                        <th>Rating</th>
+                        <th>Win</th>
+                        <th>Role</th>
+                        <th>Booster</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(completedResult.player_values || []).map((row) => (
+                        <tr key={row.player_id}>
+                          <td>{row.name}</td>
+                          <td>{Number(row.price || 0).toLocaleString()}</td>
+                          <td>{Number(row.points || 0).toFixed(2)}</td>
+                          <td>{Number(row.rating || 0).toFixed(2)}</td>
+                          <td>{Number(row.win || 0).toFixed(2)}</td>
+                          <td>{Number(row.role || 0).toFixed(2)}</td>
+                          <td>{Number(row.booster || 0).toFixed(2)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+    </>
+  );
   return (
-    <Section title={stageKind === "swiss" ? "Swiss Stage" : "Double-Elimination Groups (BO3)"}>
+    <Section title={stageKind === "swiss" ? "Swiss Stage" : stageKind === "bracket" ? "Playoff Bracket" : "Double-Elimination Groups (BO3)"}>
       <div className="stack">
         {!ready && <p className="muted">Loading group stage...</p>}
         {ready && (
@@ -14953,7 +15124,7 @@ function GroupsTab({
             completed-groups picker as a Top 5 sub-tab). */}
         <div className="tab-bar small">
           <button className={groupsTab === "stage" ? "tab active" : "tab"} onClick={() => setGroupsTab("stage")}>
-            {stageKind === "swiss" ? "Swiss Stage" : "Group Stage"}
+            {stageKind === "swiss" ? "Swiss Stage" : stageKind === "bracket" ? "Bracket" : "Group Stage"}
           </button>
           <button className={groupsTab === "value" ? "tab active" : "tab"} onClick={() => setGroupsTab("value")}>
             Player Value
@@ -14966,13 +15137,16 @@ function GroupsTab({
         {groupsTab === "stage" && groupFormat === "swiss" && (
           <SwissStageView results={results} teams={teams} teamLookup={teamLookup} />
         )}
+        {groupsTab === "stage" && groupFormat === "bracket" && (
+          <BracketStageView results={results} teams={teams} teamLookup={teamLookup} />
+        )}
         {groupsTab === "stage" && (
           <>
             {/* Display-only, like the Playoff tab: the draw comes from the HLTV
                 event page, loaded on open and re-synced automatically while any
                 slot is still undecided. */}
             {autofillMessage && <p className="muted">{autofillMessage}</p>}
-            {groupFormat !== "swiss" && groupSlots.map((group, g) => {
+            {!PATH_FORMATS.includes(groupFormat) && groupSlots.map((group, g) => {
               const key = `group-${g}`;
               const isCollapsed = Boolean(collapsedCards[key]);
               const summary = group
@@ -15068,13 +15242,20 @@ function GroupsTab({
                   const lastRound = Math.max(1, Number(results.playoff?.rounds || labels.length)) - 1;
                   const finalReach = reach.length > 0 ? Number(reach[lastRound] || 0) : null;
                   const earlyStop = Number(results.playoff?.stop_teams || 1) > 1;
+                  const advance = Number(results.paths_summary?.advance?.[String(tid)] || 0);
+                  const finalKey = results.bracket?.kind === "double" ? "grand_final" : "final";
                   const odds =
                     results.group_format === "swiss"
                       ? [
-                          ["Qualify", Number(results.swiss?.qualify?.[String(tid)] || 0), true],
+                          ["Qualify", advance, true],
                           ["3-0", Number(results.swiss?.records?.[String(tid)]?.["3-0"] || 0), false],
                         ]
-                      : [[results.playoff ? "Playoffs" : "Qualify", qualify, false], ["Win group", first, false]];
+                      : results.group_format === "bracket"
+                        ? [
+                            [results.bracket?.kind === "double" ? "Grand final" : "Final", Number(results.paths_summary?.stage_reach?.[String(tid)]?.[finalKey] || 0), false],
+                            ["Title", advance, true],
+                          ]
+                        : [[results.playoff ? "Playoffs" : "Qualify", qualify, false], ["Win group", first, false]];
                   if (results.playoff) {
                     if (finalReach != null && !earlyStop) odds.push([labels[lastRound] || "Final", finalReach, false]);
                     odds.push([earlyStop ? "Qualify" : "Title", title, true]);
@@ -15088,8 +15269,10 @@ function GroupsTab({
                         <TeamLogo hltvTeamId={info?.hltv_team_id} name={teamName(tid)} size={42} />
                         <div className="event-team-headtext">
                           <span className="event-team-name">{teamName(tid)}</span>
-                          {results.group_format === "swiss" ? (
-                            <span className="event-team-rank">Seed {results.swiss?.seeds?.[String(tid)] ?? "-"}</span>
+                          {PATH_FORMATS.includes(results.group_format) ? (
+                            <span className="event-team-rank">
+                              Seed {results.swiss?.seeds?.[String(tid)] ?? (results.groups?.[0] || []).map(Number).indexOf(Number(tid)) + 1}
+                            </span>
                           ) : (
                             groupIdx >= 0 && <span className="event-team-rank">Group {groupIdx + 1}</span>
                           )}
@@ -15364,7 +15547,21 @@ function GroupsTab({
             Stage simulation.
           </p>
         )}
-        {groupsTab === "top5" && results && groupsTopSubtab === "completed" && groupFormat !== "de8_top3" && (
+        {groupsTab === "top5" && results && groupsTopSubtab === "completed" && groupFormat === "bracket" && (
+          <>
+            <div className="card sub">
+              <h3>Bracket Results</h3>
+              <BracketPicker bracket={results.bracket} teamLookup={teamLookup} picks={bracketPicks} onPick={pickBracketMatch} />
+            </div>
+            <div className="actions">
+              <button className="primary" onClick={scoreCompleted} disabled={!bracketComplete || !combosReady}>
+                Score Completed Bracket
+              </button>
+            </div>
+            {renderCompletedResults()}
+          </>
+        )}
+        {groupsTab === "top5" && results && groupsTopSubtab === "completed" && groupFormat !== "de8_top3" && !PATH_FORMATS.includes(groupFormat) && (
           <>
             {results &&
               activeCompletedDerived.map((group, g) => {
@@ -15411,65 +15608,7 @@ function GroupsTab({
                 {combosReady && !allGroupsComplete && <span className="muted">Pick every match winner first.</span>}
               </div>
             )}
-            {completedMessage && <p className="muted">{completedMessage}</p>}
-            {completedResult && (
-              <>
-                <div className="card sub">
-                  <h3>Best Team For These Results</h3>
-                  <p className="muted">
-                    Outcome probability {(Number(completedResult.outcome_probability || 0) * 100).toFixed(3)}% of{" "}
-                    {Number(completedResult.outcomes_count || 0).toLocaleString()} stored outcomes.
-                  </p>
-                  {(completedResult.top_teams || []).slice(0, 10).map((team, idx) => (
-                    <div key={idx} className="card sub">
-                      <h4>
-                        #{idx + 1} Score {Number(team.bracket_score || 0).toFixed(2)} | Cost {team.cost}
-                      </h4>
-                      <p className="muted">
-                        {(team.players || []).map((p, i) => (
-                          <span key={`${p.player_id}-${i}`}>
-                            {i > 0 ? ", " : ""}
-                            <button type="button" className="inline-link-btn" onClick={() => openCompletedPlayer(p)}>
-                              {p.name}
-                            </button>{" "}
-                            {Number(rosterPoints(p, "completed").total || 0).toFixed(1)}
-                          </span>
-                        ))}
-                      </p>
-                    </div>
-                  ))}
-                </div>
-                <div className="card sub">
-                  <h3>Player Scores</h3>
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Player</th>
-                        <th>Cost</th>
-                        <th>Points</th>
-                        <th>Rating</th>
-                        <th>Win</th>
-                        <th>Role</th>
-                        <th>Booster</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {(completedResult.player_values || []).map((row) => (
-                        <tr key={row.player_id}>
-                          <td>{row.name}</td>
-                          <td>{Number(row.price || 0).toLocaleString()}</td>
-                          <td>{Number(row.points || 0).toFixed(2)}</td>
-                          <td>{Number(row.rating || 0).toFixed(2)}</td>
-                          <td>{Number(row.win || 0).toFixed(2)}</td>
-                          <td>{Number(row.role || 0).toFixed(2)}</td>
-                          <td>{Number(row.booster || 0).toFixed(2)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </>
-            )}
+            {renderCompletedResults()}
           </>
         )}
 
@@ -15598,21 +15737,14 @@ function TournamentTab({ teams, teamLookup, players, sortTeams, applyFilters, on
           playoffLayoutDetected={kindInfo?.playoff_layout || "cross"}
         />
       )}
-      {kind === "playoff" && (
-        <PlayoffTab
-          {...sharedProps}
-          detectedBracketSize={kindInfo?.playoff_size}
-          playoffThirdPlace={Boolean(kindInfo?.playoff_third_place)}
-          grandFinalBo={Number(kindInfo?.grand_final_bo || 3)}
-        />
-      )}
-      {kind === "double_elim" && (
-        <PlayoffTab
-          {...sharedProps}
-          detectedBracketSize={Number(kindInfo?.playoff_size || 8)}
-          detectedBracketKind="double"
-          grandFinalBo={Number(kindInfo?.grand_final_bo || 5)}
-          routingError={kindInfo?.routing_error ? `This event's bracket routing is not supported: ${kindInfo.routing_error}` : ""}
+      {(kind === "playoff" || kind === "double_elim") && (
+        <GroupsTab
+          teams={teams}
+          teamLookup={teamLookup}
+          players={players}
+          refresh={refresh}
+          stageKind="bracket"
+          playoffBo={kindInfo?.playoff_bo_rules || null}
         />
       )}
       {kind === "bounty" && <BountyTab {...sharedProps} />}

@@ -4332,3 +4332,11 @@ button:disabled {
 .pool-legend i.bar-a { width: 12px; height: 10px; background: #ff6b1a; }
 .pool-legend i.bar-b { width: 12px; height: 10px; background: #3a4452; }
 .mm-warn { color: #f0a763; }
+
+/* Completed-bracket picker: the groups picker's match rows laid out as
+   bracket cards (label on top, the two picks stacked) */
+.pb-matches .gsl-match { flex-direction: column; align-items: stretch; gap: 6px; width: 100%; box-sizing: border-box; }
+.pb-matches .gsl-match .gsl-label { min-width: 0; }
+.pb-matches .gsl-pick { display: flex; flex-direction: column; flex-wrap: nowrap; gap: 4px; }
+.pb-matches .gsl-pick button { text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pb-round:not(:first-child) .pb-match-wrap:has(> .gsl-match)::before { display: none; }

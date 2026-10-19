@@ -56,8 +56,8 @@ def _bounty_hooks() -> Dict[str, Any]:
 # import this module's neighbours at load time.
 FORMATS: Dict[str, Callable[[], Dict[str, Any]]] = {
     "groups": _groups_hooks,
-    "playoff": _playoff_hooks,
-    "double_elim": _playoff_hooks,
+    "playoff": _groups_hooks,  # brackets are a format of the groups engine too (services/paths_engine)
+    "double_elim": _groups_hooks,
     "swiss": _groups_hooks,  # the Swiss stage is a group format of the groups engine (services/swiss_engine)
     "bounty": _bounty_hooks,
 }

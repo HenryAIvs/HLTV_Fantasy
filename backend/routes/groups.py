@@ -925,8 +925,8 @@ def _conditional_player_detail(
     idxs = [int(i) for i in idxs if 0 <= int(i) < n_total]
     if not idxs:
         raise HTTPException(status_code=400, detail="outcome_indexes is required")
-    if fmt == "swiss":
-        return _swiss_conditional_detail(results, model, idxs, pid, tid, body, single)
+    if fmt in _PATH_FORMATS:
+        return _paths_conditional_detail(results, model, idxs, pid, tid, body, single)
     decomp = model[3] or {}
     paths = decomp.get("paths")
     by_group: Dict[int, List[dict]] = {}
@@ -2139,6 +2139,8 @@ def bake_event_valuations(
     kind = get_event_tournament_kind(event_id) or detected.get("kind")
     if kind == "swiss":
         return _bake_swiss_event(event_id, trigger, started, refresh_inputs)
+    if kind in ("playoff", "double_elim"):
+        return _bake_bracket_event(event_id, detected, trigger, started, refresh_inputs)
     if kind != "groups":
         # backend.services.event_pipeline routes other formats to their bakers.
         return {"status": "skipped", "event_id": event_id, "reason": f"not a groups event ({kind})"}
@@ -2218,9 +2220,15 @@ def bake_event_valuations(
     }
 
 # ----------------------------------------------------------------------------
-# Swiss stage: the "swiss" group format (services/swiss_engine). One group of
-# 16 in seed order; the outcome space is a seeded Monte Carlo sample of
-# whole stages kept as paths, reproducible from the stored run.
+# Path formats: every stage the path engine values (services/paths_engine +
+# services/stage_formats) — the Swiss stage (sampled) and the single- /
+# double-elimination brackets (enumerated exactly). One stored contract:
+# `groups` = [the team order], `group_format` = "swiss" | "bracket", a format
+# block (`swiss` / `bracket`) holding what regenerates the paths (seed order,
+# win matrices, seed), `paths_summary` (stage reach, advance and match-reach
+# odds per team), `stage_stats` in the Point Sources contract, and the input
+# snapshot — so the Top 5 modes, the breakdowns and the page are shared.
+_PATH_FORMATS = ("swiss", "bracket")
 _SWISS_SHAPE = (16, 8)
 
 
@@ -2248,6 +2256,38 @@ def _prefill_prob_cache(prob_cache: Dict, team_ids: List[int], win_probs: Dict[s
             for j, b in enumerate(team_ids):
                 if i != j:
                     prob_cache[(int(a), int(b)) + tag] = float(matrix[i][j])
+
+
+def _finish_paths_bake(event_id: int, payload: dict, snapshot: Dict[str, Any], inputs_meta: dict, started: float, extra: dict) -> Dict[str, Any]:
+    """Compute, store, warm and summarise a path-format bake."""
+    try:
+        result, model = _compute_paths_result(payload, snapshot, event_id)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("Bake failed for event %s", event_id, exc_info=True)
+        return {"status": "error", "event_id": event_id, "reason": f"{type(exc).__name__}: {str(exc)[:280]}"}
+    _GROUPS_STATE.save(payload, result, key=event_id)
+    saved = _GROUPS_STATE.load(key=event_id)
+    if saved:
+        _JOINT_MODEL_CACHE.clear()
+        _JOINT_MODEL_CACHE[(event_id, saved["updated_at"])] = model
+    top5_warm = _seed_live_queries(event_id, saved) if saved else {}
+    try:
+        combinations = _precompute_groups_best_team(event_id)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("Combinations failed for event %s", event_id, exc_info=True)
+        combinations = {"error": str(exc)[:200]}
+    return {
+        "status": "ok",
+        "event_id": event_id,
+        "group_format": payload.get("group_format"),
+        "top5_warm_seconds": top5_warm,
+        "combinations": combinations,
+        "outcomes": int(model[1][0].shape[0]),
+        "pairings": len(model[3]["paths"].keys),
+        "inputs": "frozen at event start" if inputs_meta.get("frozen") else "fresh (event not started)",
+        "seconds": round(time.time() - started, 1),
+        **extra,
+    }
 
 
 def _bake_swiss_event(event_id: int, trigger: str, started: float, refresh_inputs: bool) -> Dict[str, Any]:
@@ -2289,61 +2329,109 @@ def _bake_swiss_event(event_id: int, trigger: str, started: float, refresh_input
     }
     snapshot, inputs_meta = _event_inputs(event_id, team_ids, refresh=refresh_inputs)
     payload["inputs"] = inputs_meta
+    return _finish_paths_bake(event_id, payload, snapshot, inputs_meta, started, {"kind": "swiss", "bo3_mode": bo3_mode, "sims": int(payload["swiss"]["n_sims"])})
+
+
+def _bake_bracket_event(event_id: int, detected: dict, trigger: str, started: float, refresh_inputs: bool) -> Dict[str, Any]:
+    """The bracket bake (single or double elimination): the seeded slots
+    from the event page, the decider and final series from the detected
+    format, the groups bake's input snapshot and start freeze, every outcome
+    enumerated and stored as a "bracket" run of the groups state."""
+    from backend.data.event_db import get_event_detail
+    from backend.routes import playoff as playoff_routes
+    from backend.services import stage_formats
+
+    event = get_event_detail(event_id) or {}
+    kind = str(detected.get("kind") or "playoff")
     try:
-        result, model = _compute_swiss_result(payload, snapshot, event_id)
+        auto = autofill_event_playoff(hltv_event_id=event.get("hltv_event_id"), fantasy_event_id=event_id)
     except Exception as exc:  # noqa: BLE001
-        logging.getLogger(__name__).warning("Swiss bake failed for event %s", event_id, exc_info=True)
-        return {"status": "error", "event_id": event_id, "reason": f"{type(exc).__name__}: {str(exc)[:280]}"}
-    _GROUPS_STATE.save(payload, result, key=event_id)
-    saved = _GROUPS_STATE.load(key=event_id)
-    if saved:
-        _JOINT_MODEL_CACHE.clear()
-        _JOINT_MODEL_CACHE[(event_id, saved["updated_at"])] = model
-    top5_warm = _seed_live_queries(event_id, saved) if saved else {}
-    try:
-        combinations = _precompute_groups_best_team(event_id)
-    except Exception as exc:  # noqa: BLE001
-        logging.getLogger(__name__).warning("Combinations failed for event %s", event_id, exc_info=True)
-        combinations = {"error": str(exc)[:200]}
-    return {
-        "status": "ok",
-        "event_id": event_id,
-        "kind": "swiss",
-        "top5_warm_seconds": top5_warm,
-        "combinations": combinations,
-        "group_format": "swiss",
-        "bo3_mode": bo3_mode,
-        "sims": int(payload["swiss"]["n_sims"]),
-        "pairings": len(model[3]["paths"].keys),
-        "inputs": "frozen at event start" if inputs_meta.get("frozen") else "fresh (event not started)",
-        "seconds": round(time.time() - started, 1),
+        detail = getattr(exc, "detail", None) or str(exc)
+        return {"status": "skipped", "event_id": event_id, "reason": f"bracket unavailable: {str(detail)[:200]}"}
+    ids = [int(t or 0) for t in (auto.get("team_ids") or [])]
+    if not ids or any(t <= 0 for t in ids):
+        return {"status": "skipped", "event_id": event_id, "reason": "bracket not published yet (TBD slots)"}
+    bracket_kind = "double" if (str(auto.get("bracket_kind") or "") == "double" or kind == "double_elim") else "single"
+    if bracket_kind == "double" and len(ids) != 8:
+        return {"status": "unsupported", "event_id": event_id, "reason": f"double elimination with {len(ids)} teams is not modelled (8 only)"}
+    if bracket_kind == "single" and len(ids) not in stage_formats.SINGLE_SIZES:
+        return {"status": "unsupported", "event_id": event_id, "reason": f"a {len(ids)}-team bracket is not modelled (2, 4, 8 or 16)"}
+    third_place = bool(detected.get("playoff_third_place")) and bracket_kind == "single"
+    final_bo = int(playoff_routes._detected_final_bo(event_id) or 3)
+    payload = {
+        "groups": [ids], "group_format": "bracket", "combined_playoffs": False, "playoff_stop_teams": 1,
+        "playoff_third_place": third_place, "event_id": event_id,
+        "bracket": {"kind": bracket_kind, "team_slots": ids, "third_place": third_place, "final_bo": final_bo},
+        "baked": {"trigger": trigger, "at": started},
     }
+    snapshot, inputs_meta = _event_inputs(event_id, ids, refresh=refresh_inputs)
+    payload["inputs"] = inputs_meta
+    return _finish_paths_bake(event_id, payload, snapshot, inputs_meta, started, {"kind": kind, "bracket": bracket_kind, "teams": len(ids), "third_place": third_place, "final_bo": final_bo})
 
 
-def _compute_swiss_result(payload: dict, snapshot: Dict[str, Any], event_id: int) -> tuple:
-    """(stored results, outcome model) of a Swiss run from its payload and
-    input snapshot. Runs inside the event's roster context (the pipeline)."""
-    from backend.services import swiss_engine
+def _paths_build(payload_or_results: dict, team_ids: List[int], prob_cache: Dict, regenerate: bool) -> tuple:
+    """(paths, seeds for the team states, format block) for a payload (a
+    bake: win matrices from the model) or a stored run (regenerate: the
+    stored matrices, seeded into the cache)."""
+    import numpy as np
+
+    from backend.services import paths_engine, stage_formats, swiss_engine
+
+    src = payload_or_results
+    fmt = str(src.get("group_format") or "")
+    if fmt == "swiss":
+        sw = dict(src.get("swiss") or {})
+        seeds = {int(t): int(s) for t, s in (sw.get("seeds") or {}).items()}
+        bo3_mode = str(sw.get("bo3_mode") or "elim_qual")
+        if regenerate:
+            win_probs = sw.get("win_probs") or {}
+            _prefill_prob_cache(prob_cache, team_ids, win_probs)
+        else:
+            win_probs = stage_formats.win_matrices(team_ids, swiss_engine.series_for_mode(bo3_mode), prob_cache)
+        samples = swiss_engine.sample_paths(
+            team_ids, seeds, win_probs.get("bo1") or win_probs.get("bo3"), win_probs.get("bo3") or win_probs.get("bo1"),
+            bo3_mode, int(sw.get("n_sims") or swiss_engine.SWISS_SAMPLES), int(sw.get("seed") or swiss_engine.SWISS_SEED),
+        )
+        paths = stage_formats.swiss_paths(samples, team_ids, stage_formats.matrices_by_series(win_probs))
+        block = {"swiss": {**sw, "win_probs": win_probs, "records": swiss_engine.records(samples, team_ids)}}
+        return paths, seeds, block
+    br = dict(src.get("bracket") or {})
+    spec = stage_formats.bracket_spec(str(br.get("kind") or "single"), team_ids, bool(br.get("third_place")), int(br.get("final_bo") or 3))
+    if regenerate:
+        win_probs = br.get("win_probs") or {}
+        _prefill_prob_cache(prob_cache, team_ids, win_probs)
+    else:
+        win_probs = stage_formats.win_matrices(team_ids, stage_formats.bracket_series(spec), prob_cache)
+    paths = stage_formats.bracket_paths_for(spec, team_ids, stage_formats.matrices_by_series(win_probs))
+    best = int(np.argmax(paths.outcome_prob))
+    block = {
+        "bracket": {
+            **br, "win_probs": win_probs, "rounds": spec["rounds"],
+            "stages": [st.descriptor() | {"series": int(st.series)} for st in spec["stages"]],
+            "matches": [[k, s, list(fa), list(fb)] for k, s, fa, fb in spec["matches"]],
+            "best": paths_engine.outcome_bracket(paths, best), "best_probability": float(paths.outcome_prob[best]),
+        }
+    }
+    return paths, {tid: i + 1 for i, tid in enumerate(team_ids)}, block
+
+
+def _compute_paths_result(payload: dict, snapshot: Dict[str, Any], event_id: int) -> tuple:
+    """(stored results, outcome model) of a path-format run from its payload
+    and input snapshot. Runs inside the event's roster context (the
+    pipeline)."""
+    from backend.services import paths_engine
     from backend.services.rating_curve import average_bucket_pct_override
 
-    sw = dict(payload.get("swiss") or {})
+    fmt = str(payload.get("group_format") or "")
     team_ids = [int(t) for t in (payload.get("groups") or [[]])[0]]
-    seeds = {int(t): int(s) for t, s in (sw.get("seeds") or {}).items()}
-    bo3_mode = str(sw.get("bo3_mode") or "elim_qual")
-    n_sims = int(sw.get("n_sims") or swiss_engine.SWISS_SAMPLES)
-    seed = int(sw.get("seed") or swiss_engine.SWISS_SEED)
     player_rows_by_id, team_rank_by_id = _lookup_context_from_snapshot(snapshot, team_ids)
     curve = (snapshot or {}).get("average_bucket_pct")
     prob_cache: Dict = {}
     with team_strength.rank_overrides(team_rank_by_id), average_bucket_pct_override(curve):
-        win_probs = swiss_engine.win_matrices(team_ids, bo3_mode, prob_cache)
-        samples = swiss_engine.sample_paths(
-            team_ids, seeds, win_probs.get("bo1") or win_probs.get("bo3"), win_probs.get("bo3") or win_probs.get("bo1"),
-            bo3_mode, n_sims, seed,
-        )
+        paths, seeds, block = _paths_build(payload, team_ids, prob_cache, regenerate=False)
         base_states = initialize_teams(team_ids, seeds)
-        paths = swiss_engine.score_paths(samples, team_ids, base_states, player_rows_by_id, team_rank_by_id, prob_cache, win_probs)
-        model = swiss_engine.build_model(paths)
+        sc = paths_engine.score(paths, base_states, player_rows_by_id, team_rank_by_id, prob_cache)
+        model = paths_engine.build_model(sc)
         means = model[3]["means"]
         teams_out: Dict[int, Dict[str, Any]] = {}
         for tid in team_ids:
@@ -2360,25 +2448,28 @@ def _compute_swiss_result(payload: dict, snapshot: Dict[str, Any], event_id: int
                     "role_id": p.role_id,
                 }
             teams_out[int(tid)] = {"team_id": int(tid), "wins": 0, "losses": 0, "players": players_out}
-        stats = swiss_engine.stage_stats(paths, teams_out, team_rank_by_id)
-    summary = swiss_engine.team_summary(paths)
+        summary = paths_engine.team_summary(sc)
+        view = paths_engine.stage_view(sc, None, paths.weight, sc.pids, None, team_rank_by_id)
+    for name in block:
+        block[name]["event_id"] = int(event_id)
     meta = payload.get("inputs") or {}
     result = {
         "teams": teams_out,
         "outcomes": [],
-        "outcomes_count": 0,
+        "outcomes_count": int(paths.n),
         "groups": [team_ids],
         "group_count": 1,
-        "group_format": "swiss",
-        "quals_per_group": _SWISS_SHAPE[1],
+        "group_format": fmt,
+        "quals_per_group": _SWISS_SHAPE[1] if fmt == "swiss" else 1,
         "place_odds": {},
-        "stage_stats": stats,
+        "stage_stats": view,
         "combined_playoffs": False,
-        "playoff_third_place": False,
+        "playoff_third_place": bool(payload.get("playoff_third_place")),
         "playoff_layout": None,
         "playoff": None,
-        "method": "swiss_monte_carlo",
-        "swiss": {**sw, "event_id": int(event_id), "win_probs": win_probs, **summary},
+        "method": "swiss_monte_carlo" if fmt == "swiss" else "bracket_exact",
+        "paths_summary": summary,
+        **block,
         "input_snapshot": {
             "taken_at": meta.get("taken_at"),
             "frozen": bool(meta.get("frozen")),
@@ -2390,98 +2481,78 @@ def _compute_swiss_result(payload: dict, snapshot: Dict[str, Any], event_id: int
     return result, model
 
 
-def _swiss_paths(results: dict):
-    """A stored Swiss run's scored sample space, regenerated from the run:
-    seed, seed order, win matrices, snapshot rows, the ranks and curve it was
-    valued with, the event's rosters."""
-    from backend.services import swiss_engine
+def _paths_for(results: dict):
+    """A stored path-format run's scored outcome space, regenerated from the
+    run: its stored win matrices, seed order (and seed), snapshot rows, the
+    ranks and curve it was valued with, the event's rosters."""
+    from backend.services import paths_engine
     from backend.services.rating_curve import average_bucket_pct_override
 
-    sw = results.get("swiss") or {}
     team_ids = [int(t) for t in (results.get("groups") or [[]])[0]]
-    seeds = {int(t): int(s) for t, s in (sw.get("seeds") or {}).items()}
-    win_probs = sw.get("win_probs") or {}
-    bo3_mode = str(sw.get("bo3_mode") or "elim_qual")
     player_rows_by_id, team_rank_by_id, overrides = _run_lookup_context(results, team_ids)
     curve = (results.get("input_snapshot") or {}).get("average_bucket_pct")
     prob_cache: Dict = {}
-    _prefill_prob_cache(prob_cache, team_ids, win_probs)
-    samples = swiss_engine.sample_paths(
-        team_ids, seeds, win_probs.get("bo1") or win_probs.get("bo3"), win_probs.get("bo3") or win_probs.get("bo1"),
-        bo3_mode, int(sw.get("n_sims") or swiss_engine.SWISS_SAMPLES), int(sw.get("seed") or swiss_engine.SWISS_SEED),
-    )
-    event_id = int(sw.get("event_id") or 0) or None
+    paths, seeds, block = _paths_build(results, team_ids, prob_cache, regenerate=True)
+    fmt_block = results.get("swiss") if results.get("group_format") == "swiss" else results.get("bracket")
+    event_id = int((fmt_block or {}).get("event_id") or 0) or None
     with event_rosters.for_event(event_id), team_strength.rank_overrides(overrides), average_bucket_pct_override(curve):
         base_states = initialize_teams(team_ids, seeds)
-        return swiss_engine.score_paths(samples, team_ids, base_states, player_rows_by_id, team_rank_by_id, prob_cache, win_probs)
+        return paths_engine.score(paths, base_states, player_rows_by_id, team_rank_by_id, prob_cache)
 
 
-def _swiss_model(results: dict) -> tuple:
-    from backend.services import swiss_engine
+def _paths_model(results: dict) -> tuple:
+    from backend.services import paths_engine
 
-    return swiss_engine.build_model(_swiss_paths(results))
+    return paths_engine.build_model(_paths_for(results))
 
 
-def _swiss_conditional_detail(
+def _paths_conditional_detail(
     results: dict, model: tuple, idxs: List[int], pid: int, tid: int, body: dict, single: bool,
 ) -> Dict[str, Any]:
-    """A Swiss run's Point Sources over a subset of its samples, under the
-    roster's plan: the per-round view and the team's runs (swiss_engine)."""
+    """A path-format run's Point Sources over a subset of its outcomes (the
+    outcomes a roster wins, weighted as the planner weights them; or one
+    outcome), under the roster's plan, plus the team's runs."""
     import numpy as np
 
-    from backend.services import swiss_engine
+    from backend.services import paths_engine
 
-    paths = (model[3] or {}).get("paths")
-    if paths is None:
-        raise HTTPException(status_code=409, detail="The stored run carries no sample paths; re-bake the event first.")
-    n = paths.samples.n
+    sc = (model[3] or {}).get("paths")
+    if sc is None:
+        raise HTTPException(status_code=409, detail="The stored run carries no outcome paths; re-bake the event first.")
     sel = np.asarray(idxs, dtype=np.int64)
-    w = np.full(len(sel), 1.0 / len(sel), dtype=np.float64)
+    w_raw = np.asarray(sc.paths.weight, dtype=np.float64)[sel]
+    mass = float(w_raw.sum())
+    if mass <= 0:
+        raise HTTPException(status_code=400, detail="The given outcomes carry no probability.")
+    w = w_raw / mass
     plan = _plan_for_player(results, pid, body)
-    summary = swiss_engine.round_summary(paths, pid, sel, w, plan)
-    teams_out = results.get("teams") or {}
     ranks = {
         int(t): int(row["rank"])
         for t, row in ((results.get("stage_stats") or {}).get("teams") or {}).items()
         if (row or {}).get("rank") is not None
     }
-    stats = _assemble_stage_stats("swiss", _new_stage_acc(), summary, teams_out, ranks)
-    role_info = None
-    if plan.get("role_pm") is not None:
-        role_info = {
-            "role_id": plan.get("role_id"), "major": float(plan.get("major") or 0.0), "minor": float(plan.get("minor") or 0.0),
-            "points": float(plan["role_pm"]),
-        }
-    stats = swiss_engine.finish_stage_stats(stats, paths, {pid: role_info} if role_info else None, round_pad=summary.get("round_pad"))
-    prow = stats["players"].get(str(pid)) or {"stages": {}}
-    trow = stats["teams"].get(str(tid)) or {}
-    comps = {"rating": 0.0, "win": 0.0, "role": 0.0, "booster": 0.0}
-    for cell in (prow.get("stages") or {}).values():
-        for k in comps:
-            comps[k] += float(cell.get(k) or 0.0)
-    pad = prow.get("playoff_padding")
-    if pad:
-        for k in comps:
-            comps[k] += float(pad.get(k) or 0.0)
-    comps["total"] = comps["rating"] + comps["win"] + comps["role"] + comps["booster"]
-    runs_out = swiss_engine.runs(paths, pid, sel, w, plan)
+    view = paths_engine.stage_view(sc, sel, w, [pid], {pid: plan}, ranks)
+    prow = view["players"].get(str(pid)) or {"stages": {}, "role": None, "penalty": 0.0}
+    trow = view["teams"].get(str(tid)) or {}
+    comps = paths_engine.components_of(prow)
+    runs_out = paths_engine.runs(sc, pid, sel, w, plan)
     return {
         "n_outcomes": len(idxs),
-        "mass": len(idxs) / float(n),
-        "probability": swiss_engine.sample_probability(paths, int(idxs[0])) if single else None,
+        "mass": mass,
+        "probability": float(sc.paths.outcome_prob[int(idxs[0])]) if single else None,
         "team_id": tid,
         "components": comps,
-        "stage_list": stats["stages"],
+        "stage_list": view["stages"],
         "stage_ev": prow.get("stages") or {},
         "team_rounds": trow.get("rounds") or {},
         "team_ranks": {str(t): r for t, r in ranks.items()},
         "role_info": prow.get("role"),
         "padding": None,
         "padding_prob": 0.0,
-        "penalty": 0.0,
-        "playoff_padding": pad,
+        "penalty": float(prow.get("penalty") or 0.0),
+        "playoff_padding": None,
         "playoff_pad_prob": float(trow.get("playoff_padding_prob") or 0.0),
-        "playoff_penalty": float(prow.get("playoff_penalty") or 0.0),
+        "playoff_penalty": 0.0,
         "runs": runs_out["runs"],
         "runs_rest": runs_out["rest"],
     }
@@ -3525,8 +3596,8 @@ def _slim_groups_results(results: Dict[str, Any]) -> Dict[str, Any]:
         for tid in outcome.get("qualified") or []:
             bucket[str(tid)] = bucket.get(str(tid), 0.0) + prob
     slim["qualify_odds"] = odds
-    if str(results.get("group_format") or "") == "swiss":
-        slim["qualify_odds"] = {"0": dict(((results.get("swiss") or {}).get("qualify")) or {})}
+    if str(results.get("group_format") or "") in _PATH_FORMATS:
+        slim["qualify_odds"] = {"0": dict(((results.get("paths_summary") or {}).get("advance")) or {})}
     slim["outcomes_count"] = int(results.get("outcomes_count") or len(results.get("outcomes") or []))
     return slim
 
@@ -3645,8 +3716,8 @@ def _event_outcome_model(results: dict, cache_key: Any = None) -> tuple:
     if cache_key is not None and cache_key in _JOINT_MODEL_CACHE:
         return _JOINT_MODEL_CACHE[cache_key]
     groups = results.get("groups") or []
-    if str(results.get("group_format") or "") == "swiss":
-        model = _swiss_model(results)
+    if str(results.get("group_format") or "") in _PATH_FORMATS:
+        model = _paths_model(results)
     elif len(groups) == 1 and not ((results.get("playoff") or {}).get("pairing_table")):
         raw = _group_player_outcome_vectors(results)
         vectors = {0: {pid: np.asarray(v, dtype=np.float64) for pid, v in (raw.get(0) or {}).items()}}
@@ -4146,10 +4217,10 @@ def _team_match_reach_probs(results: dict) -> Dict[int, Dict[int, float]]:
     booster slots run through the playoffs, so the roster booster solve needs
     the full run; stored results from before `playoff.match_reach` existed fall
     back to the group matches only."""
-    if str(results.get("group_format") or "") == "swiss":
+    if str(results.get("group_format") or "") in _PATH_FORMATS:
         return {
             int(t): {int(n): float(p) for n, p in (d or {}).items()}
-            for t, d in ((results.get("swiss") or {}).get("match_reach") or {}).items()
+            for t, d in ((results.get("paths_summary") or {}).get("match_reach") or {}).items()
         }
     reach = _group_team_reach_probs(results)
     for tid_s, per_num in ((results.get("playoff") or {}).get("match_reach") or {}).items():
@@ -5205,17 +5276,39 @@ def query_groups_best_team_completed(payload: dict | None = None, event_id: Opti
     latest_combos = None if live_pool else _GROUPS_BEST_STATE.load(key=key)
     if not live_pool and not latest_combos:
         raise HTTPException(status_code=404, detail="No stored combinations found. Run Combinations first.")
-    picks_by_group = body.get("group_winners") or []
-    selected = _find_completed_group_outcomes(results, picks_by_group)
     scores_by_pid: Dict[int, float] = {}
     components_by_pid: Dict[int, dict] = {}
     probability = 1.0
-    for outcome in selected:
-        probability *= float(outcome.get("probability") or 0.0)
-        for pid_raw, score in (outcome.get("players") or {}).items():
-            scores_by_pid[int(pid_raw)] = float(score)
-        for pid_raw, comps in (outcome.get("player_components") or {}).items():
-            components_by_pid[int(pid_raw)] = dict(comps or {})
+    fmt = str(results.get("group_format") or "")
+    if fmt in _PATH_FORMATS:
+        # a bracket: the picks (match key -> winner) name one enumerated outcome
+        from backend.services import paths_engine, stage_formats
+
+        if fmt != "bracket":
+            raise HTTPException(status_code=400, detail="Completed results are not available for this stage format")
+        br = results.get("bracket") or {}
+        team_ids = [int(t) for t in (results.get("groups") or [[]])[0]]
+        spec = stage_formats.bracket_spec(str(br.get("kind") or "single"), team_ids, bool(br.get("third_place")), int(br.get("final_bo") or 3))
+        picks = {str(k): int(v) for k, v in (body.get("bracket_picks") or {}).items() if v}
+        code = stage_formats.picks_to_code(spec, picks, team_ids)
+        if code is None:
+            raise HTTPException(status_code=400, detail="Pick every match winner first")
+        model = _event_outcome_model(results, (key, latest["updated_at"]))
+        sc = model[3]["paths"]
+        probability = float(sc.paths.outcome_prob[code])
+        for pid in sc.pids:
+            c = paths_engine.player_totals(sc, pid)["comps"][code]
+            scores_by_pid[int(pid)] = float(c.sum())
+            components_by_pid[int(pid)] = {"rating": float(c[0]), "win": float(c[1]), "role": float(c[2]), "booster": float(c[3]), "total": float(c.sum())}
+    else:
+        picks_by_group = body.get("group_winners") or []
+        selected = _find_completed_group_outcomes(results, picks_by_group)
+        for outcome in selected:
+            probability *= float(outcome.get("probability") or 0.0)
+            for pid_raw, score in (outcome.get("players") or {}).items():
+                scores_by_pid[int(pid_raw)] = float(score)
+            for pid_raw, comps in (outcome.get("player_components") or {}).items():
+                components_by_pid[int(pid_raw)] = dict(comps or {})
     options = parse_optimizer_payload(body)
     player_values = []
     for pid, score in scores_by_pid.items():
