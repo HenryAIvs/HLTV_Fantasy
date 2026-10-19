@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 ROUNDS = 5
 TARGET = 3  # wins to qualify / losses to go out
-SWISS_SAMPLES = 30000
+SWISS_SAMPLES = 100000
 SWISS_SEED = 20240101
 _CHUNK = 2500  # fixed chunking: the sample stream is the same whatever the worker count
 RECORDS = ("3-0", "3-1", "3-2", "2-3", "1-3", "0-3")
