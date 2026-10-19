@@ -10078,19 +10078,11 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
               )}
               {playerTab === "topxGraph" && (
                 <div className="stack">
-                  {playerCurveLoading && <p className="muted">Loading Top-X data...</p>}
                   {playerCurveError && <p className="error">{playerCurveError}</p>}
-                  {!playerCurveLoading && !playerCurveError && playerTopx.bucketRows.length === 0 && (
-                    <p className="muted">No adjusted Top-X bucket data available yet.</p>
-                  )}
-                  {playerTopx.bucketRows.length > 0 && (
-                    <>
-                      <TopXCurveSummary curve={playerCurve} fallbackRating={playerForm.rating} />
-                      <div className="value-chart-wrap topx-chart">
-                        <TopXCurveChart topx={playerTopx} height={260} />
-                      </div>
-                      <TopXCurveTable topx={playerTopx} />
-                    </>
+                  {(playerCurve?.model_rows || []).length > 0 && (
+                    <div className="value-chart-wrap topx-chart">
+                      <ModelCurveChart curve={playerCurve} height={300} />
+                    </div>
                   )}
                 </div>
               )}
@@ -11793,6 +11785,92 @@ const TopXCurveChart = ({ topx, height = 260 }) => (
     </ComposedChart>
   </ResponsiveContainer>
 );
+
+// The player card's Top X tab: the learned model's expected rating against
+// a typical team of each HLTV rank (orange, log rank axis) and the player's
+// last ten maps as grey dots at the opponent's rank at the time.
+const MODEL_CURVE_TICKS = [1, 2, 3, 5, 10, 20, 30, 50, 100];
+
+const ModelCurveChart = ({ curve, height = 300 }) => {
+  const line = (Array.isArray(curve?.model_rows) ? curve.model_rows : [])
+    .map((m) => ({ rank: Number(m?.rank), rating: Number(m?.rating) }))
+    .filter((m) => Number.isFinite(m.rank) && m.rank >= 1 && m.rank <= 100 && Number.isFinite(m.rating));
+  const dots = (Array.isArray(curve?.recent_maps) ? curve.recent_maps : [])
+    .map((m, i) => ({
+      key: `${m?.date}-${m?.map}-${i}`,
+      rank: Number.isFinite(Number(m?.opponent_rank)) ? Math.min(100, Math.max(1, Number(m.opponent_rank))) : 100,
+      unranked: !Number.isFinite(Number(m?.opponent_rank)),
+      rating: Number(m?.rating),
+      date: m?.date,
+      map: m?.map,
+      opponent: m?.opponent,
+      score: m?.score,
+      won: m?.won,
+    }))
+    .filter((d) => Number.isFinite(d.rating));
+  const axis = buildNiceStepAxis([...line.map((p) => p.rating), ...dots.map((d) => d.rating)], 0.2);
+  return (
+    <ResponsiveContainer width="100%" height={height}>
+      <ComposedChart data={line} margin={{ top: 12, right: 18, left: 6, bottom: 12 }}>
+        <CartesianGrid stroke="#232a34" strokeDasharray="3 3" />
+        <XAxis
+          type="number"
+          dataKey="rank"
+          scale="log"
+          domain={[1, 100]}
+          ticks={MODEL_CURVE_TICKS}
+          interval={0}
+          minTickGap={0}
+          tick={{ fill: "#9fb2c9", fontSize: 12 }}
+          axisLine={{ stroke: "#3a4452" }}
+          tickLine={{ stroke: "#3a4452" }}
+          tickFormatter={(v) => String(v)}
+          label={{ value: "Opponent HLTV rank", position: "insideBottom", offset: -8, fill: "#7f97bd", fontSize: 11 }}
+        />
+        <YAxis
+          tick={{ fill: "#9fb2c9", fontSize: 12 }}
+          axisLine={{ stroke: "#3a4452" }}
+          tickLine={{ stroke: "#3a4452" }}
+          domain={axis.domain}
+          ticks={axis.ticks}
+          interval={0}
+          minTickGap={0}
+          tickFormatter={(v) => Number(v).toFixed(1)}
+          width={44}
+        />
+        <Tooltip
+          cursor={false}
+          content={({ active, payload }) => {
+            if (!active || !payload || payload.length === 0) return null;
+            const d = payload[0]?.payload || {};
+            return (
+              <div className="pool-tooltip">
+                {d.map ? (
+                  <>
+                    <div className="pool-tooltip-title">
+                      {d.map} · {formatDMY(d.date)}
+                    </div>
+                    <div>
+                      {d.opponent} {d.unranked ? "(unranked)" : `#${d.rank}`} · {d.won === null || d.won === undefined ? "" : d.won ? "W" : "L"} {d.score}
+                    </div>
+                    <div>Rating {Number(d.rating).toFixed(2)}</div>
+                  </>
+                ) : (
+                  <>
+                    <div className="pool-tooltip-title">Opponent #{d.rank}</div>
+                    <div>Expected {Number(d.rating).toFixed(3)}</div>
+                  </>
+                )}
+              </div>
+            );
+          }}
+        />
+        <Line type="monotone" dataKey="rating" name="Model" stroke="#ff6b1a" strokeWidth={2.6} dot={false} isAnimationActive={false} />
+        <Scatter data={dots} dataKey="rating" name="Last 10 maps" fill="#8fa3bf" shape={(p) => <circle cx={p.cx} cy={p.cy} r={5} fill="#8fa3bf" stroke="#0a0c10" strokeWidth={1.5} />} isAnimationActive={false} />
+      </ComposedChart>
+    </ResponsiveContainer>
+  );
+};
 
 // The bucket table.
 const TopXCurveTable = ({ topx }) => (

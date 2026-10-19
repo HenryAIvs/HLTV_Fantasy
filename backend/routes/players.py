@@ -960,11 +960,16 @@ def fetch_player_rating_curve(player_id: int):
         model_rows = rating_model.rank_curve(int(player_id), own_rank)
     except Exception:  # noqa: BLE001 - the card still shows the Top-X curve
         model_rows = []
+    try:
+        recent = rating_model.recent_maps(int(player_id), 10)
+    except Exception:  # noqa: BLE001
+        recent = []
     return {
         "player_id": player_id,
         "player_name": player.get("name"),
         **curve,
         "model_rows": model_rows,
+        "recent_maps": recent,
     }
 
 

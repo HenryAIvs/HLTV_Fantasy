@@ -304,6 +304,58 @@ def rank_curve(player_id: int, own_rank: Any, ranks: Iterable[int] = range(1, 10
     return [{"rank": r, "rating": round(float(p), 4)} for r, p in zip(ranks, smoothed)]
 
 
+def recent_maps(player_id: int, n: int = 10, conn: Optional[sqlite3.Connection] = None) -> List[Dict[str, Any]]:
+    """The player's last `n` stored maps, oldest first: date, map, opponent,
+    the opponent's HLTV rank at the time (None when unranked), the map score
+    from the player's side, whether it was won, and the player's rating."""
+    import json as _json
+
+    own = conn is None
+    conn = conn or _connect()
+    try:
+        rows = conn.execute(
+            """SELECT match_url, match_date, team1, team2, hltv_rank_1, hltv_rank_2, maps_json, map_player_stats_json
+               FROM hltv_results
+               WHERE map_player_stats_json LIKE ? AND match_date IS NOT NULL
+               ORDER BY match_date DESC, match_id DESC LIMIT ?""",
+            (f'%"player_id": {int(player_id)},%', max(3, int(n))),
+        ).fetchall()
+    finally:
+        if own:
+            conn.close()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        try:
+            maps = _json.loads(r[6] or "[]")
+            mps = _json.loads(r[7] or "{}")
+        except Exception:  # noqa: BLE001
+            continue
+        match_maps: List[Dict[str, Any]] = []
+        for mp in maps:
+            sc1, sc2 = mp.get("score1"), mp.get("score2")
+            for p in mps.get(mp.get("map")) or []:
+                if int(p.get("player_id") or 0) != int(player_id) or p.get("rating") is None:
+                    continue
+                is_t1 = p.get("team") == r[2]
+                opp = r[3] if is_t1 else r[2]
+                opp_rank = r[5] if is_t1 else r[4]
+                try:
+                    opp_rank = int(opp_rank) if opp_rank is not None and 0 < int(opp_rank) < _RANK_PLACEHOLDER else None
+                except (TypeError, ValueError):
+                    opp_rank = None
+                own_s, opp_s = (sc1, sc2) if is_t1 else (sc2, sc1)
+                match_maps.append({
+                    "date": r[1], "map": mp.get("map"), "opponent": opp, "opponent_rank": opp_rank,
+                    "score": f"{own_s}-{opp_s}" if own_s is not None and opp_s is not None else "",
+                    "won": bool(own_s > opp_s) if own_s is not None and opp_s is not None else None,
+                    "rating": float(p["rating"]), "match_url": r[0],
+                })
+        out.extend(reversed(match_maps))  # newest map of the match first, like the matches
+        if len(out) >= n:
+            break
+    return list(reversed(out[:n]))
+
+
 def attach_match_ratings(player_rows_by_id: Dict[int, dict], team_of_player: Dict[int, int], team_rank_by_id: Dict[int, int]) -> int:
     """Give every player row `model_ratings`: {opponent team id: expected
     rating} for each other team in the context. Rows of players without
