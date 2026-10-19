@@ -2105,6 +2105,7 @@ function GroupPlayerBreakdownModal({ player, teamLookup, teams, onClose }) {
           ? [{ key: "others", muted: true, name: `Others (${rest.length})`, play: restPlay, win: wavg(rest, "win"), winPts: wavg(rest, "winPts"), rating: wavg(rest, "rating"), total: wavg(rest, "total") }]
           : []),
         ...(elimProb > 0.0005 ? [{ key: "elim", muted: true, name: "Out earlier", play: elimProb, winPts: elimPts / elimProb, total: elimPts / elimProb }] : []),
+        ...(bye > 0.0005 && play > 0.0005 ? [{ key: "pad", muted: true, name: "Qualified earlier", play: bye, total: 0 }] : []),
         ...(elsewhere > 0.0005 ? [{ key: "else", muted: true, name: elsewhereLabel, play: elsewhere, total: 0 }] : []),
       ],
       avgRow,
@@ -2187,7 +2188,10 @@ function GroupPlayerBreakdownModal({ player, teamLookup, teams, onClose }) {
     const isBracket = sec.id === "group" || sec.stages.some((st) => (st.bracket && st.bracket !== "playoff") || st.opener);
     if (!isBracket) {
       const cards = sec.stages.map(cardFor).filter(Boolean);
-      if (sec.id === "playoff" && playoffPadCard && cards.length > 0) cards.splice(Math.min(1, cards.length), 0, playoffPadCard);
+      // the bye card sits by the round it skips: a bracket's first round, or
+      // after the last round of a stage whose padding is for rounds not played
+      const padAt = sec.stages.some((st) => st.pad_position === "end") ? cards.length : Math.min(1, cards.length);
+      if (sec.id === "playoff" && playoffPadCard && cards.length > 0) cards.splice(padAt, 0, playoffPadCard);
       return { ...sec, isBracket: false, cards };
     }
     const openerStage = sec.stages.find((st) => st.opener) || (sec.id === "group" ? sec.stages[0] : null);

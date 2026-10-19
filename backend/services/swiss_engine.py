@@ -478,6 +478,8 @@ def round_summary(paths: SwissPaths, pid: int, sel, w, plan: Optional[Dict[str, 
         "round_opp": {str(tid): round_opp},
         "bye_prob": {str(tid): bye_prob},
         "advance_rate": {str(tid): float(w[m["qualified"]].sum())},
+        # P(the team sits out round r having already qualified): the padded share of that round
+        "round_pad": {str(tid): [float(w[(pad > 0) & (m["played"].astype(np.int64) <= r)].sum()) for r in range(ROUNDS)]},
         "player_stage_ev": {
             str(pid): {
                 str(r): {
@@ -504,7 +506,7 @@ def merge_summaries(parts: List[Dict[str, Any]]) -> Dict[str, Any]:
     shaped summary for _assemble_stage_stats."""
     out: Dict[str, Any] = {"round_labels": list(ROUND_LABELS), "third_place": False}
     for key in (
-        "round_reach", "round_wins", "round_elim", "round_opp", "bye_prob", "advance_rate", "player_stage_ev",
+        "round_reach", "round_wins", "round_elim", "round_opp", "bye_prob", "advance_rate", "round_pad", "player_stage_ev",
         "player_penalty", "player_playoff_padding", "player_round_opp_pts", "player_stage_boost",
     ):
         merged: Dict[str, Any] = {}
@@ -524,15 +526,29 @@ def stage_stats(paths: SwissPaths, teams_out: Dict[Any, Any], team_rank_by_id: D
     w = np.full(n, 1.0 / n)
     sel = np.arange(n)
     parts = [round_summary(paths, pid, sel, w) for pid in paths.pids]
-    stats = _assemble_stage_stats("swiss", _new_stage_acc(), merge_summaries(parts), teams_out, team_rank_by_id)
-    return finish_stage_stats(stats, paths)
+    merged = merge_summaries(parts)
+    stats = _assemble_stage_stats("swiss", _new_stage_acc(), merged, teams_out, team_rank_by_id)
+    return finish_stage_stats(stats, paths, round_pad=merged.get("round_pad"))
 
 
-def finish_stage_stats(stats: Dict[str, Any], paths: SwissPaths, role_info: Optional[Dict[int, dict]] = None) -> Dict[str, Any]:
-    """Tag the rounds as the Swiss stage section and attach each player's role."""
+def finish_stage_stats(
+    stats: Dict[str, Any], paths: SwissPaths, role_info: Optional[Dict[int, dict]] = None,
+    round_pad: Optional[Dict[str, List[float]]] = None,
+) -> Dict[str, Any]:
+    """Tag the rounds as the Swiss stage section (its padding card belongs
+    after the last round), attach each player's role, and give every round
+    the share of teams that sit it out already qualified (the modal's `bye`,
+    which _assemble_stage_stats only sets on a bracket's first round)."""
     for st in stats.get("stages") or []:
         st["section"] = "playoff"
         st["section_title"] = "Swiss Stage"
+        st["pad_position"] = "end"
+    for tid_s, per_round in (round_pad or {}).items():
+        rounds = ((stats.get("teams") or {}).get(str(tid_s)) or {}).get("rounds") or {}
+        for r, p in enumerate(per_round):
+            cell = rounds.get(f"po_{r}")
+            if cell is not None:
+                cell["bye"] = float(p)
     for pid_s, row in (stats.get("players") or {}).items():
         info = (role_info or {}).get(int(pid_s)) or paths.role_of.get(int(pid_s))
         if info:

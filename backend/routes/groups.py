@@ -2452,7 +2452,7 @@ def _swiss_conditional_detail(
             "role_id": plan.get("role_id"), "major": float(plan.get("major") or 0.0), "minor": float(plan.get("minor") or 0.0),
             "points": float(plan["role_pm"]),
         }
-    stats = swiss_engine.finish_stage_stats(stats, paths, {pid: role_info} if role_info else None)
+    stats = swiss_engine.finish_stage_stats(stats, paths, {pid: role_info} if role_info else None, round_pad=summary.get("round_pad"))
     prow = stats["players"].get(str(pid)) or {"stages": {}}
     trow = stats["teams"].get(str(tid)) or {}
     comps = {"rating": 0.0, "win": 0.0, "role": 0.0, "booster": 0.0}
