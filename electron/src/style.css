@@ -4340,3 +4340,21 @@ button:disabled {
 .pb-matches .gsl-pick { display: flex; flex-direction: column; flex-wrap: nowrap; gap: 4px; }
 .pb-matches .gsl-pick button { text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pb-round:not(:first-child) .pb-match-wrap:has(> .gsl-match)::before { display: none; }
+
+/* Dev Lab: Rating Model (Top-X curve vs the learned rating model) */
+.rm-head { display: flex; flex-direction: column; gap: 6px; }
+.rm-tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.rm-tile .topx-tile-value { font-variant-numeric: tabular-nums; }
+.rm-updated { color: #8fa3bf; font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; }
+.rm-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.rm-legend { display: flex; flex-wrap: wrap; gap: 16px; margin: 4px 0 8px; color: #c3cddb; font-size: 12.5px; }
+.rm-legend i { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; }
+.rm-swatch { display: inline-block; width: 10px; height: 10px; margin-right: 8px; vertical-align: -1px; }
+.rm-table { margin-top: 14px; width: 100%; }
+.rm-table td, .rm-table th { text-align: right; }
+.rm-table td:first-child, .rm-table th:first-child { text-align: left; }
+.card.sub h3 { margin-top: 0; }
+@media (max-width: 1100px) {
+  .rm-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .rm-grid { grid-template-columns: 1fr; }
+}

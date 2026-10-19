@@ -95,6 +95,11 @@ async def _lifespan(app: FastAPI):
             events.ensure_map_model_evaluation()
         except Exception:  # noqa: BLE001
             logging.getLogger(__name__).warning("Could not refresh the map model evaluation", exc_info=True)
+        # The Rating Model lab's walk-forward study, same rule (~90 s when stale).
+        try:
+            events.ensure_rating_model_evaluation()
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning("Could not refresh the rating model study", exc_info=True)
         events.warm_kind_cache()  # ~1 s; needed by the first Tournament open
         try:
             roster_scores.migrate_stored_roster_sets()  # one-off per stored roster set (see the module)
