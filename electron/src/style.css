@@ -4358,3 +4358,13 @@ button:disabled {
   .rm-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .rm-grid { grid-template-columns: 1fr; }
 }
+.rm-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.rm-chip {
+  background: #171c24;
+  border: 1px solid #2c3441;
+  border-left: 3px solid #ff6b1a;
+  padding: 6px 10px;
+  font-size: 12.5px;
+  color: #e9edf3;
+}
+

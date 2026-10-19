@@ -42,15 +42,26 @@ UNRANKED = 400.0  # the rank unranked teams take in every aggregate
 WINDOW_DAYS = 182
 MIN_MAPS = 5
 FOLDS = 13
-STUDY_VERSION = 2  # bump when the features or the methods change (the cache's signature)
+STUDY_VERSION = 3  # bump when the features or the methods change (the cache's signature)
 
-FEATURES: List[str] = [
+# Every input the row builder computes. Backward elimination (2026-10-19,
+# walk-forward) showed the twelve in FEATURES match all 33 (per-map MAE
+# 0.2811 vs 0.2812); the rest are near-copies of them (the window means
+# correlate 0.9+ with the weighted recent rating, the opponent's mean rating
+# with the rating it concedes).
+ALL_FEATURES: List[str] = [
     "n_w", "mean_w", "mean_90", "mean_30", "ewm_60", "last10", "last30", "std_w", "adr_w", "kast_w",
     "career_n", "career_mean", "days_since", "trend", "opp_logrank_w",
     "team_mean_w", "star_w", "team_winrate_w", "team_n_w",
     "opp_team_mean_w", "opp_allowed_w", "opp_winrate_w", "opp_n_w", "opp_logrank_w180",
     "own_rank", "opp_rank", "own_unranked", "opp_unranked", "rank_diff", "own_vrs", "opp_vrs", "bo", "map_code",
 ]
+# The inputs the learned model uses.
+FEATURES: List[str] = [
+    "ewm_60", "std_w", "n_w", "career_mean", "career_n", "star_w", "opp_logrank_w",
+    "opp_allowed_w", "opp_winrate_w", "opp_n_w", "opp_vrs", "rank_diff",
+]
+RAW_K = 10  # raw map tuples the row builder keeps for the "raw maps" input set
 FEATURE_LABELS: Dict[str, str] = {
     "n_w": "Maps in window", "mean_w": "Window mean rating", "mean_90": "90-day mean", "mean_30": "30-day mean",
     "ewm_60": "Weighted recent rating", "last10": "Last 10 maps", "last30": "Last 30 maps", "std_w": "Rating spread",
@@ -64,7 +75,7 @@ FEATURE_LABELS: Dict[str, str] = {
     "bo": "Series length", "map_code": "Map",
 }
 MAP_CODES = {m: i for i, m in enumerate(["Ancient", "Anubis", "Dust2", "Inferno", "Mirage", "Nuke", "Overpass", "Train", "Vertigo", "Cache", "Cobblestone"])}
-OPPONENT_FEATURES = {k for k in FEATURES if k.startswith("opp_") or k == "rank_diff"}
+OPPONENT_FEATURES = {k for k in ALL_FEATURES if k.startswith("opp_") or k == "rank_diff"}
 METHODS = [
     {"key": "curve", "label": "Top-X curve (current)"},
     {"key": "gbr", "label": "Learned model"},
@@ -138,12 +149,27 @@ def _mean(xs) -> float:
     return float(np.mean(xs)) if len(xs) else float("nan")
 
 
-def build_rows(matches: List[Dict[str, Any]], window_days: int = WINDOW_DAYS) -> Dict[str, Any]:
+def extra_columns(raw_k: int = 0, half_lives: tuple = ()) -> List[str]:
+    """Names of the optional inputs build_rows appends after FEATURES: one
+    recency-weighted mean per extra half-life, then the last raw_k maps as
+    (rating, days ago, log opponent rank) triples, most recent first."""
+    cols = [f"ewm_{int(hl)}" for hl in half_lives]
+    for i in range(int(raw_k)):
+        cols += [f"raw_r_{i}", f"raw_age_{i}", f"raw_opp_{i}"]
+    return cols
+
+
+def build_rows(matches: List[Dict[str, Any]], window_days: int = WINDOW_DAYS, raw_k: int = 0, half_lives: tuple = ()) -> Dict[str, Any]:
     """One row per player-map: inputs from the matches before it only, the
-    rating as the target, and the cumulative Top-X tiers the baseline needs."""
+    rating as the target, and the cumulative Top-X tiers the baseline needs.
+    With raw_k / half_lives the optional inputs (extra_columns) follow
+    FEATURES in each row; `columns` names every column."""
     players: Dict[int, _PlayerHist] = defaultdict(_PlayerHist)
     teams: Dict[str, _TeamHist] = defaultdict(_TeamHist)
-    X: List[List[float]] = []
+    X: List[Any] = []
+    raw_k = int(raw_k)
+    half_lives = tuple(float(h) for h in half_lives)
+    n_extra = len(half_lives) + 3 * raw_k
     y: List[float] = []
     meta: List[tuple] = []  # (date ordinal, match_id, pid, opp_rank)
     topx: List[Optional[Dict[str, Any]]] = []
@@ -223,7 +249,24 @@ def build_rows(matches: List[Dict[str, Any]], window_days: int = WINDOW_DAYS) ->
                         for key in ("mean_w", "std_w", "mean_90", "mean_30", "ewm_60", "last10", "last30", "trend", "adr_w", "kast_w", "opp_logrank_w", "star_w"):
                             f[key] = float("nan")
                         topx.append(None)
-                    X.append([f[k] for k in FEATURES])
+                    row_vals = [f[k] for k in ALL_FEATURES]
+                    if n_extra:
+                        ex = np.full(n_extra, np.nan, dtype=np.float32)
+                        if h.d:
+                            dd_all = np.asarray(h.d, dtype=np.float64)
+                            r_all = np.asarray(h.r, dtype=np.float64)
+                            for j, hl in enumerate(half_lives):
+                                wts = np.power(0.5, (dn - dd_all) / hl)
+                                ex[j] = float((wts * r_all).sum() / wts.sum())
+                            kk = min(raw_k, len(h.r))
+                            base = len(half_lives)
+                            for i in range(kk):
+                                ex[base + 3 * i] = h.r[-1 - i]
+                                ex[base + 3 * i + 1] = dn - h.d[-1 - i]
+                                ex[base + 3 * i + 2] = math.log(h.opp[-1 - i])
+                        X.append(np.concatenate([np.asarray(row_vals, dtype=np.float32), ex]))
+                    else:
+                        X.append(row_vals)
                     y.append(float(p["rating"]))
                     meta.append((dn, m["match_id"], pid, opp_rank))
 
@@ -248,7 +291,8 @@ def build_rows(matches: List[Dict[str, Any]], window_days: int = WINDOW_DAYS) ->
                     h.opp.append(_rank_val(m["rank"].get(opp)))
                     h.team_mean.append(team_means[tname])
     return {
-        "X": np.asarray(X, dtype=np.float64), "y": np.asarray(y, dtype=np.float64), "meta": meta, "topx": topx,
+        "X": np.asarray(X, dtype=np.float32 if n_extra else np.float64), "y": np.asarray(y, dtype=np.float64), "meta": meta, "topx": topx,
+        "columns": ALL_FEATURES + extra_columns(raw_k, half_lives),
         "n_matches": len(matches), "n_players": len(n_players),
         "first_date": matches[0]["date"].isoformat() if matches else None,
         "last_date": matches[-1]["date"].isoformat() if matches else None,
@@ -289,17 +333,29 @@ def run_study(conn: sqlite3.Connection, window_days: int = WINDOW_DAYS, folds: i
 
     t_start = time.time()
     matches = _load_matches(conn)
-    data = build_rows(matches, window_days)
-    X, y, meta, topx = data["X"], data["y"], data["meta"], data["topx"]
+    data = build_rows(matches, window_days, raw_k=RAW_K)
+    X_all, y, meta, topx = data["X"], data["y"], data["meta"], data["topx"]
     if len(y) == 0:
         return {"error": "no stored per-map player stats"}
+    col = {c: i for i, c in enumerate(data["columns"])}
+    X = X_all[:, [col[k] for k in FEATURES]]
     dates = np.asarray([m[0] for m in meta])
     match_ids = np.asarray([m[1] for m in meta])
     pids = np.asarray([m[2] for m in meta])
     opp_rank = np.asarray([m[3] for m in meta])
-    n_w = X[:, FEATURES.index("n_w")]
+    n_w = X_all[:, col["n_w"]]
     cat_mask = [k == "map_code" for k in FEATURES]
     keep_no_opp = [i for i, k in enumerate(FEATURES) if k not in OPPONENT_FEATURES]
+    # other input sets, scored the same way (the used set's numbers are "gbr")
+    raw_cols = [c for c in data["columns"] if c.startswith("raw_")]
+    variant_sets = [
+        ("All 33 inputs", ALL_FEATURES),
+        (f"Raw last {RAW_K} maps + all 33", ALL_FEATURES + raw_cols),
+        ("6 inputs", ["career_mean", "opp_n_w", "opp_logrank_w", "ewm_60", "opp_allowed_w", "rank_diff"]),
+        ("3 inputs", ["ewm_60", "opp_allowed_w", "rank_diff"]),
+    ]
+    variant_errs: Dict[str, List[np.ndarray]] = defaultdict(list)
+    variant_series: Dict[str, List[np.ndarray]] = defaultdict(list)
 
     last = date.fromordinal(int(dates.max()))
     cutoffs = []
@@ -360,6 +416,11 @@ def run_study(conn: sqlite3.Connection, window_days: int = WINDOW_DAYS, folds: i
             _, inv = np.unique(key, return_inverse=True)
             cnt = np.bincount(inv)
             sy = np.bincount(inv, weights=yt) / cnt
+            for vlabel, vcols in variant_sets:
+                vi = [col[c] for c in vcols]
+                vp = _gbr([c == "map_code" for c in vcols]).fit(X_all[tr][:, vi], ytr).predict(X_all[te_idx][:, vi])
+                variant_errs[vlabel].append(vp - yt)
+                variant_series[vlabel].append(np.bincount(inv, weights=vp) / cnt - sy)
             masks = _rank_bucket_masks(opp_rank[te_idx])
             row: Dict[str, Any] = {"month": cut.strftime("%Y-%m"), "n_test": int(te.sum()), "n_train": int(tr.sum()), "mae": {}, "series_mae": {}}
             for k, p in preds.items():
@@ -418,8 +479,21 @@ def run_study(conn: sqlite3.Connection, window_days: int = WINDOW_DAYS, folds: i
         for i in np.argsort(-pi.importances_mean)[:15]:
             importance.append({"feature": FEATURES[i], "label": FEATURE_LABELS.get(FEATURES[i], FEATURES[i]), "mae_increase": float(pi.importances_mean[i])})
 
+    variants: List[Dict[str, Any]] = []
+    if "gbr" in summary:
+        variants.append({"label": f"{len(FEATURES)} inputs (used)", "inputs": len(FEATURES), "used": True, **summary["gbr"]})
+    for vlabel, vcols in variant_sets:
+        if variant_errs.get(vlabel):
+            e = np.concatenate(variant_errs[vlabel])
+            se = np.concatenate(variant_series[vlabel])
+            variants.append({
+                "label": vlabel, "inputs": len(vcols), "used": False,
+                "mae": float(np.abs(e).mean()), "rmse": float(np.sqrt((e ** 2).mean())), "bias": float(e.mean()),
+                "series_mae": float(np.abs(se).mean()), "series_rmse": float(np.sqrt((se ** 2).mean())),
+            })
     eligible = np.concatenate(errs["curve"]) if errs.get("curve") else np.asarray([])
     return {
+        "variants": variants,
         "data": {
             "matches": int(data["n_matches"]), "rows": int(len(y)), "players": int(data["n_players"]),
             "first_date": data["first_date"], "last_date": data["last_date"],
@@ -434,6 +508,7 @@ def run_study(conn: sqlite3.Connection, window_days: int = WINDOW_DAYS, folds: i
         "by_opposition_faced": by_faced,
         "importance": importance,
         "features": [{"key": k, "label": FEATURE_LABELS.get(k, k)} for k in FEATURES],
+        "all_features": [{"key": k, "label": FEATURE_LABELS.get(k, k)} for k in ALL_FEATURES],
         "curve_last_fold": {str(k): float(v) for k, v in pct_last.items()},
         "window_days": int(window_days), "min_maps": int(min_maps),
         "elapsed_seconds": round(time.time() - t_start, 1),

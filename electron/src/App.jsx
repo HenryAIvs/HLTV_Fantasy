@@ -12092,6 +12092,42 @@ function RatingModelLabTab() {
             </div>
           </div>
 
+          <div className="rm-grid">
+            <div className="card sub">
+              <h3>Input sets</h3>
+              <table className="mm-table rm-table">
+                <thead>
+                  <tr>
+                    <th>Inputs</th>
+                    <th>Count</th>
+                    <th>MAE per map</th>
+                    <th>MAE per series</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(r.variants || []).map((v) => (
+                    <tr key={v.label}>
+                      <td className={v.used ? "mm-win" : ""}>{v.label}</td>
+                      <td>{fmtInt(v.inputs)}</td>
+                      <td>{num(v.mae)}</td>
+                      <td>{num(v.series_mae)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="card sub">
+              <h3>Inputs the learned model uses</h3>
+              <div className="rm-chips">
+                {(r.features || []).map((f) => (
+                  <span key={f.key} className="rm-chip">
+                    {f.label}
+                  </span>
+                ))}
+              </div>
+            </div>
+          </div>
+
           <div className="card sub">
             <h3>All methods</h3>
             <table className="mm-table rm-table">
