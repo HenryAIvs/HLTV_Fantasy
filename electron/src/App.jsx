@@ -11578,9 +11578,11 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
 // Top-X curve: the player card's "Top X" tab and the Rating Lab draw the same
 // chart and table from these, so the two can never drift apart. `curve` is the
 // /players/{id}/rating-curve payload (the lab preview has the same shape).
-// Orange is the number the engine uses, white dots are what HLTV observed,
-// cyan is the player-adjusted baseline and grey the population baseline.
-const TOPX_SERIES = { predicted: "#6b7f9b", shifted: "#22d3ee", actual: "#f2f5f9", actualDot: "#f2f5f9", weighted: "#ff6b1a" };
+// Orange is the number the engine uses (the learned rating model, drawn
+// at every rank), blue the Top-X bucket curve it replaced, white dots what
+// HLTV observed, cyan the player-adjusted baseline and grey the population
+// baseline.
+const TOPX_SERIES = { predicted: "#6b7f9b", shifted: "#22d3ee", actual: "#f2f5f9", actualDot: "#f2f5f9", weighted: "#7fb3ff", model: "#ff6b1a" };
 
 const deriveTopXCurve = (curve) => {
   const bucketRows = (Array.isArray(curve?.bucket_rows) ? curve.bucket_rows : [])
@@ -11630,16 +11632,27 @@ const deriveTopXCurve = (curve) => {
   const actualPoints = bucketRows
     .filter((r) => !r.estimated && r.maps > 0 && Number.isFinite(r.rawBucketRating))
     .map((r) => ({ rank: r.tier, rating: r.rawBucketRating, maps: r.maps, tierLabel: r.tierLabel }));
+  // the learned model's curve, one point per rank, merged into the same rows
+  const modelRows = (Array.isArray(curve?.model_rows) ? curve.model_rows : [])
+    .map((m) => ({ rank: Number(m?.rank), rating: Number(m?.rating) }))
+    .filter((m) => Number.isFinite(m.rank) && m.rank >= 1 && m.rank <= 50 && Number.isFinite(m.rating));
+  const byRank = new Map(rows.map((row) => [row.rank, { ...row, modelRating: null }]));
+  modelRows.forEach((m) => {
+    const row = byRank.get(m.rank) || { rank: m.rank, rankLabel: String(m.rank), finalRating: null, predictedRating: null, shiftedRating: null };
+    byRank.set(m.rank, { ...row, modelRating: m.rating });
+  });
+  const merged = [...byRank.values()].sort((a, b) => a.rank - b.rank);
   const axis = buildNiceStepAxis(
     [
-      ...rows.map((row) => row.finalRating),
-      ...rows.map((row) => row.predictedRating),
-      ...rows.map((row) => row.shiftedRating),
+      ...merged.map((row) => row.finalRating),
+      ...merged.map((row) => row.predictedRating),
+      ...merged.map((row) => row.shiftedRating),
+      ...merged.map((row) => row.modelRating),
       ...actualPoints.map((p) => p.rating),
     ].filter((v) => Number.isFinite(v)),
     0.05
   );
-  return { bucketRows, shift, rows, actualPoints, axis };
+  return { bucketRows, shift, rows: merged, actualPoints, axis, hasModel: modelRows.length > 0 };
 };
 
 // "Overall rating | Sample maps | Weight base | vs-ranked shift" line.
@@ -11758,13 +11771,25 @@ const TopXCurveChart = ({ topx, height = 260 }) => (
       <Line
         type="linear"
         dataKey="finalRating"
-        name="Weighted"
+        name="Top-X weighted"
         stroke={TOPX_SERIES.weighted}
-        strokeWidth={2.4}
+        strokeWidth={topx.hasModel ? 1.6 : 2.4}
         dot={{ r: 3, fill: TOPX_SERIES.weighted, strokeWidth: 0 }}
-        connectNulls={false}
+        connectNulls
         isAnimationActive={false}
       />
+      {topx.hasModel && (
+        <Line
+          type="monotone"
+          dataKey="modelRating"
+          name="Model"
+          stroke={TOPX_SERIES.model}
+          strokeWidth={2.6}
+          dot={false}
+          connectNulls
+          isAnimationActive={false}
+        />
+      )}
     </ComposedChart>
   </ResponsiveContainer>
 );

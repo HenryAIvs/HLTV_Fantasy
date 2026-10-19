@@ -444,6 +444,7 @@ def _build_playoff_lookup_context(team_slots: List[int]) -> tuple[Dict[int, dict
 
         team_rank_by_id: Dict[int, int] = {}
         player_ids = set()
+        team_of_player: Dict[int, int] = {}
         for r in team_rows:
             tid = int(r["team_id"])
             rank = r["hltv_rank"]
@@ -454,6 +455,7 @@ def _build_playoff_lookup_context(team_slots: List[int]) -> tuple[Dict[int, dict
             for pid in roster:
                 if pid:
                     player_ids.add(int(pid))
+                    team_of_player[int(pid)] = tid
 
         player_rows_by_id: Dict[int, dict] = {}
         if player_ids:
@@ -465,10 +467,17 @@ def _build_playoff_lookup_context(team_slots: List[int]) -> tuple[Dict[int, dict
                 tuple(player_ids),
             ).fetchall()
             player_rows_by_id = {int(r["player_id"]): dict(r) for r in p_rows}
-
-        return player_rows_by_id, team_rank_by_id
     finally:
         conn.close()
+    # the learned rating model's expected rating per opponent (travels with
+    # the rows into the stored input snapshot; see services/rating_model)
+    try:
+        from backend.services import rating_model
+
+        rating_model.attach_match_ratings(player_rows_by_id, team_of_player, team_rank_by_id)
+    except Exception:  # noqa: BLE001 - the Top-X curve still prices the rows
+        logging.getLogger(__name__).warning("Could not attach the learned match ratings", exc_info=True)
+    return player_rows_by_id, team_rank_by_id
 
 
 def _simulate_bracket(team_slots: List[int], vrs_ranks: Dict[int, int], rng=None):

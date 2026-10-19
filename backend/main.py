@@ -84,6 +84,14 @@ async def _lifespan(app: FastAPI):
     import threading
 
     def _warm() -> None:
+        # The rating model the valuations use: reload it, or train it when
+        # the scoreboards changed since it was stored (~40 s).
+        try:
+            from backend.services import rating_model
+
+            rating_model.ensure()
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning("Could not refresh the rating model", exc_info=True)
         # The win-probability model the simulators use: train it when the data
         # or the feature set changed since it was last stored (~25 s).
         try:

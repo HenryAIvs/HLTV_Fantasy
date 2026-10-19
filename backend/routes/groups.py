@@ -2091,6 +2091,11 @@ def _event_inputs(event_id: int, team_ids: List[int], refresh: bool = False) -> 
 
             snapshot["average_bucket_pct"] = {str(t): float(v) for t, v in get_average_bucket_pct().items()}
             _INPUT_SNAPSHOT.save(dict(existing.get("payload") or {}), snapshot, key=int(event_id))
+        if not any("model_ratings" in (row or {}) for row in (snapshot.get("players") or {}).values()):
+            # frozen before the learned rating model: pin its expected ratings
+            # onto the frozen rows (prices, roles, boosters, ranks unchanged)
+            _pin_model_ratings(event_id, team_ids, snapshot)
+            _INPUT_SNAPSHOT.save(dict(existing.get("payload") or {}), snapshot, key=int(event_id))
         meta = dict((existing.get("payload") or {}))
         meta.update({"frozen": True, "started": True, "start_at": start})
         return snapshot, meta
@@ -2098,6 +2103,29 @@ def _event_inputs(event_id: int, team_ids: List[int], refresh: bool = False) -> 
     meta = {"event_id": int(event_id), "taken_at": time.time(), "frozen": started, "started": started, "start_at": start}
     _INPUT_SNAPSHOT.save(meta, snapshot, key=int(event_id))
     return snapshot, meta
+
+
+def _pin_model_ratings(event_id: int, team_ids: List[int], snapshot: Dict[str, Any]) -> None:
+    """Attach the learned model's expected rating per opponent to a stored
+    snapshot's player rows (services/rating_model), with the snapshot's own
+    team ranks and the event's rosters."""
+    from backend.services import rating_model
+    from backend.swiss_stage.player_loading import load_team_players
+
+    rows = {int(pid): row for pid, row in (snapshot.get("players") or {}).items()}
+    ranks = {int(t): int(r) for t, r in (snapshot.get("team_ranks") or {}).items()}
+    team_of_player: Dict[int, int] = {}
+    with event_rosters.for_event(int(event_id)):
+        for tid in team_ids:
+            roster = event_rosters.roster_for(int(tid))
+            if roster is None:
+                roster = [p for p in (load_team_players(int(tid)) or {})]
+            for pid in roster or []:
+                team_of_player[int(pid)] = int(tid)
+    try:
+        rating_model.attach_match_ratings(rows, team_of_player, {int(t): ranks.get(int(t), 100) for t in team_ids})
+    except Exception:  # noqa: BLE001 - the rows keep pricing through the curve
+        logging.getLogger(__name__).warning("Could not pin the learned match ratings", exc_info=True)
 
 
 def _lookup_context_from_snapshot(snapshot: Dict[str, Any], team_ids: List[int]) -> tuple:

@@ -42,7 +42,7 @@ UNRANKED = 400.0  # the rank unranked teams take in every aggregate
 WINDOW_DAYS = 182
 MIN_MAPS = 5
 FOLDS = 13
-STUDY_VERSION = 3  # bump when the features or the methods change (the cache's signature)
+STUDY_VERSION = 5  # bump when the features or the methods change (the cache's signature)
 
 # Every input the row builder computes. Backward elimination (2026-10-19,
 # walk-forward) showed the twelve in FEATURES match all 33 (per-map MAE
@@ -96,6 +96,8 @@ def _load_matches(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
            WHERE map_player_stats_json IS NOT NULL AND match_date IS NOT NULL
            ORDER BY match_date, match_id"""
     ).fetchall()
+    from backend.data import team_aliases
+
     out = []
     for r in rows:
         try:
@@ -107,14 +109,18 @@ def _load_matches(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         if not maps or not mps:
             continue
         wins_needed = max(int(r["score1"] or 0), int(r["score2"] or 0)) or 1
+        t1, t2 = r["team1"], r["team2"]
         out.append(
             {
                 "match_id": int(r["match_id"] or 0),
                 "date": d,
-                "team1": r["team1"],
-                "team2": r["team2"],
-                "rank": {r["team1"]: r["hltv_rank_1"], r["team2"]: r["hltv_rank_2"]},
-                "vrs": {r["team1"]: r["vrs_rank_1"], r["team2"]: r["vrs_rank_2"]},
+                "team1": t1,
+                "team2": t2,
+                # the scoreboard names as stored (the player rows carry them) and
+                # the history key each resolves to (renames merged, see team_aliases)
+                "key": {t1: team_aliases.key(str(t1 or "")) or str(t1), t2: team_aliases.key(str(t2 or "")) or str(t2)},
+                "rank": {t1: r["hltv_rank_1"], t2: r["hltv_rank_2"]},
+                "vrs": {t1: r["vrs_rank_1"], t2: r["vrs_rank_2"]},
                 "bo": {1: 1, 2: 3, 3: 5}.get(wins_needed, 3),
                 "maps": maps,
                 "mps": mps,
@@ -139,14 +145,126 @@ class _PlayerHist:
 
 
 class _TeamHist:
-    __slots__ = ("d", "won", "mean", "opp_mean", "opp_rank")
+    __slots__ = ("d", "won", "mean", "opp_mean", "opp_rank", "rank", "vrs")
 
     def __init__(self):
-        self.d, self.won, self.mean, self.opp_mean, self.opp_rank = [], [], [], [], []
+        self.d, self.won, self.mean, self.opp_mean, self.opp_rank, self.rank, self.vrs = [], [], [], [], [], [], []
 
 
 def _mean(xs) -> float:
     return float(np.mean(xs)) if len(xs) else float("nan")
+
+
+def match_maps(m: Dict[str, Any]) -> List[tuple]:
+    """(map name, score1, score2, {scoreboard team name: player rows}) for each
+    map of a stored match that has a full scoreboard for both sides."""
+    out = []
+    for mp in m["maps"]:
+        plist = m["mps"].get(mp.get("map"))
+        sc1, sc2 = mp.get("score1"), mp.get("score2")
+        if not plist or sc1 is None or sc2 is None:
+            continue
+        by_team: Dict[str, list] = defaultdict(list)
+        for p in plist:
+            if p.get("rating") is None or not p.get("player_id"):
+                continue
+            by_team[p["team"]].append(p)
+        if len(by_team) != 2:
+            continue
+        out.append((mp.get("map"), int(sc1), int(sc2), by_team))
+    return out
+
+
+def record_match(m: Dict[str, Any], map_rows: List[tuple], players: Dict[int, _PlayerHist], teams: Dict[str, _TeamHist]) -> None:
+    """Append a match's maps to the player and team histories (after its rows
+    were built, so nothing of the match leaks into its own inputs)."""
+    dn = m["date"].toordinal()
+    for name, sc1, sc2, by_team in map_rows:
+        team_means = {t: _mean([p["rating"] for p in ps]) for t, ps in by_team.items()}
+        for tname, ps in by_team.items():
+            opp = m["team2"] if tname == m["team1"] else m["team1"]
+            won = (sc1 > sc2) if tname == m["team1"] else (sc2 > sc1)
+            th = teams[m["key"][tname]]
+            th.d.append(dn)
+            th.won.append(float(won))
+            th.mean.append(team_means[tname])
+            th.opp_mean.append(team_means[opp])
+            th.opp_rank.append(_rank_val(m["rank"].get(opp)))
+            th.rank.append(_rank_val(m["rank"].get(tname)))
+            th.vrs.append(_rank_val(m["vrs"].get(tname)))
+            for p in ps:
+                h = players[int(p["player_id"])]
+                h.d.append(dn)
+                h.r.append(float(p["rating"]))
+                h.adr.append(float(p["adr"]) if p.get("adr") is not None else float("nan"))
+                h.kast.append(float(p["kast"]) if p.get("kast") is not None else float("nan"))
+                h.opp.append(_rank_val(m["rank"].get(opp)))
+                h.team_mean.append(team_means[tname])
+
+
+def player_window_features(h: _PlayerHist, dn: int, window_days: int = WINDOW_DAYS) -> Dict[str, float]:
+    """A player's own inputs as of day `dn` from their history (the same
+    numbers build_rows computes for a row)."""
+    start = dn - window_days
+    k0 = bisect.bisect_left(h.d, start)
+    r = np.asarray(h.r[k0:], dtype=np.float64)
+    n = len(r)
+    f: Dict[str, float] = {"n_w": float(n), "career_n": float(len(h.r)), "career_mean": _mean(h.r), "days_since": float(dn - h.d[-1]) if h.d else float("nan")}
+    if n:
+        dd = np.asarray(h.d[k0:], dtype=np.float64)
+        opp_r = np.asarray(h.opp[k0:], dtype=np.float64)
+        f["mean_w"] = float(r.mean())
+        f["std_w"] = float(r.std()) if n > 1 else float("nan")
+        m90, m30 = dd >= dn - 90, dd >= dn - 30
+        f["mean_90"] = float(r[m90].mean()) if m90.any() else float("nan")
+        f["mean_30"] = float(r[m30].mean()) if m30.any() else float("nan")
+        wts = np.power(0.5, (dn - dd) / 60.0)
+        f["ewm_60"] = float((wts * r).sum() / wts.sum())
+        f["last10"] = float(r[-10:].mean())
+        f["last30"] = float(r[-30:].mean())
+        f["trend"] = f["last10"] - f["mean_w"]
+        f["adr_w"] = float(np.nanmean(np.asarray(h.adr[k0:], dtype=np.float64)))
+        f["kast_w"] = float(np.nanmean(np.asarray(h.kast[k0:], dtype=np.float64)))
+        f["opp_logrank_w"] = float(np.log(opp_r).mean())
+        f["star_w"] = float((r - np.asarray(h.team_mean[k0:], dtype=np.float64)).mean())
+    else:
+        for key in ("mean_w", "std_w", "mean_90", "mean_30", "ewm_60", "last10", "last30", "trend", "adr_w", "kast_w", "opp_logrank_w", "star_w"):
+            f[key] = float("nan")
+    return f
+
+
+def team_window_features(th: _TeamHist, dn: int, window_days: int = WINDOW_DAYS, as_opponent: bool = True) -> Dict[str, float]:
+    """A team's inputs as of day `dn`: its own form (team_*) or, as the
+    opponent of the row's player, the opp_* set."""
+    start = dn - window_days
+    j0 = bisect.bisect_left(th.d, start)
+    if as_opponent:
+        return {
+            "opp_team_mean_w": _mean(th.mean[j0:]), "opp_allowed_w": _mean(th.opp_mean[j0:]),
+            "opp_winrate_w": _mean(th.won[j0:]), "opp_n_w": float(len(th.d) - j0),
+            "opp_logrank_w180": float(np.log(th.opp_rank[j0:]).mean()) if len(th.d) > j0 else float("nan"),
+        }
+    return {"team_mean_w": _mean(th.mean[j0:]), "team_winrate_w": _mean(th.won[j0:]), "team_n_w": float(len(th.d) - j0)}
+
+
+# The direction each input may move the rating (0 = free): a weaker opponent
+# (worse rank, concedes more, wins less) never lowers it, and better recent
+# form or career level never lowers it. Measured walk-forward (2026-10-19):
+# the constraints cost nothing (per-map MAE 0.2807 vs 0.2811 free) and make
+# the per-rank curve monotone.
+MONOTONE = {"rank_diff": -1, "opp_allowed_w": 1, "opp_winrate_w": -1, "opp_vrs": 1, "ewm_60": 1, "career_mean": 1}
+
+
+def make_model(categorical: List[bool], columns: Optional[List[str]] = None):
+    from sklearn.ensemble import HistGradientBoostingRegressor
+
+    kw = {}
+    if columns is not None:
+        kw["monotonic_cst"] = [MONOTONE.get(k, 0) for k in columns]
+    return HistGradientBoostingRegressor(
+        loss="squared_error", learning_rate=0.05, max_iter=500, max_leaf_nodes=31, min_samples_leaf=80,
+        l2_regularization=1.0, categorical_features=categorical, random_state=7, **kw,
+    )
 
 
 def extra_columns(raw_k: int = 0, half_lives: tuple = ()) -> List[str]:
@@ -177,34 +295,17 @@ def build_rows(matches: List[Dict[str, Any]], window_days: int = WINDOW_DAYS, ra
     for m in matches:
         dn = m["date"].toordinal()
         start = dn - window_days
-        map_rows = []
-        for map_idx, mp in enumerate(m["maps"]):
-            plist = m["mps"].get(mp.get("map"))
-            sc1, sc2 = mp.get("score1"), mp.get("score2")
-            if not plist or sc1 is None or sc2 is None:
-                continue
-            by_team: Dict[str, list] = defaultdict(list)
-            for p in plist:
-                if p.get("rating") is None or not p.get("player_id"):
-                    continue
-                by_team[p["team"]].append(p)
-            if len(by_team) != 2:
-                continue
-            map_rows.append((mp.get("map"), int(sc1), int(sc2), by_team))
+        map_rows = match_maps(m)
 
         for name, sc1, sc2, by_team in map_rows:
             for tname, ps in by_team.items():
                 opp = m["team2"] if tname == m["team1"] else m["team1"]
                 own_rank = _rank_val(m["rank"].get(tname))
                 opp_rank = _rank_val(m["rank"].get(opp))
-                th, oh = teams[tname], teams[opp]
-                i0 = bisect.bisect_left(th.d, start)
-                j0 = bisect.bisect_left(oh.d, start)
+                th, oh = teams[m["key"][tname]], teams[m["key"][opp]]
                 team_ctx = {
-                    "team_mean_w": _mean(th.mean[i0:]), "team_winrate_w": _mean(th.won[i0:]), "team_n_w": len(th.d) - i0,
-                    "opp_team_mean_w": _mean(oh.mean[j0:]), "opp_allowed_w": _mean(oh.opp_mean[j0:]),
-                    "opp_winrate_w": _mean(oh.won[j0:]), "opp_n_w": len(oh.d) - j0,
-                    "opp_logrank_w180": float(np.log(oh.opp_rank[j0:]).mean()) if len(oh.d) > j0 else float("nan"),
+                    **team_window_features(th, dn, window_days, as_opponent=False),
+                    **team_window_features(oh, dn, window_days, as_opponent=True),
                     "own_rank": math.log(own_rank), "opp_rank": math.log(opp_rank),
                     "own_unranked": float(own_rank >= UNRANKED), "opp_unranked": float(opp_rank >= UNRANKED),
                     "rank_diff": math.log(own_rank) - math.log(opp_rank),
@@ -216,38 +317,17 @@ def build_rows(matches: List[Dict[str, Any]], window_days: int = WINDOW_DAYS, ra
                     n_players.add(pid)
                     h = players[pid]
                     k0 = bisect.bisect_left(h.d, start)
-                    r = np.asarray(h.r[k0:], dtype=np.float64)
-                    n = len(r)
                     f: Dict[str, float] = dict(team_ctx)
-                    f["n_w"] = float(n)
-                    f["career_n"] = float(len(h.r))
-                    f["career_mean"] = _mean(h.r)
-                    f["days_since"] = float(dn - h.d[-1]) if h.d else float("nan")
-                    if n:
-                        dd = np.asarray(h.d[k0:], dtype=np.float64)
+                    f.update(player_window_features(h, dn, window_days))
+                    if len(h.r) > k0:
+                        r = np.asarray(h.r[k0:], dtype=np.float64)
                         opp_r = np.asarray(h.opp[k0:], dtype=np.float64)
-                        f["mean_w"] = float(r.mean())
-                        f["std_w"] = float(r.std()) if n > 1 else float("nan")
-                        m90, m30 = dd >= dn - 90, dd >= dn - 30
-                        f["mean_90"] = float(r[m90].mean()) if m90.any() else float("nan")
-                        f["mean_30"] = float(r[m30].mean()) if m30.any() else float("nan")
-                        wts = np.power(0.5, (dn - dd) / 60.0)
-                        f["ewm_60"] = float((wts * r).sum() / wts.sum())
-                        f["last10"] = float(r[-10:].mean())
-                        f["last30"] = float(r[-30:].mean())
-                        f["trend"] = f["last10"] - f["mean_w"]
-                        f["adr_w"] = float(np.nanmean(np.asarray(h.adr[k0:], dtype=np.float64)))
-                        f["kast_w"] = float(np.nanmean(np.asarray(h.kast[k0:], dtype=np.float64)))
-                        f["opp_logrank_w"] = float(np.log(opp_r).mean())
-                        f["star_w"] = float((r - np.asarray(h.team_mean[k0:], dtype=np.float64)).mean())
                         tiers = {}
                         for t in (5, 10, 20, 30, 50):
                             msk = opp_r <= t
                             tiers[t] = (float(r[msk].mean()) if msk.any() else None, int(msk.sum()))
                         topx.append({"rating": float(r.mean()), "tiers": tiers})
                     else:
-                        for key in ("mean_w", "std_w", "mean_90", "mean_30", "ewm_60", "last10", "last30", "trend", "adr_w", "kast_w", "opp_logrank_w", "star_w"):
-                            f[key] = float("nan")
                         topx.append(None)
                     row_vals = [f[k] for k in ALL_FEATURES]
                     if n_extra:
@@ -270,26 +350,7 @@ def build_rows(matches: List[Dict[str, Any]], window_days: int = WINDOW_DAYS, ra
                     y.append(float(p["rating"]))
                     meta.append((dn, m["match_id"], pid, opp_rank))
 
-        # now the match joins the histories
-        for name, sc1, sc2, by_team in map_rows:
-            team_means = {t: _mean([p["rating"] for p in ps]) for t, ps in by_team.items()}
-            for tname, ps in by_team.items():
-                opp = m["team2"] if tname == m["team1"] else m["team1"]
-                won = (sc1 > sc2) if tname == m["team1"] else (sc2 > sc1)
-                th = teams[tname]
-                th.d.append(dn)
-                th.won.append(float(won))
-                th.mean.append(team_means[tname])
-                th.opp_mean.append(team_means[opp])
-                th.opp_rank.append(_rank_val(m["rank"].get(opp)))
-                for p in ps:
-                    h = players[int(p["player_id"])]
-                    h.d.append(dn)
-                    h.r.append(float(p["rating"]))
-                    h.adr.append(float(p["adr"]) if p.get("adr") is not None else float("nan"))
-                    h.kast.append(float(p["kast"]) if p.get("kast") is not None else float("nan"))
-                    h.opp.append(_rank_val(m["rank"].get(opp)))
-                    h.team_mean.append(team_means[tname])
+        record_match(m, map_rows, players, teams)
     return {
         "X": np.asarray(X, dtype=np.float32 if n_extra else np.float64), "y": np.asarray(y, dtype=np.float64), "meta": meta, "topx": topx,
         "columns": ALL_FEATURES + extra_columns(raw_k, half_lives),
@@ -367,11 +428,7 @@ def run_study(conn: sqlite3.Connection, window_days: int = WINDOW_DAYS, folds: i
             yy, mm = yy - 1, 12
     cutoffs.sort()
 
-    def _gbr(cats):
-        return HistGradientBoostingRegressor(
-            loss="squared_error", learning_rate=0.05, max_iter=500, max_leaf_nodes=31, min_samples_leaf=80,
-            l2_regularization=1.0, categorical_features=cats, random_state=7,
-        )
+    _gbr = make_model
 
     saved_curve = curve_mod.get_average_bucket_pct()
     fold_rows: List[Dict[str, Any]] = []
@@ -401,9 +458,9 @@ def run_study(conn: sqlite3.Connection, window_days: int = WINDOW_DAYS, folds: i
             preds["overall"] = np.asarray([topx[i]["rating"] for i in te_idx])
             preds["curve"] = np.asarray([_curve_predict(curve_mod, topx[i], opp_rank[i]) for i in te_idx])
             Xtr, ytr, Xte = X[tr], y[tr], X[te_idx]
-            gbr = _gbr(cat_mask).fit(Xtr, ytr)
+            gbr = _gbr(cat_mask, FEATURES).fit(Xtr, ytr)
             preds["gbr"] = gbr.predict(Xte)
-            preds["gbr_no_opponent"] = _gbr([cat_mask[i] for i in keep_no_opp]).fit(Xtr[:, keep_no_opp], ytr).predict(Xte[:, keep_no_opp])
+            preds["gbr_no_opponent"] = _gbr([cat_mask[i] for i in keep_no_opp], [FEATURES[i] for i in keep_no_opp]).fit(Xtr[:, keep_no_opp], ytr).predict(Xte[:, keep_no_opp])
             med = np.nanmedian(Xtr, axis=0)
             med = np.where(np.isnan(med), 0.0, med)
             Xtr_l = np.where(np.isnan(Xtr), med, Xtr)
@@ -418,7 +475,7 @@ def run_study(conn: sqlite3.Connection, window_days: int = WINDOW_DAYS, folds: i
             sy = np.bincount(inv, weights=yt) / cnt
             for vlabel, vcols in variant_sets:
                 vi = [col[c] for c in vcols]
-                vp = _gbr([c == "map_code" for c in vcols]).fit(X_all[tr][:, vi], ytr).predict(X_all[te_idx][:, vi])
+                vp = _gbr([c == "map_code" for c in vcols], vcols).fit(X_all[tr][:, vi], ytr).predict(X_all[te_idx][:, vi])
                 variant_errs[vlabel].append(vp - yt)
                 variant_series[vlabel].append(np.bincount(inv, weights=vp) / cnt - sy)
             masks = _rank_bucket_masks(opp_rank[te_idx])

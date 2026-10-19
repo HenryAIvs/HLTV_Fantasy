@@ -633,6 +633,15 @@ class DataScheduler:
             )
         except Exception as exc:  # noqa: BLE001 - the fetches above still count
             notes.append(f"holdout evaluation failed: {exc}")
+        # The rating model the valuations use: retrain on tonight's scoreboards.
+        try:
+            from backend.services import rating_model
+
+            self._set_state(processed=0, total=0, message="Rating model: refreshing the app model")
+            info = rating_model.ensure()
+            notes.append(f"rating model {'retrained' if info.get('trained') else 'already current'} ({int(info.get('rows') or 0)} maps)")
+        except Exception as exc:  # noqa: BLE001
+            notes.append(f"rating model refresh failed: {exc}")
         # The Rating Model lab's study: the Top-X curve vs the learned rating
         # model, re-run when tonight added scoreboards (about 90 s).
         try:

@@ -129,7 +129,7 @@ def apply_fantasy_points_for_team(
         else:
             row = _get_player_cached(player.player_id)
         if row is not None:
-            match_rating = pick_match_rating(row, opponent_rank)
+            match_rating = pick_match_rating(row, opponent_rank, opponent_team_id)
         else:
             match_rating = player.rating
 

@@ -942,10 +942,29 @@ def fetch_player_rating_curve(player_id: int):
     if not player:
         raise HTTPException(status_code=404, detail="Player not found")
     curve = build_player_topx_graph(player)
+    # the learned model's curve: expected rating against a typical team of
+    # each rank, from the player's own team's rank (services/rating_model)
+    model_rows: list = []
+    try:
+        from backend.services import rating_model, team_strength
+
+        conn = _connect()
+        try:
+            team = conn.execute(
+                "SELECT team_id FROM teams WHERE ? IN (player1_id, player2_id, player3_id, player4_id, player5_id) ORDER BY team_id DESC LIMIT 1",
+                (int(player_id),),
+            ).fetchone()
+        finally:
+            conn.close()
+        own_rank = team_strength.get_hltv_rank(int(team["team_id"])) if team else 50
+        model_rows = rating_model.rank_curve(int(player_id), own_rank)
+    except Exception:  # noqa: BLE001 - the card still shows the Top-X curve
+        model_rows = []
     return {
         "player_id": player_id,
         "player_name": player.get("name"),
         **curve,
+        "model_rows": model_rows,
     }
 
 
