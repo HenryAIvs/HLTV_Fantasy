@@ -14550,31 +14550,15 @@ function GroupsTab({
   };
 
   const valueData = useMemo(() => buildPlayerValueRowsFromSimulation(results, players), [results, players]);
-  // Swiss stage: every priced player as one card, team-agnostic, best
-  // expected points first, with the price and the value against the
-  // price line (the Player Value tab's measure).
-  const swissPlayerCards = useMemo(() => {
-    if (groupFormat !== "swiss" || !results?.teams) return [];
-    const byPid = {};
+  // Each player's price (the run's snapshot) and value against the price
+  // line, for the team rows' cards.
+  const valueByPid = useMemo(() => {
+    const m = {};
     (valueData.rows || []).forEach((r) => {
-      byPid[Number(r.player_id)] = r;
+      m[Number(r.player_id)] = r;
     });
-    const cards = [];
-    Object.entries(results.teams).forEach(([tid, t]) => {
-      Object.entries(t?.players || {}).forEach(([pid, comps]) => {
-        const v = byPid[Number(pid)] || {};
-        cards.push({
-          player_id: Number(pid),
-          team_id: Number(tid),
-          comps: comps || {},
-          price: Number(v.price || 0),
-          distance: Number(v.distance || 0),
-          total: Number(comps?.total_points || 0),
-        });
-      });
-    });
-    return cards.sort((a, b) => b.total - a.total);
-  }, [groupFormat, results, valueData]);
+    return m;
+  }, [valueData]);
   const matchLabels =
     groupFormat === "de8"
       ? [
@@ -14794,6 +14778,10 @@ function GroupsTab({
   // group-place odds, so the favourites read top-down like the Playoff tab.
   const valuationTeamOrder = useMemo(() => {
     if (!results?.teams) return [];
+    if (results.group_format === "swiss") {
+      const q = results.swiss?.qualify || {};
+      return Object.keys(results.teams).sort((x, y) => Number(q[y] || 0) - Number(q[x] || 0));
+    }
     const score = (tid) => {
       const title = Number(results.playoff?.advance_rate?.[String(tid)] || 0);
       const place = results.place_odds?.[String(tid)] || {};
@@ -14978,59 +14966,13 @@ function GroupsTab({
         {groupsTab === "stage" && groupFormat === "swiss" && (
           <SwissStageView results={results} teams={teams} teamLookup={teamLookup} />
         )}
-        {groupsTab === "stage" && groupFormat === "swiss" && swissPlayerCards.length > 0 && (
-          <div className="card sub">
-            <h3>Players</h3>
-            <div className="event-team-players swiss-players">
-              {swissPlayerCards.map((c) => {
-                const name = playerNameById[c.player_id] || String(c.player_id);
-                return (
-                  <div
-                    className="event-player-card clickable"
-                    key={c.player_id}
-                    onClick={() => openGroupPlayer({ player_id: c.player_id, name, team_id: c.team_id })}
-                  >
-                    <PlayerPhoto playerId={c.player_id} name={name} size={52} />
-                    <div className="event-player-name">{name}</div>
-                    <div className="event-player-team">{teamName(c.team_id)}</div>
-                    {c.comps.role_id != null && (
-                      <div className="event-player-role">
-                        <RoleBadge roleId={c.comps.role_id} size={16} />
-                        <span>{ROLE_NAMES[c.comps.role_id] || `Role ${c.comps.role_id}`}</span>
-                      </div>
-                    )}
-                    <div className="event-player-rating">{c.total.toFixed(2)}</div>
-                    <div className="event-player-stats ev-mini">
-                      {[
-                        ["Rating", c.comps.rating_points_total],
-                        ["Win", c.comps.win_points_total],
-                        ["Role", c.comps.role_points_total],
-                        ["Boost", c.comps.booster_points_total],
-                      ].map(([label, value]) => (
-                        <div className="event-player-stat" key={label}>
-                          <div className="event-player-mini">{Number(value || 0).toFixed(1)}</div>
-                          <div className="event-player-stat-label">{label}</div>
-                        </div>
-                      ))}
-                    </div>
-                    <div className="event-player-price combo-price">${Math.round(c.price / 1000)}k</div>
-                    <div className={`event-player-value${c.distance < -0.005 ? " neg" : c.distance > 0.005 ? " pos" : ""}`}>
-                      {c.distance >= 0 ? "+" : ""}
-                      {c.distance.toFixed(1)}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        )}
-        {groupsTab === "stage" && groupFormat !== "swiss" && (
+        {groupsTab === "stage" && (
           <>
             {/* Display-only, like the Playoff tab: the draw comes from the HLTV
                 event page, loaded on open and re-synced automatically while any
                 slot is still undecided. */}
             {autofillMessage && <p className="muted">{autofillMessage}</p>}
-            {groupSlots.map((group, g) => {
+            {groupFormat !== "swiss" && groupSlots.map((group, g) => {
               const key = `group-${g}`;
               const isCollapsed = Boolean(collapsedCards[key]);
               const summary = group
@@ -15126,7 +15068,13 @@ function GroupsTab({
                   const lastRound = Math.max(1, Number(results.playoff?.rounds || labels.length)) - 1;
                   const finalReach = reach.length > 0 ? Number(reach[lastRound] || 0) : null;
                   const earlyStop = Number(results.playoff?.stop_teams || 1) > 1;
-                  const odds = [[results.playoff ? "Playoffs" : "Qualify", qualify, false], ["Win group", first, false]];
+                  const odds =
+                    results.group_format === "swiss"
+                      ? [
+                          ["Qualify", Number(results.swiss?.qualify?.[String(tid)] || 0), true],
+                          ["3-0", Number(results.swiss?.records?.[String(tid)]?.["3-0"] || 0), false],
+                        ]
+                      : [[results.playoff ? "Playoffs" : "Qualify", qualify, false], ["Win group", first, false]];
                   if (results.playoff) {
                     if (finalReach != null && !earlyStop) odds.push([labels[lastRound] || "Final", finalReach, false]);
                     odds.push([earlyStop ? "Qualify" : "Title", title, true]);
@@ -15140,7 +15088,11 @@ function GroupsTab({
                         <TeamLogo hltvTeamId={info?.hltv_team_id} name={teamName(tid)} size={42} />
                         <div className="event-team-headtext">
                           <span className="event-team-name">{teamName(tid)}</span>
-                          {groupIdx >= 0 && <span className="event-team-rank">Group {groupIdx + 1}</span>}
+                          {results.group_format === "swiss" ? (
+                            <span className="event-team-rank">Seed {results.swiss?.seeds?.[String(tid)] ?? "-"}</span>
+                          ) : (
+                            groupIdx >= 0 && <span className="event-team-rank">Group {groupIdx + 1}</span>
+                          )}
                           <div className="event-team-odds">
                             {odds.map(([label, p, accent]) => (
                               <div className={`event-team-odd${accent ? " accent" : ""}`} key={label}>
@@ -15183,6 +15135,25 @@ function GroupsTab({
                                   </div>
                                 ))}
                               </div>
+                              {valueByPid[Number(pid)] && (
+                                <div className="event-player-price combo-price">
+                                  ${Math.round(Number(valueByPid[Number(pid)].price || 0) / 1000)}k
+                                </div>
+                              )}
+                              {valueByPid[Number(pid)] && (
+                                <div
+                                  className={`event-player-value${
+                                    Number(valueByPid[Number(pid)].distance) < -0.005
+                                      ? " neg"
+                                      : Number(valueByPid[Number(pid)].distance) > 0.005
+                                        ? " pos"
+                                        : ""
+                                  }`}
+                                >
+                                  {Number(valueByPid[Number(pid)].distance) >= 0 ? "+" : ""}
+                                  {Number(valueByPid[Number(pid)].distance || 0).toFixed(1)}
+                                </div>
+                              )}
                             </div>
                           );
                         })}
