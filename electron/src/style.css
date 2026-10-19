@@ -479,6 +479,19 @@ tr:hover { background: #10141a; }
   white-space: nowrap;
 }
 
+/* Swiss stage: the player grid's value against the price line */
+.swiss-players { margin-top: 10px; }
+.event-player-value {
+  font-family: var(--display);
+  font-stretch: condensed;
+  font-weight: 700;
+  font-size: 13px;
+  color: #8fa3bf;
+  line-height: 1.1;
+}
+.event-player-value.pos { color: #3fbf7f; }
+.event-player-value.neg { color: #e0705a; }
+
 /* Swiss stage: seed order with record odds */
 .swiss-seed-table { width: 100%; border-collapse: collapse; margin-top: 12px; font-variant-numeric: tabular-nums; }
 .swiss-seed-table th, .swiss-seed-table td { padding: 7px 10px; border-top: 1px solid #1f2530; white-space: nowrap; }

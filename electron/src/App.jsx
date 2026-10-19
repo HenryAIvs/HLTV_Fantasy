@@ -1225,11 +1225,15 @@ const buildPlayerValueRowsFromSimulation = (simResults, players) => {
       const points = pointsCandidates.find((v) => Number.isFinite(v));
       if (!Number.isFinite(points)) return;
 
-      const price = Number(player?.price);
+      // the price the run was valued at (its input snapshot) over the players
+      // table, which only holds the last imported event's prices; the run's
+      // own team over the table's current one (a re-spelt team is a new row)
+      const snap = raw.input_snapshot?.players?.[String(pid)];
+      const price = Number(snap?.price ?? player?.price);
       byId.set(pid, {
         player_id: pid,
-        name: player?.name || `Player ${pid}`,
-        team_id: Number(player?.team_id || tid || 0),
+        name: player?.name || snap?.name || `Player ${pid}`,
+        team_id: Number(tid || player?.team_id || 0),
         price: Number.isFinite(price) ? price : 0,
         points,
         raw_booster: Number(comps?.booster_points_total || comps?.booster || 0),
@@ -13908,16 +13912,12 @@ function SwissStageView({ results, teams, teamLookup }) {
   const order = (results.groups?.[0] || []).map(Number);
   const teamInfo = (tid) => (teams || []).find((t) => Number(t.team_id) === Number(tid));
   const pct = (v) => `${(Number(v || 0) * 100).toFixed(1)}%`;
-  const modeLabel = { all: "Bo3", none: "Bo1", elim_qual: "Bo1 · deciders Bo3" }[sw.bo3_mode] || sw.bo3_mode || "";
   const wins = ["3-0", "3-1", "3-2"];
   const losses = ["2-3", "1-3", "0-3"];
   return (
     <div className="card sub group-card">
       <div className="group-card-head">
         <h3>{sw.stage_name && sw.stage_name !== "SixteenEight" ? sw.stage_name : "Swiss"}</h3>
-        <span className="pill">
-          {sw.team_count} teams · top {sw.advance_count} · {modeLabel}
-        </span>
       </div>
       <table className="swiss-seed-table">
         <thead>
@@ -14550,6 +14550,31 @@ function GroupsTab({
   };
 
   const valueData = useMemo(() => buildPlayerValueRowsFromSimulation(results, players), [results, players]);
+  // Swiss stage: every priced player as one card, team-agnostic, best
+  // expected points first, with the price and the value against the
+  // price line (the Player Value tab's measure).
+  const swissPlayerCards = useMemo(() => {
+    if (groupFormat !== "swiss" || !results?.teams) return [];
+    const byPid = {};
+    (valueData.rows || []).forEach((r) => {
+      byPid[Number(r.player_id)] = r;
+    });
+    const cards = [];
+    Object.entries(results.teams).forEach(([tid, t]) => {
+      Object.entries(t?.players || {}).forEach(([pid, comps]) => {
+        const v = byPid[Number(pid)] || {};
+        cards.push({
+          player_id: Number(pid),
+          team_id: Number(tid),
+          comps: comps || {},
+          price: Number(v.price || 0),
+          distance: Number(v.distance || 0),
+          total: Number(comps?.total_points || 0),
+        });
+      });
+    });
+    return cards.sort((a, b) => b.total - a.total);
+  }, [groupFormat, results, valueData]);
   const matchLabels =
     groupFormat === "de8"
       ? [
@@ -14952,6 +14977,52 @@ function GroupsTab({
 
         {groupsTab === "stage" && groupFormat === "swiss" && (
           <SwissStageView results={results} teams={teams} teamLookup={teamLookup} />
+        )}
+        {groupsTab === "stage" && groupFormat === "swiss" && swissPlayerCards.length > 0 && (
+          <div className="card sub">
+            <h3>Players</h3>
+            <div className="event-team-players swiss-players">
+              {swissPlayerCards.map((c) => {
+                const name = playerNameById[c.player_id] || String(c.player_id);
+                return (
+                  <div
+                    className="event-player-card clickable"
+                    key={c.player_id}
+                    onClick={() => openGroupPlayer({ player_id: c.player_id, name, team_id: c.team_id })}
+                  >
+                    <PlayerPhoto playerId={c.player_id} name={name} size={52} />
+                    <div className="event-player-name">{name}</div>
+                    <div className="event-player-team">{teamName(c.team_id)}</div>
+                    {c.comps.role_id != null && (
+                      <div className="event-player-role">
+                        <RoleBadge roleId={c.comps.role_id} size={16} />
+                        <span>{ROLE_NAMES[c.comps.role_id] || `Role ${c.comps.role_id}`}</span>
+                      </div>
+                    )}
+                    <div className="event-player-rating">{c.total.toFixed(2)}</div>
+                    <div className="event-player-stats ev-mini">
+                      {[
+                        ["Rating", c.comps.rating_points_total],
+                        ["Win", c.comps.win_points_total],
+                        ["Role", c.comps.role_points_total],
+                        ["Boost", c.comps.booster_points_total],
+                      ].map(([label, value]) => (
+                        <div className="event-player-stat" key={label}>
+                          <div className="event-player-mini">{Number(value || 0).toFixed(1)}</div>
+                          <div className="event-player-stat-label">{label}</div>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="event-player-price combo-price">${Math.round(c.price / 1000)}k</div>
+                    <div className={`event-player-value${c.distance < -0.005 ? " neg" : c.distance > 0.005 ? " pos" : ""}`}>
+                      {c.distance >= 0 ? "+" : ""}
+                      {c.distance.toFixed(1)}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
         )}
         {groupsTab === "stage" && groupFormat !== "swiss" && (
           <>
