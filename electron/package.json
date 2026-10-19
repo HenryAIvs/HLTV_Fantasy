@@ -1,7 +1,7 @@
 {
   "name": "cs-fantasy",
   "productName": "CS Fantasy Toolkit",
-  "version": "0.1.56",
+  "version": "0.1.57",
   "description": "Counter-Strike fantasy valuations, brackets and roster optimisation.",
   "homepage": "https://csfantasy.co.uk/",
   "author": "HenryAIvs",
@@ -74,8 +74,8 @@
   "devDependencies": {
     "@vitejs/plugin-react": "^5.2.0",
     "cross-env": "^7.0.3",
-    "electron": "^30.0.0",
-    "electron-builder": "^26.0.0",
+    "electron": "^44.8.0",
+    "electron-builder": "^26.15.3",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "recharts": "^3.7.0",
@@ -83,5 +83,9 @@
   },
   "dependencies": {
     "electron-updater": "^6.3.0"
-  }
+  },
+  "allowScripts": {
+    "electron@44.8.0": true
+  },
+  "overrides": {}
 }
