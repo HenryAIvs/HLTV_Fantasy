@@ -1496,6 +1496,22 @@ function PriceVsPointsPanel({ title, rows, slope, intercept, showTable = true, o
         })),
     [rows]
   );
+  // the players the search matches: highlighted on the chart, listed in the table
+  const searchActive = search.trim().length > 0;
+  const matchedIds = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return new Set();
+    return new Set(
+      rows
+        .filter(
+          (r) =>
+            String(r.name || "").toLowerCase().includes(q) ||
+            String(r.player_id || "").includes(q) ||
+            String(r.team_id || "").includes(q)
+        )
+        .map((r) => Number(r.player_id))
+    );
+  }, [rows, search]);
   const filteredRows = useMemo(() => {
     const q = search.trim().toLowerCase();
     let out = [...rows];
@@ -1694,10 +1710,17 @@ function PriceVsPointsPanel({ title, rows, slope, intercept, showTable = true, o
                     const pid = Number(pt?.player_id);
                     if (Number.isFinite(pid)) dotPosRef.current.set(pid, { cx, cy });
                     const active = hover != null && pid === Number(hover.id);
+                    const matched = searchActive && matchedIds.has(pid);
+                    const lit = active || matched;
                     return (
-                      <g>
-                        {active && <circle cx={cx} cy={cy} r={9.5} fill="none" stroke="#ff8a47" strokeWidth={2} />}
-                        <circle cx={cx} cy={cy} r={active ? 6 : 4.5} fill={active ? "#ff8a47" : "#4fc3ff"} />
+                      <g opacity={searchActive && !lit ? 0.28 : 1}>
+                        {lit && <circle cx={cx} cy={cy} r={9.5} fill="none" stroke="#ff8a47" strokeWidth={2} />}
+                        <circle cx={cx} cy={cy} r={lit ? 6 : 4.5} fill={lit ? "#ff8a47" : "#4fc3ff"} />
+                        {matched && !active && (
+                          <text x={cx} y={cy - 13} textAnchor="middle" fill="#ffb07a" fontSize={11} fontWeight={700}>
+                            {pt?.name}
+                          </text>
+                        )}
                       </g>
                     );
                   }}
