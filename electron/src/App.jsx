@@ -2679,44 +2679,6 @@ function useMapStatsJob({ refresh, notify, modalRefreshRef }) {
   };
 }
 
-const MapStatsJobControls = ({ job, teamsAvailable }) => (
-  <div className="teams-toolbar">
-    <button className="secondary" onClick={() => job.start(false)} disabled={job.active || !teamsAvailable}>
-      {job.active ? `Importing Map Stats ${job.processed}/${job.total}` : "Import All Map Stats"}
-    </button>
-    {job.active && job.jobId && (
-      <button className="secondary" onClick={job.pause} disabled={job.status === "pausing"}>
-        {job.status === "pausing" ? "Pausing..." : "Pause"}
-      </button>
-    )}
-    {job.active && job.jobId && (
-      <button className="danger" onClick={job.cancel} disabled={job.status === "canceling"}>
-        {job.status === "canceling" ? "Canceling..." : "Cancel"}
-      </button>
-    )}
-    {job.resumable && job.jobId && (
-      <button className="secondary" onClick={job.resume}>
-        Resume
-      </button>
-    )}
-  </div>
-);
-
-const MapStatsJobProgress = ({ job }) =>
-  !job.show ? null : (
-    <div className="card sub">
-      <p className="muted">
-        Map stats progress: {job.processed.toLocaleString()} / {job.total.toLocaleString()} | ok {job.ok} | failed {job.failed}
-        {job.active && job.total > job.processed ? ` | ETA: ${formatBatchEta(job.etaSeconds)}` : ""}
-      </p>
-      <div className="progress">
-        <div className="progress-bar determinate" style={{ width: `${job.progressPct}%` }} />
-      </div>
-      <p className="muted">Status: {job.statusLabel}</p>
-      {job.lastError && <p className="muted">Last error: {job.lastError}</p>}
-    </div>
-  );
-
 const MapsBarTooltip = ({ active, payload, label }) => {
   if (!active || !payload || !payload.length) return null;
   const row = payload[0]?.payload || {};
@@ -6789,131 +6751,15 @@ function EventsTab({ refreshData, notify, players, teams = [], onOpenPlayer, onO
   );
 }
 
-function MatchesDataPanel({ notify, mode = "full", teams = [], players = [], onOpenPlayer, onOpenTeam }) {
-  // Split across pages: Scheduling renders mode="import" (ingestion controls +
-  // progress), Database > Matches renders mode="view" (stored-matches browser).
-  const showImport = mode !== "view";
-  const showTable = mode !== "import";
+function MatchesDataPanel({ notify, teams = [], players = [], onOpenPlayer, onOpenTeam }) {
   const [recentResults, setRecentResults] = useState([]);
   const [recentResultsLoading, setRecentResultsLoading] = useState(false);
   const [recentResultsError, setRecentResultsError] = useState("");
-  const [recentResultsImportMode, setRecentResultsImportMode] = useState("until_date");
-  const [recentResultsPages, setRecentResultsPages] = useState("3");
-  const [recentResultsUntilDate, setRecentResultsUntilDate] = useState("");
-  const [recentResultsMaxHltvRank, setRecentResultsMaxHltvRank] = useState("0");
-  const [recentResultsRankFilterMode, setRecentResultsRankFilterMode] = useState("both");
   const [recentResultsOffset, setRecentResultsOffset] = useState(0);
-  const [recentResultsImporting, setRecentResultsImporting] = useState(false);
-  const [recentResultsImportProcessed, setRecentResultsImportProcessed] = useState(0);
-  const [recentResultsImportTotal, setRecentResultsImportTotal] = useState(0);
-  const [recentResultsImportEtaSeconds, setRecentResultsImportEtaSeconds] = useState(null);
-  const [recentResultsImportPhase, setRecentResultsImportPhase] = useState("");
-  const [recentResultsImportCurrent, setRecentResultsImportCurrent] = useState("");
-  const [recentResultsImportJobId, setRecentResultsImportJobId] = useState("");
-  const [recentResultsImportStatus, setRecentResultsImportStatus] = useState("");
-  const [recentResultsRankingDatesDone, setRecentResultsRankingDatesDone] = useState(0);
-  const [recentResultsRankingDatesTotal, setRecentResultsRankingDatesTotal] = useState(0);
   const [selectedMatchUrl, setSelectedMatchUrl] = useState("");
   const [selectedMatchRow, setSelectedMatchRow] = useState(null);
   const [showMatchModal, setShowMatchModal] = useState(false);
   const initialLoadRef = useRef(false);
-  const recentResultsImportPollingRef = useRef(false);
-  const recentResultsImportEtaRef = useRef({
-    phase: "",
-    total: 0,
-    lastProcessed: 0,
-    lastAt: 0,
-    rate: null,
-  });
-  const RECENT_RESULTS_IMPORT_JOB_ID_KEY = "hltv_results_import_job_id";
-  const RECENT_RESULTS_IMPORT_JOB_STARTED_AT_KEY = "hltv_results_import_job_started_at";
-  const recentResultsImportProgressPct =
-    recentResultsImportTotal > 0
-      ? Math.min(100, Math.max(0, (recentResultsImportProcessed / recentResultsImportTotal) * 100))
-      : 0;
-  const recentResultsImportIndeterminate = recentResultsImporting && recentResultsImportTotal <= 0;
-  const recentResultsImportActive = ["queued", "running", "pausing", "canceling"].includes(recentResultsImportStatus);
-  const recentResultsImportResumable = ["paused", "failed"].includes(recentResultsImportStatus);
-  const recentResultsBusy = recentResultsLoading || recentResultsImportActive;
-
-  const formatRecentResultsEta = (seconds) => {
-    if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return "-";
-    const s = Math.max(0, Math.round(seconds));
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    const r = s % 60;
-    if (h > 0) return `${h}h ${m}m ${r}s`;
-    if (m > 0) return `${m}m ${r}s`;
-    return `${r}s`;
-  };
-  const formatRecentResultsImportPhase = (phase) => {
-    const labels = {
-      queued: "Queued",
-      fetching_results: "Fetching result pages",
-      filtering_by_rank: "Filtering by HLTV rank",
-      fetching_match_details: "Fetching match details",
-      storing_results: "Saving matches",
-      deduping_results: "Removing duplicates",
-      enriching_points: "Finding rankings",
-      completed: "Completed",
-      failed: "Failed",
-    };
-    return labels[phase] || "Importing";
-  };
-
-  const updateRecentResultsEta = (phase, processed, total) => {
-    const now = Date.now();
-    const state = recentResultsImportEtaRef.current;
-    const changedScope = state.phase !== phase || state.total !== total || processed < state.lastProcessed;
-    if (changedScope) {
-      recentResultsImportEtaRef.current = {
-        phase,
-        total,
-        lastProcessed: processed,
-        lastAt: now,
-        rate: null,
-      };
-      setRecentResultsImportEtaSeconds(total > 0 && processed >= total ? 0 : null);
-      return;
-    }
-
-    const delta = processed - state.lastProcessed;
-    const elapsedSec = Math.max(0.001, (now - state.lastAt) / 1000);
-    if (delta > 0 && total > processed) {
-      const instantRate = delta / elapsedSec;
-      const nextRate = state.rate == null ? instantRate : state.rate * 0.65 + instantRate * 0.35;
-      recentResultsImportEtaRef.current = {
-        ...state,
-        lastProcessed: processed,
-        lastAt: now,
-        rate: nextRate,
-      };
-      setRecentResultsImportEtaSeconds(nextRate > 0 ? (total - processed) / nextRate : null);
-    } else if (total > 0 && processed >= total) {
-      recentResultsImportEtaRef.current = {
-        ...state,
-        lastProcessed: processed,
-        lastAt: now,
-      };
-      setRecentResultsImportEtaSeconds(0);
-    } else if (state.rate == null) {
-      setRecentResultsImportEtaSeconds(null);
-    }
-  };
-
-  const buildRecentResultsUntilDate = () => {
-    const value = String(recentResultsUntilDate || "").trim();
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return "";
-    const parsed = new Date(`${value}T00:00:00Z`);
-    return Number.isNaN(parsed.getTime()) ? "" : value;
-  };
-
-  const clearRecentResultsImportStorage = () => {
-    localStorage.removeItem(RECENT_RESULTS_IMPORT_JOB_ID_KEY);
-    localStorage.removeItem(RECENT_RESULTS_IMPORT_JOB_STARTED_AT_KEY);
-    setRecentResultsImportJobId("");
-  };
-
   const [matchSearch, setMatchSearch] = useState("");
   const [matchSort, setMatchSort] = useState("date_desc");
   const [matchRankValue, setMatchRankValue] = useState("");
@@ -6977,248 +6823,6 @@ function MatchesDataPanel({ notify, mode = "full", teams = [], players = [], onO
   }, [teams]);
   const logoForTeamName = (name) => hltvIdByTeamName[String(name || "").trim().toLowerCase()];
 
-  const AUTO_FETCH_JOBS_KEY = "hltv_auto_fetch_jobs_after_import";
-  const [autoRunFetchJobs, setAutoRunFetchJobs] = useState(() => localStorage.getItem(AUTO_FETCH_JOBS_KEY) === "1");
-  const autoRunFetchJobsRef = useRef(autoRunFetchJobs);
-  const [autoChainStatus, setAutoChainStatus] = useState("");
-  const toggleAutoRunFetchJobs = (checked) => {
-    setAutoRunFetchJobs(checked);
-    autoRunFetchJobsRef.current = checked;
-    localStorage.setItem(AUTO_FETCH_JOBS_KEY, checked ? "1" : "0");
-  };
-
-  const pollFetchJobUntilDone = async (basePath, jobId) => {
-    for (;;) {
-      let status;
-      try {
-        status = await api.get(`${basePath}/job/${jobId}`, 60000);
-      } catch {
-        await new Promise((resolve) => setTimeout(resolve, 5000));
-        continue;
-      }
-      const st = String(status?.status || "");
-      if (["completed", "failed", "paused", "canceled"].includes(st)) return status;
-      await new Promise((resolve) => setTimeout(resolve, 3000));
-    }
-  };
-
-  const runAutoFetchJobs = async () => {
-    try {
-      setAutoChainStatus("Auto: fetching missing historical map stats...");
-      const hist = await api.post("/events/hltv-results/historical-map-stats/start", {});
-      if (hist?.job_id) {
-        const done = await pollFetchJobUntilDone("/events/hltv-results/historical-map-stats", hist.job_id);
-        if (String(done?.status) !== "completed") {
-          setAutoChainStatus(`Auto: historical stats job ended (${done?.status}); veto backfill not started.`);
-          return;
-        }
-      }
-      setAutoChainStatus("Auto: fetching missing match vetoes...");
-      const veto = await api.post("/events/hltv-results/veto-backfill/start", {});
-      if (veto?.job_id) {
-        const done = await pollFetchJobUntilDone("/events/hltv-results/veto-backfill", veto.job_id);
-        if (String(done?.status) !== "completed") {
-          setAutoChainStatus(`Auto: veto backfill ended (${done?.status}).`);
-          return;
-        }
-      }
-      setAutoChainStatus("Auto: import + both fetch jobs complete.");
-      if (notify) notify("Import and fetch jobs complete");
-    } catch (e) {
-      setAutoChainStatus(`Auto fetch jobs failed: ${e?.message || e}`);
-    }
-  };
-
-  const pollRecentResultsImportJob = async (jobId, startedAtMs) => {
-    if (!jobId || recentResultsImportPollingRef.current) return;
-    recentResultsImportPollingRef.current = true;
-    setRecentResultsImporting(true);
-    try {
-      let done = false;
-      while (!done) {
-        const status = await api.get(`/events/hltv-results/import/job/${jobId}`);
-        if (status?.detail) {
-          setRecentResultsError(String(status.detail));
-          clearRecentResultsImportStorage();
-          return;
-        }
-
-        const processed = Number(status.processed_units || 0);
-        const total = Number(status.total_units || 0);
-        setRecentResultsImportProcessed(processed);
-        setRecentResultsImportTotal(total);
-        const phase = String(status.phase || status.status || "");
-        setRecentResultsImportPhase(phase);
-        setRecentResultsImportCurrent(String(status.current || ""));
-        setRecentResultsImportStatus(String(status.status || ""));
-        setRecentResultsImportJobId(String(status.job_id || jobId));
-        setRecentResultsRankingDatesDone(Number(status.ranking_dates_done || 0));
-        setRecentResultsRankingDatesTotal(Number(status.ranking_dates_total || 0));
-
-        updateRecentResultsEta(phase, processed, total);
-
-        if (status.status === "failed") {
-          setRecentResultsError(status.error || "Failed to import/store HLTV results.");
-          done = true;
-          break;
-        }
-        if (status.status === "paused") {
-          done = true;
-          break;
-        }
-        if (status.status === "canceled") {
-          if (notify) notify("HLTV results import canceled.");
-          clearRecentResultsImportStorage();
-          done = true;
-          break;
-        }
-        if (status.status === "completed") {
-          const res = status.result || {};
-          if (notify) {
-            notify(
-              `Imported HLTV results: ${res.kept ?? res.fetched ?? 0} kept, ${res.skipped_existing || 0} already imported, ${res.rank_filtered_out || 0} rank-filtered, ${res.date_filtered_out || 0} date-filtered, ${res.inserted || 0} inserted, ${res.updated || 0} updated`
-            );
-          }
-          clearRecentResultsImportStorage();
-          await loadStoredRecentResults(0);
-          if (autoRunFetchJobsRef.current) runAutoFetchJobs();
-          done = true;
-          break;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 500));
-      }
-    } catch (e) {
-      setRecentResultsError(e?.message || "Failed to import/store HLTV results.");
-      clearRecentResultsImportStorage();
-    } finally {
-      recentResultsImportPollingRef.current = false;
-      setRecentResultsImporting(false);
-    }
-  };
-
-  const importRecentResultsToDb = async () => {
-    const importMode = recentResultsImportMode === "max_pages" ? "max_pages" : "until_date";
-    const untilDate = buildRecentResultsUntilDate();
-    const pages = Math.max(1, Number(recentResultsPages) || 1);
-    const maxHltvRank = Math.max(0, Math.min(500, Number(recentResultsMaxHltvRank) || 0));
-    if (importMode === "until_date" && !untilDate) {
-      setRecentResultsError("Enter a valid Import Back To Date before starting date mode.");
-      return;
-    }
-    setRecentResultsImporting(true);
-    setRecentResultsImportProcessed(0);
-    setRecentResultsImportTotal(importMode === "until_date" ? 0 : pages);
-    setRecentResultsImportEtaSeconds(null);
-    recentResultsImportEtaRef.current = { phase: "", total: 0, lastProcessed: 0, lastAt: 0, rate: null };
-    setRecentResultsImportPhase("queued");
-    setRecentResultsImportCurrent("");
-    setRecentResultsRankingDatesDone(0);
-    setRecentResultsRankingDatesTotal(0);
-    setRecentResultsError("");
-    try {
-      const start = await api.post("/events/hltv-results/import/start", {
-        import_mode: importMode,
-        pages: importMode === "max_pages" ? pages : 1,
-        start_offset: 0,
-        page_stride: 100,
-        per_page_limit: 100,
-        until_date: importMode === "until_date" ? untilDate : "",
-        max_hltv_rank: maxHltvRank,
-        rank_filter_mode: recentResultsRankFilterMode,
-      });
-      if (start?.detail) {
-        setRecentResultsError(String(start.detail));
-        return;
-      }
-      const jobId = start?.job_id;
-      if (!jobId) {
-        setRecentResultsError("Failed to start HLTV results import job.");
-        return;
-      }
-      const startedAt = Date.now();
-      setRecentResultsImportJobId(String(jobId));
-      setRecentResultsImportStatus("queued");
-      localStorage.setItem(RECENT_RESULTS_IMPORT_JOB_ID_KEY, String(jobId));
-      localStorage.setItem(RECENT_RESULTS_IMPORT_JOB_STARTED_AT_KEY, String(startedAt));
-      await pollRecentResultsImportJob(jobId, startedAt);
-    } catch (e) {
-      setRecentResultsError(e?.message || "Failed to import/store HLTV results.");
-      clearRecentResultsImportStorage();
-    } finally {
-      if (!recentResultsImportPollingRef.current) setRecentResultsImporting(false);
-    }
-  };
-
-  const pauseRecentResultsImportJob = async () => {
-    const jobId = recentResultsImportJobId || localStorage.getItem(RECENT_RESULTS_IMPORT_JOB_ID_KEY);
-    if (!jobId) return;
-    setRecentResultsImportStatus("pausing");
-    setRecentResultsImportCurrent("Pausing after current request");
-    try {
-      const status = await api.post(`/events/hltv-results/import/job/${jobId}/pause`, {});
-      if (status?.detail) {
-        setRecentResultsError(String(status.detail));
-        return;
-      }
-      setRecentResultsImportStatus(String(status.status || "pausing"));
-      setRecentResultsImportPhase(String(status.phase || status.status || ""));
-      setRecentResultsImportCurrent(String(status.current || ""));
-      setRecentResultsRankingDatesDone(Number(status.ranking_dates_done || 0));
-      setRecentResultsRankingDatesTotal(Number(status.ranking_dates_total || 0));
-    } catch (e) {
-      setRecentResultsError(e?.message || "Failed to pause HLTV results import.");
-    }
-  };
-
-  const cancelRecentResultsImportJob = async () => {
-    const jobId = recentResultsImportJobId || localStorage.getItem(RECENT_RESULTS_IMPORT_JOB_ID_KEY);
-    if (!jobId) return;
-    setRecentResultsImportStatus("canceling");
-    setRecentResultsImportCurrent("Canceling after current request");
-    try {
-      const status = await api.post(`/events/hltv-results/import/job/${jobId}/cancel`, {});
-      if (status?.detail) {
-        setRecentResultsError(String(status.detail));
-        return;
-      }
-      setRecentResultsImportStatus(String(status.status || "canceling"));
-      setRecentResultsImportPhase(String(status.phase || status.status || ""));
-      setRecentResultsImportCurrent(String(status.current || ""));
-      if (String(status.status || "") === "canceled") {
-        setRecentResultsImporting(false);
-        clearRecentResultsImportStorage();
-        if (notify) notify("HLTV results import canceled.");
-      }
-    } catch (e) {
-      setRecentResultsError(e?.message || "Failed to cancel HLTV results import.");
-    }
-  };
-
-  const resumeRecentResultsImportJob = async () => {
-    const jobId = recentResultsImportJobId || localStorage.getItem(RECENT_RESULTS_IMPORT_JOB_ID_KEY);
-    if (!jobId) return;
-    setRecentResultsImporting(true);
-    setRecentResultsImportStatus("queued");
-    recentResultsImportEtaRef.current = { phase: "", total: 0, lastProcessed: 0, lastAt: 0, rate: null };
-    setRecentResultsImportEtaSeconds(null);
-    setRecentResultsError("");
-    try {
-      const status = await api.post(`/events/hltv-results/import/job/${jobId}/resume`, {});
-      if (status?.detail) {
-        setRecentResultsError(String(status.detail));
-        return;
-      }
-      const startedAt = Date.now();
-      localStorage.setItem(RECENT_RESULTS_IMPORT_JOB_ID_KEY, String(jobId));
-      localStorage.setItem(RECENT_RESULTS_IMPORT_JOB_STARTED_AT_KEY, String(startedAt));
-      await pollRecentResultsImportJob(jobId, startedAt);
-    } catch (e) {
-      setRecentResultsError(e?.message || "Failed to resume HLTV results import.");
-    } finally {
-      if (!recentResultsImportPollingRef.current) setRecentResultsImporting(false);
-    }
-  };
-
   const openMatchModal = async (row) => {
     const url = String(row?.match_url || "").trim();
     if (!url) return;
@@ -7248,151 +6852,10 @@ function MatchesDataPanel({ notify, mode = "full", teams = [], players = [], onO
     if (initialLoadRef.current) return;
     initialLoadRef.current = true;
     loadStoredRecentResults(0);
-    const jobId = localStorage.getItem(RECENT_RESULTS_IMPORT_JOB_ID_KEY);
-    if (jobId) {
-      const startedAt = Number(localStorage.getItem(RECENT_RESULTS_IMPORT_JOB_STARTED_AT_KEY) || Date.now());
-      pollRecentResultsImportJob(jobId, startedAt);
-    } else {
-      api
-        .get("/events/hltv-results/import/latest")
-        .then((latest) => {
-          if (!latest?.exists) return;
-          const status = String(latest.status || "");
-          if (!["queued", "running", "pausing", "paused", "failed"].includes(status)) return;
-          const latestJobId = String(latest.job_id || "");
-          if (!latestJobId) return;
-          setRecentResultsImportJobId(latestJobId);
-          setRecentResultsImportStatus(status);
-          setRecentResultsImportProcessed(Number(latest.processed_units || 0));
-          setRecentResultsImportTotal(Number(latest.total_units || 0));
-          setRecentResultsImportPhase(String(latest.phase || status));
-          setRecentResultsImportCurrent(String(latest.current || ""));
-          setRecentResultsRankingDatesDone(Number(latest.ranking_dates_done || 0));
-          setRecentResultsRankingDatesTotal(Number(latest.ranking_dates_total || 0));
-          const startedAt = Date.now();
-          localStorage.setItem(RECENT_RESULTS_IMPORT_JOB_ID_KEY, latestJobId);
-          localStorage.setItem(RECENT_RESULTS_IMPORT_JOB_STARTED_AT_KEY, String(startedAt));
-          if (["queued", "running", "pausing"].includes(status)) pollRecentResultsImportJob(latestJobId, startedAt);
-        })
-        .catch(() => {});
-    }
   }, []);
 
   return (
     <div className="stack">
-      {showImport && (
-      <>
-      <div className="grid four">
-        <Select
-          label="Import Mode"
-          value={recentResultsImportMode}
-          onChange={setRecentResultsImportMode}
-          options={[
-            { value: "until_date", label: "Until date" },
-            { value: "max_pages", label: "Max pages" },
-          ]}
-        />
-        {recentResultsImportMode === "until_date" ? (
-          <label className="field">
-            <span>Import Back To Date</span>
-            <input
-              type="date"
-              value={recentResultsUntilDate}
-              onChange={(e) => setRecentResultsUntilDate(e.target.value)}
-              max={new Date().toISOString().slice(0, 10)}
-            />
-          </label>
-        ) : (
-          <Input
-            label="Pages"
-            value={recentResultsPages}
-            onChange={setRecentResultsPages}
-            placeholder="e.g. 30"
-          />
-        )}
-        <Input
-          label="Max HLTV Rank"
-          value={recentResultsMaxHltvRank}
-          onChange={setRecentResultsMaxHltvRank}
-          placeholder="0 = all ranks"
-        />
-        <Select
-          label="Rank Filter"
-          value={recentResultsRankFilterMode}
-          onChange={setRecentResultsRankFilterMode}
-          options={[
-            { value: "both", label: "Both teams" },
-            { value: "either", label: "Either team" },
-          ]}
-        />
-      </div>
-      <div className="actions" style={{ marginTop: 0 }}>
-        <button className="primary" onClick={importRecentResultsToDb} disabled={recentResultsBusy || recentResultsImportResumable}>
-          {recentResultsImporting ? "Importing..." : "Import HLTV Results To SQL"}
-        </button>
-        {recentResultsImportActive && recentResultsImportJobId && (
-          <button
-            className="secondary"
-            onClick={pauseRecentResultsImportJob}
-            disabled={["pausing", "canceling"].includes(recentResultsImportStatus)}
-          >
-            {recentResultsImportStatus === "pausing" ? "Pausing..." : "Pause"}
-          </button>
-        )}
-        {recentResultsImportResumable && recentResultsImportJobId && (
-          <button className="secondary" onClick={resumeRecentResultsImportJob}>
-            Resume
-          </button>
-        )}
-        {(recentResultsImportActive || recentResultsImportResumable) && recentResultsImportJobId && (
-          <button className="danger" onClick={cancelRecentResultsImportJob} disabled={recentResultsImportStatus === "canceling"}>
-            {recentResultsImportStatus === "canceling" ? "Canceling..." : "Cancel"}
-          </button>
-        )}
-        <label className="checkbox-inline">
-          <input
-            type="checkbox"
-            checked={autoRunFetchJobs}
-            onChange={(e) => toggleAutoRunFetchJobs(e.target.checked)}
-          />
-          <span>Auto-run fetch jobs after import (historical map stats, then vetoes)</span>
-        </label>
-      </div>
-      {autoChainStatus && <p className="muted">{autoChainStatus}</p>}
-      {recentResultsImporting && (
-        <div className="card sub">
-          <p className="muted">
-            {formatRecentResultsImportPhase(recentResultsImportPhase)}:{" "}
-            {recentResultsImportTotal > 0
-              ? `${recentResultsImportProcessed.toLocaleString()} / ${recentResultsImportTotal.toLocaleString()} | ETA: ${formatRecentResultsEta(recentResultsImportEtaSeconds)}`
-              : `${recentResultsImportProcessed.toLocaleString()} pages fetched`}
-          </p>
-          <div className="progress">
-            <div
-              className={`progress-bar ${recentResultsImportIndeterminate ? "" : "determinate"}`}
-              style={recentResultsImportIndeterminate ? undefined : { width: `${recentResultsImportProgressPct}%` }}
-            />
-          </div>
-          {recentResultsRankingDatesTotal > 0 && (
-            <p className="muted">
-              Ranking dates checked: {recentResultsRankingDatesDone.toLocaleString()} /{" "}
-              {recentResultsRankingDatesTotal.toLocaleString()}
-            </p>
-          )}
-          {recentResultsImportCurrent && <p className="muted">{recentResultsImportCurrent}</p>}
-        </div>
-      )}
-      {!recentResultsImporting && recentResultsImportResumable && recentResultsImportJobId && (
-        <div className="card sub">
-          <p className="muted">
-            {formatRecentResultsImportPhase(recentResultsImportPhase)}: {recentResultsImportCurrent || "Import can be resumed."}
-          </p>
-        </div>
-      )}
-      </>
-      )}
-      {showTable && (
-      <>
       <div className="grid two">
         <Input label="Search Matches" value={matchSearch} onChange={changeMatchSearch} placeholder="Team or day/month/year" className="search-field" />
         <div className="match-rank-filter">
@@ -7515,8 +6978,6 @@ function MatchesDataPanel({ notify, mode = "full", teams = [], players = [], onO
               : undefined
           }
         />
-      )}
-      </>
       )}
     </div>
   );
@@ -8927,7 +8388,6 @@ function DatabaseTab({ players, teams, loading, error, refresh, notify, openPlay
         <Section title="Matches">
           <MatchesDataPanel
             notify={notify}
-            mode="view"
             teams={teams}
             players={players}
             onOpenPlayer={openPlayerDetailsFromTeam}
@@ -8949,7 +8409,7 @@ const teamInitials = (name) =>
     .join("")
     .toUpperCase();
 
-function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
+function SchedulingTab({ notify, players, refresh }) {
   const [status, setStatus] = useState(null);
   const [runs, setRuns] = useState([]);
   const [saveBusy, setSaveBusy] = useState(false);
@@ -9252,22 +8712,6 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
       </Section>
 
       <ModelDataPanel topN={teamDataTopN} />
-
-      <Section title="Imports">
-        <div className="sch-imports">
-          <div className="card sub">
-            <h3>Matches</h3>
-            <MatchesDataPanel notify={notify} mode="import" />
-          </div>
-          {mapStats && (
-            <div className="card sub">
-              <h3>Map stats</h3>
-              <MapStatsJobControls job={mapStats} teamsAvailable={(teams || []).length > 0} />
-              <MapStatsJobProgress job={mapStats} />
-            </div>
-          )}
-        </div>
-      </Section>
 
       <Section title="Run History">
         {recentRuns.length === 0 ? (
@@ -12840,7 +12284,7 @@ export default function App() {
         onSelectEvent={selectViewEvent}
       />
     ),
-    scheduling: <SchedulingTab notify={notify} players={players} refresh={load} mapStats={mapStatsJob} teams={teams} />,
+    scheduling: <SchedulingTab notify={notify} players={players} refresh={load} />,
     users: <UsersTab notify={notify} me={auth.user} />,
   };
 
