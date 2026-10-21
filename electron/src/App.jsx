@@ -8595,17 +8595,18 @@ function SchedulingTab({ notify, players, refresh }) {
   );
 
   const lastRunOf = (task) => (runs || []).find((r) => r.task === task && r.finished_at) || null;
-  const taskCard = (task) => {
+  const taskRow = (task) => {
+    const label = TASK_LABELS[task] || task;
     const on = Boolean(config[`do_${task}`]);
     const last = lastByTask[task];
     const run = lastRunOf(task);
     const setting =
       task === "matches"
-        ? ["Look back", <input key="lb" type="number" min={1} max={30} value={lookbackDays} onChange={(e) => setLookbackDays(Number(e.target.value))} onBlur={() => patchConfig({ matches_lookback_days: lookbackDays })} disabled={saveBusy} />, "days"]
+        ? ["Look back", <input key="lb" type="number" min={1} max={30} aria-label="Look back, days" value={lookbackDays} onChange={(e) => setLookbackDays(Number(e.target.value))} onBlur={() => patchConfig({ matches_lookback_days: lookbackDays })} disabled={saveBusy} />, "days"]
         : task === "team_data"
-          ? ["Top", <input key="tn" type="number" min={10} max={500} value={teamDataTopN} onChange={(e) => setTeamDataTopN(Number(e.target.value))} onBlur={() => patchConfig({ team_data_top_n: teamDataTopN })} disabled={saveBusy} />, "teams"]
+          ? ["Top", <input key="tn" type="number" min={10} max={500} aria-label="Top teams" value={teamDataTopN} onChange={(e) => setTeamDataTopN(Number(e.target.value))} onBlur={() => patchConfig({ team_data_top_n: teamDataTopN })} disabled={saveBusy} />, "teams"]
           : task === "map_model"
-            ? ["Up to", <input key="mm" type="number" min={1} max={720} value={mapModelMinutes} onChange={(e) => setMapModelMinutes(Number(e.target.value))} onBlur={() => patchConfig({ map_model_minutes: mapModelMinutes })} disabled={saveBusy} />, "min / night"]
+            ? ["Up to", <input key="mm" type="number" min={1} max={720} aria-label="Minutes per night" value={mapModelMinutes} onChange={(e) => setMapModelMinutes(Number(e.target.value))} onBlur={() => patchConfig({ map_model_minutes: mapModelMinutes })} disabled={saveBusy} />, "min / night"]
             : null;
     const live = state.running && state.current_task === task;
     const cov = coverage || {};
@@ -8636,52 +8637,59 @@ function SchedulingTab({ notify, players, refresh }) {
       <span className="pill warn" title={run.message || ""}>Failed</span>
     );
     return (
-      <div className={`sch-task${on ? " on" : " off"}${live ? " live" : ""}`} key={task}>
-        <div className="sch-task-head">
-          <div>
-            <div className="sch-task-name">{TASK_LABELS[task]}</div>
-            <div className="topx-tile-label">{TASK_SUB[task]}</div>
-          </div>
+      <tr key={task} className={`${on ? "" : "off"}${live ? " live" : ""}`}>
+        <td>
+          <div className="sch-row-name">{label}</div>
+          <div className="sch-row-sub">{TASK_SUB[task]}</div>
+        </td>
+        <td>
           <label className="switch" title={on ? "Enabled" : "Disabled"}>
-            <input type="checkbox" checked={on} onChange={(e) => patchConfig({ [`do_${task}`]: e.target.checked })} disabled={saveBusy} />
+            <input type="checkbox" aria-label={`Run ${label} nightly`} checked={on} onChange={(e) => patchConfig({ [`do_${task}`]: e.target.checked })} disabled={saveBusy} />
             <span className="switch-track" />
           </label>
-        </div>
-        <div className="sch-task-stat">
-          <div className="topx-tile-label">Last ok</div>
-          <div className="sch-task-value" title={Number(last) > 0 ? new Date(Number(last) * 1000).toLocaleString() : ""}>
+        </td>
+        <td>
+          <div className="sch-row-when" title={Number(last) > 0 ? new Date(Number(last) * 1000).toLocaleString() : ""}>
             {relTime(last)}
           </div>
-          <div className="topx-tile-maps">{run ? `${fmtDur(run.finished_at - run.started_at)} · ${run.trigger}` : "\u00a0"}</div>
-        </div>
-        {covLines.length > 0 && (
-          <div className="sch-task-cov">
-            {covLines.map(([label, done, total, missing]) => (
-              <div className="sch-task-cov-row" key={label}>
-                <span>{label}</span>
-                <span className={Number(missing) > 0 ? "warn" : ""}>
-                  {done == null ? "-" : Number(done).toLocaleString()}
-                  {total != null ? <span className="muted"> / {Number(total).toLocaleString()}</span> : null}
-                  {Number(missing) > 0 ? ` · ${Number(missing).toLocaleString()} missing` : ""}
-                </span>
-              </div>
-            ))}
-          </div>
-        )}
-        {setting && (
-          <div className="sch-task-setting">
-            <span className="topx-tile-label">{setting[0]}</span>
-            {setting[1]}
-            <span className="muted">{setting[2]}</span>
-          </div>
-        )}
-        <div className="sch-task-foot">
-          {pill}
-          <button className="secondary" onClick={() => runNow(task)} disabled={runBusy || state.running}>
+          <div className="sch-row-sub">{run ? `${fmtDur(run.finished_at - run.started_at)} · ${run.trigger}` : "-"}</div>
+        </td>
+        <td>{pill}</td>
+        <td>
+          {setting ? (
+            <span className="sch-row-setting">
+              <span className="sch-row-sub">{setting[0]}</span>
+              {setting[1]}
+              <span className="sch-row-sub">{setting[2]}</span>
+            </span>
+          ) : (
+            <span className="sch-row-sub">-</span>
+          )}
+        </td>
+        <td>
+          {covLines.length > 0 ? (
+            <div className="sch-row-data">
+              {covLines.map(([name, done, total, missing]) => (
+                <div className="sch-row-line" key={name}>
+                  <span className="sch-row-sub">{name}</span>
+                  <span>
+                    <strong>{done == null ? "-" : Number(done).toLocaleString()}</strong>
+                    {total != null ? <span className="sch-row-sub"> / {Number(total).toLocaleString()}</span> : null}
+                    {Number(missing) > 0 ? <span className="warn"> · {Number(missing).toLocaleString()} missing</span> : null}
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <span className="sch-row-sub">-</span>
+          )}
+        </td>
+        <td className="num">
+          <button className="secondary" aria-label={`Run ${label} now`} onClick={() => runNow(task)} disabled={runBusy || state.running}>
             Run
           </button>
-        </div>
-      </div>
+        </td>
+      </tr>
     );
   };
 
@@ -8751,7 +8759,20 @@ function SchedulingTab({ notify, players, refresh }) {
       </Section>
 
       <Section title="Tasks">
-        <div className="sch-tasks">{["events", "rankings", "team_data", "matches", "map_model"].map(taskCard)}</div>
+        <table className="sch-task-table">
+          <thead>
+            <tr>
+              <th>Task</th>
+              <th>Nightly</th>
+              <th>Last ok</th>
+              <th>Status</th>
+              <th>Setting</th>
+              <th>Data</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>{["events", "rankings", "team_data", "matches", "map_model"].map(taskRow)}</tbody>
+        </table>
         <div className="actions">
           <button className="primary" onClick={() => runNow("all")} disabled={runBusy || state.running}>
             {state.running ? "Refresh in progress…" : "Run all now"}
