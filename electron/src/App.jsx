@@ -9122,9 +9122,11 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
   const lastRun = (runs || []).find((r) => r.finished_at) || null;
   const lastNight = nights[0] || null;
 
+  const lastRunOf = (task) => (runs || []).find((r) => r.task === task && r.finished_at) || null;
   const taskCard = (task) => {
     const on = Boolean(config[`do_${task}`]);
     const last = lastByTask[task];
+    const run = lastRunOf(task);
     const setting =
       task === "matches"
         ? ["Look back", <input key="lb" type="number" min={1} max={30} value={lookbackDays} onChange={(e) => setLookbackDays(Number(e.target.value))} onBlur={() => patchConfig({ matches_lookback_days: lookbackDays })} disabled={saveBusy} />, "days"]
@@ -9134,6 +9136,19 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
             ? ["Up to", <input key="mm" type="number" min={1} max={720} value={mapModelMinutes} onChange={(e) => setMapModelMinutes(Number(e.target.value))} onBlur={() => patchConfig({ map_model_minutes: mapModelMinutes })} disabled={saveBusy} />, "min / night"]
             : null;
     const live = state.running && state.current_task === task;
+    const pill = live ? (
+      <span className="pill ok">Running{state.total > 0 ? ` ${Number(state.processed).toLocaleString()} / ${Number(state.total).toLocaleString()}` : ""}</span>
+    ) : !on ? (
+      <span className="pill">Off</span>
+    ) : !run ? (
+      <span className="pill">-</span>
+    ) : run.status === "success" ? (
+      <span className="pill ok">OK</span>
+    ) : run.status === "warning" ? (
+      <span className="pill caution" title={run.message || ""}>Warning</span>
+    ) : (
+      <span className="pill warn" title={run.message || ""}>Failed</span>
+    );
     return (
       <div className={`sch-task${on ? " on" : " off"}${live ? " live" : ""}`} key={task}>
         <div className="sch-task-head">
@@ -9146,25 +9161,22 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
             <span className="switch-track" />
           </label>
         </div>
-        <div className="sch-task-meta">
-          <span>Last ok</span>
-          <span title={Number(last) > 0 ? new Date(Number(last) * 1000).toLocaleString() : ""}>{relTime(last)}</span>
-          {setting && (
-            <>
-              <span>{setting[0]}</span>
-              <span className="sch-task-setting">
-                {setting[1]}
-                <span className="muted">{setting[2]}</span>
-              </span>
-            </>
-          )}
+        <div className="sch-task-stat">
+          <div className="topx-tile-label">Last ok</div>
+          <div className="sch-task-value" title={Number(last) > 0 ? new Date(Number(last) * 1000).toLocaleString() : ""}>
+            {relTime(last)}
+          </div>
+          <div className="topx-tile-maps">{run ? `${fmtDur(run.finished_at - run.started_at)} · ${run.trigger}` : "\u00a0"}</div>
         </div>
+        {setting && (
+          <div className="sch-task-setting">
+            <span className="topx-tile-label">{setting[0]}</span>
+            {setting[1]}
+            <span className="muted">{setting[2]}</span>
+          </div>
+        )}
         <div className="sch-task-foot">
-          {live ? (
-            <span className="pill ok">Running{state.total > 0 ? ` ${state.processed}/${state.total}` : ""}</span>
-          ) : (
-            <span />
-          )}
+          {pill}
           <button className="secondary" onClick={() => runNow(task)} disabled={runBusy || state.running}>
             Run
           </button>

@@ -3429,23 +3429,27 @@ button:disabled {
   background: #171c24;
   border: 1px solid #2c3441;
   border-left: 3px solid #2c3441;
-  padding: 12px 14px;
+  padding: 14px 16px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 14px;
   clip-path: polygon(8px 0, 100% 0, 100% 100%, 0 100%, 0 8px);
 }
 .sch-task.on { border-left-color: #ff6b1a; }
-.sch-task.off { opacity: 0.6; }
+.sch-task.off > :not(.sch-task-head), .sch-task.off .sch-task-name { opacity: 0.55; }
 .sch-task.live { border-color: #ff6b1a; }
-.sch-task-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
-.sch-task-name { font-family: var(--display); font-stretch: condensed; text-transform: uppercase; font-size: 16px; font-weight: 700; color: #f2f5f9; letter-spacing: 0.03em; }
-.sch-task-meta { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; align-items: center; font-size: 13px; color: #e9edf3; font-variant-numeric: tabular-nums; }
-.sch-task-meta > span:nth-child(odd) { color: #8fa3bf; font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; }
-.sch-task-setting { display: flex; align-items: center; gap: 8px; }
-.sch-task-setting input { width: 72px; padding: 4px 8px; }
-.sch-task-foot { display: flex; justify-content: space-between; align-items: center; margin-top: auto; }
-.sch-task-foot .secondary { padding: 4px 12px; font-size: 11px; }
+.sch-task-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; min-height: 54px; }
+.sch-task-name { font-family: var(--display); font-stretch: condensed; text-transform: uppercase; font-size: 17px; font-weight: 700; color: #f2f5f9; letter-spacing: 0.03em; line-height: 1.15; }
+.sch-task-head .topx-tile-label { margin-top: 3px; }
+.sch-task-stat { display: flex; flex-direction: column; gap: 2px; }
+.sch-task-value { font-family: var(--display); font-stretch: condensed; font-size: 28px; font-weight: 700; line-height: 1.1; color: #f2f5f9; font-variant-numeric: tabular-nums; }
+.sch-task-setting { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #10141a; border: 1px solid #242b35; }
+.sch-task-setting input { width: 72px; padding: 5px 8px; }
+.sch-task-setting .muted { font-size: 12px; }
+.sch-task-foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: auto; padding-top: 12px; border-top: 1px solid #242b35; }
+.sch-task-foot .pill { font-family: var(--display); font-stretch: condensed; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 700; font-size: 12px; padding: 5px 10px; }
+.sch-task-foot .secondary { padding: 8px 18px; font-size: 12px; }
+.pill.caution { background: #3a2a10; border-color: #92400e; color: #fcd34d; }
 .switch { position: relative; display: inline-block; width: 38px; height: 20px; flex: none; }
 .switch input { opacity: 0; width: 0; height: 0; margin: 0; position: absolute; }
 .switch-track { position: absolute; inset: 0; background: #2c3441; border-radius: 20px; transition: background 0.15s; cursor: pointer; }
