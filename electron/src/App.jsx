@@ -4999,7 +4999,13 @@ function PlayoffTab({
       .filter(Boolean)
       .sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
   }, [slots, teams]);
+  // A team's players for the filters: the roster the stored run was valued
+  // with (the event's own lineup, stand-ins included), else the teams table.
   const teamPlayerIds = (teamId) => {
+    const fromRun = Object.keys(results?.teams?.[String(teamId)]?.players || {})
+      .map((pid) => Number(pid))
+      .filter((pid) => Number.isFinite(pid) && pid > 0);
+    if (fromRun.length > 0) return fromRun;
     const team = teams.find((t) => Number(t.team_id) === Number(teamId));
     if (!team) return [];
     return [team.player1_id, team.player2_id, team.player3_id, team.player4_id, team.player5_id]
@@ -5017,7 +5023,7 @@ function PlayoffTab({
     });
     return m;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [playoffTeamsForFilters, playerNameById, teams]);
+  }, [playoffTeamsForFilters, playerNameById, teams, results]);
   const comboSearchNames = useMemo(
     () => Object.keys(comboSearchPidByName).sort((a, b) => a.localeCompare(b)),
     [comboSearchPidByName]
@@ -15259,7 +15265,14 @@ function GroupsTab({
       .filter(Boolean)
       .sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
   }, [results, teams]);
+  // A team's players for the filters: the roster the stored valuation was
+  // run with (the event's own lineup, stand-ins included), else the teams
+  // table's HLTV lineup.
   const teamPlayerIds = (teamId) => {
+    const fromRun = Object.keys(results?.teams?.[String(teamId)]?.players || {})
+      .map((pid) => Number(pid))
+      .filter((pid) => Number.isFinite(pid) && pid > 0);
+    if (fromRun.length > 0) return fromRun;
     const team = (teams || []).find((t) => Number(t.team_id) === Number(teamId));
     if (!team) return [];
     return [team.player1_id, team.player2_id, team.player3_id, team.player4_id, team.player5_id]
@@ -15276,7 +15289,7 @@ function GroupsTab({
     });
     return m;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [groupsTeamsForFilters, playerNameById, teams]);
+  }, [groupsTeamsForFilters, playerNameById, teams, results]);
   const comboSearchNames = useMemo(
     () => Object.keys(comboSearchPidByName).sort((a, b) => a.localeCompare(b)),
     [comboSearchPidByName]
