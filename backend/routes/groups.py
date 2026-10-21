@@ -5403,6 +5403,14 @@ def query_groups_best_team_completed(payload: dict | None = None, event_id: Opti
             for pid_raw, comps in (outcome.get("player_components") or {}).items():
                 components_by_pid[int(pid_raw)] = dict(comps or {})
     options = parse_optimizer_payload(body)
+    # the role each player was valued with, for the roster cards' badges
+    role_by_pid: Dict[int, str] = {}
+    team_by_pid: Dict[int, int] = {}
+    for tid, td in (results.get("teams") or {}).items():
+        for pid_raw, pdata in (td.get("players") or {}).items():
+            team_by_pid[int(pid_raw)] = int(tid)
+            if (pdata or {}).get("role_id") is not None:
+                role_by_pid[int(pid_raw)] = str(pdata["role_id"])
     player_values = []
     for pid, score in scores_by_pid.items():
         row = get_player(pid) or {}
@@ -5411,7 +5419,7 @@ def query_groups_best_team_completed(payload: dict | None = None, event_id: Opti
             {
                 "player_id": pid,
                 "name": row.get("name", f"Player {pid}"),
-                "team_id": 0,
+                "team_id": team_by_pid.get(pid, 0),
                 "price": int(row.get("price") or 0),
                 "points": float(score),
                 "rating": float(comps.get("rating", 0.0) or 0.0),
@@ -5440,7 +5448,11 @@ def query_groups_best_team_completed(payload: dict | None = None, event_id: Opti
                 pid = int(player.get("player_id") or 0)
                 score = float(scores_by_pid.get(pid, 0.0))
                 total += score
-                players.append({**player, "outcome": roster_scores.outcome_of(components_by_pid.get(pid), score)})
+                players.append({
+                    **player,
+                    "role_name": player.get("role_name") or role_by_pid.get(pid, ""),
+                    "outcome": roster_scores.outcome_of(components_by_pid.get(pid), score),
+                })
             scored.append({**team, "players": players, "total_ev": total, "bracket_score": total})
         scored = _filter_saved_combo_teams(scored, set(), set(), str(body.get("search") or ""))
         scored.sort(key=lambda team: float(team.get("bracket_score") or 0.0), reverse=True)
@@ -5457,7 +5469,11 @@ def query_groups_best_team_completed(payload: dict | None = None, event_id: Opti
                 pid = int(player.get("player_id") or 0)
                 score = float(scores_by_pid.get(pid, 0.0))
                 total += score
-                players.append({**player, "outcome": roster_scores.outcome_of(components_by_pid.get(pid), score)})
+                players.append({
+                    **player,
+                    "role_name": player.get("role_name") or role_by_pid.get(pid, ""),
+                    "outcome": roster_scores.outcome_of(components_by_pid.get(pid), score),
+                })
             scored.append({**team, "players": players, "total_ev": total, "bracket_score": total})
         scored.sort(key=lambda team: float(team.get("bracket_score") or 0.0), reverse=True)
         combos_total = len(teams)

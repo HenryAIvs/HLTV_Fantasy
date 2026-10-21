@@ -1768,6 +1768,72 @@ function PriceVsPointsPanel({ title, rows, slope, intercept, showTable = true, o
   );
 }
 
+// Completed results: every player's points for the chosen results, in the
+// app's standard table (photo, team, sortable columns, player search).
+function PlayerScoresTable({ rows, teamOfPid, teamLookup, onOpen }) {
+  const [search, setSearch] = useState("");
+  const [sortBy, setSortBy] = useState("points_desc");
+  const list = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    let out = (rows || []).map((r) => ({ ...r, team_id: teamOfPid?.[Number(r.player_id)] ?? r.team_id }));
+    if (q) {
+      out = out.filter(
+        (r) => String(r.name || "").toLowerCase().includes(q) || String(teamLookup?.[r.team_id] || "").toLowerCase().includes(q)
+      );
+    }
+    const [key, dir] = sortBy.split("_");
+    const sign = dir === "asc" ? 1 : -1;
+    const val = (r) => (key === "name" ? String(r.name || "") : key === "team" ? String(teamLookup?.[r.team_id] || "") : Number(r[key] || 0));
+    out.sort((a, b) => {
+      const va = val(a);
+      const vb = val(b);
+      return (typeof va === "string" ? va.localeCompare(vb) : va - vb) * sign;
+    });
+    return out;
+  }, [rows, search, sortBy, teamOfPid, teamLookup]);
+  return (
+    <div className="card sub">
+      <h3>Player Scores</h3>
+      <div className="grid two">
+        <Input label="Search Players" value={search} onChange={setSearch} placeholder="Player or team" className="search-field" />
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <SortHeader sortValue={sortBy} asc="name_asc" desc="name_desc" onChange={setSortBy}>Player</SortHeader>
+            <SortHeader sortValue={sortBy} asc="team_asc" desc="team_desc" onChange={setSortBy}>Team</SortHeader>
+            <SortHeader sortValue={sortBy} asc="price_asc" desc="price_desc" defaultDirection="desc" onChange={setSortBy}>Price</SortHeader>
+            <SortHeader sortValue={sortBy} asc="points_asc" desc="points_desc" defaultDirection="desc" onChange={setSortBy}>Points</SortHeader>
+            <SortHeader sortValue={sortBy} asc="rating_asc" desc="rating_desc" defaultDirection="desc" onChange={setSortBy}>Rating</SortHeader>
+            <SortHeader sortValue={sortBy} asc="win_asc" desc="win_desc" defaultDirection="desc" onChange={setSortBy}>Win</SortHeader>
+            <SortHeader sortValue={sortBy} asc="role_asc" desc="role_desc" defaultDirection="desc" onChange={setSortBy}>Role</SortHeader>
+            <SortHeader sortValue={sortBy} asc="booster_asc" desc="booster_desc" defaultDirection="desc" onChange={setSortBy}>Boost</SortHeader>
+          </tr>
+        </thead>
+        <tbody>
+          {list.map((r) => (
+            <tr key={r.player_id} onClick={() => onOpen && onOpen(r)}>
+              <td>
+                <div className="table-player-cell">
+                  <PlayerPhoto playerId={Number(r.player_id)} name={r.name} size={28} />
+                  <span>{r.name}</span>
+                </div>
+              </td>
+              <td>{teamLookup?.[r.team_id] || "-"}</td>
+              <td>${Math.round(Number(r.price || 0) / 1000)}k</td>
+              <td>{Number(r.points || 0).toFixed(2)}</td>
+              <td>{Number(r.rating || 0).toFixed(2)}</td>
+              <td>{Number(r.win || 0).toFixed(2)}</td>
+              <td>{Number(r.role || 0).toFixed(2)}</td>
+              <td>{Number(r.booster || 0).toFixed(2)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function PointSourcesModal({ player, teamLookup, onClose }) {
   if (!player) return null;
   const hasConcreteBreakdown = Array.isArray(player.point_breakdown) && player.point_breakdown.length > 0;
@@ -12317,29 +12383,120 @@ function PickerBoard({ columns, teamLookup, onPick }) {
   );
 }
 
-// Completed Swiss picker: the same board as the brackets. Rounds the
-// backend has paired show their matches; the rounds still to come show
-// their match count as placeholders until the round before is complete.
-function SwissPicker({ walk, teamLookup, picks, onPick }) {
-  const paired = (walk?.rounds || []).map((rd) => ({
-    key: `r${rd.round}`,
-    title: `Round ${rd.round}`,
-    matches: rd.matches.map((m) => ({
-      key: m.key,
-      title: `${m.pool} · Bo${m.bo}`,
-      a: m.a,
-      b: m.b,
-      w: Number(picks[m.key]) === Number(m.a) || Number(picks[m.key]) === Number(m.b) ? Number(picks[m.key]) : null,
-      pa: "TBD",
-      pb: "TBD",
-    })),
-  }));
-  const pending = (walk?.placeholders || []).map((ph) => ({
-    key: `r${ph.round}`,
-    title: `Round ${ph.round}`,
-    matches: Array.from({ length: ph.matches }, (_, i) => ({ key: `r${ph.round}_${i}`, title: `Match ${i + 1}`, a: null, b: null, w: null, pa: "TBD", pb: "TBD" })),
-  }));
-  return <PickerBoard columns={[...paired, ...pending]} teamLookup={teamLookup} onPick={onPick} />;
+// Completed Swiss board, laid out the way HLTV draws a Swiss stage: one
+// column per round with the record pools stacked inside it (1:0 above 0:1),
+// each match a logo-vs-logo card (click a side to make it the winner), the
+// rounds still to come as unknown cards, and the finishing records on the
+// right: qualified in green, eliminated in red, filled as teams get there.
+function SwissBoard({ walk, teams, teamLookup, picks, onPick }) {
+  const hltvIdByTeamId = {};
+  (teams || []).forEach((t) => {
+    hltvIdByTeamId[Number(t.team_id)] = t.hltv_team_id;
+  });
+  const name = (tid) => teamLookup[tid] || String(tid);
+  const rec = (pool) => String(pool || "").replace("-", ":");
+  const poolOrder = (a, b) => {
+    const [aw, al] = String(a).split("-").map(Number);
+    const [bw, bl] = String(b).split("-").map(Number);
+    return bw - aw || al - bl;
+  };
+  const side = (tid, m, known) => {
+    const picked = Number(picks[m.key] || 0);
+    const cls = known && picked ? (picked === Number(tid) ? " won" : " lost") : "";
+    return (
+      <button
+        key={`${m.key}-${tid ?? "tbd"}`}
+        type="button"
+        className={`sw-side${cls}`}
+        disabled={!known}
+        title={known ? name(tid) : "TBD"}
+        onClick={() => known && onPick(m.key, tid)}
+      >
+        {known ? <TeamLogo hltvTeamId={hltvIdByTeamId[Number(tid)]} name={name(tid)} size={34} /> : <span className="sw-unknown">?</span>}
+        <span className="sw-side-name">{known ? name(tid) : ""}</span>
+      </button>
+    );
+  };
+  const columns = [];
+  (walk?.rounds || []).forEach((rd) => {
+    const byPool = {};
+    rd.matches.forEach((m) => {
+      (byPool[m.pool] = byPool[m.pool] || []).push(m);
+    });
+    columns.push({
+      key: `r${rd.round}`,
+      title: `Round ${rd.round}`,
+      pools: Object.keys(byPool)
+        .sort(poolOrder)
+        .map((pool) => ({ pool, matches: byPool[pool].map((m) => ({ key: m.key, a: m.a, b: m.b, known: true })) })),
+    });
+  });
+  (walk?.placeholders || []).forEach((ph) => {
+    columns.push({
+      key: `r${ph.round}`,
+      title: `Round ${ph.round}`,
+      pools: (ph.pools || []).map((p) => ({
+        pool: p.pool,
+        matches: Array.from({ length: p.matches }, (_, i) => ({ key: `r${ph.round}_${p.pool}_${i}`, a: null, b: null, known: false })),
+      })),
+    });
+  });
+  const records = walk?.records || {};
+  const finalSlots = walk?.final_slots || {};
+  const finished = (pool) => {
+    const [w, l] = String(pool).split("-").map(Number);
+    return Object.keys(records).filter((tid) => Number(records[tid][0]) === w && Number(records[tid][1]) === l);
+  };
+  const finalRows = (pools) =>
+    pools
+      .filter((pool) => finalSlots[pool])
+      .map((pool) => {
+        const done = finished(pool);
+        const empty = Math.max(0, Number(finalSlots[pool] || 0) - done.length);
+        return (
+          <div className="sw-final-row" key={pool}>
+            <span className="sw-final-rec">{rec(pool)}</span>
+            <span className="sw-final-teams">
+              {done.map((tid) => (
+                <span className="sw-final-team" key={tid} title={name(tid)}>
+                  <TeamLogo hltvTeamId={hltvIdByTeamId[Number(tid)]} name={name(tid)} size={30} />
+                </span>
+              ))}
+              {Array.from({ length: empty }, (_, k) => (
+                <span className="sw-unknown" key={`e-${k}`}>
+                  ?
+                </span>
+              ))}
+            </span>
+          </div>
+        );
+      });
+  return (
+    <div className="sw-board">
+      {columns.map((col) => (
+        <div className="sw-col" key={col.key}>
+          <div className="sw-col-title">{col.title}</div>
+          {col.pools.map((p) => (
+            <div className="sw-pool" key={`${col.key}-${p.pool}`}>
+              <div className="sw-pool-title">{rec(p.pool)}</div>
+              {p.matches.map((m) => (
+                <div className="sw-match" key={m.key}>
+                  {side(m.a, m, m.known)}
+                  <span className="sw-vs">vs</span>
+                  {side(m.b, m, m.known)}
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      ))}
+      <div className="sw-col sw-final">
+        <div className="sw-col-title">Final</div>
+        <div className="sw-final-block qualified">{finalRows(["3-0", "3-1", "3-2"])}</div>
+        <div className="sw-final-block eliminated">{finalRows(["2-3", "1-3", "0-3"])}</div>
+      </div>
+    </div>
+  );
 }
 
 // Swiss stage (a group format of the groups engine): the seed order with
@@ -13032,7 +13189,8 @@ function GroupsTab({
     setCompletedResult(null);
   };
   const swissComplete = groupFormat === "swiss" && Boolean(swissWalk?.complete);
-  const scoreCompleted = async () => {
+  const [completedPage, setCompletedPage] = useState(0);
+  const scoreCompleted = async (nextPage = 0) => {
     setCompletedMessage("");
     try {
       const data = await api.post(
@@ -13044,8 +13202,8 @@ function GroupsTab({
               ? { swiss_picks: swissPicks }
               : { group_winners: activeCompletedDerived.map((g) => g.picks.map(Number)) }),
           search: comboSearch,
-          page: 0,
-          page_size: 200,
+          page: Number(nextPage) || 0,
+          page_size: COMBO_PAGE_SIZE,
         },
         120000
       );
@@ -13053,6 +13211,7 @@ function GroupsTab({
         setCompletedMessage(String(data.detail));
         return;
       }
+      setCompletedPage(Number(data?.page || nextPage || 0));
       setCompletedResult(data);
     } catch (e) {
       setCompletedMessage(e?.message || "Failed to score completed groups.");
@@ -13105,10 +13264,12 @@ function GroupsTab({
           ["Opening 1 loser", "Opening 2 loser"],
           ["Winners' loser", "Elimination winner"],
         ];
-  const metricLabel = (team) =>
-    comboMode === "single_outcome"
+  const metricLabel = (team, mode = comboMode) =>
+    mode === "completed"
+      ? `Score ${Number(team?.bracket_score ?? team?.total_ev ?? 0).toFixed(2)}`
+      : mode === "single_outcome"
       ? `Ceiling ${Number(team?.ceiling_points || 0).toFixed(2)}`
-      : comboMode === "most_outcomes"
+      : mode === "most_outcomes"
       ? `Win ${(Number(team?.outcome_win_probability || 0) * 100).toFixed(1)}%`
       : `EV ${Number(team?.average_ev ?? team?.total_ev ?? 0).toFixed(2)}`;
   const groupTeamInitials = (teamId) => {
@@ -13444,6 +13605,15 @@ function GroupsTab({
     ));
   // Completed Groups: components come from the exact-outcome player_values row,
   // so open with those concrete values and an outcome-specific note.
+  const teamOfPid = useMemo(() => {
+    const m = {};
+    Object.entries(results?.teams || {}).forEach(([tid, td]) => {
+      Object.keys(td?.players || {}).forEach((pid) => {
+        m[Number(pid)] = Number(tid);
+      });
+    });
+    return m;
+  }, [results]);
   const completedEvByPid = useMemo(() => {
     const map = {};
     (completedResult?.player_values || []).forEach((row) => {
@@ -13466,68 +13636,110 @@ function GroupsTab({
     });
   };
 
+  // The roster strips every Top 5 list draws (rank, metric, cost, one card
+  // per player with the points split): the ranking modes and the completed
+  // results share it, so they cannot drift.
+  const renderRosterRows = (list, mode, offset, onCard) => (
+        <div className="event-team-rows">
+          {(list || []).map((team, idx) => {
+            const boostByPid = {};
+            (team.booster_assignments || []).forEach((a) => {
+              const pid = Number(a.player_id);
+              boostByPid[pid] = (boostByPid[pid] || 0) + Number(a.expected_points || 0);
+            });
+            return (
+              <div key={idx} className="stack combo-team">
+                <div className="event-team-row">
+                  <div className="event-team-head">
+                    <div className="combo-rank">#{idx + 1 + offset}</div>
+                    <div className="event-team-headtext">
+                      <span className="event-team-name">{metricLabel(team, mode)}</span>
+                      <span className="combo-cost">Cost ${Number(team.cost || 0).toLocaleString()}</span>
+                    </div>
+                  </div>
+                  <div className="event-team-players">
+                    {(team.players || []).map((p) => {
+                      const roleNum = Number(p.role_name);
+                      const roleId =
+                        p.role_name != null && p.role_name !== "" && Number.isFinite(roleNum)
+                          ? roleNum
+                          : roleIdFromName(p.role_name);
+                      const assigned = boostByPid[Number(p.player_id)];
+                      const boost = assigned != null ? assigned : Number(p.booster_ev || 0);
+                      // the kind of points this ranking mode shows; a serialised roster
+                      // already folds the assigned booster into its average
+                      const pts = rosterPoints(p, mode);
+                      const score =
+                        Number(pts.total || 0) +
+                        (mode === "average" && assigned != null && !(Number(p.booster_ev) > 0) ? assigned : 0);
+                      const rosterCtx =
+                        (team.booster_assignments || []).length > 0
+                          ? {
+                              role_id: roleId,
+                              role_ev: Number(p.role_ev || 0),
+                              booster_ev: boost,
+                              boosters: (team.booster_assignments || []).filter(
+                                (a) => Number(a.player_id) === Number(p.player_id)
+                              ),
+                            }
+                          : null;
+                      return (
+                        <div
+                          className="event-player-card clickable"
+                          key={p.player_id}
+                          onClick={() => onCard(p, rosterCtx, team)}
+                        >
+                          <PlayerPhoto playerId={Number(p.player_id)} name={p.name} size={52} />
+                          <div className="event-player-name">{p.name}</div>
+                          <div className="event-player-team">{teamLookup[p.team_id] || p.team_id}</div>
+                          <div className="event-player-role">
+                            {roleId != null && <RoleBadge roleId={roleId} size={16} />}
+                            <span>{roleLabel(p.role_name)}</span>
+                          </div>
+                          <div className="event-player-rating">{score.toFixed(2)}</div>
+                          <div className="event-player-stats ev-mini">
+                            {POINTS_PARTS.map(([label, part]) => [
+                              label,
+                              part === "booster" && mode === "average" ? boost : pts[part],
+                            ]).map(([label, value]) => (
+                              <div className="event-player-stat" key={label}>
+                                <div className="event-player-mini">{Number(value || 0).toFixed(1)}</div>
+                                <div className="event-player-stat-label">{label}</div>
+                              </div>
+                            ))}
+                          </div>
+                          <div className="event-player-price combo-price">
+                            ${Math.round(Number(p.price || 0) / 1000)}k
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+  );
+
   const renderCompletedResults = () => (
     <>
-            {completedMessage && <p className="muted">{completedMessage}</p>}
-            {completedResult && (
-              <>
-                <div className="card sub">
-                  <h3>Best Team For These Results</h3>
-                  <p className="muted">
-                    {groupFormat === "swiss"
-                      ? `Path probability 1 in ${Number(completedResult.outcome_probability) > 0 ? Math.round(1 / Number(completedResult.outcome_probability)).toLocaleString() : "∞"}`
-                      : `Outcome probability ${(Number(completedResult.outcome_probability || 0) * 100).toFixed(3)}% of ${Number(completedResult.outcomes_count || 0).toLocaleString()} stored outcomes.`}
-                  </p>
-                  {(completedResult.top_teams || []).slice(0, 10).map((team, idx) => (
-                    <div key={idx} className="card sub">
-                      <h4>
-                        #{idx + 1} Score {Number(team.bracket_score || 0).toFixed(2)} | Cost {team.cost}
-                      </h4>
-                      <p className="muted">
-                        {(team.players || []).map((p, i) => (
-                          <span key={`${p.player_id}-${i}`}>
-                            {i > 0 ? ", " : ""}
-                            <button type="button" className="inline-link-btn" onClick={() => openCompletedPlayer(p)}>
-                              {p.name}
-                            </button>{" "}
-                            {Number(rosterPoints(p, "completed").total || 0).toFixed(1)}
-                          </span>
-                        ))}
-                      </p>
-                    </div>
-                  ))}
-                </div>
-                <div className="card sub">
-                  <h3>Player Scores</h3>
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Player</th>
-                        <th>Cost</th>
-                        <th>Points</th>
-                        <th>Rating</th>
-                        <th>Win</th>
-                        <th>Role</th>
-                        <th>Booster</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {(completedResult.player_values || []).map((row) => (
-                        <tr key={row.player_id}>
-                          <td>{row.name}</td>
-                          <td>{Number(row.price || 0).toLocaleString()}</td>
-                          <td>{Number(row.points || 0).toFixed(2)}</td>
-                          <td>{Number(row.rating || 0).toFixed(2)}</td>
-                          <td>{Number(row.win || 0).toFixed(2)}</td>
-                          <td>{Number(row.role || 0).toFixed(2)}</td>
-                          <td>{Number(row.booster || 0).toFixed(2)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </>
-            )}
+      {completedMessage && <p className="muted">{completedMessage}</p>}
+      {completedResult && (
+        <>
+          <div className="card sub">
+            <h3>Best Team For These Results</h3>
+            <p className="muted">
+              {groupFormat === "swiss"
+                ? `Path probability 1 in ${Number(completedResult.outcome_probability) > 0 ? Math.round(1 / Number(completedResult.outcome_probability)).toLocaleString() : "∞"}`
+                : `Outcome probability ${(Number(completedResult.outcome_probability || 0) * 100).toFixed(3)}% of ${Number(completedResult.outcomes_count || 0).toLocaleString()} stored outcomes.`}
+            </p>
+            <ComboPager page={completedPage} pageSize={COMBO_PAGE_SIZE} total={completedResult.filtered_count} onPage={scoreCompleted} />
+            {renderRosterRows(completedResult.page_teams || completedResult.top_teams || [], "completed", completedPage * COMBO_PAGE_SIZE, (p) => openCompletedPlayer(p))}
+          </div>
+          <PlayerScoresTable rows={completedResult.player_values || []} teamOfPid={teamOfPid} teamLookup={teamLookup} onOpen={openCompletedPlayer} />
+        </>
+      )}
     </>
   );
   return (
@@ -13867,86 +14079,7 @@ function GroupsTab({
                         metric, cost, then one card per player with the EV split.
                         The roster's booster assignment (when the query returns
                         one) is folded into each player's Boost. */}
-                    <div className="event-team-rows">
-                      {(allTeams && allTeams.length > 0 ? allTeams : topTeams).map((team, idx) => {
-                        const boostByPid = {};
-                        (team.booster_assignments || []).forEach((a) => {
-                          const pid = Number(a.player_id);
-                          boostByPid[pid] = (boostByPid[pid] || 0) + Number(a.expected_points || 0);
-                        });
-                        return (
-                          <div key={idx} className="stack combo-team">
-                            <div className="event-team-row">
-                              <div className="event-team-head">
-                                <div className="combo-rank">#{idx + 1 + page * COMBO_PAGE_SIZE}</div>
-                                <div className="event-team-headtext">
-                                  <span className="event-team-name">{metricLabel(team)}</span>
-                                  <span className="combo-cost">Cost ${Number(team.cost || 0).toLocaleString()}</span>
-                                </div>
-                              </div>
-                              <div className="event-team-players">
-                                {(team.players || []).map((p) => {
-                                  const roleNum = Number(p.role_name);
-                                  const roleId =
-                                    p.role_name != null && p.role_name !== "" && Number.isFinite(roleNum)
-                                      ? roleNum
-                                      : roleIdFromName(p.role_name);
-                                  const assigned = boostByPid[Number(p.player_id)];
-                                  const boost = assigned != null ? assigned : Number(p.booster_ev || 0);
-                                  // the kind of points this ranking mode shows; a serialised roster
-                                  // already folds the assigned booster into its average
-                                  const pts = rosterPoints(p, comboMode);
-                                  const score =
-                                    Number(pts.total || 0) +
-                                    (comboMode === "average" && assigned != null && !(Number(p.booster_ev) > 0) ? assigned : 0);
-                                  const rosterCtx =
-                                    (team.booster_assignments || []).length > 0
-                                      ? {
-                                          role_id: roleId,
-                                          role_ev: Number(p.role_ev || 0),
-                                          booster_ev: boost,
-                                          boosters: (team.booster_assignments || []).filter(
-                                            (a) => Number(a.player_id) === Number(p.player_id)
-                                          ),
-                                        }
-                                      : null;
-                                  return (
-                                    <div
-                                      className="event-player-card clickable"
-                                      key={p.player_id}
-                                      onClick={() => openGroupPlayer(p, rosterCtx, team)}
-                                    >
-                                      <PlayerPhoto playerId={Number(p.player_id)} name={p.name} size={52} />
-                                      <div className="event-player-name">{p.name}</div>
-                                      <div className="event-player-team">{teamLookup[p.team_id] || p.team_id}</div>
-                                      <div className="event-player-role">
-                                        {roleId != null && <RoleBadge roleId={roleId} size={16} />}
-                                        <span>{roleLabel(p.role_name)}</span>
-                                      </div>
-                                      <div className="event-player-rating">{score.toFixed(2)}</div>
-                                      <div className="event-player-stats ev-mini">
-                                        {POINTS_PARTS.map(([label, part]) => [
-                                          label,
-                                          part === "booster" && comboMode === "average" ? boost : pts[part],
-                                        ]).map(([label, value]) => (
-                                          <div className="event-player-stat" key={label}>
-                                            <div className="event-player-mini">{Number(value || 0).toFixed(1)}</div>
-                                            <div className="event-player-stat-label">{label}</div>
-                                          </div>
-                                        ))}
-                                      </div>
-                                      <div className="event-player-price combo-price">
-                                        ${Math.round(Number(p.price || 0) / 1000)}k
-                                      </div>
-                                    </div>
-                                  );
-                                })}
-                              </div>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
+                    {renderRosterRows(allTeams && allTeams.length > 0 ? allTeams : topTeams, comboMode, page * COMBO_PAGE_SIZE, openGroupPlayer)}
                   </div>
                 )}
                 {topMessage && <p className="muted">{topMessage}</p>}
@@ -13967,10 +14100,10 @@ function GroupsTab({
           <>
             <div className="card sub">
               <h3>Swiss Results</h3>
-              <SwissPicker walk={swissWalk} teamLookup={teamLookup} picks={swissPicks} onPick={pickSwissMatch} />
+              <SwissBoard walk={swissWalk} teams={teams} teamLookup={teamLookup} picks={swissPicks} onPick={pickSwissMatch} />
             </div>
             <div className="actions">
-              <button className="primary" onClick={scoreCompleted} disabled={!swissComplete || !combosReady}>
+              <button className="primary" onClick={() => scoreCompleted(0)} disabled={!swissComplete || !combosReady}>
                 Score Completed Swiss
               </button>
             </div>
@@ -13984,7 +14117,7 @@ function GroupsTab({
               <BracketPicker bracket={results.bracket} teamLookup={teamLookup} picks={bracketPicks} onPick={pickBracketMatch} />
             </div>
             <div className="actions">
-              <button className="primary" onClick={scoreCompleted} disabled={!bracketComplete || !combosReady}>
+              <button className="primary" onClick={() => scoreCompleted(0)} disabled={!bracketComplete || !combosReady}>
                 Score Completed Bracket
               </button>
             </div>
@@ -14032,7 +14165,7 @@ function GroupsTab({
               })}
             {results && (
               <div className="actions">
-                <button className="primary" onClick={scoreCompleted} disabled={!allGroupsComplete || !combosReady}>
+                <button className="primary" onClick={() => scoreCompleted(0)} disabled={!allGroupsComplete || !combosReady}>
                   Score Completed Groups
                 </button>
                 {combosReady && !allGroupsComplete && <span className="muted">Pick every match winner first.</span>}

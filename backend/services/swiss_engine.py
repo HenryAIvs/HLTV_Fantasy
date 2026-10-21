@@ -116,31 +116,38 @@ def walk(team_ids: List[int], seeds: Dict[int, int], bo3_mode: str, picks: Dict[
             stopped = True
             break
     complete = (not stopped) and all(t.wins >= TARGET or t.losses >= TARGET for t in states.values())
+    shape = _format_shape(len(team_ids))
     return {
         "rounds": rounds,
-        "placeholders": _placeholder_rounds(len(team_ids), len(rounds)),
+        "placeholders": [rd_ for rd_ in shape["rounds"] if rd_["round"] > len(rounds)],
+        "final_slots": shape["final"],
         "complete": complete,
         "records": {str(tid): [int(t.wins), int(t.losses)] for tid, t in states.items()},
     }
 
 
-def _placeholder_rounds(team_count: int, paired: int) -> List[Dict[str, int]]:
-    """How many matches each not-yet-paired round will hold (fixed by the
-    format, whatever the results): the record pools split evenly every
-    round, and a pool at the target is done."""
+def _format_shape(team_count: int) -> Dict[str, Any]:
+    """What the format fixes whatever the results: each round's record pools
+    and their match counts (the pools split evenly every round, a pool at
+    the target is done) and how many teams finish on each record."""
     pools: Dict[tuple, int] = {(0, 0): int(team_count)}
-    out = []
+    rounds = []
     for r in range(ROUNDS):
         alive = {k: n for k, n in pools.items() if k[0] < TARGET and k[1] < TARGET}
-        matches = sum(n // 2 for n in alive.values())
-        if r >= paired and matches > 0:
-            out.append({"round": r + 1, "matches": int(matches)})
+        if not alive:
+            break
+        rounds.append({
+            "round": r + 1,
+            "matches": int(sum(n // 2 for n in alive.values())),
+            "pools": [{"pool": f"{w}-{l}", "matches": int(n // 2)} for (w, l), n in sorted(alive.items(), key=lambda kv: (-kv[0][0], kv[0][1]))],
+        })
         nxt: Dict[tuple, int] = {k: n for k, n in pools.items() if k not in alive}
         for (w, l), n in alive.items():
             nxt[(w + 1, l)] = nxt.get((w + 1, l), 0) + n // 2
             nxt[(w, l + 1)] = nxt.get((w, l + 1), 0) + n - n // 2
         pools = nxt
-    return out
+    final = {f"{w}-{l}": int(n) for (w, l), n in pools.items() if n > 0}
+    return {"rounds": rounds, "final": final}
 
 
 def samples_from_walk(team_ids: List[int], walked: Dict[str, Any]) -> SwissSamples:
