@@ -319,11 +319,12 @@ const ALL_TABS = [
   { key: "view", label: "Database" },
   { key: "events", label: "Events" },
   { key: "tournament", label: "Tournament" },
+  { key: "live", label: "Live" },
   { key: "devlab", label: "Dev Lab" },
   { key: "scheduling", label: "Scheduling" },
   { key: "users", label: "Users" },
 ];
-const PUBLIC_TAB_KEYS = ["view", "events", "tournament"];
+const PUBLIC_TAB_KEYS = ["view", "events", "tournament", "live"];
 const visibleTabs = () => (PUBLIC_BUILD ? ALL_TABS.filter((t) => PUBLIC_TAB_KEYS.includes(t.key)) : ALL_TABS);
 const NOT_PUBLISHED = "Valuations for this event have not been published yet.";
 
@@ -6234,6 +6235,188 @@ const describeEventFormat = (k) => {
   return { key: String(k.kind), short: String(k.kind), long: "" };
 };
 
+// Live: every current fantasy event as it actually stands, from the stored
+// results (services/live_state). The Swiss board and the bracket board are
+// the completed-stage pickers in read-only mode, filled with real winners.
+function LiveTab() {
+  const [events, setEvents] = useState(null);
+  const load = async () => {
+    try {
+      const d = await api.get("/live/events", 60000);
+      setEvents(Array.isArray(d?.events) ? d.events : []);
+    } catch {
+      setEvents((prev) => prev || []);
+    }
+  };
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 60000);
+    return () => clearInterval(t);
+  }, []);
+  if (events === null) return <div className="stack" />;
+  if (events.length === 0) {
+    return (
+      <Section title="Live">
+        <p className="muted">No current events.</p>
+      </Section>
+    );
+  }
+  return (
+    <div className="stack">
+      {events.map((ev) => (
+        <LiveEventCard key={ev.event_id} ev={ev} />
+      ))}
+    </div>
+  );
+}
+
+function LiveEventCard({ ev }) {
+  const teamLookup = useMemo(() => {
+    const m = {};
+    Object.entries(ev.teams || {}).forEach(([tid, t]) => {
+      m[Number(tid)] = t?.name || String(tid);
+    });
+    return m;
+  }, [ev]);
+  const teamRows = useMemo(() => Object.entries(ev.teams || {}).map(([tid, t]) => ({ team_id: Number(tid), hltv_team_id: t?.hltv_team_id, name: t?.name })), [ev]);
+  const hltvId = (tid) => ev.teams?.[String(tid)]?.hltv_team_id;
+  const dm = (ts) => {
+    const d = new Date(Number(ts) * 1000);
+    return `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}`;
+  };
+  const statusLabel = ev.status === "live" ? "Live" : ev.status === "upcoming" ? "Upcoming" : "Finished";
+  const daysTo = Math.ceil((Number(ev.start_at) - Date.now() / 1000) / 86400);
+  const results = [...(ev.matches || [])].reverse();
+  const last = results[0];
+  return (
+    <Section title={ev.name}>
+      <div className="live-strip">
+        <div className={`topx-tile${ev.status === "live" ? "" : " empty"}`}>
+          <div className="topx-tile-label">Status</div>
+          <div className="topx-tile-value">{statusLabel}</div>
+          <div className="topx-tile-maps">
+            {dm(ev.start_at)} – {dm(ev.end_at)}
+            {ev.status === "upcoming" && daysTo > 0 ? ` · in ${daysTo}d` : ""}
+          </div>
+        </div>
+        <div className="topx-tile">
+          <div className="topx-tile-label">Matches played</div>
+          <div className="topx-tile-value">
+            {Number(ev.played || 0)}
+            {ev.total ? <span className="live-of"> / {ev.total}</span> : null}
+          </div>
+          <div className="topx-tile-maps">{ev.label}</div>
+        </div>
+        <div className="topx-tile">
+          <div className="topx-tile-label">Last result</div>
+          {last ? (
+            <>
+              <div className="topx-tile-value live-last">
+                {teamLookup[last.a]} {last.score_a}–{last.score_b} {teamLookup[last.b]}
+              </div>
+              <div className="topx-tile-maps">{formatDMY(last.date)}</div>
+            </>
+          ) : (
+            <div className="topx-tile-value">-</div>
+          )}
+        </div>
+        <div className="topx-tile">
+          <div className="topx-tile-label">Teams</div>
+          <div className="topx-tile-value">{Object.keys(ev.teams || {}).length}</div>
+          <div className="topx-tile-maps">{ev.group_format === "swiss" ? "Swiss" : ev.group_format === "bracket" ? (ev.bracket?.kind === "double" ? "Double elimination" : "Single elimination") : "Groups"}</div>
+        </div>
+      </div>
+
+      {ev.group_format === "swiss" && ev.swiss && (
+        <div className="card sub">
+          <h3>Swiss Stage</h3>
+          <SwissBoard walk={ev.swiss} teams={teamRows} teamLookup={teamLookup} picks={ev.swiss.picks || {}} onPick={() => {}} readOnly />
+        </div>
+      )}
+      {ev.group_format === "bracket" && ev.bracket && (
+        <div className="card sub">
+          <h3>Bracket</h3>
+          <BracketPicker bracket={ev.bracket} teamLookup={teamLookup} picks={ev.bracket_picks || {}} onPick={() => {}} readOnly />
+        </div>
+      )}
+      {Array.isArray(ev.groups) && ev.groups.length > 0 && (
+        <div className="live-groups">
+          {ev.groups.map((g, i) => (
+            <div className="card sub live-group" key={i}>
+              <h3>Group {i + 1}</h3>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Team</th>
+                    <th className="num">W</th>
+                    <th className="num">L</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {g.teams.map((tid) => (
+                    <tr key={tid}>
+                      <td>
+                        <div className="table-player-cell">
+                          <TeamLogo hltvTeamId={hltvId(tid)} name={teamLookup[tid]} size={22} />
+                          <span>{teamLookup[tid] || tid}</span>
+                        </div>
+                      </td>
+                      <td className="num">{g.records?.[String(tid)]?.[0] ?? 0}</td>
+                      <td className="num">{g.records?.[String(tid)]?.[1] ?? 0}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {results.length > 0 && (
+        <div className="card sub">
+          <h3>Results</h3>
+          <table className="live-results">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Match</th>
+                <th className="num">Maps</th>
+              </tr>
+            </thead>
+            <tbody>
+              {results.map((m) => {
+                const aWon = Number(m.winner) === Number(m.a);
+                const bWon = Number(m.winner) === Number(m.b);
+                return (
+                  <tr key={m.url || `${m.date}-${m.a}-${m.b}`}>
+                    <td>{formatDMY(m.date)}</td>
+                    <td>
+                      <div className="live-match">
+                        <span className={`live-side${aWon ? " win" : bWon ? " lose" : ""}`}>
+                          <TeamLogo hltvTeamId={hltvId(m.a)} name={teamLookup[m.a]} size={22} />
+                          {teamLookup[m.a] || m.a}
+                        </span>
+                        <span className="live-score">
+                          {m.score_a ?? "-"}–{m.score_b ?? "-"}
+                        </span>
+                        <span className={`live-side right${bWon ? " win" : aWon ? " lose" : ""}`}>
+                          {teamLookup[m.b] || m.b}
+                          <TeamLogo hltvTeamId={hltvId(m.b)} name={teamLookup[m.b]} size={22} />
+                        </span>
+                      </div>
+                    </td>
+                    <td className="num">{m.maps || "-"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Section>
+  );
+}
+
 function DevLabTab() {
   return <RatingModelLabTab />;
 }
@@ -10262,7 +10445,7 @@ function BracketStageView({ results, teams, teamLookup }) {
 
 // Completed-bracket picker: every match of the stored bracket in play order,
 // each a pick between the two teams its earlier picks feed into it.
-function BracketPicker({ bracket, teamLookup, picks, onPick }) {
+function BracketPicker({ bracket, teamLookup, picks, onPick, readOnly = false }) {
   const matches = bracket?.matches || [];
   const stages = bracket?.stages || [];
   const slots = (bracket?.team_slots || []).map(Number);
@@ -10289,13 +10472,13 @@ function BracketPicker({ bracket, teamLookup, picks, onPick }) {
   const columns = stages
     .filter((s) => !s.pad && byStage[s.key])
     .map((s) => ({ key: s.key, title: s.full, matches: byStage[s.key].map((m, i) => ({ ...m, title: titleOf(m, i, s) })) }));
-  return <PickerBoard columns={columns} teamLookup={teamLookup} onPick={onPick} />;
+  return <PickerBoard columns={columns} teamLookup={teamLookup} onPick={onPick} readOnly={readOnly} />;
 }
 
 // The completed-stage picker board every format draws: one column per
 // round, one card per match (its title, the two sides as buttons, the
 // picked winner lit), unknown sides as disabled placeholders.
-function PickerBoard({ columns, teamLookup, onPick }) {
+function PickerBoard({ columns, teamLookup, onPick, readOnly = false }) {
   return (
     <div className="pb-bracket">
       {columns.map((col) => (
@@ -10313,9 +10496,9 @@ function PickerBoard({ columns, teamLookup, onPick }) {
                     ].map(([tid, placeholder], rowIdx) => (
                       <button
                         key={rowIdx}
-                        disabled={!tid}
+                        disabled={!tid || readOnly}
                         className={tid && m.w === tid ? "active" : ""}
-                        onClick={() => tid && onPick(m.key, tid)}
+                        onClick={() => tid && !readOnly && onPick(m.key, tid)}
                       >
                         {tid ? teamLookup[tid] || tid : placeholder}
                       </button>
@@ -10336,7 +10519,7 @@ function PickerBoard({ columns, teamLookup, onPick }) {
 // each match a logo-vs-logo card (click a side to make it the winner), the
 // rounds still to come as unknown cards, and the finishing records on the
 // right: qualified in green, eliminated in red, filled as teams get there.
-function SwissBoard({ walk, teams, teamLookup, picks, onPick }) {
+function SwissBoard({ walk, teams, teamLookup, picks, onPick, readOnly = false }) {
   const hltvIdByTeamId = {};
   (teams || []).forEach((t) => {
     hltvIdByTeamId[Number(t.team_id)] = t.hltv_team_id;
@@ -10356,9 +10539,9 @@ function SwissBoard({ walk, teams, teamLookup, picks, onPick }) {
         key={`${m.key}-${tid ?? "tbd"}`}
         type="button"
         className={`sw-side${cls}`}
-        disabled={!known}
+        disabled={!known || readOnly}
         title={known ? name(tid) : "TBD"}
-        onClick={() => known && onPick(m.key, tid)}
+        onClick={() => known && !readOnly && onPick(m.key, tid)}
       >
         {known ? <TeamLogo hltvTeamId={hltvIdByTeamId[Number(tid)]} name={name(tid)} size={34} /> : <span className="sw-unknown">?</span>}
         <span className="sw-side-name">{known ? name(tid) : ""}</span>
@@ -10380,14 +10563,23 @@ function SwissBoard({ walk, teams, teamLookup, picks, onPick }) {
     });
   });
   (walk?.placeholders || []).forEach((ph) => {
-    columns.push({
-      key: `r${ph.round}`,
-      title: `Round ${ph.round}`,
-      pools: (ph.pools || []).map((p) => ({
-        pool: p.pool,
-        matches: Array.from({ length: p.matches }, (_, i) => ({ key: `r${ph.round}_${p.pool}_${i}`, a: null, b: null, known: false })),
-      })),
-    });
+    const pending = (ph.pools || []).map((p) => ({
+      pool: p.pool,
+      matches: Array.from({ length: p.matches }, (_, i) => ({ key: `r${ph.round}_${p.pool}_${i}`, a: null, b: null, known: false })),
+    }));
+    // a round already partly played keeps one column: its unplayed slots
+    // join the played pools (or stand as their own pool), in record order
+    const col = columns.find((c) => c.key === `r${ph.round}`);
+    if (col) {
+      pending.forEach((pp) => {
+        const existing = col.pools.find((x) => x.pool === pp.pool);
+        if (existing) existing.matches.push(...pp.matches);
+        else col.pools.push(pp);
+      });
+      col.pools.sort((x, y) => poolOrder(x.pool, y.pool));
+    } else {
+      columns.push({ key: `r${ph.round}`, title: `Round ${ph.round}`, pools: pending });
+    }
   });
   const records = walk?.records || {};
   const finalSlots = walk?.final_slots || {};
@@ -10420,7 +10612,7 @@ function SwissBoard({ walk, teams, teamLookup, picks, onPick }) {
         );
       });
   return (
-    <div className="sw-board">
+    <div className={`sw-board${readOnly ? " readonly" : ""}`}>
       {columns.map((col) => (
         <div className="sw-col" key={col.key}>
           <div className="sw-col-title">{col.title}</div>
@@ -12545,6 +12737,7 @@ export default function App() {
       />
     ),
     devlab: <DevLabTab />,
+    live: <LiveTab />,
     tournament: (
       <TournamentTab
         key={`tournament-${viewEventId || "current"}`}

@@ -3472,3 +3472,26 @@ button:disabled {
   .sch-imports { grid-template-columns: 1fr; }
 }
 
+/* Live page */
+.live-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 14px; }
+.live-strip .topx-tile-value { font-size: 28px; font-variant-numeric: tabular-nums; }
+.live-strip .live-of { color: #8fa3bf; font-size: 18px; }
+.live-strip .live-last { font-size: 18px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.live-groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.live-group h3 { margin-top: 0; }
+.live-group table { margin: 0; }
+.live-results td, .live-results th { vertical-align: middle; }
+.live-match { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 12px; }
+.live-side { display: inline-flex; align-items: center; gap: 8px; color: #8fa3bf; }
+.live-side.right { justify-content: flex-end; }
+.live-side.win { color: #f2f5f9; font-weight: 700; }
+.live-side.lose { opacity: 0.6; }
+.live-score { font-family: var(--display); font-stretch: condensed; font-weight: 700; font-size: 17px; min-width: 56px; text-align: center; color: #f2f5f9; font-variant-numeric: tabular-nums; }
+.sw-board.readonly .sw-side { cursor: default; }
+.sw-board.readonly .sw-side:disabled { opacity: 1; }
+.sw-board.readonly .sw-side.lost:disabled { opacity: 0.35; }
+.pb-bracket .gsl-pick button:disabled.active { opacity: 1; }
+@media (max-width: 1100px) { .live-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.live-group .table-player-cell span { max-width: none; white-space: normal; overflow: visible; text-overflow: clip; }
+.live-group td.num, .live-group th.num { width: 48px; text-align: right; }
+

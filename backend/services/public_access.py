@@ -56,6 +56,7 @@ PUBLIC_ROUTES: List[Tuple[str, str]] = [
     ("POST", r"/groups/best-team/query"),
     ("POST", r"/groups/best-team/completed-query"),
     ("POST", r"/groups/swiss/pairings"),
+    ("GET", r"/live/events"),
 ]
 
 # Read-only data the Database tab, the player/team modals and the Tournament
