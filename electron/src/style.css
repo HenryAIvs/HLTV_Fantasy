@@ -3273,7 +3273,7 @@ button:disabled {
 .mm-jobs { display: flex; flex-direction: column; gap: 10px; }
 .mm-job {
   display: grid;
-  grid-template-columns: 250px minmax(0, 1fr) auto;
+  grid-template-columns: 220px minmax(0, 1fr) auto;
   gap: 12px 20px;
   align-items: center;
   padding: 12px 14px;
@@ -3416,4 +3416,59 @@ button:disabled {
 .event-player-card.exc { border-color: #b23b38; opacity: 0.6; }
 .event-player-card.inc { border-color: #34d399; }
 .swiss-seed-table .filter-toggle { padding: 3px 9px; font-size: 10px; }
+
+/* Scheduling page: status tiles, task cards with switches, grouped history */
+.sch-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.sch-tile .topx-tile-value { font-size: 30px; font-variant-numeric: tabular-nums; }
+.topx-tile.warn { border-left-color: #e2504c; }
+.sch-tile-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
+.sch-tile input[type="time"] { width: 120px; }
+.sch-tile .secondary { padding: 4px 10px; font-size: 11px; }
+.sch-tasks { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.sch-task {
+  background: #171c24;
+  border: 1px solid #2c3441;
+  border-left: 3px solid #2c3441;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  clip-path: polygon(8px 0, 100% 0, 100% 100%, 0 100%, 0 8px);
+}
+.sch-task.on { border-left-color: #ff6b1a; }
+.sch-task.off { opacity: 0.6; }
+.sch-task.live { border-color: #ff6b1a; }
+.sch-task-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.sch-task-name { font-family: var(--display); font-stretch: condensed; text-transform: uppercase; font-size: 16px; font-weight: 700; color: #f2f5f9; letter-spacing: 0.03em; }
+.sch-task-meta { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; align-items: center; font-size: 13px; color: #e9edf3; font-variant-numeric: tabular-nums; }
+.sch-task-meta > span:nth-child(odd) { color: #8fa3bf; font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; }
+.sch-task-setting { display: flex; align-items: center; gap: 8px; }
+.sch-task-setting input { width: 72px; padding: 4px 8px; }
+.sch-task-foot { display: flex; justify-content: space-between; align-items: center; margin-top: auto; }
+.sch-task-foot .secondary { padding: 4px 12px; font-size: 11px; }
+.switch { position: relative; display: inline-block; width: 38px; height: 20px; flex: none; }
+.switch input { opacity: 0; width: 0; height: 0; margin: 0; position: absolute; }
+.switch-track { position: absolute; inset: 0; background: #2c3441; border-radius: 20px; transition: background 0.15s; cursor: pointer; }
+.switch-track::before { content: ""; position: absolute; width: 14px; height: 14px; left: 3px; top: 3px; background: #c6d0dc; border-radius: 50%; transition: transform 0.15s, background 0.15s; }
+.switch input:checked + .switch-track { background: #ff6b1a; }
+.switch input:checked + .switch-track::before { transform: translateX(18px); background: #0a0c10; }
+.switch input:disabled + .switch-track { opacity: 0.5; cursor: not-allowed; }
+.sch-live { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+.sch-live .pills { flex-wrap: wrap; }
+.sch-imports { display: grid; grid-template-columns: 1.3fr 1fr; gap: 14px; align-items: start; }
+.sch-imports .card.sub h3 { margin-top: 0; }
+.sch-history-tools { display: flex; align-items: center; gap: 14px; margin-bottom: 10px; }
+.sch-night { border: 1px solid #242b35; background: #10141a; }
+.sch-night + .sch-night { margin-top: 10px; }
+.sch-night-head { display: grid; grid-template-columns: 1fr auto auto 16px; gap: 16px; align-items: center; padding: 10px 14px; cursor: pointer; user-select: none; }
+.sch-night-head:hover { background: #141a22; }
+.sch-night-date { font-family: var(--display); font-stretch: condensed; text-transform: uppercase; font-weight: 700; font-size: 15px; color: #f2f5f9; }
+.sch-night-meta { color: #8fa3bf; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.sch-night table { margin: 0; border-top: 1px solid #242b35; }
+.sch-night td.details { max-width: 520px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #8fa3bf; }
+.pill.ok { background: #12301f; border-color: #1f6f3f; color: #86efac; }
+@media (max-width: 1100px) {
+  .sch-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .sch-imports { grid-template-columns: 1fr; }
+}
 

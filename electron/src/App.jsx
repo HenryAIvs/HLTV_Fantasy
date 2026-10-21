@@ -8679,32 +8679,40 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
   const [saveBusy, setSaveBusy] = useState(false);
   const [runBusy, setRunBusy] = useState(false);
   const [message, setMessage] = useState("");
-  // Local edit state so typing a time doesn't fire a save per keystroke.
+  // Local edit state so typing a value doesn't fire a save per keystroke.
   const [runTime, setRunTime] = useState("00:00");
   const [lookbackDays, setLookbackDays] = useState(3);
   const [mapModelMinutes, setMapModelMinutes] = useState(120);
   const [teamDataTopN, setTeamDataTopN] = useState(200);
+  const [failuresOnly, setFailuresOnly] = useState(false);
+  const [openNights, setOpenNights] = useState(null); // null = the latest night only
   const pollRef = useRef(null);
 
   const TASK_LABELS = {
-    events: "New fantasy events",
-    rankings: "Team rankings (HLTV + VRS)",
-    team_data: "Team rosters and map stats (top-ranked teams)",
-    matches: "New matches played",
-    map_model: "Map model data (vetoes, scoreboards, historical map stats)",
-    valuations: "Event valuations (groups + playoff)",
-    hltv_session: "HLTV login check",
+    events: "Fantasy events",
+    rankings: "Team rankings",
+    team_data: "Rosters & map stats",
+    matches: "New matches",
+    map_model: "Map model data",
+    valuations: "Event valuations",
+    hltv_session: "HLTV login",
+    backup: "Backup",
+    ratings: "Top-X ratings",
   };
-  // The scraper browser's HLTV login rides on a remember-me cookie that dies on
-  // a fixed date (~400 days after the last real sign-in); the nightly run
-  // re-checks it and this button checks on demand (one page load, ~10-20s).
+  const TASK_SUB = {
+    events: "hltv.org/fantasy",
+    rankings: "HLTV + VRS",
+    team_data: "top-ranked teams",
+    matches: "results import",
+    map_model: "vetoes · scoreboards · map stats",
+  };
   const [sessionBusy, setSessionBusy] = useState(false);
   const checkSession = async () => {
     setSessionBusy(true);
     setMessage("");
     try {
       await api.get("/admin/hltv-session-status", 120000);
-      await loadStatus(); // the pill below re-renders from the persisted snapshot
+      await loadStatus();
     } catch (e) {
       setMessage(e?.message || "HLTV login check failed");
     } finally {
@@ -8728,17 +8736,16 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
   };
   const loadRuns = async () => {
     try {
-      const data = await api.get("/schedule/runs?limit=50", 15000);
+      const data = await api.get("/schedule/runs?limit=200", 15000);
       setRuns(data.runs || []);
     } catch {
-      /* runs table is non-critical; status error already surfaces */
+      /* runs are non-critical; the status error already surfaces */
     }
   };
 
   useEffect(() => {
     loadStatus();
     loadRuns();
-    // Poll while the tab is open so live progress and run history stay fresh.
     pollRef.current = setInterval(() => {
       loadStatus();
       loadRuns();
@@ -8774,7 +8781,7 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
       } else if (res?.status === "error") {
         setMessage(res.detail || "Failed to start run.");
       } else {
-        notify(`Started: ${(res.tasks || [task]).join(", ")}`);
+        notify(`Started: ${(res.tasks || [task]).map((t) => TASK_LABELS[t] || t).join(", ")}`);
       }
       loadStatus();
     } catch (e) {
@@ -8784,239 +8791,269 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
     }
   };
 
-  const fmtTs = (ts) => (Number(ts) > 0 ? new Date(Number(ts) * 1000).toLocaleString() : "Never");
+  // ---- formatting -----------------------------------------------------
+  const pad2 = (n) => String(n).padStart(2, "0");
+  const clock = (ts) => (Number(ts) > 0 ? new Date(Number(ts) * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "-");
+  const dayOf = (ts) => {
+    const d = new Date(Number(ts) * 1000);
+    return `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)}/${d.getFullYear()}`;
+  };
+  const fmtDur = (secs) => {
+    const s = Math.max(0, Math.round(Number(secs) || 0));
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ${pad2(s % 60)}s`;
+    return `${Math.floor(m / 60)}h ${pad2(m % 60)}m`;
+  };
+  const relTime = (ts) => {
+    if (!(Number(ts) > 0)) return "never";
+    const diff = Date.now() / 1000 - Number(ts);
+    const abs = Math.abs(diff);
+    const txt = abs < 60 ? "now" : abs < 3600 ? `${Math.round(abs / 60)}m` : abs < 86400 ? `${Math.floor(abs / 3600)}h ${pad2(Math.round((abs % 3600) / 60))}m` : `${Math.floor(abs / 86400)}d`;
+    if (txt === "now") return txt;
+    return diff >= 0 ? `${txt} ago` : `in ${txt}`;
+  };
+  const nextRun = Number(status?.next_run_at || 0);
+  const nextLabel = nextRun > 0 ? (dayOf(nextRun) === dayOf(Date.now() / 1000) ? "Today" : "Tomorrow") : "";
+  const session = status?.hltv_session || null;
+  const sessionLevel = session ? session.level || "ok" : "none";
+
+  // ---- run history grouped by night ---------------------------------
+  const nights = useMemo(() => {
+    const groups = new Map();
+    (runs || []).forEach((run) => {
+      if (failuresOnly && run.status === "success") return;
+      const key = dayOf(run.started_at);
+      if (!groups.has(key)) groups.set(key, { key, rows: [], failed: 0, secs: 0, first: run.started_at, last: run.finished_at || run.started_at });
+      const g = groups.get(key);
+      g.rows.push(run);
+      if (run.status !== "success") g.failed += 1;
+      if (run.finished_at && run.started_at) g.secs += Math.max(0, run.finished_at - run.started_at);
+      g.first = Math.min(g.first, run.started_at);
+      g.last = Math.max(g.last, run.finished_at || run.started_at);
+    });
+    return Array.from(groups.values());
+  }, [runs, failuresOnly]);
+  const isOpen = (key, idx) => (openNights ? openNights.has(key) : idx === 0);
+  const toggleNight = (key, idx) => {
+    setOpenNights((prev) => {
+      const next = new Set(prev || (nights[0] ? [nights[0].key] : []));
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+  const lastRun = (runs || []).find((r) => r.finished_at) || null;
+  const lastNight = nights[0] || null;
+
+  const taskCard = (task) => {
+    const on = Boolean(config[`do_${task}`]);
+    const last = lastByTask[task];
+    const setting =
+      task === "matches"
+        ? ["Look back", <input key="lb" type="number" min={1} max={30} value={lookbackDays} onChange={(e) => setLookbackDays(Number(e.target.value))} onBlur={() => patchConfig({ matches_lookback_days: lookbackDays })} disabled={saveBusy} />, "days"]
+        : task === "team_data"
+          ? ["Top", <input key="tn" type="number" min={10} max={500} value={teamDataTopN} onChange={(e) => setTeamDataTopN(Number(e.target.value))} onBlur={() => patchConfig({ team_data_top_n: teamDataTopN })} disabled={saveBusy} />, "teams"]
+          : task === "map_model"
+            ? ["Up to", <input key="mm" type="number" min={1} max={720} value={mapModelMinutes} onChange={(e) => setMapModelMinutes(Number(e.target.value))} onBlur={() => patchConfig({ map_model_minutes: mapModelMinutes })} disabled={saveBusy} />, "min / night"]
+            : null;
+    const live = state.running && state.current_task === task;
+    return (
+      <div className={`sch-task${on ? " on" : " off"}${live ? " live" : ""}`} key={task}>
+        <div className="sch-task-head">
+          <div>
+            <div className="sch-task-name">{TASK_LABELS[task]}</div>
+            <div className="topx-tile-label">{TASK_SUB[task]}</div>
+          </div>
+          <label className="switch" title={on ? "Enabled" : "Disabled"}>
+            <input type="checkbox" checked={on} onChange={(e) => patchConfig({ [`do_${task}`]: e.target.checked })} disabled={saveBusy} />
+            <span className="switch-track" />
+          </label>
+        </div>
+        <div className="sch-task-meta">
+          <span>Last ok</span>
+          <span title={Number(last) > 0 ? new Date(Number(last) * 1000).toLocaleString() : ""}>{relTime(last)}</span>
+          {setting && (
+            <>
+              <span>{setting[0]}</span>
+              <span className="sch-task-setting">
+                {setting[1]}
+                <span className="muted">{setting[2]}</span>
+              </span>
+            </>
+          )}
+        </div>
+        <div className="sch-task-foot">
+          {live ? (
+            <span className="pill ok">Running{state.total > 0 ? ` ${state.processed}/${state.total}` : ""}</span>
+          ) : (
+            <span />
+          )}
+          <button className="secondary" onClick={() => runNow(task)} disabled={runBusy || state.running}>
+            Run
+          </button>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="stack">
       <Section title="Nightly Data Refresh">
-        <p className="muted">
-          The always-on backend refreshes data automatically each night, so the Database pages don't need manual
-          imports. Tasks run in sequence (they share one scraping browser). Requires the backend auto-start install
-          (scripts\install-autostart.ps1) for refreshes to happen with the app closed.
-        </p>
-        <div className="grid three">
-          <div className="field">
-            <span>Scheduler</span>
-            <label className="checkbox-inline">
-              <input
-                type="checkbox"
-                checked={Boolean(config.enabled)}
-                onChange={(e) => patchConfig({ enabled: e.target.checked })}
-                disabled={saveBusy}
-              />
-              <span>{config.enabled ? "Enabled" : "Disabled"}</span>
-            </label>
+        <div className="sch-strip">
+          <div className={`topx-tile sch-tile${config.enabled ? "" : " empty"}`}>
+            <div className="topx-tile-label">Scheduler</div>
+            <div className="sch-tile-row">
+              <label className="switch" title={config.enabled ? "Enabled" : "Disabled"}>
+                <input type="checkbox" checked={Boolean(config.enabled)} onChange={(e) => patchConfig({ enabled: e.target.checked })} disabled={saveBusy} />
+                <span className="switch-track" />
+              </label>
+              <input type="time" value={runTime} onChange={(e) => setRunTime(e.target.value)} onBlur={() => patchConfig({ run_time: runTime })} disabled={saveBusy} />
+            </div>
+            <div className="topx-tile-maps">{config.enabled ? `Daily at ${runTime}` : "Paused"}</div>
           </div>
-          <div className="field">
-            <span>Run time (daily)</span>
-            <input
-              type="time"
-              value={runTime}
-              onChange={(e) => setRunTime(e.target.value)}
-              onBlur={() => patchConfig({ run_time: runTime })}
-              disabled={saveBusy}
-            />
+          <div className="topx-tile sch-tile">
+            <div className="topx-tile-label">Next run</div>
+            <div className="topx-tile-value">{nextRun > 0 ? clock(nextRun) : "-"}</div>
+            <div className="topx-tile-maps">
+              {nextRun > 0 ? `${nextLabel} · ${relTime(nextRun)}` : ""}
+              {status?.catch_up_pending ? " · catching up" : ""}
+            </div>
           </div>
-          <div className="field">
-            <span>Next scheduled run</span>
-            <div className="pill">{status?.next_run_at ? new Date(status.next_run_at * 1000).toLocaleString() : "-"}</div>
+          <div className={`topx-tile sch-tile${lastNight && lastNight.failed > 0 ? " warn" : ""}`}>
+            <div className="topx-tile-label">Last night</div>
+            <div className="topx-tile-value">{lastNight ? (lastNight.failed > 0 ? `${lastNight.failed} failed` : "All ok") : "-"}</div>
+            <div className="topx-tile-maps">
+              {lastNight ? `${lastNight.rows.length} tasks · ${fmtDur(lastNight.secs)} · ${lastNight.key}` : ""}
+            </div>
+          </div>
+          <div className={`topx-tile sch-tile${sessionLevel !== "ok" && sessionLevel !== "none" ? " warn" : ""}`}>
+            <div className="topx-tile-label">HLTV login</div>
+            <div className="topx-tile-value">{sessionLevel === "none" ? "-" : sessionLevel === "ok" ? "Signed in" : sessionLevel}</div>
+            <div className="sch-tile-row">
+              <span className="topx-tile-maps" title={session?.message || ""}>
+                {session?.checked_at ? `checked ${relTime(session.checked_at)}` : "not checked"}
+              </span>
+              <button className="secondary" onClick={checkSession} disabled={sessionBusy || state.running}>
+                {sessionBusy ? "Checking…" : "Check"}
+              </button>
+            </div>
           </div>
         </div>
-        <div className="field" style={{ marginTop: 8 }}>
-          <span>HLTV login (scraper browser)</span>
-          <div className="pills">
-            <div className={status?.hltv_session && status.hltv_session.level !== "ok" ? "pill warn" : "pill"}>
-              {status?.hltv_session?.message || "Not checked yet"}
+        {state.running && (
+          <div className="sch-live">
+            <div className="pills">
+              <span className="pill ok">Running</span>
+              <strong>{TASK_LABELS[state.current_task] || state.current_task}</strong>
+              <span className="muted">
+                {state.total > 0 ? `${Number(state.processed).toLocaleString()} / ${Number(state.total).toLocaleString()}` : ""}
+                {state.trigger ? ` · ${state.trigger}` : ""}
+                {state.started_at ? ` · ${fmtDur(Date.now() / 1000 - state.started_at)}` : ""}
+              </span>
+              {state.message && <span className="muted">{state.message}</span>}
             </div>
-            <button className="secondary" onClick={checkSession} disabled={sessionBusy || state.running}>
-              {sessionBusy ? "Checking..." : "Check now"}
-            </button>
+            {state.total > 0 && (
+              <div className="mm-bar">
+                <div className="mm-bar-fill" style={{ width: `${Math.min(100, (100 * Number(state.processed)) / Number(state.total))}%` }} />
+              </div>
+            )}
           </div>
-          {status?.hltv_session?.checked_at && (
-            <div className="muted" style={{ fontSize: 12 }}>
-              Last checked {new Date(status.hltv_session.checked_at * 1000).toLocaleString()}; re-checked after every nightly run,
-              warns 30 days before the login cookie expires.
-            </div>
-          )}
-        </div>
+        )}
         {Array.isArray(status?.dev_flags) && status.dev_flags.length > 0 && (
-          <div className="field" style={{ marginTop: 8 }}>
-            <span>Flagged for development</span>
-            <div className="pills" style={{ flexWrap: "wrap" }}>
-              {status.dev_flags.map((f) => (
-                <div className="pill warn" key={f.key} title={f.detail}>
-                  {f.key}
-                  {Array.isArray(f.event_ids) && f.event_ids.length > 0 ? ` (event ${f.event_ids.join(", ")})` : ""}
-                </div>
-              ))}
-            </div>
-            <div className="muted" style={{ fontSize: 12 }}>
-              Formats the app met but refuses to model until their bracket is verified. Hover a flag for details.
-            </div>
+          <div className="pills" style={{ flexWrap: "wrap", marginTop: 10 }}>
+            {status.dev_flags.map((f) => (
+              <div className="pill warn" key={f.key} title={f.detail}>
+                {f.key}
+                {Array.isArray(f.event_ids) && f.event_ids.length > 0 ? ` · event ${f.event_ids.join(", ")}` : ""}
+              </div>
+            ))}
           </div>
         )}
         {message && <p className="muted">{message}</p>}
       </Section>
 
       <Section title="Tasks">
-        <table>
-          <thead>
-            <tr>
-              <th>Task</th>
-              <th>Enabled</th>
-              <th>Last successful run</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {["events", "rankings", "team_data", "matches", "map_model"].map((task) => {
-              const flagKey = `do_${task}`;
-              return (
-                <tr key={task}>
-                  <td>
-                    {TASK_LABELS[task]}
-                    {task === "events" && (
-                      <div className="muted" style={{ fontSize: 12 }}>
-                        Checks hltv.org/fantasy and imports any fantasy events not in the database; the active
-                        event is never switched automatically.
-                      </div>
-                    )}
-                    {task === "matches" && (
-                      <div className="muted" style={{ fontSize: 12 }}>
-                        Imports results back{" "}
-                        <input
-                          type="number"
-                          min={1}
-                          max={30}
-                          value={lookbackDays}
-                          onChange={(e) => setLookbackDays(Number(e.target.value))}
-                          onBlur={() => patchConfig({ matches_lookback_days: lookbackDays })}
-                          disabled={saveBusy}
-                          style={{ width: 52 }}
-                        />{" "}
-                        day(s); already-imported matches are skipped.
-                      </div>
-                    )}
-                    {task === "team_data" && (
-                      <div className="muted" style={{ fontSize: 12 }}>
-                        Current lineups and six-month map stats for the top{" "}
-                        <input
-                          type="number"
-                          min={10}
-                          max={500}
-                          value={teamDataTopN}
-                          onChange={(e) => setTeamDataTopN(Number(e.target.value))}
-                          onBlur={() => patchConfig({ team_data_top_n: teamDataTopN })}
-                          disabled={saveBusy}
-                          style={{ width: 60 }}
-                        />{" "}
-                        ranked teams.
-                      </div>
-                    )}
-                    {task === "map_model" && (
-                      <div className="muted" style={{ fontSize: 12 }}>
-                        Whatever the map model is missing (the three jobs under Data Coverage below), for up to{" "}
-                        <input
-                          type="number"
-                          min={1}
-                          max={720}
-                          value={mapModelMinutes}
-                          onChange={(e) => setMapModelMinutes(Number(e.target.value))}
-                          onBlur={() => patchConfig({ map_model_minutes: mapModelMinutes })}
-                          disabled={saveBusy}
-                          style={{ width: 60 }}
-                        />{" "}
-                        minutes a night; anything left continues the next night.
-                      </div>
-                    )}
-                  </td>
-                  <td>
-                    <input
-                      type="checkbox"
-                      checked={Boolean(config[flagKey])}
-                      onChange={(e) => patchConfig({ [flagKey]: e.target.checked })}
-                      disabled={saveBusy}
-                    />
-                  </td>
-                  <td>{fmtTs(lastByTask[task])}</td>
-                  <td>
-                    <button className="secondary" onClick={() => runNow(task)} disabled={runBusy || state.running}>
-                      Run now
-                    </button>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+        <div className="sch-tasks">{["events", "rankings", "team_data", "matches", "map_model"].map(taskCard)}</div>
         <div className="actions">
           <button className="primary" onClick={() => runNow("all")} disabled={runBusy || state.running}>
-            {state.running ? "Refresh in progress..." : "Run All Now"}
+            {state.running ? "Refresh in progress…" : "Run all now"}
           </button>
-          {state.running && (
-            <span className="muted">
-              Running {TASK_LABELS[state.current_task] || state.current_task}
-              {state.total > 0 ? ` — ${state.processed}/${state.total}` : ""}
-              {state.trigger ? ` (${state.trigger})` : ""}
-            </span>
-          )}
         </div>
       </Section>
 
       <ModelDataPanel topN={teamDataTopN} />
 
-      <Section title="Matches Import">
-        <MatchesDataPanel notify={notify} mode="import" />
+      <Section title="Imports">
+        <div className="sch-imports">
+          <div className="card sub">
+            <h3>Matches</h3>
+            <MatchesDataPanel notify={notify} mode="import" />
+          </div>
+          {mapStats && (
+            <div className="card sub">
+              <h3>Map stats</h3>
+              <MapStatsJobControls job={mapStats} teamsAvailable={(teams || []).length > 0} />
+              <MapStatsJobProgress job={mapStats} />
+            </div>
+          )}
+        </div>
       </Section>
 
-      {mapStats && (
-        <Section title="Map Stats Import">
-          <p className="muted">
-            Scrapes each team's HLTV map page (last 3 months). Pausable and resumable; safe to leave running.
-          </p>
-          <MapStatsJobControls job={mapStats} teamsAvailable={(teams || []).length > 0} />
-          <MapStatsJobProgress job={mapStats} />
-        </Section>
-      )}
-
       <Section title="Run History">
-        {runs.length === 0 && <p className="muted">No runs recorded yet.</p>}
-        {runs.length > 0 && (
-          <table>
-            <thead>
-              <tr>
-                <th>Task</th>
-                <th>Trigger</th>
-                <th>Status</th>
-                <th>Started</th>
-                <th>Duration</th>
-                <th>Details</th>
-              </tr>
-            </thead>
-            <tbody>
-              {runs.map((run) => {
-                const dur =
-                  run.finished_at && run.started_at
-                    ? `${Math.max(0, Math.round(run.finished_at - run.started_at))}s`
-                    : "-";
-                return (
-                  <tr key={run.id}>
-                    <td>{TASK_LABELS[run.task] || run.task}</td>
-                    <td>{run.trigger}</td>
-                    <td>
-                      <span className={run.status === "success" ? "pill" : "pill warn"}>{run.status}</span>
-                    </td>
-                    <td>{fmtTs(run.started_at)}</td>
-                    <td>{dur}</td>
-                    <td className="muted" style={{ maxWidth: 420, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {run.message || ""}
-                    </td>
+        <div className="sch-history-tools">
+          <label className="checkbox-inline">
+            <input type="checkbox" checked={failuresOnly} onChange={(e) => setFailuresOnly(e.target.checked)} />
+            <span>Failures only</span>
+          </label>
+          {lastRun && (
+            <span className="muted">
+              Last finished {TASK_LABELS[lastRun.task] || lastRun.task} · {relTime(lastRun.finished_at)}
+            </span>
+          )}
+        </div>
+        {nights.length === 0 && <p className="muted">{failuresOnly ? "No failures recorded." : "No runs recorded yet."}</p>}
+        {nights.map((night, idx) => (
+          <div className="sch-night" key={night.key}>
+            <div className="sch-night-head" onClick={() => toggleNight(night.key, idx)}>
+              <span className="sch-night-date">{night.key}</span>
+              <span className="sch-night-meta">
+                {clock(night.first)} – {clock(night.last)} · {night.rows.length} tasks · {fmtDur(night.secs)}
+              </span>
+              <span className={`pill${night.failed > 0 ? " warn" : " ok"}`}>{night.failed > 0 ? `${night.failed} failed` : "all ok"}</span>
+              <span className="muted">{isOpen(night.key, idx) ? "▾" : "▸"}</span>
+            </div>
+            {isOpen(night.key, idx) && (
+              <table>
+                <thead>
+                  <tr>
+                    <th>Task</th>
+                    <th>Trigger</th>
+                    <th>Status</th>
+                    <th>Started</th>
+                    <th>Duration</th>
+                    <th>Details</th>
                   </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
+                </thead>
+                <tbody>
+                  {night.rows.map((run) => (
+                    <tr key={run.id}>
+                      <td>{TASK_LABELS[run.task] || run.task}</td>
+                      <td className="muted">{run.trigger}</td>
+                      <td>
+                        <span className={run.status === "success" ? "pill ok" : "pill warn"}>{run.status}</span>
+                      </td>
+                      <td>{clock(run.started_at)}</td>
+                      <td>{run.finished_at && run.started_at ? fmtDur(run.finished_at - run.started_at) : "-"}</td>
+                      <td className="details" title={run.message || ""}>
+                        {run.message || ""}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        ))}
       </Section>
     </div>
   );
@@ -9578,7 +9615,7 @@ function BackfillRow({ name, detail, done, total, missing, unit, extra, job, ver
     <div className={`mm-job${active ? " active" : ""}`}>
       <div className="mm-job-info">
         <div className="mm-job-name">{name}</div>
-        <div className="mm-job-detail">{detail}</div>
+        {detail && <div className="mm-job-detail">{detail}</div>}
       </div>
       <div className="mm-job-cov">
         <div className="mm-job-cov-head">
@@ -9704,14 +9741,9 @@ function ModelDataPanel({ topN = 200 }) {
 
   return (
     <Section title="Data Coverage">
-      <p className="muted mm-data-note">
-        What the models need and how much of it is stored. The nightly tasks fetch whatever is missing; any job can
-        also be run from here.
-      </p>
       <div className="mm-jobs">
         <BackfillRow
-          name="Team rosters"
-          detail={`Current five-player lineups from the HLTV team pages of the top ${Number(topN) || 200} ranked teams; players are created by HLTV id.`}
+          name={`Team rosters · top ${Number(topN) || 200}`}
           done={rosterCoverage?.with_roster}
           total={rosterCoverage?.teams_in_scope}
           missing={rosterCoverage?.missing_roster}
@@ -9720,7 +9752,6 @@ function ModelDataPanel({ topN = 200 }) {
         />
         <BackfillRow
           name="Historical map stats"
-          detail="Six-month map stats for both teams as of each match date. Maps without them are left out of the model."
           done={histCoverage?.cached_windows}
           total={histCoverage?.required_windows}
           missing={histCoverage?.missing_windows}
@@ -9730,7 +9761,6 @@ function ModelDataPanel({ topN = 200 }) {
         />
         <BackfillRow
           name="Match vetoes"
-          detail="Who picked each map, plus missing per-map scores and player stats. Feeds the picked-map feature and veto-simulated series."
           done={vetoCoverage?.with_veto}
           total={vetoCoverage?.total_matches}
           missing={vetoCoverage?.missing_veto}
@@ -9739,7 +9769,6 @@ function ModelDataPanel({ topN = 200 }) {
         />
         <BackfillRow
           name="Per-map scoreboards"
-          detail="Player scoreboards for every map (the map tabs in the match view), mostly re-parsed from archived pages without scraping."
           done={mapSbCoverage?.with_map_scoreboards}
           total={mapSbCoverage?.total_matches}
           missing={mapSbCoverage?.missing_map_scoreboards}
