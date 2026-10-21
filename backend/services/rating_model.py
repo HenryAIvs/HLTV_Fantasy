@@ -1,7 +1,7 @@
 """The rating model the valuations use: a player's expected HLTV rating in a
 match, learned from every stored per-map scoreboard.
 
-It replaces the Top-X bucket curve (rating_curve / rating_picker). The study
+It replaced the Top-X bucket curve on 2026-10-19. The study
 behind it (rating_model_study, shown on Dev Lab → Rating Model) measured it
 walk-forward against that curve: a lower error every month and no bias
 against weak or unranked opponents, where the curve under-predicted by
@@ -22,7 +22,7 @@ player rows (playoff._build_playoff_lookup_context) each row gets
 `model_ratings`, the player's expected rating against every other team of
 the event, and that travels with the stored input snapshot — so a stored run
 re-scores exactly, whatever the model learns later. The engine reads it
-through rating_picker.pick_match_rating.
+through match_rating().
 """
 from __future__ import annotations
 
@@ -302,6 +302,23 @@ def rank_curve(player_id: int, own_rank: Any, ranks: Iterable[int] = range(1, 10
     wts = np.asarray(weights[: len(_CURVE_OFFSETS)])
     smoothed = (preds * wts).sum(axis=1) / wts.sum()
     return [{"rank": r, "rating": round(float(p), 4)} for r, p in zip(ranks, smoothed)]
+
+
+def match_rating(row: Dict[str, Any], opponent_team_id: Any) -> float:
+    """The rating the engine scores a player with against that opponent: the
+    row's learned `model_ratings` entry (attached when the valuation's rows
+    were built), else the row's stored rating (a player with no stored maps),
+    else 1.0."""
+    learned = row.get("model_ratings") if isinstance(row, dict) else None
+    if opponent_team_id is not None and isinstance(learned, dict):
+        value = learned.get(str(int(opponent_team_id)))
+        if value is not None:
+            return float(value)
+    try:
+        value = float(row.get("rating"))
+        return value if value > 0 else 1.0
+    except (TypeError, ValueError, AttributeError):
+        return 1.0
 
 
 def recent_maps(player_id: int, n: int = 10, conn: Optional[sqlite3.Connection] = None) -> List[Dict[str, Any]]:

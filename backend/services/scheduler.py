@@ -1,8 +1,8 @@
 """Nightly data-ingestion scheduler.
 
 A single daemon thread wakes periodically and, once per day at the configured
-local time, runs the three ingestion jobs in sequence — team rankings, new
-matches, then player Top-X ratings. They run sequentially because they all
+local time, runs the ingestion jobs in sequence — team rankings, team data,
+new matches, then the map and rating models. They run sequentially because they all
 serialize on the one shared HLTV browser anyway. Manual "run now" triggers reuse
 the same code path. State + history live in schedule_db.
 
@@ -128,7 +128,7 @@ class DataScheduler:
     # resurrects interruption-paused jobs itself — a pause the USER requested
     # (pause_requested=True) is respected and left alone.
     def _job_families(self):
-        from backend.routes import admin, events, players, teams
+        from backend.routes import admin, events, teams
 
         return [
             ("trigger rates", admin._get_latest_trigger_job, admin.resume_trigger_backfill_job),
@@ -136,8 +136,6 @@ class DataScheduler:
             ("map scoreboards", events._get_latest_map_sb_job, events.resume_map_scoreboards_job),
             ("historical map-stats", events._get_latest_historical_job, events.resume_historical_map_stats_job),
             ("results import", events.get_latest_hltv_results_import_job, events.resume_hltv_results_import_job),
-            ("topx batch", lambda: players._get_latest_topx_batch_job(include_completed=False),
-             players.resume_fetch_top_ratings_batch_job),
             ("rankings refresh", teams._get_latest_rankings_job, teams.resume_rankings_refresh_job),
             ("team rosters", teams._get_latest_roster_job, teams.resume_roster_import_job),
             ("map-stats import", lambda: teams._get_latest_map_stats_job(include_completed=False),
@@ -251,14 +249,11 @@ class DataScheduler:
         if cfg.get("do_rankings"):
             tasks.append("rankings")
         # Rosters + team map stats for the top-N teams; after rankings so the
-        # scope uses tonight's ranks, before ratings so new roster players
-        # get their Top-X numbers the same night.
+        # scope uses tonight's ranks.
         if cfg.get("do_team_data"):
             tasks.append("team_data")
         if cfg.get("do_matches"):
             tasks.append("matches")
-        if cfg.get("do_ratings"):
-            tasks.append("ratings")
         # After the results import, so tonight's new matches get their
         # vetoes, scoreboards and map-stat windows too.
         if cfg.get("do_map_model"):
@@ -422,8 +417,6 @@ class DataScheduler:
                 msg = self._task_rankings()
             elif task == "matches":
                 msg = self._task_matches(cfg)
-            elif task == "ratings":
-                msg = self._task_ratings()
             elif task == "map_model":
                 msg = self._task_map_model(cfg)
             elif task == "team_data":
@@ -486,25 +479,6 @@ class DataScheduler:
         until = (date.today() - timedelta(days=lookback)).isoformat()
         result = events.import_hltv_results({"import_mode": "until_date", "until_date": until}) or {}
         return _short(result)
-
-    def _task_ratings(self) -> str:
-        from backend.data.player_db import get_all_players, get_active_topx_window
-        from backend.routes import players
-
-        try:
-            months = int(get_active_topx_window() or 3)
-        except Exception:
-            months = 3
-        ids = [int(p["player_id"]) for p in get_all_players() if p.get("player_id")]
-        items = [{"player_id": pid} for pid in ids]
-
-        # _run_top_ratings_batch reports (row, processed, total, ok, failed).
-        def _progress(row, processed, total, ok, failed) -> None:
-            self._set_state(processed=int(processed), total=int(total),
-                            message=f"Ratings {processed}/{total} ({months}mo, {failed} failed)")
-
-        result = players._run_top_ratings_batch(items, 1, progress_callback=_progress, months=months) or {}
-        return f"{len(ids)} players, {months}mo: {_short(result)}"
 
     def _drive_job(self, name, unit, total_hint, latest_fn, start_fn, resume_fn, pause_fn, deadline,
                    processed_key="processed_items", total_key="total_items"):

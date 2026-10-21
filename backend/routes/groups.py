@@ -548,13 +548,10 @@ def _group_stage_records(results: dict, cache_key: Any, event_id: Optional[int])
     extra_rounds = int((results.get("playoff") or {}).get("rounds") or 0) if results.get("combined_playoffs") else 0
     out: Dict[int, List[Dict[str, Any]]] = {}
     prob_cache: Dict = {}
-    from backend.services.rating_curve import average_bucket_pct_override
 
     from backend.services import leader_role
 
-    curve = (results.get("input_snapshot") or {}).get("average_bucket_pct")  # runs baked before it was stored: the fitted curve
-    with event_rosters.for_event(event_id), team_strength.rank_overrides(overrides), average_bucket_pct_override(curve), \
-            leader_role.use(leader_role.loaded(results.get("leader_odds"))):
+    with event_rosters.for_event(event_id), team_strength.rank_overrides(overrides), leader_role.use(leader_role.loaded(results.get("leader_odds"))):
         for g_idx, group in enumerate(groups):
             acc: Dict[str, Any] = {"_records": []}
             enumerate_group(
@@ -2062,13 +2059,9 @@ def _take_input_snapshot(event_id: int, team_ids: List[int]) -> Dict[str, Any]:
         if price is not None:
             out["price"] = int(price)
         players[str(pid)] = out
-    from backend.services.rating_curve import get_average_bucket_pct
-
     return {
         "players": players,
         "team_ranks": {str(tid): int(rank) for tid, rank in team_rank_by_id.items()},
-        # the rating-vs-rank curve the rows are scored through (refit nightly)
-        "average_bucket_pct": {str(t): float(v) for t, v in get_average_bucket_pct().items()},
     }
 
 
@@ -2084,13 +2077,6 @@ def _event_inputs(event_id: int, team_ids: List[int], refresh: bool = False) -> 
     existing = _INPUT_SNAPSHOT.load(key=int(event_id))
     if existing and started and not refresh:
         snapshot = existing["result"]
-        if "average_bucket_pct" not in snapshot:
-            # frozen before the curve travelled with the snapshot: pin the curve
-            # the run is valued with now, so a later refit cannot move it
-            from backend.services.rating_curve import get_average_bucket_pct
-
-            snapshot["average_bucket_pct"] = {str(t): float(v) for t, v in get_average_bucket_pct().items()}
-            _INPUT_SNAPSHOT.save(dict(existing.get("payload") or {}), snapshot, key=int(event_id))
         if not any("model_ratings" in (row or {}) for row in (snapshot.get("players") or {}).values()):
             # frozen before the learned rating model: pin its expected ratings
             # onto the frozen rows (prices, roles, boosters, ranks unchanged)
@@ -2456,16 +2442,14 @@ def _compute_paths_result(payload: dict, snapshot: Dict[str, Any], event_id: int
     and input snapshot. Runs inside the event's roster context (the
     pipeline)."""
     from backend.services import paths_engine
-    from backend.services.rating_curve import average_bucket_pct_override
 
     fmt = str(payload.get("group_format") or "")
     team_ids = [int(t) for t in (payload.get("groups") or [[]])[0]]
     player_rows_by_id, team_rank_by_id = _lookup_context_from_snapshot(snapshot, team_ids)
-    curve = (snapshot or {}).get("average_bucket_pct")
     prob_cache: Dict = {}
     from backend.services import leader_role
 
-    with team_strength.rank_overrides(team_rank_by_id), average_bucket_pct_override(curve):
+    with team_strength.rank_overrides(team_rank_by_id):
         paths, seeds, block = _paths_build(payload, team_ids, prob_cache, regenerate=False)
         leader_odds = _paths_leader_odds(team_ids, block)
         with leader_role.use(leader_odds):
@@ -2516,7 +2500,6 @@ def _compute_paths_result(payload: dict, snapshot: Dict[str, Any], event_id: int
             "frozen": bool(meta.get("frozen")),
             "start_at": meta.get("start_at"),
             "players": (snapshot or {}).get("players") or {},
-            "average_bucket_pct": curve,
         },
     }
     return result, model
@@ -2525,13 +2508,11 @@ def _compute_paths_result(payload: dict, snapshot: Dict[str, Any], event_id: int
 def _paths_for(results: dict):
     """A stored path-format run's scored outcome space, regenerated from the
     run: its stored win matrices, seed order (and seed), snapshot rows, the
-    ranks and curve it was valued with, the event's rosters."""
+    ranks it was valued with, the event's rosters."""
     from backend.services import paths_engine
-    from backend.services.rating_curve import average_bucket_pct_override
 
     team_ids = [int(t) for t in (results.get("groups") or [[]])[0]]
     player_rows_by_id, team_rank_by_id, overrides = _run_lookup_context(results, team_ids)
-    curve = (results.get("input_snapshot") or {}).get("average_bucket_pct")
     prob_cache: Dict = {}
     paths, seeds, block = _paths_build(results, team_ids, prob_cache, regenerate=True)
     fmt_block = results.get("swiss") if results.get("group_format") == "swiss" else results.get("bracket")
@@ -2539,8 +2520,7 @@ def _paths_for(results: dict):
 
     event_id = int((fmt_block or {}).get("event_id") or 0) or None
     leader_odds = leader_role.loaded(results.get("leader_odds"))  # runs baked before: HLTV's percentages, as stored
-    with event_rosters.for_event(event_id), team_strength.rank_overrides(overrides), average_bucket_pct_override(curve), \
-            leader_role.use(leader_odds):
+    with event_rosters.for_event(event_id), team_strength.rank_overrides(overrides), leader_role.use(leader_odds):
         base_states = initialize_teams(team_ids, seeds)
         return paths_engine.score(paths, base_states, player_rows_by_id, team_rank_by_id, prob_cache)
 
@@ -2820,11 +2800,9 @@ def _compute_groups_result(payload: dict, progress_callback=None, snapshot: Opti
     else:
         player_rows_by_id, team_rank_by_id = _build_playoff_lookup_context(all_team_ids)
     from backend.services import leader_role
-    from backend.services.rating_curve import average_bucket_pct_override
 
-    curve = (snapshot or {}).get("average_bucket_pct")
     prob_cache: Dict = {}
-    with team_strength.rank_overrides(team_rank_by_id if snapshot else None), average_bucket_pct_override(curve):
+    with team_strength.rank_overrides(team_rank_by_id if snapshot else None):
         # the Leader role's percentages: each team's 2-0 / 2-1 / loss odds against the field
         leader_odds = leader_role.field_odds(all_team_ids, lambda a, b: cached_win_prob(prob_cache, a, b, "bo3"), 2)
         with leader_role.use(leader_odds):
@@ -2843,7 +2821,6 @@ def _compute_groups_result(payload: dict, progress_callback=None, snapshot: Opti
             "frozen": bool(meta.get("frozen")),
             "start_at": meta.get("start_at"),
             "players": snapshot.get("players") or {},
-            "average_bucket_pct": curve,
         }
     return result
 

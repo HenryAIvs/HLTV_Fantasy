@@ -14,7 +14,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from backend.routes import players, teams, simulation, bracket, best_team, playoff, groups, admin, events, schedule, assets
 from backend.services.backend_port import APP_ID, HOST, PORT_FILE, select_port, write_port_info
 from backend.data.event_db import ensure_event_schema
-from backend.data.player_db import ensure_schema, ensure_topx_windows_schema
+from backend.data.player_db import ensure_schema
 from backend.data.team_db import ensure_team_schema
 from backend.data.schedule_db import ensure_schedule_schema
 from backend.services.scheduler import scheduler
@@ -25,14 +25,12 @@ from backend.services import roster_scores
 
 SCHEMA_INITIALIZERS = (
     ensure_schema,
-    ensure_topx_windows_schema,
     ensure_team_schema,
     ensure_event_schema,
     simulation.ensure_simulation_schema,
     best_team.ensure_best_team_schema,
     playoff.ensure_playoff_schema,
     groups.ensure_groups_schema,
-    players.ensure_topx_batch_schema,
     teams.ensure_map_stats_import_schema,
     teams.ensure_rankings_refresh_schema,
     events.ensure_historical_stats_job_schema,
@@ -70,10 +68,6 @@ def configure_logging() -> None:
 async def _lifespan(app: FastAPI):
     for ensure in SCHEMA_INITIALIZERS:
         ensure()
-    try:
-        players.refresh_average_rating_curve()
-    except Exception:
-        logging.getLogger(__name__).warning("Could not fit average rating curve at startup", exc_info=True)
     # Nightly data-ingestion scheduler runs for as long as the backend is up.
     try:
         scheduler.start()

@@ -1,30 +1,28 @@
+"""The Top-X bucket curve the app priced ratings with until 2026-10-19, kept
+only as the baseline the Rating Model study scores the learned model against
+(Dev Lab → Rating Model). Nothing else reads it.
+
+Per player: HLTV's cumulative "rating vs top N" tiers become non-overlapping
+bands, each band shrinks toward a population curve (the typical fractional
+drop vs stronger opposition, refit from the players in scope) by its map
+count, and the band ratings interpolate at the opponent's rank; outside the
+top 50 the overall rating stands.
+"""
+from __future__ import annotations
+
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
 
 TOP_TIERS = (5, 10, 20, 30, 50)
 
-# Bucket shrinkage prior: a band's own rating only outweighs the average-player
-# curve once it has this many real maps behind it. Fixed (not scaled by the
-# player's total activity) because trusting a band is a question of *that band's*
-# sample size, not how much the player played elsewhere. k=20 is conservative:
-# a small sample (~7 maps) only moves the estimate ~1/4 of the way to its raw
-# rating; a band needs ~20 maps to count half its own weight against the prior.
+
 BUCKET_PRIOR_MAPS = 20.0
 
-# Player-level prior strength: maps of ranked evidence before a player's overall
-# deviation from the average curve is half-trusted as a shift to their whole
-# curve. Higher = the player's own ranked sample overrides the population prior
-# more slowly. See _personal_offset.
+
 PERSONAL_PRIOR_MAPS = 25.0
 
-# Average player degradation curve, stored as a FRACTIONAL deprivation per tier:
-# the typical player's rating vs top-N is (1 + pct[tier]) times their overall
-# rating (pct is usually negative for the strongest tiers). Kept as a fraction,
-# not an absolute rating delta, so the prior scales with each player's level —
-# applying it to a 1.3 player deprives more absolute points than for a 0.9
-# player. Fitted from players with real per-tier data; used both as the
-# shrinkage prior and as the estimate for players lacking per-tier data.
+
 _AVERAGE_BUCKET_PCT: Dict[int, float] = {}
 
 
@@ -35,27 +33,6 @@ def set_average_bucket_pct(pct: Dict[int, float]) -> None:
 
 def get_average_bucket_pct() -> Dict[int, float]:
     return dict(_AVERAGE_BUCKET_PCT)
-
-
-class average_bucket_pct_override:
-    """Context manager: `with average_bucket_pct_override(pct): ...` values
-    with that curve (a stored run's snapshot) instead of the fitted one; None
-    leaves the fitted curve in place."""
-
-    def __init__(self, pct: Optional[Dict[Any, Any]]):
-        self.pct = None if pct is None else {int(k): float(v) for k, v in dict(pct).items()}
-
-    def __enter__(self):
-        global _AVERAGE_BUCKET_PCT
-        self._saved = _AVERAGE_BUCKET_PCT
-        if self.pct is not None:
-            _AVERAGE_BUCKET_PCT = self.pct
-        return self
-
-    def __exit__(self, *exc):
-        global _AVERAGE_BUCKET_PCT
-        _AVERAGE_BUCKET_PCT = self._saved
-        return False
 
 
 def fit_average_bucket_pct(player_rows) -> Dict[int, float]:
@@ -79,6 +56,8 @@ def fit_average_bucket_pct(player_rows) -> Dict[int, float]:
             sums[tier] += (float(delta) / float(overall)) * float(maps)
             weights[tier] += float(maps)
     return {t: sums[t] / weights[t] for t in TOP_TIERS if weights[t] > 0}
+
+
 BUCKET_RANGES = {
     5: (1, 5),
     10: (6, 10),
@@ -86,6 +65,8 @@ BUCKET_RANGES = {
     30: (21, 30),
     50: (31, 50),
 }
+
+
 TIER_LABELS = {
     5: "Top 5",
     10: "6-10",
@@ -117,15 +98,6 @@ def _get_tier_maps(row: Dict[str, Any], tier: int) -> Optional[float]:
 
 def _tier_label(tier: int) -> str:
     return TIER_LABELS.get(int(tier), f"Top {int(tier)}")
-
-
-def _total_recent_maps_proxy(row: Dict[str, Any]) -> Optional[float]:
-    maps_50 = _get_tier_maps(row, 50)
-    if maps_50 is not None and maps_50 > 0:
-        return maps_50
-    maps_values = [_get_tier_maps(row, tier) for tier in TOP_TIERS]
-    valid = [float(v) for v in maps_values if v is not None and v > 0]
-    return max(valid) if valid else None
 
 
 def _derive_bucket_from_cumulative(
@@ -311,44 +283,6 @@ def _linear_interpolate(points: List[Tuple[float, float]], x: float) -> float:
     return float(ordered[-1][1])
 
 
-def build_player_interpolated_rows(bucket_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Interpolate three rank-adjusted curves across ranks 1-50:
-    - predicted_rating: the average-player prior (overall scaled by the curve)
-    - final_rating:     the shrinkage-weighted blend the match engine uses
-    (bucket_rating is kept as an alias of final_rating for backward compat)."""
-    final_points: List[Tuple[float, float]] = []
-    prior_points: List[Tuple[float, float]] = []
-    for row in bucket_rows:
-        tier = int(row.get("tier") or 0)
-        if tier not in TOP_TIERS:
-            continue
-        fr = _safe_float(row.get("bucket_rating"))
-        pr = _safe_float(row.get("prior_rating"))
-        if fr is not None:
-            final_points.append((float(tier), float(fr)))
-        if pr is not None:
-            prior_points.append((float(tier), float(pr)))
-
-    if not final_points:
-        return []
-
-    ranks = [1, 5, 10, 20, 30, 50]
-    out: List[Dict[str, Any]] = []
-    for rank in ranks:
-        final_v = _linear_interpolate(final_points, float(rank))
-        pred_v = _linear_interpolate(prior_points, float(rank)) if prior_points else None
-        out.append(
-            {
-                "rank": int(rank),
-                "rank_label": str(rank),
-                "bucket_rating": final_v,
-                "final_rating": final_v,
-                "predicted_rating": pred_v,
-            }
-        )
-    return out
-
-
 def predict_rating_vs_rank(row: Dict[str, Any], opponent_rank: Any) -> Optional[float]:
     """
     Predict player rating against an opponent at HLTV rank X.
@@ -384,19 +318,3 @@ def predict_rating_vs_rank(row: Dict[str, Any], opponent_rank: Any) -> Optional[
             return _linear_interpolate(est, rank)
         return None
     return _linear_interpolate(points, rank)
-
-
-def build_player_topx_graph(row: Dict[str, Any]) -> Dict[str, Any]:
-    base_rating = _safe_float(row.get("rating"))
-    bucket_rows = build_player_bucket_rows(row)
-    sample_maps = float(sum(float(r.get("maps") or 0.0) for r in bucket_rows if int(r.get("tier") or 0) in TOP_TIERS))
-    total_maps_proxy = _total_recent_maps_proxy(row)
-    personal_offset = next((float(r.get("personal_offset") or 0.0) for r in bucket_rows), 0.0)
-    return {
-        "base_rating": float(base_rating) if base_rating is not None else 1.0,
-        "sample_maps": sample_maps,
-        "total_maps_proxy": float(total_maps_proxy) if total_maps_proxy is not None else None,
-        "personal_offset": personal_offset,
-        "bucket_rows": bucket_rows,
-        "graph_rows": build_player_interpolated_rows(bucket_rows),
-    }

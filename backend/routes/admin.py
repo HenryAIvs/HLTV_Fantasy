@@ -30,7 +30,7 @@ from backend.services.hltv_browser import (
     run_hltv_browser_session,
 )
 from backend.services import hltv_session
-from backend.services.rating_picker import pick_match_rating
+from backend.services import rating_model
 from backend.swiss_stage.fantasy_scoring import (
     compute_rating_points,
     compute_role_points,
@@ -2835,7 +2835,7 @@ def booster_calc(payload: Dict[str, Any]):
     Utility calculator for per-match and expected fantasy components.
     Payload:
       {
-        "player_id": int,            # required; loads Top-X profile for match rating prediction
+        "player_id": int,            # required; the learned rating model predicts the match rating
         "major_pct": float,
         "minor_pct": float,
         "win_prob": float,           # expected per-match win probability [0,1]
@@ -2905,7 +2905,8 @@ def booster_calc(payload: Dict[str, Any]):
     rating_points_sum = 0.0
     for match_no in range(1, matches + 1):
         opp_rank = opponent_ranks[match_no - 1]
-        match_rating = float(pick_match_rating(picker_row, int(opp_rank)))
+        learned = rating_model.predict(pid, 50, int(opp_rank))
+        match_rating = float(learned) if learned is not None else float(picker_row.get("rating") or 1.0)
 
         player.rating = match_rating
         rating_points = compute_rating_points(player)

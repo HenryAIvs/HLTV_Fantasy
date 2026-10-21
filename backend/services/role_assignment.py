@@ -3,7 +3,18 @@
 import json
 from typing import Dict, List, Tuple, Optional
 
-from backend.services.rating_curve import _safe_float
+import math as _math
+
+
+def _safe_float(value):
+    try:
+        if value is None:
+            return None
+        if isinstance(value, float) and _math.isnan(value):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _compute_role_score(major: float, minor: float) -> float:

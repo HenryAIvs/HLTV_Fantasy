@@ -11,7 +11,7 @@ from typing import Callable
 import random
 
 from backend.data.player_db import get_player
-from backend.services.rating_picker import pick_match_rating
+from backend.services import rating_model
 from backend.swiss_stage.fantasy_scoring import (
     compute_booster_points,
     compute_rating_points,
@@ -129,7 +129,7 @@ def apply_fantasy_points_for_team(
         else:
             row = _get_player_cached(player.player_id)
         if row is not None:
-            match_rating = pick_match_rating(row, opponent_rank, opponent_team_id)
+            match_rating = rating_model.match_rating(row, opponent_team_id)
         else:
             match_rating = player.rating
 

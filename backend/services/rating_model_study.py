@@ -15,10 +15,10 @@ row whose inputs come only from matches played before it:
   * the match: both ranks (log; unranked flagged), rank difference, VRS
     ranks, series length, map.
 
-The baseline is the production method itself: `rating_curve` fed the
-cumulative Top-X tiers computed from the same window, its population curve
-refitted per fold, the overall rating outside the top 50 — what
-`rating_picker.pick_match_rating` does. Walk-forward: one fold per month,
+The baseline is the Top-X bucket curve the app priced ratings with until
+2026-10-19 (topx_curve_baseline): the cumulative Top-X tiers computed from
+the same window, its population curve refitted per fold, the overall rating
+outside the top 50. Walk-forward: one fold per month,
 each model fitted on the rows before that month and scored on the month's
 rows with at least `min_maps` prior maps in the window, so every score is out
 of sample. MAE is the mean absolute error of the predicted rating; RMSE the
@@ -42,7 +42,7 @@ UNRANKED = 400.0  # the rank unranked teams take in every aggregate
 WINDOW_DAYS = 182
 MIN_MAPS = 5
 FOLDS = 13
-STUDY_VERSION = 5  # bump when the features or the methods change (the cache's signature)
+STUDY_VERSION = 6  # bump when the features or the methods change (the cache's signature)
 
 # Every input the row builder computes. Backward elimination (2026-10-19,
 # walk-forward) showed the twelve in FEATURES match all 33 (per-map MAE
@@ -77,7 +77,7 @@ FEATURE_LABELS: Dict[str, str] = {
 MAP_CODES = {m: i for i, m in enumerate(["Ancient", "Anubis", "Dust2", "Inferno", "Mirage", "Nuke", "Overpass", "Train", "Vertigo", "Cache", "Cobblestone"])}
 OPPONENT_FEATURES = {k for k in ALL_FEATURES if k.startswith("opp_") or k == "rank_diff"}
 METHODS = [
-    {"key": "curve", "label": "Top-X curve (current)"},
+    {"key": "curve", "label": "Top-X curve (replaced)"},
     {"key": "gbr", "label": "Learned model"},
     {"key": "gbr_no_opponent", "label": "Learned, no opponent inputs"},
     {"key": "ridge", "label": "Linear model"},
@@ -390,7 +390,7 @@ def run_study(conn: sqlite3.Connection, window_days: int = WINDOW_DAYS, folds: i
     from sklearn.inspection import permutation_importance
     from sklearn.linear_model import Ridge
 
-    from backend.services import rating_curve as curve_mod
+    from backend.services import topx_curve_baseline as curve_mod
 
     t_start = time.time()
     matches = _load_matches(conn)

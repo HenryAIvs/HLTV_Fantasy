@@ -14,7 +14,7 @@ _schema_ready = False
 # Task keys the scheduler knows how to run, in the order it runs them (they all
 # serialize on the shared HLTV browser anyway). Events first: a new fantasy
 # event's teams get rankings/matches the same night.
-TASK_KEYS = ("events", "rankings", "team_data", "matches", "ratings", "map_model")
+TASK_KEYS = ("events", "rankings", "team_data", "matches", "map_model")
 
 _DEFAULT_CONFIG = {
     "enabled": 1,
@@ -22,7 +22,6 @@ _DEFAULT_CONFIG = {
     "do_events": 1,
     "do_rankings": 1,
     "do_matches": 1,
-    "do_ratings": 1,
     "do_map_model": 1,
     # Team rosters + six-month map stats for the top-N ranked teams, nightly.
     "do_team_data": 1,
@@ -100,7 +99,8 @@ def get_schedule_config() -> Dict[str, Any]:
     if not row:
         return dict(_DEFAULT_CONFIG)
     cfg = {k: row[k] for k in row.keys()}
-    for flag in ("enabled", "do_events", "do_rankings", "do_matches", "do_ratings", "do_map_model", "do_team_data"):
+    cfg.pop("do_ratings", None)  # the Top-X ratings task is gone; the column stays in old databases
+    for flag in ("enabled", "do_events", "do_rankings", "do_matches", "do_map_model", "do_team_data"):
         cfg[flag] = bool(cfg.get(flag))
     cfg["matches_lookback_days"] = int(cfg.get("matches_lookback_days") or 3)
     cfg["map_model_minutes"] = int(cfg.get("map_model_minutes") or 120)
@@ -115,7 +115,6 @@ def update_schedule_config(patch: Dict[str, Any]) -> Dict[str, Any]:
         "do_events": lambda v: 1 if v else 0,
         "do_rankings": lambda v: 1 if v else 0,
         "do_matches": lambda v: 1 if v else 0,
-        "do_ratings": lambda v: 1 if v else 0,
         "do_map_model": lambda v: 1 if v else 0,
         "do_team_data": lambda v: 1 if v else 0,
         "team_data_top_n": lambda v: max(10, min(500, int(v))),
