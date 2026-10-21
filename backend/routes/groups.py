@@ -2560,8 +2560,27 @@ def swiss_pairings(payload: dict | None = None, event_id: Optional[int] = None):
     sw = results.get("swiss") or {}
     team_ids = [int(t) for t in (results.get("groups") or [[]])[0]]
     seeds = {int(t): int(v) for t, v in (sw.get("seeds") or {}).items()}
+    bo3_mode = str(sw.get("bo3_mode") or "elim_qual")
     picks = {str(k): int(v) for k, v in (body.get("swiss_picks") or {}).items() if v}
-    return swiss_engine.walk(team_ids, seeds, str(sw.get("bo3_mode") or "elim_qual"), picks)
+    if not body.get("favourites"):
+        return swiss_engine.walk(team_ids, seeds, bo3_mode, picks)
+    # "favourites win": every match still open goes to the side the run's
+    # win matrix favours, round after round, until the stage is finished
+    matrices = {int(k[2:]): v for k, v in (sw.get("win_probs") or {}).items() if str(k).startswith("bo")}
+    pos = {int(t): i for i, t in enumerate(team_ids)}
+    walked = swiss_engine.walk(team_ids, seeds, bo3_mode, picks)
+    for _ in range(swiss_engine.ROUNDS + 1):
+        if walked.get("complete") or not walked.get("rounds"):
+            break
+        for m in walked["rounds"][-1]["matches"]:
+            if m.get("winner") is not None:
+                continue
+            matrix = matrices.get(int(m["bo"])) or next(iter(matrices.values()), None)
+            p_a = float(matrix[pos[int(m["a"])]][pos[int(m["b"])]]) if matrix else 0.5
+            picks[m["key"]] = int(m["a"]) if p_a >= 0.5 else int(m["b"])
+        walked = swiss_engine.walk(team_ids, seeds, bo3_mode, picks)
+    walked["picks"] = picks
+    return walked
 
 
 def _paths_leader_odds(team_ids: List[int], block: Dict[str, Any]) -> Dict[int, Dict[str, float]]:

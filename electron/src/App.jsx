@@ -13193,6 +13193,56 @@ function GroupsTab({
     setCompletedResult(null);
   };
   const swissComplete = groupFormat === "swiss" && Boolean(swissWalk?.complete);
+  // Favourites win: every open match goes to the side the run's win matrix
+  // favours (the Swiss walk fills round by round on the backend; a bracket
+  // resolves in match order here).
+  const fillSwissFavourites = async () => {
+    try {
+      const d = await api.post("/groups/swiss/pairings", { swiss_picks: swissPicks, favourites: true }, 30000);
+      if (d?.picks) {
+        setSwissPicks(d.picks);
+        setSwissWalk(d);
+        setCompletedResult(null);
+      }
+    } catch {
+      // the board keeps the picks it has
+    }
+  };
+  const fillBracketFavourites = () => {
+    const br = results?.bracket;
+    if (!br) return;
+    const order = (results.groups?.[0] || []).map(Number);
+    const pos = {};
+    order.forEach((tid, i) => {
+      pos[tid] = i;
+    });
+    const wp = br.win_probs || {};
+    const seriesOf = {};
+    (br.stages || []).forEach((st) => {
+      seriesOf[st.key] = st.series;
+    });
+    const slots = (br.team_slots || []).map(Number);
+    const winners = {};
+    const losers = {};
+    const next = { ...bracketPicks };
+    (br.matches || []).forEach(([key, stage, fa, fb]) => {
+      const side = (f) => (f[0] === "seed" ? slots[Number(f[1])] : f[0] === "win" ? winners[String(f[1])] : losers[String(f[1])]) || null;
+      const a = side(fa);
+      const b = side(fb);
+      if (!a || !b) return;
+      let w = Number(next[key] || 0);
+      if (w !== a && w !== b) {
+        const matrix = wp[`bo${seriesOf[stage] || 3}`] || wp.bo3 || wp.bo5 || wp.bo1 || null;
+        const pA = matrix && pos[a] != null && pos[b] != null ? Number(matrix[pos[a]][pos[b]]) : 0.5;
+        w = pA >= 0.5 ? a : b;
+        next[key] = w;
+      }
+      winners[key] = w;
+      losers[key] = w === a ? b : a;
+    });
+    setBracketPicks(next);
+    setCompletedResult(null);
+  };
   const [completedPage, setCompletedPage] = useState(0);
   const scoreCompleted = async (nextPage = 0) => {
     setCompletedMessage("");
@@ -14107,6 +14157,9 @@ function GroupsTab({
               <SwissBoard walk={swissWalk} teams={teams} teamLookup={teamLookup} picks={swissPicks} onPick={pickSwissMatch} />
             </div>
             <div className="actions">
+              <button className="secondary" onClick={fillSwissFavourites} disabled={!swissWalk}>
+                Favourites win
+              </button>
               <button className="primary" onClick={() => scoreCompleted(0)} disabled={!swissComplete || !combosReady}>
                 Score Completed Swiss
               </button>
@@ -14121,6 +14174,9 @@ function GroupsTab({
               <BracketPicker bracket={results.bracket} teamLookup={teamLookup} picks={bracketPicks} onPick={pickBracketMatch} />
             </div>
             <div className="actions">
+              <button className="secondary" onClick={fillBracketFavourites}>
+                Favourites win
+              </button>
               <button className="primary" onClick={() => scoreCompleted(0)} disabled={!bracketComplete || !combosReady}>
                 Score Completed Bracket
               </button>
