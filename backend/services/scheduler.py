@@ -647,7 +647,7 @@ class DataScheduler:
         pending = self._pending_slot(cfg, now) if cfg.get("enabled") else None
         if pending is not None:
             next_run = now  # the missed slot is caught up on the next tick
-        from backend.services import dev_flags, hltv_session
+        from backend.services import hltv_session
 
         return {
             "config": cfg,
@@ -658,8 +658,6 @@ class DataScheduler:
             "last_success_by_task": schedule_db.last_success_by_task(),
             # Last persisted login-health snapshot (no page load here).
             "hltv_session": hltv_session.load_snapshot(),
-            # Shapes/formats refused as unsupported and flagged for development.
-            "dev_flags": dev_flags.list_flags(),
             "backup": _backup_status(),
         }
 

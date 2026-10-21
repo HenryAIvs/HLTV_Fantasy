@@ -2,7 +2,7 @@
 
 Rather than guess (a bracket seeded the wrong way produces confident, wrong
 valuations), unsupported shapes are rejected and recorded here so they show
-up in the Scheduling tab and the run history as work to do. Stored in
+up on Dev Lab → Flags as work to do (cleared from there once handled). Stored in
 .runtime/dev-flags.json, keyed by a short shape key.
 """
 

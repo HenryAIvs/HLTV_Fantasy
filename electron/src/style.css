@@ -3495,3 +3495,8 @@ button:disabled {
 .live-group .table-player-cell span { max-width: none; white-space: normal; overflow: visible; text-overflow: clip; }
 .live-group td.num, .live-group th.num { width: 48px; text-align: right; }
 
+/* Dev Lab: flags */
+.dev-flags td.detail { max-width: 520px; white-space: normal; color: #8fa3bf; font-size: 12.5px; line-height: 1.35; }
+.dev-flags td, .dev-flags th { vertical-align: top; }
+.dev-flags .secondary { padding: 4px 12px; font-size: 11px; }
+

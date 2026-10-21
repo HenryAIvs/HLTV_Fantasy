@@ -6417,8 +6417,101 @@ function LiveEventCard({ ev }) {
   );
 }
 
+// Dev Lab: the rating-model study and the flags — formats and shapes the
+// app met but refuses to model yet (services/dev_flags.py).
+const DEV_LAB_SUBTABS = [
+  { key: "rating", label: "Rating Model" },
+  { key: "flags", label: "Flags" },
+];
 function DevLabTab() {
-  return <RatingModelLabTab />;
+  const [sub, setSub] = useState("rating");
+  return (
+    <div className="stack">
+      <div className="tab-bar small">
+        {DEV_LAB_SUBTABS.map((t) => (
+          <button key={t.key} className={sub === t.key ? "tab active" : "tab"} onClick={() => setSub(t.key)}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+      {sub === "rating" ? <RatingModelLabTab /> : <DevFlagsTab />}
+    </div>
+  );
+}
+
+function DevFlagsTab() {
+  const [flags, setFlags] = useState(null);
+  const [busy, setBusy] = useState("");
+  const load = async () => {
+    try {
+      const d = await api.get("/admin/dev-flags", 30000);
+      setFlags(Array.isArray(d?.flags) ? d.flags : []);
+    } catch {
+      setFlags((prev) => prev || []);
+    }
+  };
+  useEffect(() => {
+    load();
+  }, []);
+  const clear = async (key) => {
+    setBusy(key);
+    try {
+      await api.delete(`/admin/dev-flags/${encodeURIComponent(key)}`);
+      setFlags((prev) => (prev || []).filter((f) => f.key !== key));
+    } catch {
+      /* the row stays; the next load shows the truth */
+    } finally {
+      setBusy("");
+    }
+  };
+  const when = (ts) => {
+    if (!(Number(ts) > 0)) return "-";
+    const d = new Date(Number(ts) * 1000);
+    return `${formatDMY(d.toISOString())} ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+  };
+  const list = flags || [];
+  return (
+    <Section title="Flags">
+      {list.length === 0 ? (
+        <p className="muted">{flags === null ? "" : "None"}</p>
+      ) : (
+        <table className="dev-flags">
+          <thead>
+            <tr>
+              <th>Shape</th>
+              <th>Kind</th>
+              <th>Events</th>
+              <th className="num">Hits</th>
+              <th>First seen</th>
+              <th>Last seen</th>
+              <th>Detail</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {list.map((f) => (
+              <tr key={f.key}>
+                <td>
+                  <span className="pill warn">{f.key}</span>
+                </td>
+                <td>{String(f.kind || "").replace(/_/g, " ")}</td>
+                <td>{Array.isArray(f.event_ids) && f.event_ids.length > 0 ? f.event_ids.join(", ") : "-"}</td>
+                <td className="num">{Number(f.count || 0).toLocaleString()}</td>
+                <td>{when(f.first_seen)}</td>
+                <td>{when(f.last_seen)}</td>
+                <td className="detail">{f.detail}</td>
+                <td className="num">
+                  <button className="secondary" onClick={() => clear(f.key)} disabled={busy === f.key}>
+                    Clear
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </Section>
+  );
 }
 
 function EventsTab({ refreshData, notify, players, teams = [], onOpenPlayer, onOpenTeam, viewEventId = null, onViewEvent = null }) {
@@ -9140,16 +9233,6 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
                 <div className="mm-bar-fill" style={{ width: `${Math.min(100, (100 * Number(state.processed)) / Number(state.total))}%` }} />
               </div>
             )}
-          </div>
-        )}
-        {Array.isArray(status?.dev_flags) && status.dev_flags.length > 0 && (
-          <div className="pills" style={{ flexWrap: "wrap", marginTop: 10 }}>
-            {status.dev_flags.map((f) => (
-              <div className="pill warn" key={f.key} title={f.detail}>
-                {f.key}
-                {Array.isArray(f.event_ids) && f.event_ids.length > 0 ? ` · event ${f.event_ids.join(", ")}` : ""}
-              </div>
-            ))}
           </div>
         )}
         {message && <p className="muted">{message}</p>}
