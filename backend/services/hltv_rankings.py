@@ -1038,7 +1038,11 @@ def get_hltv_team_map_stats_for_range(
                 "HLTV team map stats page is behind a Cloudflare/interstitial challenge. "
                 "Open once in visible browser mode and complete challenge, then retry."
             )
-        raise RankingPageParseError("Could not parse team map stats from HLTV page.")
+        # The stats page rendered but lists no maps: the team played nothing
+        # in this window. That is a result (an empty one), not a parse failure.
+        if "Map overview" not in text:
+            raise RankingPageParseError("Could not parse team map stats from HLTV page.")
+        logger.info("HLTV team map stats empty window: team_id=%s url=%s", hltv_team_id, url)
 
     return {
         "team_id": hltv_team_id,

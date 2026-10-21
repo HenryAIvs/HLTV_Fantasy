@@ -572,13 +572,21 @@ def refresh_hltv_for_all_teams_today():
             results.append({"team_name": name, "status": "error", "detail": str(exc)})
             failed += 1
 
-    logger.info("HLTV refresh complete: updated=%d inserted=%d failed=%d", updated, inserted, failed)
+    # Teams the snapshot no longer lists are unranked now, whatever rank they
+    # last held; otherwise renamed and dead rosters stay in every top-N scope.
+    unranked = 0
+    if updated > 0:
+        from backend.data.team_db import clear_stale_hltv_ranks
+
+        unranked = clear_stale_hltv_ranks([int(r.get("team_id") or 0) for r in results if r.get("status") == "ok"])
+    logger.info("HLTV refresh complete: updated=%d inserted=%d failed=%d unranked=%d", updated, inserted, failed, unranked)
     return {
         "status": "ok",
         "date": today.isoformat(),
         "updated": updated,
         "inserted": inserted,
         "failed": failed,
+        "unranked": unranked,
         "results": results,
     }
 
@@ -1588,18 +1596,27 @@ def _roster_scope_teams(top_n: int) -> list[dict]:
     return teams
 
 
-def _team_has_roster(t: dict) -> bool:
-    return all(int(t.get(f"player{i}_id") or 0) > 0 for i in range(1, 6))
+ROSTER_CHECK_FRESH_DAYS = 7
+
+
+def _roster_lineup_size(t: dict) -> int:
+    return sum(1 for i in range(1, 6) if int(t.get(f"player{i}_id") or 0) > 0)
 
 
 def _roster_coverage(top_n: int) -> dict:
+    """A team is covered once its HLTV page was read recently, whatever that
+    page listed: a lineup of fewer than five is HLTV's answer, not a gap."""
     scope = _roster_scope_teams(top_n)
-    with_roster = sum(1 for t in scope if _team_has_roster(t))
+    fresh_after = time.time() - ROSTER_CHECK_FRESH_DAYS * 86400.0
+    checked = [t for t in scope if float(t.get("roster_checked_at") or 0.0) >= fresh_after]
+    short = sum(1 for t in checked if _roster_lineup_size(t) < 5)
     return {
         "top_n": int(top_n),
         "teams_in_scope": len(scope),
-        "with_roster": with_roster,
-        "missing_roster": len(scope) - with_roster,
+        "checked": len(checked),
+        "unchecked": len(scope) - len(checked),
+        "short_lineups": short,
+        "full_lineups": len(checked) - short,
     }
 
 

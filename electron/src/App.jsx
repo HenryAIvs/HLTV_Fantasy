@@ -9458,10 +9458,11 @@ function ModelDataPanel({ topN = 200 }) {
       <div className="mm-jobs">
         <BackfillRow
           name={`Team rosters · top ${Number(topN) || 200}`}
-          done={rosterCoverage?.with_roster}
+          done={rosterCoverage?.checked}
           total={rosterCoverage?.teams_in_scope}
-          missing={rosterCoverage?.missing_roster}
+          missing={rosterCoverage?.unchecked}
           unit="teams"
+          extra={Number(rosterCoverage?.short_lineups || 0) > 0 ? `${rosterCoverage.short_lineups} with fewer than five players on HLTV` : ""}
           job={rosterJob}
         />
         <BackfillRow

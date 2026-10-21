@@ -1,3 +1,4 @@
+import time
 from typing import List, Dict, Optional
 
 from backend.data.db import connect
@@ -50,6 +51,8 @@ def ensure_team_schema() -> None:
         conn.execute("ALTER TABLE teams ADD COLUMN map_stats_imported_at TEXT")
     if "map_stats_source_url" not in col_names:
         conn.execute("ALTER TABLE teams ADD COLUMN map_stats_source_url TEXT")
+    if "roster_checked_at" not in col_names:
+        conn.execute("ALTER TABLE teams ADD COLUMN roster_checked_at REAL")
     conn.commit()
     conn.close()
 
@@ -109,21 +112,39 @@ def add_or_update_team(
     conn.close()
 
 
-def update_team_roster(team_id: int, player_ids: List[int]) -> None:
+def update_team_roster(team_id: int, player_ids: List[int], checked_at: Optional[float] = None) -> None:
     """Store a team's current lineup in its five roster slots (missing slots
-    become 0). Only the slots change; ranks and stats are left alone."""
+    become 0) and stamp when HLTV was read for it. Only the slots and the
+    stamp change; ranks and stats are left alone."""
     ids = [int(p) for p in list(player_ids)[:5] if p] + [0] * 5
     conn = connect()
     try:
         conn.execute(
             """
             UPDATE teams
-            SET player1_id = ?, player2_id = ?, player3_id = ?, player4_id = ?, player5_id = ?
+            SET player1_id = ?, player2_id = ?, player3_id = ?, player4_id = ?, player5_id = ?, roster_checked_at = ?
             WHERE team_id = ?
             """,
-            (ids[0], ids[1], ids[2], ids[3], ids[4], int(team_id)),
+            (ids[0], ids[1], ids[2], ids[3], ids[4], float(checked_at if checked_at is not None else time.time()), int(team_id)),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_stale_hltv_ranks(keep_team_ids: List[int]) -> int:
+    """Teams the latest HLTV ranking no longer lists drop to the unranked
+    placeholder (999) so nothing scopes by a rank they held months ago."""
+    keep = sorted({int(t) for t in keep_team_ids if t})
+    conn = connect()
+    try:
+        placeholders = ",".join("?" * len(keep)) or "NULL"
+        cur = conn.execute(
+            f"UPDATE teams SET hltv_rank = 999 WHERE hltv_rank IS NOT NULL AND hltv_rank < 999 AND team_id NOT IN ({placeholders})",
+            keep,
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
     finally:
         conn.close()
 
