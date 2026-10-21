@@ -8960,8 +8960,7 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
   const [lookbackDays, setLookbackDays] = useState(3);
   const [mapModelMinutes, setMapModelMinutes] = useState(120);
   const [teamDataTopN, setTeamDataTopN] = useState(200);
-  const [failuresOnly, setFailuresOnly] = useState(false);
-  const [openNights, setOpenNights] = useState(null); // null = the latest night only
+  const [runDetail, setRunDetail] = useState(null); // the run whose full details are open
   const pollRef = useRef(null);
 
   const TASK_LABELS = {
@@ -9098,7 +9097,6 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
   const nights = useMemo(() => {
     const groups = new Map();
     (runs || []).forEach((run) => {
-      if (failuresOnly && run.status === "success") return;
       const key = dayOf(run.started_at);
       if (!groups.has(key)) groups.set(key, { key, rows: [], failed: 0, secs: 0, first: run.started_at, last: run.finished_at || run.started_at });
       const g = groups.get(key);
@@ -9109,18 +9107,12 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
       g.last = Math.max(g.last, run.finished_at || run.started_at);
     });
     return Array.from(groups.values());
-  }, [runs, failuresOnly]);
-  const isOpen = (key, idx) => (openNights ? openNights.has(key) : idx === 0);
-  const toggleNight = (key, idx) => {
-    setOpenNights((prev) => {
-      const next = new Set(prev || (nights[0] ? [nights[0].key] : []));
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
-  };
-  const lastRun = (runs || []).find((r) => r.finished_at) || null;
+  }, [runs]);
   const lastNight = nights[0] || null;
+  const recentRuns = (runs || []).slice(0, 10);
+  const runStatusPill = (run) => (
+    <span className={run.status === "success" ? "pill ok" : run.status === "warning" ? "pill caution" : "pill warn"}>{run.status}</span>
+  );
 
   const lastRunOf = (task) => (runs || []).find((r) => r.task === task && r.finished_at) || null;
   const taskCard = (task) => {
@@ -9278,61 +9270,61 @@ function SchedulingTab({ notify, players, refresh, mapStats, teams = [] }) {
       </Section>
 
       <Section title="Run History">
-        <div className="sch-history-tools">
-          <label className="checkbox-inline">
-            <input type="checkbox" checked={failuresOnly} onChange={(e) => setFailuresOnly(e.target.checked)} />
-            <span>Failures only</span>
-          </label>
-          {lastRun && (
-            <span className="muted">
-              Last finished {TASK_LABELS[lastRun.task] || lastRun.task} · {relTime(lastRun.finished_at)}
-            </span>
-          )}
-        </div>
-        {nights.length === 0 && <p className="muted">{failuresOnly ? "No failures recorded." : "No runs recorded yet."}</p>}
-        {nights.map((night, idx) => (
-          <div className="sch-night" key={night.key}>
-            <div className="sch-night-head" onClick={() => toggleNight(night.key, idx)}>
-              <span className="sch-night-date">{night.key}</span>
-              <span className="sch-night-meta">
-                {clock(night.first)} – {clock(night.last)} · {night.rows.length} tasks · {fmtDur(night.secs)}
-              </span>
-              <span className={`pill${night.failed > 0 ? " warn" : " ok"}`}>{night.failed > 0 ? `${night.failed} failed` : "all ok"}</span>
-              <span className="muted">{isOpen(night.key, idx) ? "▾" : "▸"}</span>
-            </div>
-            {isOpen(night.key, idx) && (
-              <table>
-                <thead>
-                  <tr>
-                    <th>Task</th>
-                    <th>Trigger</th>
-                    <th>Status</th>
-                    <th>Started</th>
-                    <th>Duration</th>
-                    <th>Details</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {night.rows.map((run) => (
-                    <tr key={run.id}>
-                      <td>{TASK_LABELS[run.task] || run.task}</td>
-                      <td className="muted">{run.trigger}</td>
-                      <td>
-                        <span className={run.status === "success" ? "pill ok" : "pill warn"}>{run.status}</span>
-                      </td>
-                      <td>{clock(run.started_at)}</td>
-                      <td>{run.finished_at && run.started_at ? fmtDur(run.finished_at - run.started_at) : "-"}</td>
-                      <td className="details" title={run.message || ""}>
-                        {run.message || ""}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </div>
-        ))}
+        {recentRuns.length === 0 ? (
+          <p className="muted">None</p>
+        ) : (
+          <table className="sch-runs">
+            <thead>
+              <tr>
+                <th>Task</th>
+                <th>Trigger</th>
+                <th>Status</th>
+                <th>Started</th>
+                <th>Duration</th>
+                <th>Details</th>
+              </tr>
+            </thead>
+            <tbody>
+              {recentRuns.map((run) => (
+                <tr key={run.id} onClick={() => setRunDetail(run)}>
+                  <td>{TASK_LABELS[run.task] || run.task}</td>
+                  <td className="muted">{run.trigger}</td>
+                  <td>{runStatusPill(run)}</td>
+                  <td>
+                    {dayOf(run.started_at)} {clock(run.started_at)}
+                  </td>
+                  <td>{run.finished_at && run.started_at ? fmtDur(run.finished_at - run.started_at) : "-"}</td>
+                  <td className="details">{run.message || ""}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </Section>
+
+      {runDetail && (
+        <div className="modal-backdrop" onClick={() => setRunDetail(null)}>
+          <div className="modal sch-run-modal" onClick={(e) => e.stopPropagation()}>
+            <header className="modal-header">
+              <h3>{TASK_LABELS[runDetail.task] || runDetail.task}</h3>
+              <button className="close" onClick={() => setRunDetail(null)}>
+                &times;
+              </button>
+            </header>
+            <div className="modal-body">
+              <div className="pills sch-run-meta">
+                {runStatusPill(runDetail)}
+                <span className="pill">{runDetail.trigger}</span>
+                <span className="pill">
+                  {dayOf(runDetail.started_at)} {clock(runDetail.started_at)}
+                </span>
+                <span className="pill">{runDetail.finished_at && runDetail.started_at ? fmtDur(runDetail.finished_at - runDetail.started_at) : "-"}</span>
+              </div>
+              <pre className="sch-run-message">{runDetail.message || "-"}</pre>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

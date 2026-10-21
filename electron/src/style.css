@@ -3461,15 +3461,11 @@ button:disabled {
 .sch-live .pills { flex-wrap: wrap; }
 .sch-imports { display: grid; grid-template-columns: 1.3fr 1fr; gap: 14px; align-items: start; }
 .sch-imports .card.sub h3 { margin-top: 0; }
-.sch-history-tools { display: flex; align-items: center; gap: 14px; margin-bottom: 10px; }
-.sch-night { border: 1px solid #242b35; background: #10141a; }
-.sch-night + .sch-night { margin-top: 10px; }
-.sch-night-head { display: grid; grid-template-columns: 1fr auto auto 16px; gap: 16px; align-items: center; padding: 10px 14px; cursor: pointer; user-select: none; }
-.sch-night-head:hover { background: #141a22; }
-.sch-night-date { font-family: var(--display); font-stretch: condensed; text-transform: uppercase; font-weight: 700; font-size: 15px; color: #f2f5f9; }
-.sch-night-meta { color: #8fa3bf; font-size: 12.5px; font-variant-numeric: tabular-nums; }
-.sch-night table { margin: 0; border-top: 1px solid #242b35; }
-.sch-night td.details { max-width: 520px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #8fa3bf; }
+.sch-runs td.details { max-width: 520px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #8fa3bf; }
+.sch-runs td { font-variant-numeric: tabular-nums; }
+.modal.sch-run-modal { max-width: 820px; }
+.sch-run-meta { flex-wrap: wrap; margin-bottom: 12px; }
+.sch-run-message { white-space: pre-wrap; word-break: break-word; font-family: Consolas, "Cascadia Mono", ui-monospace, monospace; font-size: 12.5px; line-height: 1.5; color: #c6d0dc; background: #10141a; border: 1px solid #242b35; padding: 12px 14px; margin: 0; }
 .pill.ok { background: #12301f; border-color: #1f6f3f; color: #86efac; }
 @media (max-width: 1100px) {
   .sch-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
