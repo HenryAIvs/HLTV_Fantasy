@@ -4368,8 +4368,11 @@ button:disabled {
 }
 
 /* Completed Swiss board: HLTV's record-pool layout in the app's palette */
-.sw-board { display: flex; gap: 22px; align-items: flex-start; padding: 16px; border: 1px solid #2c3441; border-radius: 12px; background: #0e1116; overflow-x: auto; }
-.sw-col { display: flex; flex-direction: column; gap: 14px; flex: 0 0 auto; }
+.sw-board { display: flex; gap: 22px; align-items: stretch; padding: 16px; border: 1px solid #2c3441; border-radius: 12px; background: #0e1116; overflow-x: auto; }
+.sw-col { display: flex; flex-direction: column; gap: 14px; flex: 1 0 auto; }
+/* the pools spread over the board's height: a record's pool sits higher the
+   more it has won, so winners read upward and losers downward like HLTV */
+.sw-col-body { display: flex; flex-direction: column; justify-content: space-evenly; gap: 18px; flex: 1; }
 .sw-col-title { font-family: var(--display); font-stretch: condensed; font-weight: 800; font-size: 16px; color: #f2f5f9; text-align: center; }
 .sw-pool { display: flex; flex-direction: column; gap: 6px; }
 .sw-pool-title { font-family: var(--display); font-stretch: condensed; font-weight: 700; font-size: 15px; letter-spacing: 0.04em; color: #8fa3bf; }
@@ -4382,7 +4385,7 @@ button:disabled {
 .sw-side-name { font-size: 10.5px; max-width: 64px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sw-vs { color: #6f819e; font-size: 11px; font-weight: 700; text-transform: uppercase; }
 .sw-unknown { width: 32px; height: 32px; border-radius: 50%; background: #242b35; color: #6f819e; display: inline-flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; }
-.sw-final { gap: 10px; min-width: 190px; }
+.sw-final { gap: 14px; min-width: 190px; }
 .sw-final-block { border-radius: 10px; padding: 10px 12px; display: grid; gap: 10px; }
 .sw-final-block.qualified { background: rgba(31, 143, 79, 0.18); border: 1px solid rgba(63, 191, 127, 0.4); }
 .sw-final-block.eliminated { background: rgba(122, 31, 31, 0.24); border: 1px solid rgba(224, 112, 90, 0.4); }

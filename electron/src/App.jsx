@@ -12476,24 +12476,28 @@ function SwissBoard({ walk, teams, teamLookup, picks, onPick }) {
       {columns.map((col) => (
         <div className="sw-col" key={col.key}>
           <div className="sw-col-title">{col.title}</div>
-          {col.pools.map((p) => (
-            <div className="sw-pool" key={`${col.key}-${p.pool}`}>
-              <div className="sw-pool-title">{rec(p.pool)}</div>
-              {p.matches.map((m) => (
-                <div className="sw-match" key={m.key}>
-                  {side(m.a, m, m.known)}
-                  <span className="sw-vs">vs</span>
-                  {side(m.b, m, m.known)}
-                </div>
-              ))}
-            </div>
-          ))}
+          <div className="sw-col-body">
+            {col.pools.map((p) => (
+              <div className="sw-pool" key={`${col.key}-${p.pool}`}>
+                <div className="sw-pool-title">{rec(p.pool)}</div>
+                {p.matches.map((m) => (
+                  <div className="sw-match" key={m.key}>
+                    {side(m.a, m, m.known)}
+                    <span className="sw-vs">vs</span>
+                    {side(m.b, m, m.known)}
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
         </div>
       ))}
       <div className="sw-col sw-final">
         <div className="sw-col-title">Final</div>
-        <div className="sw-final-block qualified">{finalRows(["3-0", "3-1", "3-2"])}</div>
-        <div className="sw-final-block eliminated">{finalRows(["2-3", "1-3", "0-3"])}</div>
+        <div className="sw-col-body">
+          <div className="sw-final-block qualified">{finalRows(["3-0", "3-1", "3-2"])}</div>
+          <div className="sw-final-block eliminated">{finalRows(["2-3", "1-3", "0-3"])}</div>
+        </div>
       </div>
     </div>
   );
