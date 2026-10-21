@@ -13269,6 +13269,8 @@ function GroupsTab({
               ? { swiss_picks: swissPicks }
               : { group_winners: activeCompletedDerived.map((g) => g.picks.map(Number)) }),
           search: comboSearch,
+          include_player_ids: Array.from(includeSet),
+          exclude_player_ids: Array.from(excludeSet),
           page: Number(nextPage) || 0,
           page_size: COMBO_PAGE_SIZE,
         },
@@ -13284,6 +13286,13 @@ function GroupsTab({
       setCompletedMessage(e?.message || "Failed to score completed groups.");
     }
   };
+  // a scored completed stage follows the filters like the ranking modes do
+  // (the effect only fires on a filter change, never on the score itself)
+  useEffect(() => {
+    if (groupsTopSubtab !== "completed" || !completedResult) return;
+    scoreCompleted(0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [includeSet, excludeSet, comboSearch]);
 
   const valueData = useMemo(() => buildPlayerValueRowsFromSimulation(results, players), [results, players]);
   // Each player's price (the run's snapshot) and value against the price
@@ -13789,6 +13798,83 @@ function GroupsTab({
         </div>
   );
 
+  // The Top 5 filters (teams, included / excluded players, search): the
+  // ranking modes and the completed sub-tab show the same card.
+  const renderTop5Filters = () => (
+    <div className="card sub">
+      <h3>Top Teams - {(groupsTopSubtabs.find((t) => t.key === groupsTopSubtab) || {}).label || "Best Average Value"}</h3>
+      <div className="top5-filters">
+        <div className="field">
+          <span>Teams</span>
+          <div className="filter-team-grid">
+            {groupsTeamsForFilters.length === 0 && <span className="muted">No teams stored yet.</span>}
+            {groupsTeamsForFilters.map((t) => {
+              const tid = Number(t.team_id);
+              const pids = teamPlayerIds(tid);
+              const isExcluded = pids.length > 0 && pids.every((pid) => excludeSet.has(pid));
+              return (
+                <div key={`filter-team-${tid}`} className={`filter-team-card${isExcluded ? " exc" : ""}`}>
+                  <TeamLogo hltvTeamId={t.hltv_team_id} name={t.name} size={26} />
+                  <span className="filter-team-name">{t.name}</span>
+                  <div className="filter-team-toggles">
+                    <button className={`filter-toggle out${isExcluded ? " on" : ""}`} onClick={() => toggleTeamExclude(tid)}>
+                      {isExcluded ? "Excluded" : "Exclude"}
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+    {(includeSet.size > 0 || excludeSet.size > 0) && (
+      <div className="grid two">
+        {includeSet.size > 0 && (
+          <div className="filter-group in">
+            <div className="filter-group-title">Included Players</div>
+            <div className="chips">
+              {Array.from(includeSet).map((pid) => (
+                <button key={`inc-${pid}`} className="filter-chip in" title="Remove filter" onClick={() => toggleFilter(pid, "include")}>
+                  <PlayerPhoto playerId={pid} name={playerNameById[pid]} size={20} />
+                  {playerNameById[pid] || `Player ${pid}`} <span className="x">&times;</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        {excludeSet.size > 0 && (
+          <div className="filter-group out">
+            <div className="filter-group-title">Excluded Players</div>
+            <div className="chips">
+              {Array.from(excludeSet).map((pid) => (
+                <button key={`exc-${pid}`} className="filter-chip out" title="Remove filter" onClick={() => toggleFilter(pid, "exclude")}>
+                  <PlayerPhoto playerId={pid} name={playerNameById[pid]} size={20} />
+                  {playerNameById[pid] || `Player ${pid}`} <span className="x">&times;</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    )}
+        <div className="top5-controls-row">
+          <div className="top5-search">
+            <SuggestInput
+              label="Search / Filter Players"
+              value={comboSearch}
+              onChange={setComboSearch}
+              placeholder="Player name"
+              suggestions={comboSearchNames}
+              actions={[
+                { key: "in", label: "Include", onPick: (name) => addPlayerFilterByName(name, "include") },
+                { key: "out", label: "Exclude", onPick: (name) => addPlayerFilterByName(name, "exclude") },
+              ]}
+            />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
   const renderCompletedResults = () => (
     <>
       {completedMessage && <p className="muted">{completedMessage}</p>}
@@ -14102,78 +14188,7 @@ function GroupsTab({
                 </div>
                 {groupsTopSubtab !== "completed" && (
                 <>
-                <div className="card sub">
-                  <h3>Top Teams - {(groupsTopSubtabs.find((t) => t.key === groupsTopSubtab) || {}).label || "Best Average Value"}</h3>
-                  <div className="top5-filters">
-                    <div className="field">
-                      <span>Teams</span>
-                      <div className="filter-team-grid">
-                        {groupsTeamsForFilters.length === 0 && <span className="muted">No teams stored yet.</span>}
-                        {groupsTeamsForFilters.map((t) => {
-                          const tid = Number(t.team_id);
-                          const pids = teamPlayerIds(tid);
-                          const isExcluded = pids.length > 0 && pids.every((pid) => excludeSet.has(pid));
-                          return (
-                            <div key={`filter-team-${tid}`} className={`filter-team-card${isExcluded ? " exc" : ""}`}>
-                              <TeamLogo hltvTeamId={t.hltv_team_id} name={t.name} size={26} />
-                              <span className="filter-team-name">{t.name}</span>
-                              <div className="filter-team-toggles">
-                                <button className={`filter-toggle out${isExcluded ? " on" : ""}`} onClick={() => toggleTeamExclude(tid)}>
-                                  {isExcluded ? "Excluded" : "Exclude"}
-                                </button>
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                {(includeSet.size > 0 || excludeSet.size > 0) && (
-                  <div className="grid two">
-                    {includeSet.size > 0 && (
-                      <div className="filter-group in">
-                        <div className="filter-group-title">Included Players</div>
-                        <div className="chips">
-                          {Array.from(includeSet).map((pid) => (
-                            <button key={`inc-${pid}`} className="filter-chip in" title="Remove filter" onClick={() => toggleFilter(pid, "include")}>
-                              <PlayerPhoto playerId={pid} name={playerNameById[pid]} size={20} />
-                              {playerNameById[pid] || `Player ${pid}`} <span className="x">&times;</span>
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                    {excludeSet.size > 0 && (
-                      <div className="filter-group out">
-                        <div className="filter-group-title">Excluded Players</div>
-                        <div className="chips">
-                          {Array.from(excludeSet).map((pid) => (
-                            <button key={`exc-${pid}`} className="filter-chip out" title="Remove filter" onClick={() => toggleFilter(pid, "exclude")}>
-                              <PlayerPhoto playerId={pid} name={playerNameById[pid]} size={20} />
-                              {playerNameById[pid] || `Player ${pid}`} <span className="x">&times;</span>
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                )}
-                    <div className="top5-controls-row">
-                      <div className="top5-search">
-                        <SuggestInput
-                          label="Search / Filter Players"
-                          value={comboSearch}
-                          onChange={setComboSearch}
-                          placeholder="Player name"
-                          suggestions={comboSearchNames}
-                          actions={[
-                            { key: "in", label: "Include", onPick: (name) => addPlayerFilterByName(name, "include") },
-                            { key: "out", label: "Exclude", onPick: (name) => addPlayerFilterByName(name, "exclude") },
-                          ]}
-                        />
-                      </div>
-                    </div>
-                  </div>
-                </div>
+                {renderTop5Filters()}
                 {(allTeams || topTeams) && (allTeams || topTeams).length > 0 && (
                   <div className="card sub">
                     <h3>Top Teams</h3>
@@ -14205,6 +14220,7 @@ function GroupsTab({
               <h3>Swiss Results</h3>
               <SwissBoard walk={swissWalk} teams={teams} teamLookup={teamLookup} picks={swissPicks} onPick={pickSwissMatch} />
             </div>
+            {renderTop5Filters()}
             <div className="actions">
               <button className="secondary" onClick={fillSwissFavourites} disabled={!swissWalk}>
                 Favourites win
@@ -14222,6 +14238,7 @@ function GroupsTab({
               <h3>Bracket Results</h3>
               <BracketPicker bracket={results.bracket} teamLookup={teamLookup} picks={bracketPicks} onPick={pickBracketMatch} />
             </div>
+            {renderTop5Filters()}
             <div className="actions">
               <button className="secondary" onClick={fillBracketFavourites}>
                 Favourites win
@@ -14272,6 +14289,7 @@ function GroupsTab({
                   </div>
                 );
               })}
+            {results && renderTop5Filters()}
             {results && (
               <div className="actions">
                 <button className="primary" onClick={() => scoreCompleted(0)} disabled={!allGroupsComplete || !combosReady}>
