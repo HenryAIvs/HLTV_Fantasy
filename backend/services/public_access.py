@@ -55,6 +55,7 @@ PUBLIC_ROUTES: List[Tuple[str, str]] = [
     ("GET", r"/groups/event-autofill"),
     ("POST", r"/groups/best-team/query"),
     ("POST", r"/groups/best-team/completed-query"),
+    ("POST", r"/groups/swiss/pairings"),
     ("GET", r"/simulate/latest"),
     ("GET", r"/best-team/latest"),
     ("POST", r"/best-team/query"),

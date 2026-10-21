@@ -12309,6 +12309,66 @@ function BracketPicker({ bracket, teamLookup, picks, onPick }) {
   );
 }
 
+// Completed Swiss picker: the rounds the backend has paired so far (a round
+// appears once every match of the round before has a winner); click a team
+// to make it the winner.
+function SwissPicker({ walk, teamLookup, picks, onPick }) {
+  const rounds = walk?.rounds || [];
+  const records = walk?.records || {};
+  const rec = (tid) => {
+    const r = records[String(tid)];
+    return r ? `${r[0]}-${r[1]}` : "";
+  };
+  return (
+    <div className="pb-bracket">
+      {rounds.map((rd) => (
+        <div className="pb-round" key={`swiss-r${rd.round}`}>
+          <div className="pb-round-title">Round {rd.round}</div>
+          <div className="pb-matches">
+            {rd.matches.map((m) => (
+              <div className="pb-match-wrap" key={m.key}>
+                <div className="gsl-match">
+                  <span className="gsl-label">
+                    {m.pool} · Bo{m.bo}
+                  </span>
+                  <span className="gsl-pick">
+                    {[m.a, m.b].map((tid) => (
+                      <button key={tid} className={Number(picks[m.key]) === Number(tid) ? "active" : ""} onClick={() => onPick(m.key, tid)}>
+                        {teamLookup[tid] || tid}
+                      </button>
+                    ))}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+      {walk?.complete && (
+        <div className="pb-round">
+          <div className="pb-round-title">Final records</div>
+          <div className="pb-matches">
+            {Object.keys(records)
+              .sort((x, y) => (records[y][0] - records[x][0]) || (records[x][1] - records[y][1]))
+              .map((tid) => (
+                <div className="pb-match-wrap" key={`rec-${tid}`}>
+                  <div className="gsl-match">
+                    <span className="gsl-label">{rec(tid)}</span>
+                    <span className="gsl-pick">
+                      <button className={records[tid][0] >= 3 ? "active" : ""} disabled>
+                        {teamLookup[tid] || tid}
+                      </button>
+                    </span>
+                  </div>
+                </div>
+              ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Swiss stage (a group format of the groups engine): the seed order with
 // each team's record odds and qualify chance from the stored run.
 function SwissStageView({ results, teams, teamLookup }) {
@@ -12474,8 +12534,8 @@ function GroupsTab({
     { key: "average", label: "Average Player Value" },
     { key: "single_outcome", label: "Best Single Outcome" },
     { key: "most_outcomes", label: "Most Likely Winner" },
-    { key: "completed", label: stageKind === "bracket" ? "Completed Bracket" : "Completed Groups" },
-  ].filter((sub) => sub.key !== "completed" || stageKind !== "swiss");
+    { key: "completed", label: stageKind === "bracket" ? "Completed Bracket" : stageKind === "swiss" ? "Completed Swiss" : "Completed Groups" },
+  ];
   const setGroupsTopMode = (key) => {
     setGroupsTopSubtab(key);
     if (key !== "completed") setComboMode(key);
@@ -12964,6 +13024,41 @@ function GroupsTab({
   };
   const bracketComplete =
     groupFormat === "bracket" && (results?.bracket?.matches || []).length > 0 && (results?.bracket?.matches || []).every((m) => Boolean(bracketPicks[m[0]]));
+  // Swiss: the picks walk the stage; the backend pairs the next round from
+  // the sampler's own rule once a round is complete.
+  const [swissPicks, setSwissPicks] = useState({});
+  const [swissWalk, setSwissWalk] = useState(null);
+  useEffect(() => {
+    setSwissPicks({});
+    setSwissWalk(null);
+  }, [results?.swiss?.event_id, results?.swiss?.seed]);
+  useEffect(() => {
+    if (groupFormat !== "swiss" || !results?.swiss) return undefined;
+    let live = true;
+    api
+      .post("/groups/swiss/pairings", { swiss_picks: swissPicks }, 30000)
+      .then((d) => {
+        if (live && d && Array.isArray(d.rounds)) setSwissWalk(d);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [groupFormat, results?.swiss, swissPicks]);
+  const pickSwissMatch = (key, tid) => {
+    const round = Number(String(key).match(/^r(\d+)_/)?.[1] || 0);
+    setSwissPicks((prev) => {
+      const next = {};
+      Object.entries(prev).forEach(([k, v]) => {
+        const r = Number(String(k).match(/^r(\d+)_/)?.[1] || 0);
+        if (r <= round && k !== key) next[k] = v;
+      });
+      next[key] = tid;
+      return next;
+    });
+    setCompletedResult(null);
+  };
+  const swissComplete = groupFormat === "swiss" && Boolean(swissWalk?.complete);
   const scoreCompleted = async () => {
     setCompletedMessage("");
     try {
@@ -12972,7 +13067,9 @@ function GroupsTab({
         {
           ...(groupFormat === "bracket"
             ? { bracket_picks: bracketPicks }
-            : { group_winners: activeCompletedDerived.map((g) => g.picks.map(Number)) }),
+            : groupFormat === "swiss"
+              ? { swiss_picks: swissPicks }
+              : { group_winners: activeCompletedDerived.map((g) => g.picks.map(Number)) }),
           search: comboSearch,
           page: 0,
           page_size: 200,
@@ -13404,8 +13501,9 @@ function GroupsTab({
                 <div className="card sub">
                   <h3>Best Team For These Results</h3>
                   <p className="muted">
-                    Outcome probability {(Number(completedResult.outcome_probability || 0) * 100).toFixed(3)}% of{" "}
-                    {Number(completedResult.outcomes_count || 0).toLocaleString()} stored outcomes.
+                    {groupFormat === "swiss"
+                      ? `Path probability 1 in ${Number(completedResult.outcome_probability) > 0 ? Math.round(1 / Number(completedResult.outcome_probability)).toLocaleString() : "∞"}`
+                      : `Outcome probability ${(Number(completedResult.outcome_probability || 0) * 100).toFixed(3)}% of ${Number(completedResult.outcomes_count || 0).toLocaleString()} stored outcomes.`}
                   </p>
                   {(completedResult.top_teams || []).slice(0, 10).map((team, idx) => (
                     <div key={idx} className="card sub">
@@ -13891,6 +13989,20 @@ function GroupsTab({
             Completed-bracket scoring for the top-3 double-elim variant isn't supported yet — use the Group
             Stage simulation.
           </p>
+        )}
+        {groupsTab === "top5" && results && groupsTopSubtab === "completed" && groupFormat === "swiss" && (
+          <>
+            <div className="card sub">
+              <h3>Swiss Results</h3>
+              <SwissPicker walk={swissWalk} teamLookup={teamLookup} picks={swissPicks} onPick={pickSwissMatch} />
+            </div>
+            <div className="actions">
+              <button className="primary" onClick={scoreCompleted} disabled={!swissComplete || !combosReady}>
+                Score Completed Swiss
+              </button>
+            </div>
+            {renderCompletedResults()}
+          </>
         )}
         {groupsTab === "top5" && results && groupsTopSubtab === "completed" && groupFormat === "bracket" && (
           <>

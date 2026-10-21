@@ -2525,6 +2525,45 @@ def _paths_for(results: dict):
         return paths_engine.score(paths, base_states, player_rows_by_id, team_rank_by_id, prob_cache)
 
 
+def _swiss_completed_scored(results: dict, team_ids: List[int], seeds: Dict[int, int], walked: Dict[str, Any]):
+    """One finished Swiss walk scored the way the stored run's samples were:
+    its win matrices, snapshot rows, ranks, rosters and Leader odds."""
+    from backend.services import leader_role, paths_engine, stage_formats, swiss_engine
+
+    sw = results.get("swiss") or {}
+    player_rows_by_id, team_rank_by_id, overrides = _run_lookup_context(results, team_ids)
+    prob_cache: Dict = {}
+    win_probs = sw.get("win_probs") or {}
+    _prefill_prob_cache(prob_cache, team_ids, win_probs)
+    samples = swiss_engine.samples_from_walk(team_ids, walked)
+    paths = stage_formats.swiss_paths(samples, team_ids, stage_formats.matrices_by_series(win_probs))
+    event_id = int(sw.get("event_id") or 0) or None
+    with event_rosters.for_event(event_id), team_strength.rank_overrides(overrides), leader_role.use(leader_role.loaded(results.get("leader_odds"))):
+        base_states = initialize_teams(team_ids, seeds)
+        return paths_engine.score(paths, base_states, player_rows_by_id, team_rank_by_id, prob_cache)
+
+
+@router.post("/swiss/pairings")
+def swiss_pairings(payload: dict | None = None, event_id: Optional[int] = None):
+    """The Swiss stage's rounds under the given winners (match key ->
+    team id): the pairings the next round gets once a round is complete,
+    each team's record, and whether the stage is finished — the picker's
+    board."""
+    from backend.services import swiss_engine
+
+    body = payload or {}
+    key = _state_key(event_id or body.get("event_id"))
+    latest = _GROUPS_STATE.load(key=key)
+    results = (latest or {}).get("results") or {}
+    if str(results.get("group_format") or "") != "swiss":
+        raise HTTPException(status_code=404, detail="No stored Swiss stage found.")
+    sw = results.get("swiss") or {}
+    team_ids = [int(t) for t in (results.get("groups") or [[]])[0]]
+    seeds = {int(t): int(v) for t, v in (sw.get("seeds") or {}).items()}
+    picks = {str(k): int(v) for k, v in (body.get("swiss_picks") or {}).items() if v}
+    return swiss_engine.walk(team_ids, seeds, str(sw.get("bo3_mode") or "elim_qual"), picks)
+
+
 def _paths_leader_odds(team_ids: List[int], block: Dict[str, Any]) -> Dict[int, Dict[str, float]]:
     """A path-format run's Leader percentages from its win matrices: the Bo3
     matrix (the deciding series) when the format plays one, else Bo1."""
@@ -5325,20 +5364,30 @@ def query_groups_best_team_completed(payload: dict | None = None, event_id: Opti
     probability = 1.0
     fmt = str(results.get("group_format") or "")
     if fmt in _PATH_FORMATS:
-        # a bracket: the picks (match key -> winner) name one enumerated outcome
-        from backend.services import paths_engine, stage_formats
+        from backend.services import paths_engine, stage_formats, swiss_engine
 
-        if fmt != "bracket":
-            raise HTTPException(status_code=400, detail="Completed results are not available for this stage format")
-        br = results.get("bracket") or {}
         team_ids = [int(t) for t in (results.get("groups") or [[]])[0]]
-        spec = stage_formats.bracket_spec(str(br.get("kind") or "single"), team_ids, bool(br.get("third_place")), int(br.get("final_bo") or 3))
-        picks = {str(k): int(v) for k, v in (body.get("bracket_picks") or {}).items() if v}
-        code = stage_formats.picks_to_code(spec, picks, team_ids)
-        if code is None:
-            raise HTTPException(status_code=400, detail="Pick every match winner first")
-        model = _event_outcome_model(results, (key, latest["updated_at"]))
-        sc = model[3]["paths"]
+        if fmt == "swiss":
+            # the picks (match key -> winner) walk the stage round by round;
+            # the finished walk is one path, scored like any sampled one
+            sw = results.get("swiss") or {}
+            seeds = {int(t): int(v) for t, v in (sw.get("seeds") or {}).items()}
+            picks = {str(k): int(v) for k, v in (body.get("swiss_picks") or {}).items() if v}
+            walked = swiss_engine.walk(team_ids, seeds, str(sw.get("bo3_mode") or "elim_qual"), picks)
+            if not walked.get("complete"):
+                raise HTTPException(status_code=400, detail="Pick every match winner first")
+            sc = _swiss_completed_scored(results, team_ids, seeds, walked)
+            code = 0
+        else:
+            # a bracket: the picks (match key -> winner) name one enumerated outcome
+            br = results.get("bracket") or {}
+            spec = stage_formats.bracket_spec(str(br.get("kind") or "single"), team_ids, bool(br.get("third_place")), int(br.get("final_bo") or 3))
+            picks = {str(k): int(v) for k, v in (body.get("bracket_picks") or {}).items() if v}
+            code = stage_formats.picks_to_code(spec, picks, team_ids)
+            if code is None:
+                raise HTTPException(status_code=400, detail="Pick every match winner first")
+            model = _event_outcome_model(results, (key, latest["updated_at"]))
+            sc = model[3]["paths"]
         probability = float(sc.paths.outcome_prob[code])
         for pid in sc.pids:
             c = paths_engine.player_totals(sc, pid)["comps"][code]

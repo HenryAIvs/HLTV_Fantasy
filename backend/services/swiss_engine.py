@@ -56,11 +56,104 @@ def series_for_mode(bo3_mode: str) -> List[int]:
     return [3] if bo3_mode == "all" else [1] if bo3_mode == "none" else [1, 3]
 
 
+def _round_pairings(pools: Dict[tuple, list], states: Dict[int, Any]) -> list:
+    """The round's matches, pool by pool in record order, all drawn before
+    any of them is played."""
+    from backend.swiss_stage.pairing import generate_pairings
+
+    out = []
+    for key in sorted(pools):
+        out.extend(generate_pairings(pools[key], states))
+    return out
+
+
+def _open_pools(states: Dict[int, Any]) -> Dict[tuple, list]:
+    pools: Dict[tuple, list] = {}
+    for t in states.values():
+        if t.wins >= TARGET or t.losses >= TARGET:
+            continue
+        pools.setdefault((t.wins, t.losses), []).append(t)
+    return pools
+
+
+def walk(team_ids: List[int], seeds: Dict[int, int], bo3_mode: str, picks: Dict[str, int]) -> Dict[str, Any]:
+    """The stage replayed with the given winners (match key "r{round}_{i}" →
+    team id): each round's pairings as far as the picks reach — a round is
+    paired only once every match of the round before has a winner — with
+    each match's series type and record pool, every team's record so far,
+    and whether the stage is complete."""
+    from backend.swiss_stage.swiss_models import TeamState
+
+    states = {int(tid): TeamState(team_id=int(tid), vrs_rank=int(seeds[int(tid)]), players={}) for tid in team_ids}
+    rounds: List[Dict[str, Any]] = []
+    stopped = False
+    for r in range(ROUNDS):
+        pools = _open_pools(states)
+        if not pools:
+            break
+        matches = []
+        for i, (a, b) in enumerate(_round_pairings(pools, states)):
+            key = f"r{r + 1}_{i}"
+            raw = picks.get(key)
+            winner = int(raw) if raw is not None and int(raw) in (a.team_id, b.team_id) else None
+            matches.append({
+                "key": key, "a": int(a.team_id), "b": int(b.team_id), "bo": int(match_bo(a.wins, a.losses, bo3_mode)),
+                "pool": f"{a.wins}-{a.losses}", "winner": winner,
+            })
+        for m in matches:
+            if m["winner"] is None:
+                continue
+            a, b = states[m["a"]], states[m["b"]]
+            if m["winner"] == a.team_id:
+                a.record_win(b.team_id)
+                b.record_loss(a.team_id)
+            else:
+                b.record_win(a.team_id)
+                a.record_loss(b.team_id)
+        done = all(m["winner"] is not None for m in matches)
+        rounds.append({"round": r + 1, "matches": matches, "complete": done})
+        if not done:
+            stopped = True
+            break
+    complete = (not stopped) and all(t.wins >= TARGET or t.losses >= TARGET for t in states.values())
+    return {
+        "rounds": rounds,
+        "complete": complete,
+        "records": {str(tid): [int(t.wins), int(t.losses)] for tid, t in states.items()},
+    }
+
+
+def samples_from_walk(team_ids: List[int], walked: Dict[str, Any]) -> SwissSamples:
+    """One completed stage (a finished walk) in the sampler's arrays."""
+    import numpy as np
+
+    T = len(team_ids)
+    pos = {int(tid): i for i, tid in enumerate(team_ids)}
+    opp = np.full((1, T, ROUNDS), -1, dtype=np.int16)
+    won = np.full((1, T, ROUNDS), -1, dtype=np.int8)
+    bo = np.zeros((1, T, ROUNDS), dtype=np.int8)
+    played = np.zeros((1, T), dtype=np.int8)
+    wins = np.zeros((1, T), dtype=np.int8)
+    for rd_ in walked.get("rounds") or []:
+        r = int(rd_["round"]) - 1
+        for m in rd_["matches"]:
+            if m.get("winner") is None:
+                continue
+            ia, ib = pos[int(m["a"])], pos[int(m["b"])]
+            a_won = int(m["winner"]) == int(m["a"])
+            opp[0, ia, r], opp[0, ib, r] = ib, ia
+            won[0, ia, r], won[0, ib, r] = (1, 0) if a_won else (0, 1)
+            bo[0, ia, r] = bo[0, ib, r] = int(m["bo"])
+            played[0, ia] += 1
+            played[0, ib] += 1
+            wins[0, ia if a_won else ib] += 1
+    return SwissSamples(opp=opp, won=won, bo=bo, played=played, wins=wins)
+
+
 def _sample_chunk(args: tuple):
     """One worker's chunk of stages, from its own seed."""
     import numpy as np
 
-    from backend.swiss_stage.pairing import generate_pairings
     from backend.swiss_stage.swiss_models import TeamState
 
     team_ids, seeds, p_bo1, p_bo3, bo3_mode, n, seed = args
@@ -76,30 +169,27 @@ def _sample_chunk(args: tuple):
     for s in range(n):
         states = {tid: TeamState(team_id=tid, vrs_rank=int(seeds[tid]), players={}) for tid in team_ids}
         for r in range(ROUNDS):
-            pools: Dict[tuple, list] = {}
-            for t in states.values():
-                if t.wins >= TARGET or t.losses >= TARGET:
-                    continue
-                pools.setdefault((t.wins, t.losses), []).append(t)
+            pools = _open_pools(states)
             if not pools:
                 break
-            for key in sorted(pools):
-                for a, b in generate_pairings(pools[key], states):
-                    series = match_bo(a.wins, a.losses, bo3_mode)
-                    ia, ib = pos[a.team_id], pos[b.team_id]
-                    a_won = rng.random() < probs[series][ia][ib]
-                    if a_won:
-                        a.record_win(b.team_id)
-                        b.record_loss(a.team_id)
-                    else:
-                        b.record_win(a.team_id)
-                        a.record_loss(b.team_id)
-                    opp[s, ia, r] = ib
-                    opp[s, ib, r] = ia
-                    won[s, ia, r] = 1 if a_won else 0
-                    won[s, ib, r] = 0 if a_won else 1
-                    bo[s, ia, r] = series
-                    bo[s, ib, r] = series
+            # every pairing of the round is drawn from the records as the
+            # round starts (Buchholz included), then the round is played
+            for a, b in _round_pairings(pools, states):
+                series = match_bo(a.wins, a.losses, bo3_mode)
+                ia, ib = pos[a.team_id], pos[b.team_id]
+                a_won = rng.random() < probs[series][ia][ib]
+                if a_won:
+                    a.record_win(b.team_id)
+                    b.record_loss(a.team_id)
+                else:
+                    b.record_win(a.team_id)
+                    a.record_loss(b.team_id)
+                opp[s, ia, r] = ib
+                opp[s, ib, r] = ia
+                won[s, ia, r] = 1 if a_won else 0
+                won[s, ib, r] = 0 if a_won else 1
+                bo[s, ia, r] = series
+                bo[s, ib, r] = series
         for tid, t in states.items():
             played[s, pos[tid]] = t.wins + t.losses
             wins[s, pos[tid]] = t.wins
