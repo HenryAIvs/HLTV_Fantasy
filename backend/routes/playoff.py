@@ -231,78 +231,6 @@ def seed_playoff_queries(variant: str = "main", event_id=None) -> dict:
     return timings
 
 
-def bake_event_playoff(
-    event_id: int, trigger: str = "import", only_if_missing: bool = False, refresh_inputs: bool = False
-) -> dict:
-    """Playoff counterpart of groups.bake_event_valuations, called through it:
-    fill the bracket from the event page, enumerate it and store the roster
-    combinations, so a playoff event is published the same way a groups event
-    is - at import, refreshed nightly until it starts, frozen after. With
-    only_if_missing an already-baked event is left alone. Never raises; the
-    scheduler records the returned status."""
-    from backend.data.event_db import get_event_detail, get_event_tournament_kind
-    from backend.routes import events as events_routes
-    from backend.routes.groups import autofill_event_playoff
-
-    started = time.time()
-    event_id = int(event_id)
-    if only_if_missing and load_latest_playoff("main", event_id):
-        return {"status": "exists", "event_id": event_id, "reason": "already baked; not refreshed"}
-    event = get_event_detail(event_id)
-    if not event:
-        return {"status": "skipped", "event_id": event_id, "reason": "event not found"}
-    try:
-        detected = events_routes._detect_event_tournament_kind_cached(event)
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "skipped", "event_id": event_id, "reason": f"kind detection failed: {exc}"}
-    kind = get_event_tournament_kind(event_id) or detected.get("kind")
-    if kind not in ("playoff", "double_elim"):
-        return {"status": "skipped", "event_id": event_id, "reason": f"not a playoff event ({kind})"}
-    if detected.get("routing_error"):
-        return {"status": "unsupported", "event_id": event_id, "reason": f"bracket routing: {detected.get('routing_error')}"}
-    try:
-        auto = autofill_event_playoff(hltv_event_id=event.get("hltv_event_id"), fantasy_event_id=event_id)
-    except Exception as exc:  # noqa: BLE001
-        detail = getattr(exc, "detail", None) or str(exc)
-        return {"status": "skipped", "event_id": event_id, "reason": f"bracket unavailable: {str(detail)[:200]}"}
-    ids = [int(t or 0) for t in (auto.get("team_ids") or [])]
-    if not ids or any(t <= 0 for t in ids):
-        return {"status": "skipped", "event_id": event_id, "reason": "bracket not published yet (TBD slots)"}
-    try:
-        payload = _normalize_playoff_payload(
-            {
-                "team_slots": ids, "bracket_kind": auto.get("bracket_kind") or "single",
-                "has_third_place_decider": bool(detected.get("playoff_third_place")),
-                "final_bo": _detected_final_bo(event_id), "event_id": event_id,
-            }
-        )
-    except HTTPException as exc:
-        return {"status": "skipped", "event_id": event_id, "reason": f"invalid bracket: {exc.detail}"}
-    payload["event_id"] = event_id
-    payload["baked"] = {"trigger": trigger, "at": started, "refresh_inputs": bool(refresh_inputs)}
-    try:
-        result = _compute_playoff_result(payload)
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "error", "event_id": event_id, "reason": f"bracket run failed: {str(exc)[:300]}"}
-    save_latest_playoff(payload, result, "main", event_id)
-    bracket_seconds = round(time.time() - started, 1)
-    # Roster combinations: what the Top 5 tabs read (one run serves all three
-    # ranking modes; filters are applied at query time).
-    try:
-        combos = _store_playoff_combos(result, "main", event_id)
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "error", "event_id": event_id, "reason": f"combinations failed: {str(exc)[:300]}", "bracket_seconds": bracket_seconds}
-    return {
-        "status": "ok",
-        "event_id": event_id,
-        "kind": kind,
-        "teams": len(ids),
-        "rosters": len(combos.get("all_teams") or []),
-        "bracket_seconds": bracket_seconds,
-        "seconds": round(time.time() - started, 1),
-    }
-
-
 def _saved_combo_metric(team: dict, mode: str) -> float:
     if mode == "single_outcome":
         return float(team.get("ceiling_points") or 0.0)
@@ -478,70 +406,6 @@ def _build_playoff_lookup_context(team_slots: List[int]) -> tuple[Dict[int, dict
     except Exception:  # noqa: BLE001 - the Top-X curve still prices the rows
         logging.getLogger(__name__).warning("Could not attach the learned match ratings", exc_info=True)
     return player_rows_by_id, team_rank_by_id
-
-
-def _simulate_bracket(team_slots: List[int], vrs_ranks: Dict[int, int], rng=None):
-    team_states: Dict[int, TeamState] = initialize_teams(team_slots, vrs_ranks)
-    player_rows_by_id, team_rank_by_id = _build_playoff_lookup_context(team_slots)
-    match_results = {"quarters": [], "semis": [], "final": []}
-
-    def ts(tid: int) -> TeamState:
-        if tid not in team_states:
-            raise HTTPException(status_code=400, detail=f"Unknown team_id {tid}")
-        return team_states[tid]
-
-    def play_match(a_id: int, b_id: int, remaining_rounds_after: int):
-        A, B = ts(a_id), ts(b_id)
-        match_num_a = A.matches_played + 1
-        match_num_b = B.matches_played + 1
-        rand_fn = (rng or random).random if rng is not None else None
-        result = simulate_match_outcome(A, B, "bo3", rng=rand_fn)
-        if result.winner_id == A.team_id:
-            winner, loser = A, B
-            did_win_a, did_win_b = True, False
-        else:
-            winner, loser = B, A
-            did_win_a, did_win_b = False, True
-
-        winner.record_win(loser.team_id)
-        loser.record_loss(winner.team_id)
-
-        apply_fantasy_points_for_team(
-            A, B.team_id, result.win_probability, did_win_a, match_num_a, "bo3",
-            player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id
-        )
-        apply_fantasy_points_for_team(
-            B, A.team_id, 1.0 - result.win_probability, did_win_b, match_num_b, "bo3",
-            player_rows_by_id=player_rows_by_id, team_rank_by_id=team_rank_by_id
-        )
-
-        _apply_elimination_penalty(loser, remaining_rounds_after)
-        return winner.team_id, loser.team_id, result.win_probability
-
-    quarters = [
-        (team_slots[0], team_slots[1]),
-        (team_slots[2], team_slots[3]),
-        (team_slots[4], team_slots[5]),
-        (team_slots[6], team_slots[7]),
-    ]
-
-    semi_ids = []
-    for a, b in quarters:
-        w, l, p = play_match(a, b, remaining_rounds_after=2)
-        semi_ids.append(w)
-        match_results["quarters"].append({"winner": w, "loser": l, "p_win_a": p, "teams": [a, b]})
-
-    final_ids = []
-    for i in range(0, len(semi_ids), 2):
-        a, b = semi_ids[i], semi_ids[i + 1]
-        w, l, p = play_match(a, b, remaining_rounds_after=1)
-        final_ids.append(w)
-        match_results["semis"].append({"winner": w, "loser": l, "p_win_a": p, "teams": [a, b]})
-
-    champ, runner, p = play_match(final_ids[0], final_ids[1], remaining_rounds_after=0)
-    match_results["final"].append({"winner": champ, "loser": runner, "p_win_a": p, "teams": [final_ids[0], final_ids[1]]})
-
-    return team_states, match_results
 
 
 def _clone_team_states(team_states: Dict[int, TeamState]) -> Dict[int, TeamState]:
@@ -2937,37 +2801,6 @@ _PLAYOFF_EXACT_ROSTER_LIMIT = 2_000_000
 _PLAYOFF_TWO_PHASE_TOPK = 12000
 
 
-def _enumerate_valid_pids(players: list, include: set, budget: int, max_per_team: int, progress_callback=None):
-    """Every legal five-player roster (pid tuples) of a small pool: budget,
-    per-team cap and forced players."""
-    n = len(players)
-    pids = [int(p["player_id"]) for p in players]
-    prices = [int(p.get("price") or 0) for p in players]
-    teams = [int(p.get("team_id") or 0) for p in players]
-    include_idx = {i for i, pid in enumerate(pids) if pid in include}
-    total = math.comb(n, 5)
-    done = 0
-    for combo in itertools.combinations(range(n), 5):
-        done += 1
-        if progress_callback and done % 100000 == 0:
-            progress_callback(done, total)
-        if include_idx and not include_idx.issubset(combo):
-            continue
-        if sum(prices[i] for i in combo) > budget:
-            continue
-        counts: Dict[int, int] = {}
-        over = False
-        for i in combo:
-            c = counts.get(teams[i], 0) + 1
-            if c > max_per_team:
-                over = True
-                break
-            counts[teams[i]] = c
-        if over:
-            continue
-        yield tuple(pids[i] for i in combo)
-
-
 def _optimize_playoff_teams_by_outcomes(
     players_info: list[dict],
     results: Dict,
@@ -3208,7 +3041,6 @@ def _optimize_playoff_teams_by_outcomes(
         # defined among rosters that were planned)
         "approximate": True,
     }
-
 
 
 def _run_playoff_best_team_job(job_id: str, payload: dict | None = None) -> None:

@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
-from backend.routes import players, teams, simulation, bracket, best_team, playoff, groups, admin, events, schedule, assets
+from backend.routes import players, teams, playoff, groups, admin, events, schedule, assets
 from backend.services.backend_port import APP_ID, HOST, PORT_FILE, select_port, write_port_info
 from backend.data.event_db import ensure_event_schema
 from backend.data.player_db import ensure_schema
@@ -27,8 +27,6 @@ SCHEMA_INITIALIZERS = (
     ensure_schema,
     ensure_team_schema,
     ensure_event_schema,
-    simulation.ensure_simulation_schema,
-    best_team.ensure_best_team_schema,
     playoff.ensure_playoff_schema,
     groups.ensure_groups_schema,
     teams.ensure_map_stats_import_schema,
@@ -44,9 +42,6 @@ SCHEMA_INITIALIZERS = (
 ROUTERS = (
     (players.router, "/players", "players"),
     (teams.router, "/teams", "teams"),
-    (simulation.router, "/simulate", "simulation"),
-    (bracket.router, "/bracket", "bracket"),
-    (best_team.router, "/best-team", "best-team"),
     (playoff.router, "/playoff", "playoff"),
     (groups.router, "/groups", "groups"),
     (admin.router, "/admin", "admin"),

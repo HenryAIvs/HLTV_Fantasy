@@ -56,9 +56,6 @@ PUBLIC_ROUTES: List[Tuple[str, str]] = [
     ("POST", r"/groups/best-team/query"),
     ("POST", r"/groups/best-team/completed-query"),
     ("POST", r"/groups/swiss/pairings"),
-    ("GET", r"/simulate/latest"),
-    ("GET", r"/best-team/latest"),
-    ("POST", r"/best-team/query"),
 ]
 
 # Read-only data the Database tab, the player/team modals and the Tournament
@@ -80,7 +77,7 @@ _PUBLIC_GET_DENY_COMPILED = [re.compile(f"^{p}$") for p in PUBLIC_GET_DENY]
 _PUBLIC_COMPILED = [(m, re.compile(f"^{p}$")) for m, p in PUBLIC_ROUTES]
 
 # Endpoints that compute on request: per-client rate limit + global concurrency cap.
-_HEAVY = re.compile(r"^/(playoff/best-team/from-latest/(query|completed-query)|playoff/(outcome|winning)-player-detail|groups/best-team/(query|completed-query)|best-team/query)$")
+_HEAVY = re.compile(r"^/(playoff/best-team/from-latest/(query|completed-query)|playoff/(outcome|winning)-player-detail|groups/best-team/(query|completed-query))$")
 _RATE_WINDOW_SECONDS = 60.0
 _RATE_LIMIT = int(os.getenv("HLTV_PUBLIC_RATE_LIMIT", "60"))
 _MAX_CONCURRENT = int(os.getenv("HLTV_PUBLIC_MAX_CONCURRENT", "3"))

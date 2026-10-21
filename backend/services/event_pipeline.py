@@ -33,18 +33,6 @@ def _groups_hooks() -> Dict[str, Any]:
     return {"bake": groups.bake_event_valuations, "exists": lambda eid: groups._GROUPS_STATE.exists(eid)}
 
 
-def _playoff_hooks() -> Dict[str, Any]:
-    from backend.routes import playoff
-
-    return {"bake": playoff.bake_event_playoff, "exists": lambda eid: playoff._STATE_SETS["main"]["playoff"].exists(eid)}
-
-
-def _swiss_hooks() -> Dict[str, Any]:
-    from backend.routes import simulation
-
-    return {"bake": simulation.bake_event_swiss, "exists": lambda eid: simulation._SIM_STATE.exists(eid)}
-
-
 def _bounty_hooks() -> Dict[str, Any]:
     from backend.routes import playoff
 
@@ -113,11 +101,6 @@ def _finished(detected: Dict[str, Any], now: Optional[float] = None) -> Optional
     if start:
         return now > float(start) + ASSUMED_LENGTH_SECONDS
     return None
-
-
-def is_finished(event_id: int) -> Optional[bool]:
-    _, detected = detect_kind(event_id)
-    return _finished(detected)
 
 
 def live_events() -> list:

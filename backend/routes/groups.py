@@ -2010,7 +2010,6 @@ def _exact_combined_playoffs(
     }
 
 
-
 # Per-event snapshot of the valuation inputs (player rows, team ranks): taken
 # at every bake until the event starts, frozen from then on — see
 # `_event_inputs`. Keyed by fantasy event id.
@@ -2031,14 +2030,6 @@ def event_start_at(event_id: int) -> Optional[float]:
         return None
     start = detected.get("start_at")
     return float(start) if start else None
-
-
-def event_has_started(event_id: int) -> Optional[bool]:
-    """True/False from the event's start stamp; None when the start is unknown."""
-    start = event_start_at(event_id)
-    if start is None:
-        return None
-    return time.time() >= start
 
 
 def _take_input_snapshot(event_id: int, team_ids: List[int]) -> Dict[str, Any]:
@@ -4327,8 +4318,6 @@ def _team_match_reach_probs(results: dict) -> Dict[int, Dict[int, float]]:
         for num_s, p in per_num.items():
             d[int(num_s)] = d.get(int(num_s), 0.0) + float(p)
     return reach
-
-
 
 
 def _topk_rosters_bnb(

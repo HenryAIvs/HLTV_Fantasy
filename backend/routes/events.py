@@ -226,23 +226,6 @@ def _fit_round_share_logistic_2d(samples: List[Dict[str, float]]) -> Dict[str, f
     return model
 
 
-def _build_current_points_maps() -> Tuple[Dict[str, int], Dict[str, int]]:
-    teams = get_all_teams()
-    hltv_map: Dict[str, int] = {}
-    vrs_map: Dict[str, int] = {}
-    for t in teams:
-        key = _norm_team_name(t.get("name") or "")
-        if not key or team_aliases.is_alias_source(team_aliases.normalize(t.get("name") or "")):
-            continue  # a renamed team's old-name row never shadows its current one
-        hp = t.get("hltv_points")
-        vp = t.get("vrs_points")
-        if hp is not None:
-            hltv_map[key] = int(hp)
-        if vp is not None:
-            vrs_map[key] = int(vp)
-    return hltv_map, vrs_map
-
-
 _EVENT_NAME_ACRONYMS = {
     "iem", "esl", "pgl", "blast", "ewc", "cct", "cs2", "csgo", "rmr", "vrs",
     "eu", "na", "sa", "apac", "mena", "esea", "wesg", "lan",
@@ -1563,15 +1546,6 @@ def _parse_team_map_stats(value: Any) -> Dict[str, Dict[str, float]]:
             "win_rate": max(0.0, min(1.0, win_rate if win_rate is not None else 0.0)),
             "played": max(0.0, played if played is not None else 0.0),
         }
-    return out
-
-
-def _build_team_map_stats_by_key(teams: List[Dict[str, Any]] | None = None) -> Dict[str, Dict[str, Dict[str, float]]]:
-    out: Dict[str, Dict[str, Dict[str, float]]] = {}
-    for team in teams if teams is not None else get_all_teams():
-        key = _norm_team_name(team.get("name") or "")
-        if key:
-            out[key] = _parse_team_map_stats(team.get("map_stats_json"))
     return out
 
 
@@ -3003,18 +2977,6 @@ def _round_win_to_map_win_probability(p_round: float) -> float:
     return min(0.999, max(0.001, win_before_ot + 0.5 * ot))
 
 
-def _series_probability_from_map_probability(p_map: float, best_of: int) -> float:
-    games = max(1, int(best_of))
-    if games % 2 == 0:
-        games += 1
-    need = games // 2 + 1
-    p = min(0.999, max(0.001, float(p_map)))
-    total = 0.0
-    for wins in range(need, games + 1):
-        total += math.comb(games, wins) * (p ** wins) * ((1.0 - p) ** (games - wins))
-    return min(0.999, max(0.001, total))
-
-
 _RATING_START = 1500.0
 # Player ratings are Glicko-style: a mean and a deviation per player. The
 # deviation starts at _PLAYER_SIGMA0, shrinks with every map down to
@@ -3383,92 +3345,6 @@ def _fit_map_model_set(
     return models
 
 
-def _approx_scoreline_from_round_probability(p_round_team1: float) -> tuple[int, int]:
-    p = min(0.999, max(0.001, float(p_round_team1)))
-    if p >= 0.5:
-        loser_raw = 13.0 * (1.0 - p) / p
-        if loser_raw >= 11.5:
-            return 12, 12
-        loser = max(0, min(11, round(loser_raw)))
-        return 13, int(loser)
-    winner_p = 1.0 - p
-    loser_raw = 13.0 * p / winner_p
-    if loser_raw >= 11.5:
-        return 12, 12
-    loser = max(0, min(11, round(loser_raw)))
-    return int(loser), 13
-
-
-def _scoreline_distribution_from_round_probability(p_round_team1: float) -> List[Dict[str, Any]]:
-    p = min(0.999, max(0.001, float(p_round_team1)))
-    q = 1.0 - p
-    rows: List[Dict[str, Any]] = []
-    for loser in range(12):
-        rows.append(
-            {
-                "score": f"13-{loser}",
-                "team1_score": 13,
-                "team2_score": loser,
-                "probability": math.comb(12 + loser, loser) * (p ** 13) * (q ** loser),
-            }
-        )
-    rows.append(
-        {
-            "score": "12-12",
-            "team1_score": 12,
-            "team2_score": 12,
-            "probability": math.comb(24, 12) * (p ** 12) * (q ** 12),
-        }
-    )
-    for loser in range(11, -1, -1):
-        rows.append(
-            {
-                "score": f"{loser}-13",
-                "team1_score": loser,
-                "team2_score": 13,
-                "probability": math.comb(12 + loser, loser) * (q ** 13) * (p ** loser),
-            }
-        )
-    return rows
-
-
-def _round_share_feature_values(sample: Dict[str, Any]) -> Dict[str, float]:
-    return {name: float(sample.get(sample_key) or 0.0) for name, sample_key in ROUND_SHARE_FEATURES}
-
-
-def _round_share_feature_breakdown(model: Dict[str, Any], sample: Dict[str, Any]) -> Dict[str, Any]:
-    values = _round_share_feature_values(sample)
-    rows = []
-    logit = float(model.get("a") or 0.0)
-    for name, _sample_key in ROUND_SHARE_FEATURES:
-        coef_key = f"b_{name}"
-        if coef_key not in model:
-            continue
-        raw = float(values.get(name) or 0.0)
-        mean = float(model.get(f"mean_{name}", 0.0))
-        std = float(model.get(f"std_{name}", 1.0)) or 1.0
-        standardized = (raw - mean) / std
-        coef = float(model.get(coef_key) or 0.0)
-        contribution = coef * standardized
-        logit += contribution
-        rows.append(
-            {
-                "feature": name,
-                "value": raw,
-                "mean": mean,
-                "std": std,
-                "standardized": standardized,
-                "coefficient": coef,
-                "contribution": contribution,
-            }
-        )
-    return {
-        "intercept": float(model.get("a") or 0.0),
-        "logit": logit,
-        "features": rows,
-    }
-
-
 def _predict_from_round_share_features(model: Dict[str, Any], values: Dict[str, float]) -> float:
     z = float(model.get("a") or 0.0)
     for name, _sample_key in ROUND_SHARE_FEATURES:
@@ -3480,80 +3356,6 @@ def _predict_from_round_share_features(model: Dict[str, Any], values: Dict[str, 
         raw = float(values.get(name, mean))
         z += float(model.get(coef_key) or 0.0) * ((raw - mean) / std)
     return _sigmoid(z)
-
-
-def _rank_level_band(level: float) -> Dict[str, Any]:
-    if level <= 5:
-        return {"key": "level_0_5", "label": "Level <= 5", "min": None, "max": 5}
-    if level <= 10:
-        return {"key": "level_5_10", "label": "Level 5-10", "min": 5, "max": 10}
-    if level <= 20:
-        return {"key": "level_10_20", "label": "Level 10-20", "min": 10, "max": 20}
-    if level <= 40:
-        return {"key": "level_20_40", "label": "Level 20-40", "min": 20, "max": 40}
-    return {"key": "level_40_plus", "label": "Level > 40", "min": 40, "max": None}
-
-
-def _build_rank_effect_curve(model: Dict[str, Any], samples: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
-    band_order = ["level_0_5", "level_5_10", "level_10_20", "level_20_40", "level_40_plus"]
-    band_meta = {
-        "level_0_5": {"key": "level_0_5", "label": "Level <= 5", "min": None, "max": 5},
-        "level_5_10": {"key": "level_5_10", "label": "Level 5-10", "min": 5, "max": 10},
-        "level_10_20": {"key": "level_10_20", "label": "Level 10-20", "min": 10, "max": 20},
-        "level_20_40": {"key": "level_20_40", "label": "Level 20-40", "min": 20, "max": 40},
-        "level_40_plus": {"key": "level_40_plus", "label": "Level > 40", "min": 40, "max": None},
-    }
-    grouped: Dict[str, Dict[int, Dict[str, float]]] = {key: {} for key in band_order}
-    for idx, sample in enumerate(samples or []):
-        try:
-            hltv_gap = float(sample["hltv_gap"])
-            vrs_gap = float(sample["vrs_gap"])
-            hltv_level = float(sample["hltv_level"])
-            vrs_level = float(sample["vrs_level"])
-            score1 = int(sample["score1"])
-            score2 = int(sample["score2"])
-        except Exception:
-            continue
-        gap = (hltv_gap + vrs_gap) / 2.0
-        level = (hltv_level + vrs_level) / 2.0
-        if level <= 0:
-            continue
-        outcome = int(sample.get("outcome") or (1 if score1 > score2 else -1 if score1 < score2 else 0))
-        actual = 1.0 if outcome > 0 else 0.0 if outcome < 0 else 0.5
-        predicted = _model_map_win_probability(model, _round_share_feature_values(sample))
-        band = _rank_level_band(level)
-        gap_bucket = int(math.floor(gap / 5.0) * 5)
-        bucket = grouped[band["key"]].setdefault(
-            gap_bucket,
-            {"n": 0.0, "predicted_sum": 0.0, "actual_sum": 0.0, "gap_sum": 0.0, "level_sum": 0.0},
-        )
-        bucket["n"] += 1.0
-        bucket["predicted_sum"] += predicted
-        bucket["actual_sum"] += actual
-        bucket["gap_sum"] += gap
-        bucket["level_sum"] += level
-    level_bands = []
-    for key in band_order:
-        rows = []
-        for gap_bucket, values in sorted(grouped[key].items()):
-            n = max(1.0, float(values["n"]))
-            rows.append(
-                {
-                    "gap": gap_bucket + 2.5,
-                    "gap_min": gap_bucket,
-                    "gap_max": gap_bucket + 5,
-                    "n": int(values["n"]),
-                    "predicted_winrate": float(values["predicted_sum"]) / n,
-                    "actual_winrate": float(values["actual_sum"]) / n,
-                    "avg_gap": float(values["gap_sum"]) / n,
-                    "avg_level": float(values["level_sum"]) / n,
-                }
-            )
-        level_bands.append({**band_meta[key], "rows": rows, "n": sum(int(row["n"]) for row in rows)})
-    return {
-        "level_bands": level_bands,
-        "description": "Each chart groups real training maps into a matchup-level band, buckets average HLTV/VRS rank gap into 5-rank bins, then plots the average predicted map winrate for Team A in each gap bin. The actual winrate for that same bin is included as a comparison line.",
-    }
 
 
 # ---- the veto model -------------------------------------------------------------
@@ -3974,20 +3776,6 @@ def _fit_veto_calibration(veto_model: Dict[str, Any], bundles: List[Dict[str, An
     veto_model["calibration"] = {"a": float(a), "b": float(b_), "vetoes": len(usable)}
 
 
-def _series_win_probability(map_probs: List[float], wins_needed: int) -> float:
-    """P(team A wins the series) given independent per-map win probabilities."""
-    wins_needed = max(1, int(wins_needed))
-    dist = [1.0]
-    for p in map_probs:
-        p = min(1.0, max(0.0, float(p)))
-        nxt = [0.0] * (len(dist) + 1)
-        for wins, prob in enumerate(dist):
-            nxt[wins + 1] += prob * p
-            nxt[wins] += prob * (1.0 - p)
-        dist = nxt
-    return float(sum(prob for wins, prob in enumerate(dist) if wins >= wins_needed))
-
-
 def _series_wins_needed(score1: Any, score2: Any) -> int:
     """Maps a side must win, from a stored series score. Bo1 rows keep the MAP
     score (13-9, 22-19) as the series score, so anything above 5 is one map;
@@ -4005,8 +3793,6 @@ def _best_of_series_win_probability(p_map: float, wins_needed: int) -> float:
     return float(
         sum(math.comb(total_maps, k) * p**k * (1.0 - p) ** (total_maps - k) for k in range(wins_needed, total_maps + 1))
     )
-
-
 
 
 def _lab_data_signature() -> Dict[str, int]:

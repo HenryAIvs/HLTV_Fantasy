@@ -118,12 +118,6 @@ def _probe(port: int, timeout: float = 1.5) -> dict[str, Any] | str | None:
     return FOREIGN
 
 
-def probe_backend(port: int, timeout: float = 1.5) -> dict[str, Any] | None:
-    """GET /health on the port; return its JSON only if it is one of ours."""
-    found = _probe(port, timeout)
-    return found if isinstance(found, dict) else None
-
-
 def _wait_for_sibling(port: int) -> dict[str, Any] | None:
     """Give a sibling that is still booting time to answer; a definite
     non-matching answer means a foreign occupant and returns immediately."""

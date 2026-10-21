@@ -146,12 +146,6 @@ def slugify_hltv_team_name(name: str | None) -> str:
     return slug or "team"
 
 
-def _last_3_months_range(end: date | None = None) -> tuple[str, str]:
-    end_d = end or date.today()
-    start_d = end_d - relativedelta(months=3)
-    return start_d.isoformat(), end_d.isoformat()
-
-
 def _build_hltv_team_maps_url(team_id: int, slug: str, start_date: str | None = None, end_date: str | None = None) -> str:
     url = f"https://www.hltv.org/stats/teams/maps/{int(team_id)}/{slugify_hltv_team_name(slug)}"
     if start_date and end_date:

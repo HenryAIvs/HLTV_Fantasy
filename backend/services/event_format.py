@@ -524,26 +524,6 @@ def parse_playoff_bo_rules(format_text: str) -> Optional[Dict[str, int]]:
     return rules
 
 
-def swiss_bucket_bo(bucket: str, rules: Optional[Dict[str, int]]) -> int:
-    """Best-of for one swiss record bucket ('TwoOne' = 2 wins, 1 loss).
-
-    A team on 2 wins plays a progression match, on 2 losses an elimination
-    match (2-2 is both); everything else uses the stage default."""
-    if not rules:
-        return 3
-    numbers = _variant_numbers(str(bucket or ""))
-    wins = numbers[0] if numbers else 0
-    losses = numbers[1] if len(numbers) > 1 else 0
-    if wins == 2 or losses == 2:
-        candidates = []
-        if wins == 2:
-            candidates.append(int(rules.get("progression") or 0))
-        if losses == 2:
-            candidates.append(int(rules.get("elimination") or 0))
-        return max(candidates) or int(rules.get("default") or 3)
-    return int(rules.get("default") or 3)
-
-
 def detect_event_structure(html: str) -> Dict[str, Any]:
     """Everything the page's structured markers say about the tournament."""
     formats_table = parse_formats_table(html)
