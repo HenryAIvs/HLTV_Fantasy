@@ -594,19 +594,6 @@ class DataScheduler:
             after = int((coverage_fn() or {}).get(missing_key) or 0)
             notes.append(f"{note}, {after} {unit} left")
             failed_any = failed_any or failed
-        # Keep the Model Lab's cached holdout evaluation current (about 20 s
-        # when tonight changed the data it uses).
-        try:
-            self._set_state(processed=0, total=0, message="Map model: refreshing the holdout evaluation")
-            info = events.ensure_map_model_evaluation()
-            m = info.get("metrics") or {}
-            notes.append(
-                f"holdout evaluation {'re-run' if info.get('evaluated') else 'already current'} "
-                f"(map Brier {float(m.get('brier') or 0):.3f}, series Brier {float(m.get('series_brier') or 0):.3f} "
-                f"on {int((info.get('split') or {}).get('test_maps') or 0)} maps)"
-            )
-        except Exception as exc:  # noqa: BLE001 - the fetches above still count
-            notes.append(f"holdout evaluation failed: {exc}")
         # The rating model the valuations use: retrain on tonight's scoreboards.
         try:
             from backend.services import rating_model
