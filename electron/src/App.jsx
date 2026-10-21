@@ -14429,6 +14429,15 @@ function SwissStageView({ results, teams, teamLookup }) {
   const pct = (v) => `${(Number(v || 0) * 100).toFixed(1)}%`;
   const wins = ["3-0", "3-1", "3-2"];
   const losses = ["2-3", "1-3", "0-3"];
+  // qualify odds: the engine's advance share for the team, else the three
+  // winning records summed (older runs stored them under swiss.qualify)
+  const qualifyOf = (tid) => {
+    const adv = results.paths_summary?.advance?.[String(tid)];
+    if (adv !== undefined && adv !== null) return Number(adv);
+    if (sw.qualify?.[String(tid)] !== undefined) return Number(sw.qualify[String(tid)]);
+    const rec = sw.records?.[String(tid)] || {};
+    return wins.reduce((acc, r) => acc + Number(rec[r] || 0), 0);
+  };
   return (
     <div className="card sub group-card">
       <div className="group-card-head">
@@ -14468,7 +14477,7 @@ function SwissStageView({ results, teams, teamLookup }) {
                     {pct(rec[r])}
                   </td>
                 ))}
-                <td className="num strong">{pct(sw.qualify?.[String(tid)])}</td>
+                <td className="num strong">{pct(qualifyOf(tid))}</td>
                 {losses.map((r) => (
                   <td className="num" key={r}>
                     {pct(rec[r])}
