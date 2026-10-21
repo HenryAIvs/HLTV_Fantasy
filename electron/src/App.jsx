@@ -12505,7 +12505,7 @@ function SwissBoard({ walk, teams, teamLookup, picks, onPick }) {
 
 // Swiss stage (a group format of the groups engine): the seed order with
 // each team's record odds and qualify chance from the stored run.
-function SwissStageView({ results, teams, teamLookup }) {
+function SwissStageView({ results, teams, teamLookup, excludeSet = null, teamPlayerIds = null, onToggleTeam = null }) {
   const sw = results?.swiss || null;
   if (!sw) {
     return (
@@ -12549,6 +12549,7 @@ function SwissStageView({ results, teams, teamLookup }) {
                 {r}
               </th>
             ))}
+            {onToggleTeam && <th />}
           </tr>
         </thead>
         <tbody>
@@ -12573,6 +12574,18 @@ function SwissStageView({ results, teams, teamLookup }) {
                     {pct(rec[r])}
                   </td>
                 ))}
+                {onToggleTeam &&
+                  (() => {
+                    const pids = teamPlayerIds ? teamPlayerIds(tid) : [];
+                    const out = pids.length > 0 && pids.every((p) => excludeSet?.has(p));
+                    return (
+                      <td className="num">
+                        <button className={`filter-toggle out${out ? " on" : ""}`} onClick={() => onToggleTeam(tid)}>
+                          {out ? "Excluded" : "Exclude"}
+                        </button>
+                      </td>
+                    );
+                  })()}
               </tr>
             );
           })}
@@ -13817,7 +13830,14 @@ function GroupsTab({
         </div>
 
         {groupsTab === "stage" && groupFormat === "swiss" && (
-          <SwissStageView results={results} teams={teams} teamLookup={teamLookup} />
+          <SwissStageView
+            results={results}
+            teams={teams}
+            teamLookup={teamLookup}
+            excludeSet={excludeSet}
+            teamPlayerIds={teamPlayerIds}
+            onToggleTeam={toggleTeamExclude}
+          />
         )}
         {groupsTab === "stage" && groupFormat === "bracket" && (
           <BracketStageView results={results} teams={teams} teamLookup={teamLookup} />
@@ -13945,8 +13965,10 @@ function GroupsTab({
                   const rows = Object.entries(data.players || {}).sort(
                     (x, y) => Number(y[1].total_points ?? 0) - Number(x[1].total_points ?? 0)
                   );
+                  const teamPids = teamPlayerIds(tid);
+                  const teamExcluded = teamPids.length > 0 && teamPids.every((p) => excludeSet.has(p));
                   return (
-                    <div className="event-team-row" key={tid}>
+                    <div className={`event-team-row${teamExcluded ? " exc" : ""}`} key={tid}>
                       <div className="event-team-head">
                         <TeamLogo hltvTeamId={info?.hltv_team_id} name={teamName(tid)} size={42} />
                         <div className="event-team-headtext">
@@ -13966,15 +13988,22 @@ function GroupsTab({
                               </div>
                             ))}
                           </div>
+                          <div className="filter-team-toggles">
+                            <button className={`filter-toggle out${teamExcluded ? " on" : ""}`} onClick={() => toggleTeamExclude(tid)}>
+                              {teamExcluded ? "Excluded" : "Exclude"}
+                            </button>
+                          </div>
                         </div>
                       </div>
                       <div className="event-team-players">
                         {rows.map(([pid, comps]) => {
                           const total = Number(comps.total_points ?? 0);
                           const name = playerNameById[Number(pid)] || String(pid);
+                          const included = includeSet.has(Number(pid));
+                          const excluded = excludeSet.has(Number(pid));
                           return (
                             <div
-                              className="event-player-card clickable"
+                              className={`event-player-card clickable${excluded ? " exc" : included ? " inc" : ""}`}
                               key={pid}
                               onClick={() => openGroupPlayer({ player_id: Number(pid), name, team_id: Number(tid) })}
                             >
@@ -14019,6 +14048,26 @@ function GroupsTab({
                                   {Number(valueByPid[Number(pid)].distance || 0).toFixed(1)}
                                 </div>
                               )}
+                              <div className="event-player-filters">
+                                <button
+                                  className={`filter-toggle in${included ? " on" : ""}`}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    toggleFilter(Number(pid), "include");
+                                  }}
+                                >
+                                  {included ? "Included" : "Include"}
+                                </button>
+                                <button
+                                  className={`filter-toggle out${excluded ? " on" : ""}`}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    toggleFilter(Number(pid), "exclude");
+                                  }}
+                                >
+                                  {excluded ? "Excluded" : "Exclude"}
+                                </button>
+                              </div>
                             </div>
                           );
                         })}

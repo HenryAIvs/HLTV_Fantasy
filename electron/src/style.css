@@ -4394,3 +4394,15 @@ button:disabled {
 .sw-final-teams { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .sw-final-team { display: inline-flex; }
 
+/* Include / exclude from the team rows and the Swiss seed table (the same
+   toggles as the Top 5 filters, same state) */
+.filter-toggle.in.on { background: #34d399; border-color: #34d399; color: #0a0c10; }
+.event-team-head .filter-team-toggles { margin: 8px 0 0; }
+.event-team-row.exc { border-left-color: #b23b38; }
+.event-team-row.exc .event-team-players { opacity: 0.55; }
+.event-player-filters { display: flex; gap: 6px; margin-top: 8px; }
+.event-player-card .filter-toggle { padding: 3px 8px; font-size: 10px; }
+.event-player-card.exc { border-color: #b23b38; opacity: 0.6; }
+.event-player-card.inc { border-color: #34d399; }
+.swiss-seed-table .filter-toggle { padding: 3px 9px; font-size: 10px; }
+
