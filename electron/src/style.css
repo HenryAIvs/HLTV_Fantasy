@@ -3004,7 +3004,6 @@ button:disabled {
   padding: 12px 20px;
   flex: 1 1 0;
   min-width: 205px;
-  max-width: 340px;
   clip-path: polygon(8px 0, 100% 0, 100% 100%, 0 100%, 0 8px);
 }
 /* the four component tiles never reach the card edge: they share the width evenly and their labels stay compact */
