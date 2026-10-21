@@ -8481,6 +8481,7 @@ function SchedulingTab({ notify, players, refresh }) {
   useEffect(() => {
     loadStatus();
     loadRuns();
+    loadCoverage();
     pollRef.current = setInterval(() => {
       loadStatus();
       loadRuns();
@@ -8491,6 +8492,25 @@ function SchedulingTab({ notify, players, refresh }) {
   const config = status?.config || {};
   const state = status?.state || {};
   const lastByTask = status?.last_success_by_task || {};
+
+  // What the nightly tasks maintain, counted on their cards; refreshed on
+  // load and whenever a run finishes.
+  const [coverage, setCoverage] = useState({});
+  const loadCoverage = async () => {
+    const get = (path) => api.get(path, 60000).catch(() => null);
+    const [rosters, hist, veto, sb] = await Promise.all([
+      get("/teams/rosters/coverage?top_n=0"),
+      get("/events/hltv-results/historical-map-stats/coverage"),
+      get("/events/hltv-results/veto-backfill/coverage"),
+      get("/events/hltv-results/map-scoreboards/coverage"),
+    ]);
+    setCoverage({ rosters, hist, veto, sb });
+  };
+  const wasRunningRef = useRef(false);
+  useEffect(() => {
+    if (wasRunningRef.current && !state.running) loadCoverage();
+    wasRunningRef.current = Boolean(state.running);
+  }, [state.running]);
 
   const patchConfig = async (patch) => {
     setSaveBusy(true);
@@ -8588,6 +8608,20 @@ function SchedulingTab({ notify, players, refresh }) {
             ? ["Up to", <input key="mm" type="number" min={1} max={720} value={mapModelMinutes} onChange={(e) => setMapModelMinutes(Number(e.target.value))} onBlur={() => patchConfig({ map_model_minutes: mapModelMinutes })} disabled={saveBusy} />, "min / night"]
             : null;
     const live = state.running && state.current_task === task;
+    const cov = coverage || {};
+    const covLines =
+      {
+        team_data: [
+          ["Rosters", cov.rosters?.checked, cov.rosters?.teams_in_scope, cov.rosters?.unchecked],
+          ["Fewer than five", cov.rosters?.short_lineups, null, 0],
+        ],
+        map_model: [
+          ["Map windows", cov.hist?.cached_windows, cov.hist?.required_windows, cov.hist?.missing_windows],
+          ["Vetoes", cov.veto?.with_veto, cov.veto?.total_matches, cov.veto?.missing_veto],
+          ["Scoreboards", cov.sb?.with_map_scoreboards, cov.sb?.total_matches, cov.sb?.missing_map_scoreboards],
+        ],
+        matches: [["Stored", cov.veto?.total_matches, null, 0]],
+      }[task] || [];
     const pill = live ? (
       <span className="pill ok">Running{state.total > 0 ? ` ${Number(state.processed).toLocaleString()} / ${Number(state.total).toLocaleString()}` : ""}</span>
     ) : !on ? (
@@ -8620,6 +8654,20 @@ function SchedulingTab({ notify, players, refresh }) {
           </div>
           <div className="topx-tile-maps">{run ? `${fmtDur(run.finished_at - run.started_at)} · ${run.trigger}` : "\u00a0"}</div>
         </div>
+        {covLines.length > 0 && (
+          <div className="sch-task-cov">
+            {covLines.map(([label, done, total, missing]) => (
+              <div className="sch-task-cov-row" key={label}>
+                <span>{label}</span>
+                <span className={Number(missing) > 0 ? "warn" : ""}>
+                  {done == null ? "-" : Number(done).toLocaleString()}
+                  {total != null ? <span className="muted"> / {Number(total).toLocaleString()}</span> : null}
+                  {Number(missing) > 0 ? ` · ${Number(missing).toLocaleString()} missing` : ""}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
         {setting && (
           <div className="sch-task-setting">
             <span className="topx-tile-label">{setting[0]}</span>
@@ -8710,8 +8758,6 @@ function SchedulingTab({ notify, players, refresh }) {
           </button>
         </div>
       </Section>
-
-      <ModelDataPanel topN={teamDataTopN} />
 
       <Section title="Run History">
         {recentRuns.length === 0 ? (
@@ -9170,329 +9216,6 @@ function RatingModelLabTab() {
           </div>
         </div>
       )}
-    </Section>
-  );
-}
-
-function useBackfillJob(basePath, jobLabel) {
-  const [status, setStatus] = useState("idle");
-  const [jobId, setJobId] = useState("");
-  const [processed, setProcessed] = useState(0);
-  const [total, setTotal] = useState(0);
-  const [ok, setOk] = useState(0);
-  const [failed, setFailed] = useState(0);
-  const [current, setCurrent] = useState("");
-  const [lastError, setLastError] = useState("");
-  const [etaSeconds, setEtaSeconds] = useState(null);
-  // True only once the user acts on the job in THIS mounted session, so a
-  // stale error hydrated from a previous run stays hidden.
-  const [interacted, setInteracted] = useState(false);
-  const pollingRef = useRef(false);
-  const onSettledRef = useRef(null);
-
-  const apply = (data, jobIdOverride = "") => {
-    const id = String(jobIdOverride || data?.job_id || "");
-    const nextStatus = String(data?.status || "queued");
-    const nextProcessed = Number(data?.processed_items || 0);
-    const nextTotal = Number(data?.total_items || 0);
-    setStatus(nextStatus);
-    setJobId(id);
-    setProcessed(nextProcessed);
-    setTotal(nextTotal);
-    setOk(Number(data?.ok || 0));
-    setFailed(Number(data?.failed || 0));
-    setCurrent(String(data?.current_item || ""));
-    setLastError(String(data?.last_error || data?.error || ""));
-    const startedAtMs = getBatchStartedAtMs(data);
-    if (nextProcessed > 0 && nextTotal > nextProcessed && ["queued", "running", "pausing", "canceling"].includes(nextStatus)) {
-      const elapsedSeconds = Math.max(1, (Date.now() - startedAtMs) / 1000);
-      const rate = nextProcessed / elapsedSeconds;
-      setEtaSeconds(rate > 0 ? (nextTotal - nextProcessed) / rate : null);
-    } else {
-      setEtaSeconds(null);
-    }
-    return { jobId: id, nextStatus };
-  };
-
-  const poll = async (id) => {
-    if (!id || pollingRef.current) return;
-    pollingRef.current = true;
-    try {
-      let done = false;
-      let pollFailures = 0;
-      while (!done) {
-        let data;
-        try {
-          data = await api.get(`${basePath}/job/${id}`, 60000);
-          pollFailures = 0;
-        } catch (pollError) {
-          pollFailures += 1;
-          if (pollFailures >= 5) throw pollError;
-          await new Promise((resolve) => setTimeout(resolve, 3000));
-          continue;
-        }
-        const applied = apply(data, id);
-        if (["completed", "failed", "paused", "canceled"].includes(applied.nextStatus)) {
-          if (onSettledRef.current) onSettledRef.current();
-          done = true;
-          break;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-      }
-    } catch (e) {
-      setStatus("failed");
-      setLastError(String(e?.message || `Failed to poll ${jobLabel} job.`));
-    } finally {
-      pollingRef.current = false;
-    }
-  };
-
-  const start = async () => {
-    setInteracted(true);
-    setStatus("queued");
-    setProcessed(0);
-    setTotal(0);
-    setOk(0);
-    setFailed(0);
-    setLastError("");
-    setCurrent("");
-    try {
-      const res = await api.post(`${basePath}/start`, {});
-      const id = String(res?.job_id || "");
-      if (!id) throw new Error(`Failed to start ${jobLabel} job.`);
-      setJobId(id);
-      await poll(id);
-    } catch (e) {
-      setStatus("failed");
-      setLastError(String(e?.message || `Failed to start ${jobLabel} job.`));
-    }
-  };
-
-  const control = async (action) => {
-    if (!jobId) return;
-    setInteracted(true);
-    try {
-      const res = await api.post(`${basePath}/job/${jobId}/${action}`, {});
-      const applied = apply(res, jobId);
-      if (["queued", "running", "pausing", "canceling"].includes(applied.nextStatus)) poll(jobId);
-    } catch (e) {
-      setLastError(String(e?.message || `Failed to ${action} ${jobLabel} job.`));
-    }
-  };
-
-  const hydrate = async () => {
-    try {
-      const latest = await api.get(`${basePath}/latest`);
-      if (!latest?.exists) return;
-      if (["completed", "canceled"].includes(String(latest?.status || ""))) return;
-      const applied = apply(latest);
-      if (["queued", "running", "pausing", "canceling"].includes(applied.nextStatus)) poll(applied.jobId);
-    } catch {
-      // Optional panel; ignore startup failures.
-    }
-  };
-
-  return {
-    status,
-    jobId,
-    processed,
-    total,
-    ok,
-    failed,
-    current,
-    lastError,
-    interacted,
-    etaSeconds,
-    active: ["queued", "running", "pausing", "canceling"].includes(status),
-    resumable: ["paused", "failed"].includes(status),
-    pctDone: total > 0 ? Math.min(100, Math.max(0, (processed / total) * 100)) : 0,
-    start,
-    pause: () => control("pause"),
-    cancel: () => control("cancel"),
-    resume: () => control("resume"),
-    hydrate,
-    onSettledRef,
-  };
-}
-
-// One row of the Model Lab's data panel: what the job covers, how much is
-// stored, and the job's controls/progress (job = useBackfillJob(...)).
-function BackfillRow({ name, detail, done, total, missing, unit, extra, job, verb = "Fetch", activeLabel = "Fetching" }) {
-  const loaded = total != null;
-  const d = Number(done || 0);
-  const t = Number(total || 0);
-  const m = Number(missing || 0);
-  const pctDone = t > 0 ? Math.min(100, (d / t) * 100) : 0;
-  const active = job.active;
-  const showProgress = job.status !== "idle" && job.status !== "completed";
-  return (
-    <div className={`mm-job${active ? " active" : ""}`}>
-      <div className="mm-job-info">
-        <div className="mm-job-name">{name}</div>
-        {detail && <div className="mm-job-detail">{detail}</div>}
-      </div>
-      <div className="mm-job-cov">
-        <div className="mm-job-cov-head">
-          <span className="mm-job-cov-value">{loaded && t > 0 ? `${pctDone.toFixed(1)}%` : "—"}</span>
-          <span className="mm-job-cov-text">
-            {!loaded
-              ? "Checking coverage..."
-              : `${d.toLocaleString()} of ${t.toLocaleString()} ${unit}${t > 0 ? (m > 0 ? ` · ${m.toLocaleString()} missing` : " · complete") : ""}${extra ? ` · ${extra}` : ""}`}
-          </span>
-        </div>
-        <div className="mm-bar">
-          <div className="mm-bar-fill" style={{ width: `${pctDone}%` }} />
-        </div>
-        {showProgress && (
-          <div className="mm-job-progress">
-            <span>
-              {active ? activeLabel : job.status} {job.processed.toLocaleString()} / {job.total.toLocaleString()} · ok {job.ok} · failed{" "}
-              {job.failed}
-              {active && job.total > job.processed ? ` · ETA ${formatBatchEta(job.etaSeconds)}` : ""}
-            </span>
-            {job.current && <span className="mm-job-current">{job.current}</span>}
-            {job.lastError && <span className="mm-job-error">{job.lastError}</span>}
-          </div>
-        )}
-        {job.status === "completed" && (
-          <div className="mm-job-progress">
-            <span>
-              Done: {job.ok} {verb === "Scan" ? "scanned" : "fetched"}, {job.failed} failed.
-            </span>
-          </div>
-        )}
-      </div>
-      <div className="mm-job-actions">
-        {!active && !job.resumable && (
-          <button className="secondary" onClick={job.start} disabled={t > 0 && m <= 0}>
-            {verb} missing
-          </button>
-        )}
-        {active && job.jobId && (
-          <button className="secondary" onClick={job.pause} disabled={["pausing", "canceling"].includes(job.status)}>
-            {job.status === "pausing" ? "Pausing..." : "Pause"}
-          </button>
-        )}
-        {job.resumable && job.jobId && (
-          <button className="secondary" onClick={job.resume}>
-            Resume
-          </button>
-        )}
-        {(active || job.resumable) && job.jobId && (
-          <button className="danger" onClick={job.cancel} disabled={job.status === "canceling"}>
-            {job.status === "canceling" ? "Canceling..." : "Cancel"}
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// The three backfills the map model depends on, as a Scheduling-tab panel.
-// Each is a pausable server-side job driven through useBackfillJob; the
-// scheduler's nightly "map_model" task drives these very same jobs, so
-// progress shows here whichever side started them.
-function ModelDataPanel({ topN = 200 }) {
-  const [rosterCoverage, setRosterCoverage] = useState(null);
-  const rosterJob = useBackfillJob("/teams/rosters", "team rosters");
-  const loadRosterCoverage = async () => {
-    try {
-      const cov = await api.get(`/teams/rosters/coverage?top_n=${Number(topN) || 0}`);
-      if (cov && cov.status === "ok") setRosterCoverage(cov);
-    } catch {
-      // Coverage is informational.
-    }
-  };
-  rosterJob.onSettledRef.current = loadRosterCoverage;
-  useEffect(() => {
-    loadRosterCoverage();
-    rosterJob.hydrate();
-  }, [topN]);
-  const [histCoverage, setHistCoverage] = useState(null);
-  const histJob = useBackfillJob("/events/hltv-results/historical-map-stats", "historical map stats");
-  const loadHistCoverage = async () => {
-    try {
-      const cov = await api.get("/events/hltv-results/historical-map-stats/coverage");
-      if (cov && cov.status === "ok") setHistCoverage(cov);
-    } catch {
-      // Coverage is informational; the lab still works without it.
-    }
-  };
-  histJob.onSettledRef.current = loadHistCoverage;
-
-  const [vetoCoverage, setVetoCoverage] = useState(null);
-  const vetoJob = useBackfillJob("/events/hltv-results/veto-backfill", "veto backfill");
-  const loadVetoCoverage = async () => {
-    try {
-      const cov = await api.get("/events/hltv-results/veto-backfill/coverage");
-      if (cov && cov.status === "ok") setVetoCoverage(cov);
-    } catch {
-      // Coverage is informational; the lab still works without it.
-    }
-  };
-  vetoJob.onSettledRef.current = loadVetoCoverage;
-
-  const [mapSbCoverage, setMapSbCoverage] = useState(null);
-  const mapSbJob = useBackfillJob("/events/hltv-results/map-scoreboards", "map scoreboards backfill");
-  const loadMapSbCoverage = async () => {
-    try {
-      const cov = await api.get("/events/hltv-results/map-scoreboards/coverage");
-      if (cov && cov.status === "ok") setMapSbCoverage(cov);
-    } catch {
-      // Coverage is informational; the lab still works without it.
-    }
-  };
-  mapSbJob.onSettledRef.current = loadMapSbCoverage;
-
-  useEffect(() => {
-    loadHistCoverage();
-    histJob.hydrate();
-    loadVetoCoverage();
-    vetoJob.hydrate();
-    loadMapSbCoverage();
-    mapSbJob.hydrate();
-  }, []);
-
-  return (
-    <Section title="Data Coverage">
-      <div className="mm-jobs">
-        <BackfillRow
-          name={`Team rosters · top ${Number(topN) || 200}`}
-          done={rosterCoverage?.checked}
-          total={rosterCoverage?.teams_in_scope}
-          missing={rosterCoverage?.unchecked}
-          unit="teams"
-          extra={Number(rosterCoverage?.short_lineups || 0) > 0 ? `${rosterCoverage.short_lineups} with fewer than five players on HLTV` : ""}
-          job={rosterJob}
-        />
-        <BackfillRow
-          name="Historical map stats"
-          done={histCoverage?.cached_windows}
-          total={histCoverage?.required_windows}
-          missing={histCoverage?.missing_windows}
-          unit="team windows"
-          extra={Number(histCoverage?.unmapped_team_keys || 0) > 0 ? `${histCoverage.unmapped_team_keys} team names not in the team DB` : ""}
-          job={histJob}
-        />
-        <BackfillRow
-          name="Match vetoes"
-          done={vetoCoverage?.with_veto}
-          total={vetoCoverage?.total_matches}
-          missing={vetoCoverage?.missing_veto}
-          unit="matches"
-          job={vetoJob}
-        />
-        <BackfillRow
-          name="Per-map scoreboards"
-          done={mapSbCoverage?.with_map_scoreboards}
-          total={mapSbCoverage?.total_matches}
-          missing={mapSbCoverage?.missing_map_scoreboards}
-          unit="matches"
-          job={mapSbJob}
-          verb="Scan"
-          activeLabel="Scanning"
-        />
-      </div>
     </Section>
   );
 }

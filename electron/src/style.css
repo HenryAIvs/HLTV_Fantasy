@@ -3269,66 +3269,11 @@ button:disabled {
 /* Map Model Lab: status lines, data-coverage rows, result tiles */
 
 
-.mm-data-note { color: #8fa3bf; font-size: 12.5px; margin: 0 0 12px; }
-.mm-jobs { display: flex; flex-direction: column; gap: 10px; }
-.mm-job {
-  display: grid;
-  grid-template-columns: 220px minmax(0, 1fr) auto;
-  gap: 12px 20px;
-  align-items: center;
-  padding: 12px 14px;
-  background: #10141a;
-  border: 1px solid #242b35;
-  border-left: 3px solid #2c3441;
-}
-.mm-job.active { border-left-color: #ff6b1a; }
-.mm-job-name {
-  font-family: var(--display);
-  font-stretch: condensed;
-  font-weight: 700;
-  font-size: 17px;
-  letter-spacing: 0.02em;
-  text-transform: uppercase;
-  color: #f2f5f9;
-}
-.mm-job-detail { margin-top: 2px; color: #8fa3bf; font-size: 12.5px; line-height: 1.45; }
-.mm-job-cov { min-width: 0; }
-.mm-job-cov-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; }
-.mm-job-cov-value {
-  font-family: var(--display);
-  font-stretch: condensed;
-  font-weight: 700;
-  font-size: 22px;
-  line-height: 1;
-  color: #f2f5f9;
-  font-variant-numeric: tabular-nums;
-}
-.mm-job-cov-text { color: #8fa3bf; font-size: 12.5px; }
 .mm-bar { height: 8px; background: #0a0c10; border: 1px solid #242b35; overflow: hidden; }
 .mm-bar-fill { height: 100%; background: #ff6b1a; transition: width 0.3s ease; }
-.mm-job-progress {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 14px;
-  margin-top: 8px;
-  color: #c6d0dc;
-  font-size: 12.5px;
-  font-variant-numeric: tabular-nums;
-}
-.mm-job-current { color: #8fa3bf; }
-.mm-job-error { color: #fca5a5; }
-.mm-job-actions { display: flex; gap: 8px; justify-self: end; }
-
-
 .mm-table th, .mm-table td { padding: 7px 12px; font-variant-numeric: tabular-nums; }
 
 .mm-win { color: #ff8a47; font-weight: 700; }
-@media (max-width: 1100px) {
-  .mm-job { grid-template-columns: 1fr; }
-  .mm-job-actions { justify-self: start; }
-  
-}
-
 /* Database > Players: search + scope side by side */
 .players-controls {
   display: flex;
@@ -3443,6 +3388,11 @@ button:disabled {
 .sch-task-head .topx-tile-label { margin-top: 3px; }
 .sch-task-stat { display: flex; flex-direction: column; gap: 2px; }
 .sch-task-value { font-family: var(--display); font-stretch: condensed; font-size: 28px; font-weight: 700; line-height: 1.1; color: #f2f5f9; font-variant-numeric: tabular-nums; }
+.sch-task-cov { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; align-items: baseline; font-size: 13px; color: #e9edf3; font-variant-numeric: tabular-nums; }
+.sch-task-cov-row { display: contents; }
+.sch-task-cov-row > span:first-child { color: #8fa3bf; font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
+.sch-task-cov-row > span:last-child { text-align: right; font-weight: 600; white-space: nowrap; }
+.sch-task-cov-row > span.warn { color: #fcd34d; }
 .sch-task-setting { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #10141a; border: 1px solid #242b35; }
 .sch-task-setting input { width: 72px; padding: 5px 8px; }
 .sch-task-setting .muted { font-size: 12px; }
