@@ -118,9 +118,29 @@ def walk(team_ids: List[int], seeds: Dict[int, int], bo3_mode: str, picks: Dict[
     complete = (not stopped) and all(t.wins >= TARGET or t.losses >= TARGET for t in states.values())
     return {
         "rounds": rounds,
+        "placeholders": _placeholder_rounds(len(team_ids), len(rounds)),
         "complete": complete,
         "records": {str(tid): [int(t.wins), int(t.losses)] for tid, t in states.items()},
     }
+
+
+def _placeholder_rounds(team_count: int, paired: int) -> List[Dict[str, int]]:
+    """How many matches each not-yet-paired round will hold (fixed by the
+    format, whatever the results): the record pools split evenly every
+    round, and a pool at the target is done."""
+    pools: Dict[tuple, int] = {(0, 0): int(team_count)}
+    out = []
+    for r in range(ROUNDS):
+        alive = {k: n for k, n in pools.items() if k[0] < TARGET and k[1] < TARGET}
+        matches = sum(n // 2 for n in alive.values())
+        if r >= paired and matches > 0:
+            out.append({"round": r + 1, "matches": int(matches)})
+        nxt: Dict[tuple, int] = {k: n for k, n in pools.items() if k not in alive}
+        for (w, l), n in alive.items():
+            nxt[(w + 1, l)] = nxt.get((w + 1, l), 0) + n // 2
+            nxt[(w, l + 1)] = nxt.get((w, l + 1), 0) + n - n // 2
+        pools = nxt
+    return out
 
 
 def samples_from_walk(team_ids: List[int], walked: Dict[str, Any]) -> SwissSamples:

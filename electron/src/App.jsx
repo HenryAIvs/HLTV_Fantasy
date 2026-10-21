@@ -12272,69 +12272,38 @@ function BracketPicker({ bracket, teamLookup, picks, onPick }) {
     (byStage[m.stage] = byStage[m.stage] || []).push(m);
   });
   const titleOf = (m, i, s) => DOUBLE8_MATCH_TITLE[m.key] || (byStage[s.key].length === 1 ? s.full : `${s.label} ${i + 1}`);
-  return (
-    <div className="pb-bracket">
-      {stages
-        .filter((s) => !s.pad && byStage[s.key])
-        .map((s) => (
-          <div className="pb-round" key={s.key}>
-            <div className="pb-round-title">{s.full}</div>
-            <div className="pb-matches">
-              {byStage[s.key].map((m, i) => (
-                <div className="pb-match-wrap" key={m.key}>
-                  <div className="gsl-match">
-                    <span className="gsl-label">{titleOf(m, i, s)}</span>
-                    <span className="gsl-pick">
-                      {[
-                        [m.a, m.pa],
-                        [m.b, m.pb],
-                      ].map(([tid, placeholder], rowIdx) => (
-                        <button
-                          key={rowIdx}
-                          disabled={!tid}
-                          className={tid && m.w === tid ? "active" : ""}
-                          onClick={() => tid && onPick(m.key, tid)}
-                        >
-                          {tid ? teamLookup[tid] || tid : placeholder}
-                        </button>
-                      ))}
-                    </span>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        ))}
-    </div>
-  );
+  const columns = stages
+    .filter((s) => !s.pad && byStage[s.key])
+    .map((s) => ({ key: s.key, title: s.full, matches: byStage[s.key].map((m, i) => ({ ...m, title: titleOf(m, i, s) })) }));
+  return <PickerBoard columns={columns} teamLookup={teamLookup} onPick={onPick} />;
 }
 
-// Completed Swiss picker: the rounds the backend has paired so far (a round
-// appears once every match of the round before has a winner); click a team
-// to make it the winner.
-function SwissPicker({ walk, teamLookup, picks, onPick }) {
-  const rounds = walk?.rounds || [];
-  const records = walk?.records || {};
-  const rec = (tid) => {
-    const r = records[String(tid)];
-    return r ? `${r[0]}-${r[1]}` : "";
-  };
+// The completed-stage picker board every format draws: one column per
+// round, one card per match (its title, the two sides as buttons, the
+// picked winner lit), unknown sides as disabled placeholders.
+function PickerBoard({ columns, teamLookup, onPick }) {
   return (
     <div className="pb-bracket">
-      {rounds.map((rd) => (
-        <div className="pb-round" key={`swiss-r${rd.round}`}>
-          <div className="pb-round-title">Round {rd.round}</div>
+      {columns.map((col) => (
+        <div className="pb-round" key={col.key}>
+          <div className="pb-round-title">{col.title}</div>
           <div className="pb-matches">
-            {rd.matches.map((m) => (
+            {col.matches.map((m) => (
               <div className="pb-match-wrap" key={m.key}>
                 <div className="gsl-match">
-                  <span className="gsl-label">
-                    {m.pool} · Bo{m.bo}
-                  </span>
+                  <span className="gsl-label">{m.title}</span>
                   <span className="gsl-pick">
-                    {[m.a, m.b].map((tid) => (
-                      <button key={tid} className={Number(picks[m.key]) === Number(tid) ? "active" : ""} onClick={() => onPick(m.key, tid)}>
-                        {teamLookup[tid] || tid}
+                    {[
+                      [m.a, m.pa],
+                      [m.b, m.pb],
+                    ].map(([tid, placeholder], rowIdx) => (
+                      <button
+                        key={rowIdx}
+                        disabled={!tid}
+                        className={tid && m.w === tid ? "active" : ""}
+                        onClick={() => tid && onPick(m.key, tid)}
+                      >
+                        {tid ? teamLookup[tid] || tid : placeholder}
                       </button>
                     ))}
                   </span>
@@ -12344,29 +12313,33 @@ function SwissPicker({ walk, teamLookup, picks, onPick }) {
           </div>
         </div>
       ))}
-      {walk?.complete && (
-        <div className="pb-round">
-          <div className="pb-round-title">Final records</div>
-          <div className="pb-matches">
-            {Object.keys(records)
-              .sort((x, y) => (records[y][0] - records[x][0]) || (records[x][1] - records[y][1]))
-              .map((tid) => (
-                <div className="pb-match-wrap" key={`rec-${tid}`}>
-                  <div className="gsl-match">
-                    <span className="gsl-label">{rec(tid)}</span>
-                    <span className="gsl-pick">
-                      <button className={records[tid][0] >= 3 ? "active" : ""} disabled>
-                        {teamLookup[tid] || tid}
-                      </button>
-                    </span>
-                  </div>
-                </div>
-              ))}
-          </div>
-        </div>
-      )}
     </div>
   );
+}
+
+// Completed Swiss picker: the same board as the brackets. Rounds the
+// backend has paired show their matches; the rounds still to come show
+// their match count as placeholders until the round before is complete.
+function SwissPicker({ walk, teamLookup, picks, onPick }) {
+  const paired = (walk?.rounds || []).map((rd) => ({
+    key: `r${rd.round}`,
+    title: `Round ${rd.round}`,
+    matches: rd.matches.map((m) => ({
+      key: m.key,
+      title: `${m.pool} · Bo${m.bo}`,
+      a: m.a,
+      b: m.b,
+      w: Number(picks[m.key]) === Number(m.a) || Number(picks[m.key]) === Number(m.b) ? Number(picks[m.key]) : null,
+      pa: "TBD",
+      pb: "TBD",
+    })),
+  }));
+  const pending = (walk?.placeholders || []).map((ph) => ({
+    key: `r${ph.round}`,
+    title: `Round ${ph.round}`,
+    matches: Array.from({ length: ph.matches }, (_, i) => ({ key: `r${ph.round}_${i}`, title: `Match ${i + 1}`, a: null, b: null, w: null, pa: "TBD", pb: "TBD" })),
+  }));
+  return <PickerBoard columns={[...paired, ...pending]} teamLookup={teamLookup} onPick={onPick} />;
 }
 
 // Swiss stage (a group format of the groups engine): the seed order with
